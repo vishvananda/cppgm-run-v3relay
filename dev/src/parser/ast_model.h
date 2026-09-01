@@ -8,11 +8,12 @@
 typedef std::size_t AstId;
 
 // PA10 deliberately keeps the syntax tree independent of later semantic
-// passes.  Token spellings which are part of the dump format live in text;
-// structural information lives in kind and children.
+// passes.  Structure lives in kind and children.  The token spellings that the
+// --emit-ast dump prints live in text, rendered once by the parser; a node
+// whose text was rendered from source tokens also records that token range so
+// later passes classify names from the typed tokens instead of splitting text.
 enum AstKind
 {
-	AST_INVALID = 0,
 	AST_TRANSLATION_UNIT,
 	AST_SIMPLE_DECLARATION,
 	AST_EMPTY_DECLARATION,
@@ -92,7 +93,6 @@ enum AstKind
 	AST_LAMBDA_INTRODUCER,
 	AST_LAMBDA_DECLARATOR,
 	AST_LAMBDA_SPECIFIER,
-	AST_BRACED_INIT_EXPRESSION,
 	AST_PACK_EXPANSION_EXPRESSION,
 	AST_ID_EXPRESSION,
 	AST_LITERAL,
@@ -109,7 +109,6 @@ enum AstKind
 	AST_BASE_SPECIFIER,
 	AST_BASE_NAME,
 	AST_ACCESS_SPECIFIER,
-	AST_MEMBER_DECLARATION,
 	AST_MEMBER_SPECIFIERS,
 	AST_SPECIFIER,
 	AST_SPECIAL_MEMBER_DECLARATION,
@@ -138,13 +137,10 @@ enum AstKind
 	AST_DEFAULT_ARGUMENT,
 	AST_TEMPLATE_ARGUMENT_LIST,
 	AST_TEMPLATE_ARGUMENT,
-	AST_PACK_EXPANSION,
-	AST_NOEXCEPT,
-	AST_TRAILING_TYPE,
-	AST_UNKNOWN,
 	AST_INLINE,
 	AST_VIRTUAL,
-	AST_ENUM_KEY
+	AST_ENUM_KEY,
+	AST_KIND_COUNT
 };
 
 const char* AstKindName(AstKind kind);
@@ -154,26 +150,29 @@ struct AstNode
 	AstKind kind;
 	std::string text;
 	std::vector<AstId> children;
+	// Half-open token range [first, last) the node was built from; both zero
+	// for structural nodes and for text that has no source tokens.
 	std::size_t first;
 	std::size_t last;
 
-	AstNode(AstKind kind = AST_INVALID, const std::string& text = "",
-		std::size_t first = 0, std::size_t last = 0)
+	AstNode(AstKind kind, const std::string& text, std::size_t first,
+		std::size_t last)
 		: kind(kind), text(text), first(first), last(last)
 	{
 	}
 };
 
+// Append-only node store; id 0 is the null node.
 class AstArena
 {
 public:
 	AstArena();
 
-	AstId Make(AstKind kind, std::string text = "");
+	AstId Make(AstKind kind, const std::string& text, std::size_t first,
+		std::size_t last);
 	AstNode& At(AstId id);
 	const AstNode& At(AstId id) const;
 
-	void SetSpan(AstId id, std::size_t first, std::size_t last);
 	void Add(AstId parent, AstId child);
 
 private:

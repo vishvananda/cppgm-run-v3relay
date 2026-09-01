@@ -2,13 +2,12 @@
 
 #include "exceptions.h"
 #include "tool_help_text.h"
-#include "preproc_engine.h"
+#include "preproc_host.h"
 #include "parser/ast_model.h"
 #include "parser/ast_parser.h"
 #include "parser/recog_token.h"
 
 #include <cstdlib>
-#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -17,8 +16,6 @@
 #include <vector>
 
 using namespace std;
-
-extern "C" long int syscall(long int n, ...) throw ();
 
 namespace {
 
@@ -396,41 +393,6 @@ int run_unimplemented_mode(const char * feature,
   throw NotImplementedException();
 }
 
-bool pa5_get_file_id(const string & path, PA5FileId & out_fileid)
-{
-  struct
-  {
-    unsigned long int dev;
-    unsigned long int ino;
-    long int unused[16];
-  } data;
-  const int result = static_cast<int>(syscall(4, path.c_str(), &data));
-  out_fileid = make_pair(data.dev, data.ino);
-  return result == 0;
-}
-
-PreprocBuildInfo cppgm_build_info()
-{
-  time_t now = time(0);
-  tm * local_time = localtime(&now);
-  if(local_time == 0) {
-    throw runtime_error("unable to obtain build time");
-  }
-  const char * snapshot = asctime(local_time);
-  if(snapshot == 0) {
-    throw runtime_error("unable to obtain build time");
-  }
-  const string stamp(snapshot);
-  if(stamp.size() < 24) {
-    throw runtime_error("invalid build time");
-  }
-  PreprocBuildInfo build_info;
-  build_info.date = stamp.substr(4, 7) + stamp.substr(20, 4);
-  build_info.time = stamp.substr(11, 8);
-  build_info.author = "Vishvananda";
-  return build_info;
-}
-
 int run_emit_ast_mode(const vector<string> & args)
 {
   const SourceOutputInvocation invocation =
@@ -441,10 +403,10 @@ int run_emit_ast_mode(const vector<string> & args)
   }
 
   PrintHeader(out, invocation.inputs.size());
-  const PreprocBuildInfo build_info = cppgm_build_info();
+  const PreprocBuildInfo build_info = PreprocHostBuildInfo();
   for(size_t i = 0; i < invocation.inputs.size(); ++i) {
     ostringstream discarded_preproc_output;
-    PreprocEngine preprocessor(discarded_preproc_output, pa5_get_file_id,
+    PreprocEngine preprocessor(discarded_preproc_output, PA5GetFileId,
                                build_info);
     Pa6TokenCollector collector;
     preprocessor.RunSingleFile(invocation.inputs[i], collector);

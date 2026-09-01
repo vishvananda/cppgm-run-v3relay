@@ -26,15 +26,16 @@ AstId Pa10Parser::parse_expression()
 	AstId left = parse_assignment_expression();
 	if (left == 0)
 		return 0;
-	while (consume_simple(OP_COMMA))
+	while (is_simple(OP_COMMA))
 	{
+		const size_t comma_at = pos_++;
 		AstId right = parse_assignment_expression();
 		if (right == 0)
 		{
 			restore(saved);
 			return 0;
 		}
-		const AstId binary = make(AST_BINARY_EXPRESSION, "OP_COMMA:,");
+		const AstId binary = make_token(AST_BINARY_EXPRESSION, comma_at);
 		add(binary, left);
 		add(binary, right);
 		left = binary;
@@ -42,24 +43,32 @@ AstId Pa10Parser::parse_expression()
 	return left;
 }
 
+// Memoized: the declaration/expression ambiguity at statement, condition and
+// template-argument level re-reads the same expression from the same position
+// after a failed declaration attempt.
 AstId Pa10Parser::parse_assignment_expression()
+{
+	return try_memoized(MEMO_ASSIGNMENT_EXPRESSION,
+		&Pa10Parser::parse_assignment_expression_rule);
+}
+
+AstId Pa10Parser::parse_assignment_expression_rule()
 {
 	const Mark saved = mark();
 	AstId left = parse_conditional_expression();
 	if (left == 0)
 		return 0;
-	if (is_assignment_operator(token(pos_).simple_type) &&
-		token(pos_).kind == PA6_SIMPLE_TOKEN)
+	if (token(pos_).kind == PA6_SIMPLE_TOKEN &&
+		is_assignment_operator(token(pos_).simple_type))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_assignment_expression();
 		if (right == 0)
 		{
 			restore(saved);
 			return 0;
 		}
-		const AstId result = make(AST_ASSIGNMENT_EXPRESSION, op);
+		const AstId result = make_token(AST_ASSIGNMENT_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		return result;
@@ -99,12 +108,11 @@ AstId Pa10Parser::parse_logical_or_expression()
 	AstId left = parse_logical_and_expression();
 	while (left != 0 && is_simple(OP_LOR))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_logical_and_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -117,12 +125,11 @@ AstId Pa10Parser::parse_logical_and_expression()
 	AstId left = parse_inclusive_or_expression();
 	while (left != 0 && is_simple(OP_LAND))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_inclusive_or_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -135,12 +142,11 @@ AstId Pa10Parser::parse_inclusive_or_expression()
 	AstId left = parse_exclusive_or_expression();
 	while (left != 0 && is_simple(OP_BOR))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_exclusive_or_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -153,12 +159,11 @@ AstId Pa10Parser::parse_exclusive_or_expression()
 	AstId left = parse_and_expression();
 	while (left != 0 && is_simple(OP_XOR))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_and_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -171,12 +176,11 @@ AstId Pa10Parser::parse_and_expression()
 	AstId left = parse_equality_expression();
 	while (left != 0 && is_simple(OP_AMP))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_equality_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -189,12 +193,11 @@ AstId Pa10Parser::parse_equality_expression()
 	AstId left = parse_relational_expression();
 	while (left != 0 && (is_simple(OP_EQ) || is_simple(OP_NE)))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_relational_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -209,12 +212,11 @@ AstId Pa10Parser::parse_relational_expression()
 		token(pos_).kind == PA6_SIMPLE_TOKEN &&
 		!(has_angle_boundary() && is_simple(OP_GT)))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_shift_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -229,21 +231,19 @@ AstId Pa10Parser::parse_shift_expression()
 		(!has_angle_boundary() && is_kind(PA6_RSHIFT_1_TOKEN) &&
 		 is_kind(PA6_RSHIFT_2_TOKEN, pos_ + 1))))
 	{
-		string op;
+		const size_t op_at = pos_;
+		AstId result = 0;
 		if (is_simple(OP_LSHIFT))
-		{
-			op = token_label(token(pos_));
-			++pos_;
-		}
+			result = make_token(AST_BINARY_EXPRESSION, pos_++);
 		else
 		{
-			op = "OP_RSHIFT:>>";
+			// The two `>>` pieces print as the one shift operator.
 			pos_ += 2;
+			result = make_span(AST_BINARY_EXPRESSION, op_at, pos_, "OP_RSHIFT:>>");
 		}
 		AstId right = parse_additive_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -256,12 +256,11 @@ AstId Pa10Parser::parse_additive_expression()
 	AstId left = parse_multiplicative_expression();
 	while (left != 0 && (is_simple(OP_PLUS) || is_simple(OP_MINUS)))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_multiplicative_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -275,12 +274,11 @@ AstId Pa10Parser::parse_multiplicative_expression()
 	while (left != 0 && (is_simple(OP_STAR) || is_simple(OP_DIV) ||
 		is_simple(OP_MOD)))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_pm_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -293,12 +291,11 @@ AstId Pa10Parser::parse_pm_expression()
 	AstId left = parse_cast_expression();
 	while (left != 0 && (is_simple(OP_DOTSTAR) || is_simple(OP_ARROWSTAR)))
 	{
-		const string op = token_label(token(pos_));
-		++pos_;
+		const size_t op_at = pos_++;
 		AstId right = parse_cast_expression();
 		if (right == 0)
 			return 0;
-		AstId result = make(AST_BINARY_EXPRESSION, op);
+		AstId result = make_token(AST_BINARY_EXPRESSION, op_at);
 		add(result, left);
 		add(result, right);
 		left = result;
@@ -312,7 +309,7 @@ AstId Pa10Parser::parse_cast_expression()
 	if (is_simple(KW_STATIC_CAST) || is_simple(KW_DYNAMIC_CAST) ||
 		is_simple(KW_CONST_CAST) || is_simple(KW_REINTERPET_CAST))
 	{
-		const string op = token_label(token(pos_++));
+		const size_t op_at = pos_++;
 		if (!consume_simple(OP_LT))
 		{
 			restore(saved);
@@ -330,13 +327,16 @@ AstId Pa10Parser::parse_cast_expression()
 			restore(saved);
 			return 0;
 		}
-		const AstId result = make(AST_CAST_EXPRESSION, op);
+		const AstId result = make_token(AST_CAST_EXPRESSION, op_at);
 		add(result, type);
 		add(result, expression);
 		return result;
 	}
 	if (is_simple(OP_LPAREN))
 	{
+		// (type) expr is tried only when the parenthesis holds something that
+		// can start a type: a keyword, a bound type name, or an unknown name
+		// followed by ')' and the start of an expression.
 		const Pa6Token& first = token(pos_ + 1);
 		const BindKind* binding = first.kind == PA6_IDENTIFIER_TOKEN ?
 			scopes_.Lookup(first.spelling) : 0;
@@ -362,7 +362,9 @@ AstId Pa10Parser::parse_cast_expression()
 				AstId expression = parse_cast_expression();
 				if (expression != 0)
 				{
-					const AstId result = make(AST_CAST_EXPRESSION, "OP_LPAREN:");
+					// A C-style cast prints the '(' token type with no spelling.
+					const AstId result = make_span(AST_CAST_EXPRESSION,
+						saved.position, saved.position + 1, "OP_LPAREN:");
 					add(result, type);
 					add(result, expression);
 					return result;
@@ -394,13 +396,11 @@ AstId Pa10Parser::parse_unary_expression()
 		is_simple(OP_COMPL) || is_simple(OP_STAR) || is_simple(OP_AMP) ||
 		is_simple(OP_INC) || is_simple(OP_DEC))
 	{
-		const string op = token_label(token(pos_++));
+		const size_t op_at = pos_++;
 		AstId expression = parse_unary_expression();
 		if (expression == 0)
 			return 0;
-		const AstKind kind = (op == "OP_INC:++" || op == "OP_DEC:--") ?
-			AST_UNARY_EXPRESSION : AST_UNARY_EXPRESSION;
-		const AstId result = make(kind, op);
+		const AstId result = make_token(AST_UNARY_EXPRESSION, op_at);
 		add(result, expression);
 		return result;
 	}
@@ -451,7 +451,8 @@ AstId Pa10Parser::parse_postfix_suffixes(AstId expression)
 		}
 		if (is_simple(OP_DOT) || is_simple(OP_ARROW))
 		{
-			const string op = token_label(token(pos_++));
+			const size_t op_at = pos_++;
+			const size_t name_start = pos_;
 			const bool dependent_template = consume_simple(KW_TEMPLATE);
 			AstId member = is_simple(KW_OPERATOR) ?
 				parse_operator_function_id() : parse_id_expression();
@@ -460,11 +461,10 @@ AstId Pa10Parser::parse_postfix_suffixes(AstId expression)
 				restore(saved);
 				return 0;
 			}
-			const AstNode& name = arena_.At(member);
-			const AstId identifier = make(AST_IDENTIFIER,
-				dependent_template ? string("template ") + name.text :
-				name.text);
-			const AstId result = make(AST_MEMBER_EXPRESSION, op);
+			const string name = arena_.At(member).text;
+			const AstId identifier = make_span(AST_IDENTIFIER, name_start, pos_,
+				dependent_template ? "template " + name : name);
+			const AstId result = make_token(AST_MEMBER_EXPRESSION, op_at);
 			add(result, expression);
 			add(result, identifier);
 			expression = result;
@@ -472,8 +472,7 @@ AstId Pa10Parser::parse_postfix_suffixes(AstId expression)
 		}
 		if (is_simple(OP_INC) || is_simple(OP_DEC))
 		{
-			const string op = token_label(token(pos_++));
-			const AstId result = make(AST_POSTFIX_EXPRESSION, op);
+			const AstId result = make_token(AST_POSTFIX_EXPRESSION, pos_++);
 			add(result, expression);
 			expression = result;
 			continue;
@@ -497,9 +496,9 @@ AstId Pa10Parser::parse_postfix_root()
 	if (token(pos_).kind == PA6_SIMPLE_TOKEN && is_builtin_type(token(pos_).simple_type) &&
 		is_simple(OP_LPAREN, pos_ + 1))
 	{
-		const string name = token(pos_).spelling;
+		const AstId callee = make_span(AST_ID_EXPRESSION, pos_, pos_ + 1,
+			token(pos_).spelling);
 		++pos_;
-		const AstId callee = make(AST_ID_EXPRESSION, name);
 		AstId arguments = parse_argument_list(AST_PAREN_ARGUMENT_LIST);
 		if (arguments == 0)
 			return 0;
@@ -531,16 +530,25 @@ AstId Pa10Parser::parse_postfix_root()
 AstId Pa10Parser::parse_primary_expression()
 {
 	if (is_kind(PA6_LITERAL_TOKEN))
-		return make(AST_LITERAL, token(pos_++).spelling);
+	{
+		const AstId literal = make_span(AST_LITERAL, pos_, pos_ + 1,
+			token(pos_).spelling);
+		++pos_;
+		return literal;
+	}
 	if (token(pos_).kind == PA6_SIMPLE_TOKEN &&
 		is_keyword_literal(token(pos_).simple_type))
-		return make(AST_KEYWORD_LITERAL, token_label(token(pos_++)));
+		return make_token(AST_KEYWORD_LITERAL, pos_++);
 	if (is_kind(PA6_IDENTIFIER_TOKEN) || is_simple(OP_COLON2) ||
 		is_simple(KW_DECLTYPE))
 		return parse_id_expression();
 	return 0;
 }
 
+// An id-expression: decltype(e)::name..., or an optionally qualified name
+// whose components may be template-ids.  A template-id followed by an
+// identifier or literal, or by '{' inside a template argument, is re-read as
+// a comparison (a < b > c).
 AstId Pa10Parser::parse_id_expression()
 {
 	const Mark saved = mark();
@@ -563,7 +571,7 @@ AstId Pa10Parser::parse_id_expression()
 			}
 			++pos_;
 		}
-		return make(AST_ID_EXPRESSION, Join(start, pos_));
+		return make_join(AST_ID_EXPRESSION, start, pos_);
 	}
 	if (consume_simple(OP_COLON2) && !is_kind(PA6_IDENTIFIER_TOKEN))
 	{
@@ -575,35 +583,25 @@ AstId Pa10Parser::parse_id_expression()
 		restore(saved);
 		return 0;
 	}
-	++pos_;
-	if (is_simple(OP_LT))
+	while (true)
 	{
-		const Mark template_mark = mark();
+		const Mark component = mark();
 		const bool nested_template_context = has_angle_boundary();
-		--pos_;
 		if (parse_simple_template_id() == 0 ||
 			!CanContinueTemplateIdExpression(token(pos_), nested_template_context))
-			restore(template_mark);
-	}
-	while (consume_simple(OP_COLON2))
-	{
+		{
+			restore(component);
+			++pos_;
+		}
+		if (!consume_simple(OP_COLON2))
+			break;
 		if (!is_kind(PA6_IDENTIFIER_TOKEN))
 		{
 			restore(saved);
 			return 0;
 		}
-		++pos_;
-		if (is_simple(OP_LT))
-		{
-			const Mark template_mark = mark();
-			const bool nested_template_context = has_angle_boundary();
-			--pos_;
-			if (parse_simple_template_id() == 0 ||
-				!CanContinueTemplateIdExpression(token(pos_), nested_template_context))
-				restore(template_mark);
-		}
 	}
-	return make(AST_ID_EXPRESSION, Join(start, pos_));
+	return make_join(AST_ID_EXPRESSION, start, pos_);
 }
 
 AstId Pa10Parser::parse_argument_list(AstKind kind)
@@ -634,78 +632,85 @@ AstId Pa10Parser::parse_argument_list(AstKind kind)
 	return result;
 }
 
+// sizeof, alignof, typeid and noexcept applied to a parenthesized type-id or
+// expression.  A sizeof node prints no operator text; the others print it.
 AstId Pa10Parser::parse_type_trait_expression()
 {
 	const Mark saved = mark();
-	const string op = token_label(token(pos_++));
+	const size_t op_at = pos_++;
+	const bool is_sizeof = token(op_at).IsSimple(KW_SIZEOF);
+	const AstKind kind = is_sizeof ? AST_SIZEOF_EXPRESSION :
+		AST_TYPE_TRAIT_EXPRESSION;
 	if (!enter_bracket(OP_LPAREN))
 	{
 		restore(saved);
 		return 0;
 	}
 	const Mark type_mark = mark();
-	AstId type = 0;
 	const Pa6Token& first = token(pos_);
 	const BindKind* binding = first.kind == PA6_IDENTIFIER_TOKEN ?
 		scopes_.Lookup(first.spelling) : 0;
 	const bool functional_cast = first.kind == PA6_IDENTIFIER_TOKEN &&
 		is_simple(OP_LPAREN, pos_ + 1);
-	if (!functional_cast &&
-		((first.kind == PA6_SIMPLE_TOKEN &&
-			(is_builtin_type(first.simple_type) || is_cv_qualifier(first.simple_type))) ||
-		 (first.kind == PA6_SIMPLE_TOKEN &&
-			(first.IsSimple(KW_CLASS) || first.IsSimple(KW_STRUCT) ||
-			 first.IsSimple(KW_UNION) || first.IsSimple(KW_ENUM) ||
-			 first.IsSimple(KW_DECLTYPE))) ||
-		 (first.kind == PA6_IDENTIFIER_TOKEN && binding != 0 &&
-			(*binding == BIND_TYPE || *binding == BIND_TEMPLATE)) ||
-		 (first.kind == PA6_IDENTIFIER_TOKEN &&
-			(is_simple(OP_STAR, pos_ + 1) || is_simple(OP_AMP, pos_ + 1) ||
-			 is_simple(OP_LAND, pos_ + 1)))))
+	const bool type_start = (first.kind == PA6_SIMPLE_TOKEN &&
+		(is_builtin_type(first.simple_type) || is_cv_qualifier(first.simple_type) ||
+		 first.IsSimple(KW_CLASS) || first.IsSimple(KW_STRUCT) ||
+		 first.IsSimple(KW_UNION) || first.IsSimple(KW_ENUM) ||
+		 first.IsSimple(KW_DECLTYPE))) ||
+		(first.kind == PA6_IDENTIFIER_TOKEN && binding != 0 &&
+		 (*binding == BIND_TYPE || *binding == BIND_TEMPLATE)) ||
+		(first.kind == PA6_IDENTIFIER_TOKEN &&
+		 (is_simple(OP_STAR, pos_ + 1) || is_simple(OP_AMP, pos_ + 1) ||
+		  is_simple(OP_LAND, pos_ + 1)));
+	AstId operand = 0;
+	if (!functional_cast && type_start)
 	{
-			type = parse_type_id();
-		if (type != 0 && leave_bracket(OP_RPAREN))
+		operand = parse_type_id();
+		if (operand == 0 || !leave_bracket(OP_RPAREN))
 		{
-			const AstId result = make(op == "KW_SIZEOF:sizeof" ?
-				AST_SIZEOF_EXPRESSION : AST_TYPE_TRAIT_EXPRESSION,
-				op == "KW_SIZEOF:sizeof" ? "" : op);
-			add(result, type);
-			return result;
+			operand = 0;
+			restore(type_mark);
 		}
-		restore(type_mark);
 	}
-	AstId expression = parse_expression();
-	if (expression == 0 || !leave_bracket(OP_RPAREN))
+	if (operand == 0)
 	{
-		restore(saved);
-		return 0;
+		operand = parse_expression();
+		if (operand == 0 || !leave_bracket(OP_RPAREN))
+		{
+			restore(saved);
+			return 0;
+		}
 	}
-	const AstId result = make(op == "KW_SIZEOF:sizeof" ?
-		AST_SIZEOF_EXPRESSION : AST_TYPE_TRAIT_EXPRESSION,
-		op == "KW_SIZEOF:sizeof" ? "" : op);
-	add(result, expression);
+	const AstId result = is_sizeof ? make_span(kind, op_at, op_at + 1, "") :
+		make_token(kind, op_at);
+	add(result, operand);
 	return result;
 }
 
 AstId Pa10Parser::parse_new_expression()
 {
 	const Mark saved = mark();
-	const bool global_scope = consume_simple(OP_COLON2);
-	if (!consume_simple(KW_NEW))
-		return 0;
 	const AstId result = make(AST_NEW_EXPRESSION);
-	if (global_scope)
+	if (is_simple(OP_COLON2))
 	{
-		add(result, make(AST_GLOBAL_SCOPE));
+		add(result, make_span(AST_GLOBAL_SCOPE, pos_, pos_ + 1, ""));
+		++pos_;
+	}
+	if (!consume_simple(KW_NEW))
+	{
+		restore(saved);
+		return 0;
 	}
 	if (is_simple(OP_LPAREN))
 	{
+		// A parenthesized list is a placement only when a type follows it.
 		const Mark placement_mark = mark();
 		AstId placement_args = parse_argument_list(AST_PAREN_ARGUMENT_LIST);
 		if (placement_args != 0 && (is_builtin_type(token(pos_).simple_type) ||
 			is_kind(PA6_IDENTIFIER_TOKEN)))
 		{
-			const AstId placement = make(AST_PLACEMENT,
+			const AstId placement = make_span(AST_PLACEMENT,
+				placement_mark.position, pos_,
 				"(" + Join(placement_mark.position + 1, pos_ - 1) + ")");
 			add(placement, placement_args);
 			add(result, placement);
@@ -720,9 +725,7 @@ AstId Pa10Parser::parse_new_expression()
 		if (enter_bracket(OP_LPAREN))
 		{
 			type = parse_type_id();
-			if (type != 0 && leave_bracket(OP_RPAREN))
-				;
-			else
+			if (type == 0 || !leave_bracket(OP_RPAREN))
 			{
 				type = 0;
 				restore(parenthesized_type);
@@ -737,21 +740,10 @@ AstId Pa10Parser::parse_new_expression()
 		return 0;
 	}
 	add(result, type);
-	if (is_simple(OP_LPAREN))
+	if (is_simple(OP_LPAREN) || is_simple(OP_LBRACE))
 	{
-		AstId initializer = parse_paren_initializer();
-		if (initializer == 0)
-		{
-			restore(saved);
-			return 0;
-		}
-		const AstId wrapped = make(AST_INITIALIZER);
-		add(wrapped, initializer);
-		add(result, wrapped);
-	}
-	else if (is_simple(OP_LBRACE))
-	{
-		AstId initializer = parse_braced_init_list();
+		AstId initializer = is_simple(OP_LPAREN) ? parse_paren_initializer() :
+			parse_braced_init_list();
 		if (initializer == 0)
 		{
 			restore(saved);
@@ -770,11 +762,10 @@ AstId Pa10Parser::parse_delete_expression()
 	if (!consume_simple(KW_DELETE))
 		return 0;
 	const AstId result = make(AST_DELETE_EXPRESSION);
-	if (is_simple(OP_LSQUARE, pos_) && is_simple(OP_RSQUARE, pos_ + 1))
+	if (is_simple(OP_LSQUARE) && is_simple(OP_RSQUARE, pos_ + 1))
 	{
-		++pos_;
-		++pos_;
-		add(result, make(AST_ARRAY_DELETE));
+		add(result, make_span(AST_ARRAY_DELETE, pos_, pos_ + 2, ""));
+		pos_ += 2;
 	}
 	AstId expression = parse_unary_expression();
 	if (expression == 0)
@@ -792,6 +783,7 @@ AstId Pa10Parser::parse_lambda_expression()
 	const size_t start = pos_;
 	if (!enter_bracket(OP_LSQUARE))
 		return 0;
+	// The capture list is preserved as its joined spelling.
 	while (!is_simple(OP_RSQUARE))
 	{
 		if (at_end())
@@ -801,23 +793,21 @@ AstId Pa10Parser::parse_lambda_expression()
 		}
 		++pos_;
 	}
-	if (!leave_bracket(OP_RSQUARE))
-	{
-		restore(saved);
-		return 0;
-	}
+	leave_bracket(OP_RSQUARE);
 	const AstId result = make(AST_LAMBDA_EXPRESSION);
-	add(result, make(AST_LAMBDA_INTRODUCER, Join(start, pos_)));
-	AstId declarator = 0;
+	add(result, make_join(AST_LAMBDA_INTRODUCER, start, pos_));
+	AstId parameters = 0;
 	if (is_simple(OP_LPAREN) || is_simple(KW_MUTABLE) ||
 		is_simple(KW_NOEXCEPT) || is_simple(OP_ARROW))
 	{
-		declarator = make(AST_LAMBDA_DECLARATOR);
+		const AstId declarator = make(AST_LAMBDA_DECLARATOR);
 		if (is_simple(OP_LPAREN))
-			add(declarator, parse_parameter_clause());
+		{
+			parameters = parse_parameter_clause();
+			add(declarator, parameters);
+		}
 		if (is_simple(KW_MUTABLE))
-			add(declarator, make(AST_LAMBDA_SPECIFIER,
-				token_label(token(pos_++))));
+			add(declarator, make_token(AST_LAMBDA_SPECIFIER, pos_++));
 		if (is_simple(KW_NOEXCEPT))
 		{
 			++pos_;
@@ -835,9 +825,8 @@ AstId Pa10Parser::parse_lambda_expression()
 			add(noexcept_specifier, expression);
 			add(declarator, noexcept_specifier);
 		}
-		if (is_simple(OP_ARROW))
+		if (consume_simple(OP_ARROW))
 		{
-			++pos_;
 			AstId type = parse_type_id();
 			if (type == 0)
 			{
@@ -850,7 +839,11 @@ AstId Pa10Parser::parse_lambda_expression()
 		}
 		add(result, declarator);
 	}
+	// Lambda parameters are values inside the body.
+	scopes_.Push();
+	bind_parameters(parameters);
 	AstId body = parse_compound_statement();
+	scopes_.Pop();
 	if (body == 0)
 	{
 		restore(saved);

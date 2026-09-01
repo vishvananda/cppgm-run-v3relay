@@ -6,30 +6,14 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
-#include <ctime>
 #include <utility>
 
 #include "exceptions.h"
-#include "preproc_engine.h"
+#include "preproc_host.h"
 #include "parser/recog_parser.h"
 
 using namespace std;
 
-extern "C" long int syscall(long int n, ...) throw ();
-
-bool PA5GetFileId(const string& path, PA5FileId& out_fileid)
-{
-	struct
-	{
-			unsigned long int dev;
-			unsigned long int ino;
-			long int unused[16];
-	} data;
-
-	int res = syscall(4, path.c_str(), &data);
-	out_fileid = make_pair(data.dev, data.ino);
-	return res == 0;
-}
 
 bool HasBatchStdinArg(int argc, char** argv)
 {
@@ -54,21 +38,7 @@ int RunNotImplementedBatchMode()
 
 void DoRecog(const string& srcfile)
 {
-	time_t now = time(nullptr);
-	tm* local_time = localtime(&now);
-	if (local_time == nullptr)
-		throw runtime_error("unable to obtain build time");
-	const char* asctime_snapshot = asctime(local_time);
-	if (asctime_snapshot == nullptr)
-		throw runtime_error("unable to obtain build time");
-	const string build_stamp(asctime_snapshot);
-	if (build_stamp.size() < 24)
-		throw runtime_error("invalid build time");
-	PreprocBuildInfo build_info;
-	build_info.date = build_stamp.substr(4, 7) +
-		build_stamp.substr(20, 4);
-	build_info.time = build_stamp.substr(11, 8);
-	build_info.author = "Vishvananda";
+	const PreprocBuildInfo build_info = PreprocHostBuildInfo();
 
 	ostringstream discarded_preproc_output;
 	PreprocEngine preprocessor(discarded_preproc_output, PA5GetFileId,

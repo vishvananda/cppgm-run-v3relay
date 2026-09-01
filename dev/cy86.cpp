@@ -1,6 +1,5 @@
 // (C) 2013 CPPGM Foundation www.cppgm.org.  All rights reserved.
 
-#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -14,22 +13,9 @@ using namespace std;
 #include "cy86_codegen.h"
 #include "cy86_parse.h"
 #include "exceptions.h"
-#include "preproc_engine.h"
+#include "preproc_host.h"
 
 extern "C" long int syscall(long int n, ...) throw ();
-
-bool PA5GetFileId(const string& path, PA5FileId& out_fileid)
-{
-	struct
-	{
-		unsigned long int dev;
-		unsigned long int ino;
-		long int unused[16];
-	} data;
-	const int result = syscall(4, path.c_str(), &data);
-	out_fileid = make_pair(data.dev, data.ino);
-	return result == 0;
-}
 
 bool PA9SetFileExecutable(const string& path)
 {
@@ -55,25 +41,6 @@ int RunNotImplementedBatchMode()
 	return EXIT_SUCCESS;
 }
 
-PreprocBuildInfo BuildInfo()
-{
-	time_t now = time(nullptr);
-	tm* local_time = localtime(&now);
-	if (!local_time)
-		throw runtime_error("unable to obtain build time");
-	const char* asctime_snapshot = asctime(local_time);
-	if (!asctime_snapshot)
-		throw runtime_error("unable to obtain build time");
-	const string stamp(asctime_snapshot);
-	if (stamp.size() < 24)
-		throw runtime_error("invalid build time");
-	PreprocBuildInfo result;
-	result.date = stamp.substr(4, 7) + stamp.substr(20, 4);
-	result.time = stamp.substr(11, 8);
-	result.author = "Vishvananda";
-	return result;
-}
-
 vector<Cy86Token> CollectTranslationUnit(const string& srcfile,
 	const PreprocBuildInfo& build_info)
 {
@@ -87,7 +54,7 @@ vector<Cy86Token> CollectTranslationUnit(const string& srcfile,
 
 vector<Cy86Token> CollectTokens(const vector<string>& srcfiles)
 {
-	const PreprocBuildInfo build_info = BuildInfo();
+	const PreprocBuildInfo build_info = PreprocHostBuildInfo();
 	vector<Cy86Token> tokens;
 	for (size_t i = 0; i < srcfiles.size(); ++i)
 	{

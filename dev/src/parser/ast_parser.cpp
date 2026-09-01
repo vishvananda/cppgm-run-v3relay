@@ -1,8 +1,6 @@
 #include "ast_parser.h"
 
-#include <algorithm>
 #include <limits>
-#include <sstream>
 
 using namespace std;
 
@@ -21,8 +19,7 @@ bool IsWordToken(const Pa6Token& token)
 } // namespace
 
 Pa10Parser::Pa10Parser(const vector<Pa6Token>& tokens, AstArena& arena)
-	: tokens_(tokens), arena_(arena), pos_(0), angle_refusal_(false),
-		hard_failure_(false)
+	: tokens_(tokens), arena_(arena), pos_(0)
 {
 }
 
@@ -55,14 +52,6 @@ bool Pa10Parser::is_kind(Pa6TokenKind kind, size_t at) const
 bool Pa10Parser::consume_simple(ETokenType type)
 {
 	if (!is_simple(type))
-		return false;
-	++pos_;
-	return true;
-}
-
-bool Pa10Parser::consume_kind(Pa6TokenKind kind)
-{
-	if (!is_kind(kind))
 		return false;
 	++pos_;
 	return true;
@@ -136,64 +125,70 @@ void Pa10Parser::restore(const Mark& saved)
 {
 	pos_ = saved.position;
 	brackets_.resize(saved.brackets);
-	scopes_.Rollback(saved.scope);
-	angle_refusal_ = false;
-	hard_failure_ = false;
+	if (scopes_.Rollback(saved.scope))
+		memo_.clear();
 }
 
 uint64_t Pa10Parser::memo_key(unsigned rule) const
 {
-	return (static_cast<uint64_t>(rule) << 56) ^
-		(static_cast<uint64_t>(pos_) << 1) ^ (angle_refusal_ ? 1u : 0u);
+	return (static_cast<uint64_t>(rule) << 56) |
+		(static_cast<uint64_t>(pos_) << 1) | (has_angle_boundary() ? 1u : 0u);
 }
 
 AstId Pa10Parser::try_memoized(unsigned rule, AstRule implementation)
 {
 	const uint64_t key = memo_key(rule);
-	unordered_map<uint64_t, MemoEntry>::const_iterator found = memo_.find(key);
+	const unordered_map<uint64_t, MemoEntry>::const_iterator found =
+		memo_.find(key);
 	if (found != memo_.end())
 	{
-		pos_ = found->second.end;
+		if (found->second.node != 0)
+			pos_ = found->second.end;
 		return found->second.node;
 	}
 	const Mark saved = mark();
 	const AstId node = (this->*implementation)();
-	if (node != 0)
-	{
-		MemoEntry entry;
-		entry.node = node;
-		entry.end = pos_;
-		memo_[key] = entry;
-		return node;
-	}
-	restore(saved);
-	return 0;
+	if (node == 0)
+		restore(saved);
+	MemoEntry entry;
+	entry.node = node;
+	entry.end = pos_;
+	memo_[key] = entry;
+	return node;
 }
 
-AstId Pa10Parser::make(AstKind kind, const string& text)
+AstId Pa10Parser::make(AstKind kind)
 {
-	const AstId id = arena_.Make(kind, text);
-	arena_.SetSpan(id, pos_, pos_);
-	return id;
+	return arena_.Make(kind, string(), 0, 0);
 }
 
-AstId Pa10Parser::make(AstKind kind, const string& text,
-	const vector<AstId>& children)
+AstId Pa10Parser::make_span(AstKind kind, size_t first, size_t last,
+	const string& text)
 {
-	const AstId id = make(kind, text);
-	for (size_t i = 0; i < children.size(); ++i)
-		add(id, children[i]);
-	return id;
+	return arena_.Make(kind, text, first, last);
+}
+
+AstId Pa10Parser::make_join(AstKind kind, size_t first, size_t last)
+{
+	return arena_.Make(kind, Join(first, last), first, last);
+}
+
+AstId Pa10Parser::make_token(AstKind kind, size_t at)
+{
+	return arena_.Make(kind, token_label(token(at)), at, at + 1);
+}
+
+AstId Pa10Parser::make_operator_id(size_t first)
+{
+	// An unqualified operator-function-id prints as "operator" glued to the
+	// spellings that follow it: operatorint, operator"" _x, operatornew[].
+	return arena_.Make(AST_IDENTIFIER, string("operator") + Concat(first + 1, pos_),
+		first, pos_);
 }
 
 void Pa10Parser::add(AstId parent, AstId child)
 {
 	arena_.Add(parent, child);
-}
-
-AstId Pa10Parser::leaf(AstKind kind, const Pa6Token& tok)
-{
-	return make(kind, token_label(tok));
 }
 
 string Pa10Parser::token_label(const Pa6Token& tok) const
@@ -245,15 +240,6 @@ string Pa10Parser::Concat(size_t first, size_t last) const
 			result += token(i).spelling;
 	}
 	return result;
-}
-
-string Pa10Parser::operator_name(size_t first, size_t last) const
-{
-	if (first >= last)
-		return string();
-	if (token(first).IsSimple(KW_OPERATOR))
-		return string("operator") + Concat(first + 1, last);
-	return Join(first, last);
 }
 
 bool Pa10Parser::is_builtin_type(ETokenType type) const
@@ -435,45 +421,106 @@ bool Pa10Parser::node_has_kind(AstId node, AstKind kind) const
 	return false;
 }
 
-void Pa10Parser::collect_identifier_names(AstId node,
-	vector<string>& names) const
+bool Pa10Parser::specifier_seq_has_keyword(AstId specifiers,
+	ETokenType type) const
+{
+	const AstNode& sequence = arena_.At(specifiers);
+	for (size_t i = 0; i < sequence.children.size(); ++i)
+	{
+		const AstNode& specifier = arena_.At(sequence.children[i]);
+		if (specifier.kind == AST_DECL_SPECIFIER &&
+			specifier.last == specifier.first + 1 &&
+			token(specifier.first).IsSimple(type))
+			return true;
+	}
+	return false;
+}
+
+// The declarator-id node of a declarator, looking through nested declarators
+// such as (*name)(int).  Abstract declarators have none.
+AstId Pa10Parser::declarator_identifier(AstId declarator) const
+{
+	while (declarator != 0)
+	{
+		const AstNode& node = arena_.At(declarator);
+		AstId inner = 0;
+		for (size_t i = 0; i < node.children.size() && inner == 0; ++i)
+		{
+			const AstKind kind = arena_.At(node.children[i]).kind;
+			if (kind == AST_IDENTIFIER)
+				return node.children[i];
+			if (kind == AST_NESTED_DECLARATOR || kind == AST_DECLARATOR)
+				inner = node.children[i];
+		}
+		declarator = inner;
+	}
+	return 0;
+}
+
+// The identifier a declarator-id introduces into the current scope.  A
+// qualified name, template-id or operator name redeclares an entity that lives
+// elsewhere and introduces nothing here.
+string Pa10Parser::declared_identifier(AstId identifier) const
+{
+	if (identifier == 0)
+		return string();
+	const AstNode& node = arena_.At(identifier);
+	if (node.last != node.first + 1 || !token(node.first).IsIdentifier())
+		return string();
+	return token(node.first).spelling;
+}
+
+// The unqualified name a template-declaration introduces: the last identifier
+// of the declared name outside template-argument lists and parentheses.
+// Operator and destructor names introduce no template name.
+string Pa10Parser::template_name(AstId name) const
+{
+	if (name == 0)
+		return string();
+	const AstNode& node = arena_.At(name);
+	string result;
+	size_t angle_depth = 0;
+	size_t group_depth = 0;
+	for (size_t i = node.first; i < node.last; ++i)
+	{
+		const Pa6Token& current = token(i);
+		if (current.IsSimple(OP_LPAREN) || current.IsSimple(OP_LSQUARE))
+			++group_depth;
+		else if (current.IsSimple(OP_RPAREN) || current.IsSimple(OP_RSQUARE))
+			group_depth -= group_depth != 0;
+		else if (group_depth != 0)
+			continue;
+		else if (current.IsSimple(OP_LT))
+			++angle_depth;
+		else if (current.IsSimple(OP_GT) || current.IsRshiftPart())
+			angle_depth -= angle_depth != 0;
+		else if (angle_depth != 0)
+			continue;
+		else if (current.IsSimple(KW_OPERATOR) || current.IsSimple(OP_COMPL))
+			return string();
+		else if (current.IsIdentifier())
+			result = current.spelling;
+	}
+	return result;
+}
+
+void Pa10Parser::bind_declarator_name(AstId declarator, BindKind kind)
+{
+	scopes_.Bind(declared_identifier(declarator_identifier(declarator)), kind);
+}
+
+// Binds the name of every parameter-declaration below node as a value; used
+// for the scope of a function, special member or lambda body.
+void Pa10Parser::bind_parameters(AstId node)
 {
 	if (node == 0)
 		return;
 	const AstNode& value = arena_.At(node);
-	if (value.kind == AST_IDENTIFIER)
-	{
-		names.push_back(value.text);
-		return;
-	}
-	// Nested function parameter names are not declarations in the enclosing
-	// scope.  A parameter-declaration is passed explicitly by bind_parameters.
-	if (value.kind == AST_PARAMETER_CLAUSE)
-		return;
-	for (size_t i = 0; i < value.children.size(); ++i)
-		collect_identifier_names(value.children[i], names);
-}
-
-void Pa10Parser::bind_declarator(AstId declarator, BindKind kind)
-{
-	vector<string> names;
-	collect_identifier_names(declarator, names);
-	for (size_t i = 0; i < names.size(); ++i)
-		scopes_.Bind(names[i], kind);
-}
-
-void Pa10Parser::bind_parameters(AstId declarator)
-{
-	if (declarator == 0)
-		return;
-	const AstNode& value = arena_.At(declarator);
 	if (value.kind == AST_PARAMETER_DECLARATION)
 	{
-		vector<string> names;
 		for (size_t i = 0; i < value.children.size(); ++i)
-			collect_identifier_names(value.children[i], names);
-		for (size_t i = 0; i < names.size(); ++i)
-			scopes_.Bind(names[i], BIND_VALUE);
+			if (arena_.At(value.children[i]).kind == AST_DECLARATOR)
+				bind_declarator_name(value.children[i], BIND_VALUE);
 		return;
 	}
 	for (size_t i = 0; i < value.children.size(); ++i)
@@ -484,28 +531,36 @@ void Pa10Parser::bind_template_declaration(AstId declaration)
 {
 	if (declaration == 0)
 		return;
-	const AstNode& value = arena_.At(declaration);
-	string name;
-	if (value.kind == AST_CLASS_SPECIFIER ||
-		value.kind == AST_CLASS_FORWARD_DECLARATION)
-		name = value.text;
-	else
+	const AstNode& node = arena_.At(declaration);
+	AstId name = 0;
+	switch (node.kind)
 	{
-		vector<string> names;
-		collect_identifier_names(declaration, names);
-		if (!names.empty())
-			name = names[0];
-	}
-	if (name.empty())
+	case AST_CLASS_SPECIFIER:
+	case AST_CLASS_FORWARD_DECLARATION:
+	case AST_ALIAS_DECLARATION:
+		name = declaration;
+		break;
+	case AST_TEMPLATE_DECLARATION:
+		bind_template_declaration(node.children.back());
 		return;
-	const size_t scope = name.rfind("::");
-	if (scope != string::npos)
-		name = name.substr(scope + 2);
-	const size_t template_args = name.find('<');
-	if (template_args != string::npos)
-		name = name.substr(0, template_args);
-	if (!name.empty())
-		scopes_.Bind(name, BIND_TEMPLATE);
+	case AST_FUNCTION_DEFINITION:
+	case AST_SIMPLE_DECLARATION:
+	case AST_SPECIAL_MEMBER_DEFINITION:
+	case AST_SPECIAL_MEMBER_DECLARATION:
+		for (size_t i = 0; i < node.children.size() && name == 0; ++i)
+		{
+			const AstNode& child = arena_.At(node.children[i]);
+			if (child.kind == AST_DECLARATOR)
+				name = declarator_identifier(node.children[i]);
+			else if (child.kind == AST_INIT_DECLARATOR_LIST)
+				name = declarator_identifier(
+					arena_.At(child.children[0]).children[0]);
+		}
+		break;
+	default:
+		return;
+	}
+	scopes_.Bind(template_name(name), BIND_TEMPLATE);
 }
 
 AstId Pa10Parser::parse_translation_unit()
@@ -525,7 +580,7 @@ AstId Pa10Parser::parse_translation_unit()
 	return root;
 }
 
-AstId Pa10Parser::parse_declaration()
+AstId Pa10Parser::parse_declaration(bool member_context)
 {
 	const Mark saved = mark();
 	if (is_simple(OP_SEMICOLON))
@@ -538,7 +593,7 @@ AstId Pa10Parser::parse_declaration()
 		if (explicit_instantiation != 0)
 			return explicit_instantiation;
 		restore(saved);
-		const AstId templated = parse_template_declaration();
+		const AstId templated = parse_template_declaration(member_context);
 		if (templated != 0)
 			return templated;
 		restore(saved);
@@ -581,33 +636,11 @@ AstId Pa10Parser::parse_declaration()
 			return declaration;
 		restore(saved);
 	}
-	if (is_simple(KW_CLASS) || is_simple(KW_STRUCT) || is_simple(KW_UNION))
-	{
-		const AstId class_specifier = parse_class_specifier(true);
-		if (class_specifier != 0 && consume_simple(OP_SEMICOLON))
-			return class_specifier;
-		restore(saved);
-	}
-	if (is_simple(KW_ENUM))
-	{
-		const AstId enum_specifier = parse_enum_specifier();
-		if (enum_specifier != 0 && consume_simple(OP_SEMICOLON))
-			return enum_specifier;
-		restore(saved);
-	}
 	const AstId special = parse_special_member_definition();
 	if (special != 0)
 		return special;
 	restore(saved);
-	const AstId function = parse_function_definition();
-	if (function != 0)
-		return function;
-	restore(saved);
-	const AstId simple = parse_simple_declaration();
-	if (simple != 0)
-		return simple;
-	restore(saved);
-	return 0;
+	return parse_specified_declaration(member_context);
 }
 
 AstId Pa10Parser::parse_empty_declaration()
@@ -617,36 +650,124 @@ AstId Pa10Parser::parse_empty_declaration()
 	return make(AST_EMPTY_DECLARATION);
 }
 
-AstId Pa10Parser::parse_function_definition()
+// A declaration that starts with a decl-specifier-seq: a function definition,
+// a bit-field (in a class body), or an init-declarator-list.  The specifiers
+// and the first declarator are parsed once and the continuation is chosen from
+// the next token, so a class body inside the specifiers is never re-parsed.
+AstId Pa10Parser::parse_specified_declaration(bool member_context)
 {
 	const Mark saved = mark();
-	AstId specifiers = parse_decl_specifier_seq();
+	const AstId specifiers = parse_decl_specifier_seq();
 	if (specifiers == 0)
 		return 0;
-	AstId declarator = parse_declarator();
-	if (declarator == 0 || !node_has_kind(declarator, AST_PARAMETER_CLAUSE) ||
-		!is_simple(OP_LBRACE))
+	if (consume_simple(OP_SEMICOLON))
 	{
-		restore(saved);
-		return 0;
+		// A lone class or enum definition or forward declaration prints as
+		// the specifier itself.
+		const vector<AstId>& children = arena_.At(specifiers).children;
+		if (children.size() == 1)
+		{
+			const AstKind kind = arena_.At(children[0]).kind;
+			if (kind == AST_CLASS_SPECIFIER ||
+				kind == AST_CLASS_FORWARD_DECLARATION ||
+				kind == AST_ENUM_SPECIFIER)
+				return children[0];
+		}
+		const AstId result = make(AST_SIMPLE_DECLARATION);
+		add(result, specifiers);
+		return result;
 	}
+	AstId declarator = 0;
+	if (!(member_context && is_simple(OP_COLON)))
+	{
+		declarator = parse_declarator();
+		if (declarator == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+	}
+	if (member_context && is_simple(OP_COLON))
+		return finish_bit_field_declaration(saved, specifiers, declarator);
+	if (declarator != 0 && is_simple(OP_LBRACE) &&
+		node_has_kind(declarator, AST_PARAMETER_CLAUSE))
+	{
+		const AstId definition =
+			finish_function_definition(specifiers, declarator);
+		if (definition != 0)
+			return definition;
+	}
+	return finish_simple_declaration(saved, specifiers, declarator);
+}
+
+AstId Pa10Parser::finish_function_definition(AstId specifiers,
+	AstId declarator)
+{
+	const Mark saved = mark();
 	// The function name is visible while parsing its body, and parameter
 	// bindings live only in the function scope.
-	bind_declarator(declarator, BIND_VALUE);
+	bind_declarator_name(declarator, BIND_VALUE);
 	scopes_.Push();
 	bind_parameters(declarator);
-	AstId body = parse_compound_statement();
+	const AstId body = parse_compound_statement();
+	scopes_.Pop();
 	if (body == 0)
 	{
-		scopes_.Pop();
 		restore(saved);
 		return 0;
 	}
-	scopes_.Pop();
 	const AstId result = make(AST_FUNCTION_DEFINITION);
 	add(result, specifiers);
 	add(result, declarator);
 	add(result, body);
+	return result;
+}
+
+AstId Pa10Parser::finish_simple_declaration(const Mark& saved,
+	AstId specifiers, AstId declarator)
+{
+	const AstId list = make(AST_INIT_DECLARATOR_LIST);
+	AstId item = finish_init_declarator(declarator);
+	while (item != 0)
+	{
+		add(list, item);
+		if (!consume_simple(OP_COMMA))
+			break;
+		item = parse_init_declarator();
+	}
+	if (item == 0 || !consume_simple(OP_SEMICOLON))
+	{
+		restore(saved);
+		return 0;
+	}
+	const AstId result = make(AST_SIMPLE_DECLARATION);
+	add(result, specifiers);
+	add(result, list);
+	const BindKind kind = specifier_seq_has_keyword(specifiers, KW_TYPEDEF) ?
+		BIND_TYPE : BIND_VALUE;
+	const vector<AstId>& items = arena_.At(list).children;
+	for (size_t i = 0; i < items.size(); ++i)
+		bind_declarator_name(arena_.At(items[i]).children[0], kind);
+	return result;
+}
+
+AstId Pa10Parser::finish_bit_field_declaration(const Mark& saved,
+	AstId specifiers, AstId declarator)
+{
+	++pos_;
+	const AstId width = parse_assignment_expression();
+	if (width == 0 || !consume_simple(OP_SEMICOLON))
+	{
+		restore(saved);
+		return 0;
+	}
+	const AstId bit_declarator = make(AST_BIT_FIELD_DECLARATOR);
+	add(bit_declarator, declarator);
+	add(bit_declarator, width);
+	const AstId result = make(AST_BIT_FIELD_DECLARATION);
+	add(result, specifiers);
+	add(result, bit_declarator);
+	bind_declarator_name(declarator, BIND_VALUE);
 	return result;
 }
 
@@ -699,11 +820,6 @@ AstId Pa10Parser::parse_statement()
 		}
 	}
 	return parse_expression_statement();
-}
-
-AstId Pa10Parser::parse_declaration_statement()
-{
-	return parse_declaration();
 }
 
 AstId Pa10Parser::parse_expression_statement()
@@ -935,7 +1051,7 @@ AstId Pa10Parser::parse_for_init_statement()
 		++pos_;
 		return make(AST_FOR_INIT_STATEMENT);
 	}
-	AstId declaration = parse_simple_declaration();
+	AstId declaration = parse_specified_declaration(false);
 	if (declaration != 0)
 	{
 		const AstId result = make(AST_FOR_INIT_STATEMENT);
@@ -995,16 +1111,16 @@ AstId Pa10Parser::parse_labeled_statement()
 	}
 	if (!is_kind(PA6_IDENTIFIER_TOKEN) || !is_simple(OP_COLON, pos_ + 1))
 		return 0;
-	const string name = token(pos_).spelling;
-	++pos_;
-	++pos_;
+	const size_t name_at = pos_;
+	pos_ += 2;
 	AstId statement = parse_statement();
 	if (statement == 0)
 	{
 		restore(saved);
 		return 0;
 	}
-	const AstId result = make(AST_LABELED_STATEMENT, name);
+	const AstId result = make_span(AST_LABELED_STATEMENT, name_at, name_at + 1,
+		token(name_at).spelling);
 	add(result, statement);
 	return result;
 }
@@ -1037,13 +1153,14 @@ AstId Pa10Parser::parse_jump_statement()
 			restore(saved);
 			return 0;
 		}
-		const string name = token(pos_++).spelling;
+		const size_t name_at = pos_++;
 		if (!consume_simple(OP_SEMICOLON))
 		{
 			restore(saved);
 			return 0;
 		}
-		return make(AST_GOTO_STATEMENT, name);
+		return make_span(AST_GOTO_STATEMENT, name_at, name_at + 1,
+			token(name_at).spelling);
 	}
 	if (consume_simple(KW_RETURN))
 	{
@@ -1130,8 +1247,13 @@ AstId Pa10Parser::parse_handler()
 AstId Pa10Parser::parse_exception_declaration()
 {
 	const Mark saved = mark();
-	if (consume_simple(OP_DOTS))
-		return make(AST_EXCEPTION_DECLARATION, "", vector<AstId>(1, make(AST_ELLIPSIS, "...")));
+	if (is_simple(OP_DOTS))
+	{
+		const AstId result = make(AST_EXCEPTION_DECLARATION);
+		add(result, make_span(AST_ELLIPSIS, pos_, pos_ + 1, "..."));
+		++pos_;
+		return result;
+	}
 	AstId specifiers = parse_decl_specifier_seq();
 	if (specifiers == 0)
 	{

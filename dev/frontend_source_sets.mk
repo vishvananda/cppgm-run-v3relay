@@ -10,21 +10,21 @@ FRONTEND_OBJ_BASENAMES_pptoken := pptoken_lexer unicode
 FRONTEND_OBJ_BASENAMES_posttoken := pptoken_lexer posttoken_stream posttoken_tables unicode
 FRONTEND_OBJ_BASENAMES_ctrlexpr := ctrlexpr_eval pptoken_lexer posttoken_stream posttoken_tables unicode
 FRONTEND_OBJ_BASENAMES_macro := macro_replace pptoken_lexer posttoken_stream posttoken_tables unicode
-FRONTEND_OBJ_BASENAMES_preproc := preproc_engine macro_replace ctrlexpr_eval pptoken_lexer posttoken_stream posttoken_tables unicode
-FRONTEND_OBJ_BASENAMES_recog := parser/recog_parser parser/recog_parser_cp2 parser/recog_token \
+FRONTEND_OBJ_BASENAMES_preproc := preproc_host preproc_engine macro_replace ctrlexpr_eval pptoken_lexer posttoken_stream posttoken_tables unicode
+FRONTEND_OBJ_BASENAMES_recog := preproc_host parser/recog_parser parser/recog_parser_cp2 parser/recog_token \
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer \
 	posttoken_stream posttoken_tables unicode
-FRONTEND_OBJ_BASENAMES_nsdecl := parser/nsdecl_parser parser/nsdecl_model parser/recog_token \
+FRONTEND_OBJ_BASENAMES_nsdecl := preproc_host parser/nsdecl_parser parser/nsdecl_model parser/recog_token \
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer \
 	posttoken_stream posttoken_tables unicode
-FRONTEND_OBJ_BASENAMES_nsinit := parser/nsdecl_parser parser/nsdecl_model \
+FRONTEND_OBJ_BASENAMES_nsinit := preproc_host parser/nsdecl_parser parser/nsdecl_model \
 	parser/nsinit_sema parser/nsinit_image parser/recog_token \
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer \
 	posttoken_stream posttoken_tables unicode
-FRONTEND_OBJ_BASENAMES_cy86 := cy86_parse cy86_codegen x86_assembler \
+FRONTEND_OBJ_BASENAMES_cy86 := preproc_host cy86_parse cy86_codegen x86_assembler \
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer \
 	posttoken_stream posttoken_tables unicode
-FRONTEND_OBJ_BASENAMES_cppgm++ := parser/ast_parser parser/ast_parser_decl \
+FRONTEND_OBJ_BASENAMES_cppgm++ := preproc_host parser/ast_parser parser/ast_parser_decl \
 	parser/ast_parser_expr parser/ast_scope parser/ast_model parser/recog_token \
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer posttoken_stream \
 	posttoken_tables unicode

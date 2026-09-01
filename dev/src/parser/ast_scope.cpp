@@ -7,7 +7,7 @@ SyntaxScopes::SyntaxScopes()
 
 void SyntaxScopes::Push()
 {
-	scopes_.push_back(std::unordered_map<std::string, BindKind>());
+	scopes_.push_back(Scope());
 	scope_marks_.push_back(undo_.size());
 }
 
@@ -27,8 +27,6 @@ std::size_t SyntaxScopes::Mark() const
 
 bool SyntaxScopes::Rollback(std::size_t mark)
 {
-	if (mark > undo_.size())
-		return false;
 	bool changed = false;
 	while (undo_.size() > mark)
 	{
@@ -36,7 +34,7 @@ bool SyntaxScopes::Rollback(std::size_t mark)
 		undo_.pop_back();
 		if (undo.scope_depth >= scopes_.size())
 			continue;
-		std::unordered_map<std::string, BindKind>& scope = scopes_[undo.scope_depth];
+		Scope& scope = scopes_[undo.scope_depth];
 		if (undo.had_previous)
 			scope[undo.name] = undo.previous;
 		else
@@ -48,15 +46,13 @@ bool SyntaxScopes::Rollback(std::size_t mark)
 
 void SyntaxScopes::Bind(const std::string& name, BindKind kind)
 {
-	if (name.empty() || scopes_.empty())
+	if (name.empty())
 		return;
-	std::unordered_map<std::string, BindKind>& scope = scopes_.back();
-	std::unordered_map<std::string, BindKind>::const_iterator found =
-		scope.find(name);
+	Scope& scope = scopes_.back();
+	const Scope::const_iterator found = scope.find(name);
 	Undo undo;
 	undo.scope_depth = scopes_.size() - 1;
 	undo.name = name;
-	undo.kind = kind;
 	undo.had_previous = found != scope.end();
 	undo.previous = undo.had_previous ? found->second : BIND_VALUE;
 	undo_.push_back(undo);
@@ -67,8 +63,7 @@ const BindKind* SyntaxScopes::Lookup(const std::string& name) const
 {
 	for (std::size_t i = scopes_.size(); i != 0; --i)
 	{
-		std::unordered_map<std::string, BindKind>::const_iterator found =
-			scopes_[i - 1].find(name);
+		const Scope::const_iterator found = scopes_[i - 1].find(name);
 		if (found != scopes_[i - 1].end())
 			return &found->second;
 	}
@@ -79,8 +74,7 @@ const BindKind* SyntaxScopes::LookupScopePrefix(const std::string& name) const
 {
 	for (std::size_t i = scopes_.size(); i != 0; --i)
 	{
-		std::unordered_map<std::string, BindKind>::const_iterator found =
-			scopes_[i - 1].find(name);
+		const Scope::const_iterator found = scopes_[i - 1].find(name);
 		if (found != scopes_[i - 1].end() && found->second != BIND_VALUE)
 			return &found->second;
 	}

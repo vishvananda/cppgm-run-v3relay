@@ -6,9 +6,8 @@
 namespace
 {
 
-const char* Names[] =
+const char* const Names[AST_KIND_COUNT] =
 {
-	"invalid",
 	"translation-unit",
 	"simple-declaration",
 	"empty-declaration",
@@ -88,7 +87,6 @@ const char* Names[] =
 	"lambda-introducer",
 	"lambda-declarator",
 	"lambda-specifier",
-	"braced-init-expression",
 	"pack-expansion-expression",
 	"id-expression",
 	"literal",
@@ -105,7 +103,6 @@ const char* Names[] =
 	"base-specifier",
 	"base-name",
 	"access-specifier",
-	"member-declaration",
 	"member-specifiers",
 	"specifier",
 	"special-member-declaration",
@@ -134,10 +131,6 @@ const char* Names[] =
 	"default-argument",
 	"template-argument-list",
 	"template-argument",
-	"pack-expansion",
-	"noexcept",
-	"trailing-type",
-	"unknown",
 	"inline",
 	"virtual",
 	"enum-key"
@@ -147,19 +140,19 @@ const char* Names[] =
 
 const char* AstKindName(AstKind kind)
 {
-	const std::size_t count = sizeof(Names) / sizeof(Names[0]);
 	const std::size_t index = static_cast<std::size_t>(kind);
-	return index < count ? Names[index] : "unknown";
+	return index < AST_KIND_COUNT ? Names[index] : "invalid";
 }
 
 AstArena::AstArena()
-	: nodes_(1, AstNode())
+	: nodes_(1, AstNode(AST_KIND_COUNT, std::string(), 0, 0))
 {
 }
 
-AstId AstArena::Make(AstKind kind, std::string text)
+AstId AstArena::Make(AstKind kind, const std::string& text, std::size_t first,
+	std::size_t last)
 {
-	nodes_.push_back(AstNode(kind, text));
+	nodes_.push_back(AstNode(kind, text, first, last));
 	return nodes_.size() - 1;
 }
 
@@ -175,13 +168,6 @@ const AstNode& AstArena::At(AstId id) const
 	if (id == 0 || id >= nodes_.size())
 		throw std::out_of_range("invalid AST id");
 	return nodes_[id];
-}
-
-void AstArena::SetSpan(AstId id, std::size_t first, std::size_t last)
-{
-	AstNode& node = At(id);
-	node.first = first;
-	node.last = last;
 }
 
 void AstArena::Add(AstId parent, AstId child)
