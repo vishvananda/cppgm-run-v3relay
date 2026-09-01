@@ -1,5 +1,7 @@
 #include "recog_token.h"
 
+#include <cstring>
+
 using namespace std;
 
 namespace
@@ -33,7 +35,8 @@ unsigned TokenFlags(Pa6TokenKind kind, const string& spelling)
 Pa6Token::Pa6Token(Pa6TokenKind token_kind, const string& token_spelling,
 	ETokenType token_type)
 	: kind(token_kind), simple_type(token_type), spelling(token_spelling),
-		flags(TokenFlags(token_kind, token_spelling))
+		flags(TokenFlags(token_kind, token_spelling)), lit_scalar(false),
+		lit_type(FT_INT), lit_value(0)
 {
 }
 
@@ -85,9 +88,16 @@ void Pa6TokenCollector::append_literal(const string& source)
 }
 
 void Pa6TokenCollector::emit_literal(const string& source,
-	EFundamentalType, const void*, size_t)
+	EFundamentalType type, const void* data, size_t nbytes)
 {
-	append_literal(source);
+	Pa6Token token(PA6_LITERAL_TOKEN, source);
+	token.lit_scalar = true;
+	token.lit_type = type;
+	const size_t width = nbytes < sizeof(token.lit_value) ? nbytes :
+		sizeof(token.lit_value);
+	if (data != 0 && width != 0)
+		memcpy(&token.lit_value, data, width);
+	tokens.push_back(token);
 }
 
 void Pa6TokenCollector::emit_literal_array(const string& source,

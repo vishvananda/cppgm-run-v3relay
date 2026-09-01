@@ -112,11 +112,13 @@ Fixture-pinned semantic rules (beyond the grammar):
 
 ## Failure Map
 
-All 41 pa7 fixtures currently fail with EXIT_NOT_IMPLEMENTED — the stub
-`dev/nsdecl.cpp` throws before doing anything. No prior-stage failures
-(through-pa6 is clean at 313). Ownership of the failures:
+The CP1 baseline was 41 pa7 failures because the stub
+`dev/nsdecl.cpp` threw before doing anything. CP1 now passes 36/41; the
+remaining five are the deferred namespace-semantics group. No prior-stage
+failures (through-pa6 is clean at 313). Ownership of the failures:
 
-- Tool envelope (all 41): stub throw, no pipeline, no output writer.
+- Tool envelope: implemented; all 41 now reach the pa7 pipeline and output
+  comparison.
 - Type/declarator core (130, 140, 300, 310, 320, 330, 340, 350, 360,
   370; course 320-literal-forms, 320-parenthesized-array-abstract,
   350-parenthesized-parameter-declarators, 360-void-typedef,
@@ -135,12 +137,9 @@ All 41 pa7 fixtures currently fail with EXIT_NOT_IMPLEMENTED — the stub
 ## Performance Risks
 
 - Deep parenthesized declarators (course 600-deep-parenthesized, ~1200
-  levels): recursion depth ≈ a few frames per level — keep declarator
-  frames lean (no per-frame containers); fine within the default stack.
-  The real hazard is exponential named-vs-abstract re-parse of nested
-  parens in parameters (2^depth): eliminated by the single-pass
-  Either-mode declarator with rule 8 lookahead, and by parsing each
-  decl-specifier-seq exactly once.
+  levels): the single-pass Either-mode declarator and redundant-parenthesis
+  fast path avoid exponential reparse and remain safe at the required 4000
+  levels (measured at 0.011 s on the scaled probe).
 - Transitive directive chains (course 600-deep-using-directive-chain,
   ~100 namespaces): per-lookup BFS with a visited set is O(V+E) and
   cycle-safe (mutual directives are legal); no memoization needed at
@@ -150,14 +149,14 @@ All 41 pa7 fixtures currently fail with EXIT_NOT_IMPLEMENTED — the stub
 
 ## Checkpoint Ledger
 
-- CP1 (ACTIVE) — semantic core: model + types + printer + parser +
+- CP1 (DONE) — semantic core: model + types + printer + parser +
   envelope; named namespaces, scope-chain unqualified lookup, NNS/
   qualified lookup over direct declarations only, qualified
   declarator-id merge, typedef/alias-declaration, full declarator
-  machinery. Proof: `make test-pa7` failures drop 41 → ≤18 (the 23
-  envelope/type/structure fixtures above flip), through-pa6 stays 313,
-  file audit passes.
-- CP2 — namespace semantics breadth: unnamed namespaces, inline
+  machinery. Evidence: focused packet fixtures 23/23; `make test-pa7`
+  36/41 (failures 41 → 5); `make test-report-through-pa6` 313/313;
+  file audit passes with only the pre-existing warning.
+- CP2 (NEXT) — namespace semantics breadth: unnamed namespaces, inline
   namespaces + inline-set qualified lookup + reopen check, namespace
   aliases, using-declarations, anchored transitive using-directives.
   Proof: 41/41 `make test-pa7`; clean `make test-report-through-pa7`.
@@ -167,7 +166,7 @@ All 41 pa7 fixtures currently fail with EXIT_NOT_IMPLEMENTED — the stub
   .cpp (file-audit division warning hygiene), write `pa7/audit.md`,
   close out plan. Proof: through-pa7 clean; audit passes.
 
-## Active Checkpoint — CP1: semantic core
+## Completed Checkpoint — CP1: semantic core
 
 Build the model/parser/envelope so every declaration form works at global
 scope and inside named namespaces, with lookup over direct declarations.
@@ -279,3 +278,33 @@ Known uncertainties:
 - `Pa6Token` field additions must stay inert for recog (no behavior or
   layout assumptions elsewhere — verified: through-pa6 green is the
   guard).
+
+## Active Checkpoint — CP2: namespace semantics breadth
+
+Implement the deferred namespace model semantics while preserving the CP1
+direct-declaration and type/declarator behavior: unnamed namespace reuse and
+implicit visibility, inline namespace visibility and qualified lookup, live
+anchored using-directives, namespace aliases, and using-declarations.
+
+### Implementation Packet
+
+- `dev/src/parser/nsdecl_model.h/.cpp`: make namespace lookup filter-aware
+  for direct, unqualified, and qualified paths; retain using-directive edges
+  with visited sets and anchored search; model unnamed/inline namespaces and
+  aliases without adding aliases to output member lists; import using-
+  declarations as visibility-only entries.
+- `dev/src/parser/nsdecl_parser.h/.cpp`: resolve namespace-only NNS and
+  alias/directive targets, enforce inline-reopen consistency, create/reopen
+  the one unnamed child per enclosing namespace, and commit using forms
+  without changing CP1 declaration ownership.
+- Fixtures: `pa7/tests/{120-namespace-special,200-using-directives,
+  220-namespace-alias,240-unnamed,260-double-alias,270-using-declaration,
+  280-inline-namespace,290-double-using}` plus
+  `pa7/course/pa7/{200-using-directive-anchor-nested,
+  200-using-directive-anchor-sibling,200-using-directive-transitive-extension,
+  220-namespace-name-lookup-shadowing,270-using-declaration-reuse,
+  280-inline-namespace-alias-lookup,280-inline-namespace-qualified-lookup,
+  280-inline-namespace-reopen-bad,600-deep-using-directive-chain}`.
+- Proof: current CP1 36/41 remains green, the five deferred failures are
+  reduced to zero, then `make test-report-through-pa7` and the pa7 file audit
+  pass.

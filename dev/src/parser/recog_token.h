@@ -44,6 +44,9 @@ struct Pa6Token
 	ETokenType simple_type;
 	std::string spelling;
 	unsigned flags;
+	bool lit_scalar;
+	EFundamentalType lit_type;
+	unsigned long long lit_value;
 
 	Pa6Token(Pa6TokenKind kind, const std::string& spelling,
 		ETokenType simple_type = KW_AUTO);
