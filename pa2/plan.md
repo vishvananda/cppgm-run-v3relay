@@ -125,95 +125,49 @@ Data flow inside `PostTokenStream`:
 
 | id  | scope | proof of progress | status |
 |-----|-------|-------------------|--------|
-| CP1 | skeleton: dev/src classifier + tool adapter + build wiring; routing (A) + full pp-number path (B, C) | pa2 failures drop 26 → ≤12 (groups A/B/C pass); through-pa1 53/53; file audit pass | ACTIVE |
-| CP2 | shared `unicode.h/.cpp` extraction + character literals (D) | pa2 failures ≤10; through-pa1 53/53 proves lexer refactor safe; audit pass | pending |
+| CP1 | skeleton: dev/src classifier + tool adapter + build wiring; routing (A) + full pp-number path (B, C) | `make test-pa2`: 15/26 (11 failures, down from 26); `make test-report-through-pa1`: 53/53; file audit: 16 files passed; linearity probe: 2.45s/4.88s for 200k/400k lines | complete |
+| CP2 | shared `unicode.h/.cpp` extraction + character literals (D) | pa2 failures ≤10; through-pa1 53/53 proves lexer refactor safe; audit pass | ACTIVE |
 | CP3 | string sequences: deferred encoding, concat, operator"" split (E, F) | 26/26 pa2; clean `make test-report-through-pa2`; audit pass | pending |
 | CP4 | architecture cleanup + divergence audit vs ref outside corpus | all green stays green; audit notes recorded | pending |
 
-## Active Checkpoint: CP1 — classifier skeleton + pp-number ownership
+## Active Checkpoint: CP2 — shared unicode + character literal ownership
 
-Build the production classifier with complete routing and the full pp-number
-path (integer + floating + UDL + invalid). Character literals and string
-sequences emit `invalid`-free placeholders is NOT acceptable — until CP2/CP3
-they simply won't pass their fixtures; do not fake them. Groups A, B, C (14
-fixtures) must pass; nothing previously passing may regress.
+Extract the PA1 Unicode primitives into one shared implementation and complete
+character-literal classification/value production. Preserve CP1's 15/26
+passing fixtures and make the D fixtures pass; string sequencing remains for
+CP3.
 
 ### Implementation Packet
 
 Files/symbols to create or touch:
-- `dev/src/posttoken_types.h` — `EFundamentalType`, `ETokenType`,
-  declarations of `FundamentalTypeToStringMap`, `TokenTypeToStringMap`,
-  `StringToTokenTypeMap` (definitions in `dev/src/posttoken_tables.cpp`);
-  move all three verbatim from the starter block in `dev/posttoken.cpp`.
-- `dev/src/posttoken_stream.h` — `struct IPostTokenOutputStream` (pure
-  virtual: `emit_invalid`, `emit_simple`, `emit_identifier`, `emit_literal`,
-  `emit_literal_array`, `emit_user_defined_literal_{integer,floating,
-  character,string_array}`, `emit_eof`, signatures as in the starter Debug
-  class) and `struct PostTokenStream : IPPTokenStream` (constructor takes
-  `IPostTokenOutputStream&`). Follow the `pptoken_lexer.h` convention:
-  forward-declare, don't include `IPPTokenStream.h` (it assumes
-  `using namespace std`).
-- `dev/src/posttoken_stream.cpp` — routing per Stage Design; internal
-  helpers: `ClassifyPPNumber(const string&)` (grammar scan → integer /
-  floating / udl-integer / udl-floating / invalid + suffix split point),
-  integer candidate-list valuation (2.14.2 table, overflow-checked u64),
-  `PA2Decode_float/double/long_double` moved here from the starter (semantic
-  value production, istringstream scan). CP1 stubs
-  `emit_character_literal`/`emit_user_defined_character_literal` and the four
-  string emitters as plain `emit_invalid(data)` pass-throughs — correct for
-  no fixture, honest, replaced in CP2/CP3 (string sequencing changes their
-  shape anyway).
-- `dev/posttoken.cpp` — reduce to adapter: keep `HasBatchStdinArg` /
-  `RunNotImplementedBatchMode` and the try/catch exit protocol exactly as
-  `dev/pptoken.cpp`; `DebugPostTokenOutputStream` implements
-  `IPostTokenOutputStream` (keep `HexDump`/`ValueToHexChar` here); wire
-  `PPTokenize(input, PostTokenStream(output))`.
-- `dev/frontend_source_sets.mk` — `FRONTEND_OBJ_BASENAMES_posttoken :=
-  pptoken_lexer posttoken_stream posttoken_tables`.
+- `dev/src/unicode.h` and `dev/src/unicode.cpp` — own the UTF-8
+  code-point decoder/encoder and validity helpers currently embedded in
+  `pptoken_lexer.cpp`; keep the PA1 behavior and linear scan unchanged.
+- `dev/src/pptoken_lexer.cpp` — replace the moved helper definitions with
+  the shared Unicode interface; retain the lexer’s token spelling and error
+  behavior.
+- `dev/src/posttoken_stream.cpp` — implement character-literal escape/UCN
+  decoding, code-point validity checks, prefix-to-fundamental-type selection,
+  and user-defined-character output; keep string callbacks deferred to CP3.
+- `dev/frontend_source_sets.mk` — add `unicode` to the pptoken and
+  posttoken source sets.
+- Fixtures in scope: D (`200-character-literal`,
+  `200-unicode-character-literals`) plus all A/B/C fixtures as regression
+  coverage.
 
-Fixture groups in scope: A (100-simple), B (100-integer-zero,
-200-basic-integer-suffix, 200-octal-limits, 300-hex-limits,
-300-integer-limits), C (200-basic-floating, 300-floating-suffix,
-500-plus-ud-suffix, 200-exponent-like-integer-ud-suffix,
-300-incomplete-floating-exponent-bad, 300-invalid-floating-literal-shapes,
-300-multiple-decimal-points-bad, 300-user-defined-literal-range).
-
-Required spec facts (all verified against checked-in refs, see oracle
-section above for examples):
-- 2.14.2 integer candidates — decimal: {int, long, long long}; octal/hex:
-  {int, unsigned, long, unsigned long, ll, ull}; suffix `u` → unsigned-only,
-  `l` → drop int-level, `ll` → ll-level only; combine freely, any letter
-  order/case except `lL`/`Ll` mixes (suffix must be a valid
-  integer-suffix: u/U, l/L/ll/LL, both orders). No candidate fits → invalid.
-- pp-number → token: parse integer-literal (decimal `[1-9][0-9]*`, octal
-  `0[0-7]*`, hex `0[xX][0-9a-fA-F]+`) or floating-literal
-  (fractional-constant with optional exponent, or digit-seq with required
-  exponent; exponent `[eE][+-]?digits`); remainder must be a complete
-  integer/floating-suffix, or (whole remainder) a ud-suffix starting with
-  `_` containing no `.`/`+`/`-`; else invalid. Octal digits `8`/`9` in a
-  `0`-led literal → invalid unless it parses as floating (`07_e9` is octal +
-  `_e9`; `08` is invalid; `08.5` is floating).
-- Floating suffix `f/F` → float via PA2Decode_float, none → double, `l/L` →
-  long double (16-byte hexdump); no range rejection.
-- UDL integer/floating: emit source, suffix, and prefix text only.
-- Output lines and exit protocol exactly as in Stage Design step 5.
-
-Commands:
-- Build: `make -C dev posttoken`
-- Focused: `make test-pa2` (writes `.my` files under `pa2/tests/` and
-  `cppgm.tests/course/pa2/`); single case:
-  `./dev/posttoken < pa2/tests/300-integer-limits.t | diff - pa2/tests/300-integer-limits.ref`
-- Broad (checkpoint gate): `make test-report-through-pa1` must stay 53/53;
-  `perl scripts/cppgm_file_audit.pl --stage pa2 --paths dev/src` must pass.
-- Observation only (never shelled from the tool):
-  `printf '%s' '<input>' | ./dev/posttoken-ref`
-
-Performance probe (linearity):
-```
-perl -e 'print "12345 6.5e3 0x1F_x 1.25 ;\n" x 200000' > /tmp/pa2perf.in
-time ./dev/posttoken < /tmp/pa2perf.in > /dev/null
-# double to 400000 lines; wall time must scale ~2x
-```
+Required facts:
+- Character values are valid only in [0,0xD800) or [0xE000,0x110000).
+  Ordinary literals use `char` for values ≤127 and `int` otherwise;
+  `u`, `U`, and `L` use `char16_t`, `char32_t`, and `wchar_t`.
+- Numeric and simple/octal/hex escapes contribute one code point; ordinary
+  and prefixed code-unit range checks must be enforced, and multi-code-point
+  or empty literals are invalid.
+- A user-defined character suffix is split only after a valid character value;
+  preserve source and suffix in the output protocol.
+- Run `make -C dev posttoken`, `make test-pa2`,
+  `make test-report-through-pa1`, and
+  `perl scripts/cppgm_file_audit.pl --stage pa2 --paths dev/src` after the
+  source is stable.
 
 Known uncertainties (resolve by probing `posttoken-ref`, record answers in
 this file when they change behavior):
