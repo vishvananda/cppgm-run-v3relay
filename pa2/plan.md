@@ -127,45 +127,28 @@ Data flow inside `PostTokenStream`:
 |-----|-------|-------------------|--------|
 | CP1 | skeleton: dev/src classifier + tool adapter + build wiring; routing (A) + full pp-number path (B, C) | `make test-pa2`: 15/26 (11 failures, down from 26); `make test-report-through-pa1`: 53/53; file audit: 16 files passed; linearity probe: 2.45s/4.88s for 200k/400k lines | complete |
 | CP2 | shared `unicode.h/.cpp` extraction + character literals (D) | `make -C pa2 check` passes for `200-character-literal` and `200-unicode-character-literals`; `make test-pa2`: 17/26 (9 failures, down from 11); `make test-report-through-pa1`: 53/53; file audit: 18 files passed; reference probes confirm empty `''x` invalid, malformed cooked-UCN input fails in phase 3, and the `u` BMP-maximum probe is valid | complete |
-| CP3 | string sequences: deferred encoding, concat, operator"" split (E, F) | 26/26 pa2; clean `make test-report-through-pa2`; audit pass | pending |
+| CP3 | string sequences: deferred encoding, concat, operator"" split (E, F) | named local string/raw/concat/operator checks and four supplemental string checks pass; `make -C dev posttoken`; `make test-pa2`: 26/26; `make test-report-through-pa1`: 53/53; `make test-report-through-pa2`: 79/79; file audit: 18 files passed; 100k-element sequence probe: 0.05s, 5580 KB RSS; probes confirm singleton-only `operator""` split and state reset | complete |
 | CP4 | architecture cleanup + divergence audit vs ref outside corpus | all green stays green; audit notes recorded | pending |
 
-## Active Checkpoint: CP3 — string sequences and concatenation ownership
+## Active Checkpoint: CP4 — architecture cleanup and divergence audit
 
-Implement deferred string literal decoding/encoding, adjacent string
-concatenation, user-defined string output, and the `operator""` split. Preserve
-CP2's character-literal behavior and keep malformed sequences invalid.
+Audit the completed PA2 classifier for structural or specification divergences
+outside the checked-in corpus while preserving the green through-stage gates.
+Record only evidence-backed cleanup or behavior corrections.
 
 ### Implementation Packet
 
-Files/symbols to create or touch:
-- `dev/src/posttoken_stream.cpp` — own cooked-string element decoding,
-  code-unit encoding, sequence buffering, concatenation, and string UDL
-  output; retain CP2 character ownership.
-- `dev/src/posttoken_stream.h` — extend private state only if the sequence
-  callbacks require it; keep the public output protocol unchanged.
-- Fixtures in scope: `pa2/tests/250-string-literal`,
-  `pa2/tests/250-ud-strchar`, `pa2/tests/450-string-literal-concat`,
-  `pa2/tests/700-hard-string-concat`,
-  `pa2/tests/750-reserved-literal-operator-suffix`, plus the supplemental
-  pa2 string fixtures.
+Files/symbols to inspect or touch only when evidence requires it:
+- `dev/src/posttoken_stream.cpp` and `dev/src/posttoken_stream.h` — audit
+  helper boundaries, pending-sequence ownership, and public protocol stability.
+- `pa2/tests` and `cppgm.tests/course/pa2` — use existing fixtures for any
+  divergence found; add coverage only for a real semantic boundary.
 
 Required facts:
-- Decode escapes to code points, encode each element according to the string
-  prefix, append the required null element, and reject out-of-range values.
-- Adjacent strings concatenate only when their prefixes and UDL state permit;
-  preserve the space-separated source in every output path.
-- A string UDL suffix is split only after the complete sequence is validated;
-  `operator""` handling must not consume an unrelated following token.
-- Run `make -C dev posttoken`, `make test-pa2`,
-  `make test-report-through-pa1`, and
-  `perl scripts/cppgm_file_audit.pl --stage pa2 --paths dev/src` after the
-  source is stable.
-
-Known uncertainties (resolve by probing `posttoken-ref`, recording answers
-here when they change behavior):
-- Multi-element sequences after `operator` (for example,
-  `operator ""sv "abc"`) and whether the split applies only to singleton
-  sequences.
-- Whether an invalid token between `operator` and a string sequence resets
-  the KW_OPERATOR flag.
+- Keep the one-pipeline architecture, bounded integer valuation, and linear
+  pending-string behavior intact.
+- Prefer the handout and standard over an imperfect reference outside checked
+  fixtures; error text remains non-semantic.
+- Re-run `make test-report-through-pa2` and
+  `perl scripts/cppgm_file_audit.pl --stage pa2 --paths dev/src` after any
+  source change.

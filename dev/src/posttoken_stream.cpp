@@ -612,6 +612,335 @@ bool ParseCharacterEscape(const string& source, size_t& cursor,
 	return false;
 }
 
+struct StringElement
+{
+	uint32_t codepoint;
+	bool numeric_escape;
+};
+
+struct StringLiteralClassification
+{
+	string prefix;
+	string suffix;
+	vector<StringElement> elements;
+	size_t after_quote;
+	bool raw;
+	bool empty_ordinary;
+};
+
+bool ParseStringEscape(const string& source, size_t& cursor,
+	StringElement& element)
+{
+	if (cursor >= source.size() || source[cursor] != '\\' ||
+		cursor + 1 >= source.size())
+		return false;
+
+	char escaped = source[cursor + 1];
+	int simple_codepoint;
+	if (DecodeSimpleEscape(escaped, simple_codepoint))
+	{
+		cursor += 2;
+		element.codepoint = static_cast<uint32_t>(simple_codepoint);
+		element.numeric_escape = false;
+		return true;
+	}
+
+	if (escaped == 'x')
+	{
+		size_t first_digit = cursor + 2;
+		size_t end = first_digit;
+		uint64_t value = 0;
+		bool too_large = false;
+		while (end < source.size() && IsHexDigit(source[end]))
+		{
+			int digit = HexDigitValue(source[end]);
+			if (!too_large)
+			{
+				if (value > (0xFFFFFFFFULL -
+					static_cast<uint64_t>(digit)) / 16)
+				{
+					too_large = true;
+					value = 0x100000000ULL;
+				}
+				else
+					value = value * 16 + static_cast<uint64_t>(digit);
+			}
+			++end;
+		}
+		if (end == first_digit || too_large)
+			return false;
+		cursor = end;
+		element.codepoint = static_cast<uint32_t>(value);
+		element.numeric_escape = true;
+		return true;
+	}
+
+	if (escaped >= '0' && escaped <= '7')
+	{
+		size_t end = cursor + 1;
+		uint32_t value = 0;
+		for (int digits = 0; digits < 3 && end < source.size() &&
+			source[end] >= '0' && source[end] <= '7'; ++digits, ++end)
+			value = value * 8 + static_cast<uint32_t>(source[end] - '0');
+		cursor = end;
+		element.codepoint = value;
+		element.numeric_escape = true;
+		return true;
+	}
+
+	return false;
+}
+
+bool ParseStringLiteral(const string& source,
+	StringLiteralClassification& result)
+{
+	result.prefix.clear();
+	result.suffix.clear();
+	result.elements.clear();
+	result.after_quote = 0;
+	result.raw = false;
+	result.empty_ordinary = false;
+
+	size_t quote;
+	if (source.compare(0, 4, "u8R\"") == 0)
+	{
+		result.prefix = "u8";
+		result.raw = true;
+		quote = 3;
+	}
+	else if (source.compare(0, 3, "uR\"") == 0)
+	{
+		result.prefix = "u";
+		result.raw = true;
+		quote = 2;
+	}
+	else if (source.compare(0, 3, "UR\"") == 0)
+	{
+		result.prefix = "U";
+		result.raw = true;
+		quote = 2;
+	}
+	else if (source.compare(0, 3, "LR\"") == 0)
+	{
+		result.prefix = "L";
+		result.raw = true;
+		quote = 2;
+	}
+	else if (source.compare(0, 2, "R\"") == 0)
+	{
+		result.raw = true;
+		quote = 1;
+	}
+	else if (source.compare(0, 3, "u8\"") == 0)
+	{
+		result.prefix = "u8";
+		quote = 2;
+	}
+	else if (source.compare(0, 2, "u\"") == 0)
+	{
+		result.prefix = "u";
+		quote = 1;
+	}
+	else if (source.compare(0, 2, "U\"") == 0)
+	{
+		result.prefix = "U";
+		quote = 1;
+	}
+	else if (source.compare(0, 2, "L\"") == 0)
+	{
+		result.prefix = "L";
+		quote = 1;
+	}
+	else if (!source.empty() && source[0] == '"')
+	{
+		quote = 0;
+	}
+	else
+		return false;
+
+	if (quote >= source.size() || source[quote] != '"')
+		return false;
+
+	if (result.raw)
+	{
+		size_t opening_parenthesis = source.find('(', quote + 1);
+		if (opening_parenthesis == string::npos)
+			return false;
+
+		const string delimiter = source.substr(quote + 1,
+			opening_parenthesis - quote - 1);
+		const string closing = ")" + delimiter + '"';
+		size_t closing_position = source.find(closing,
+			opening_parenthesis + 1);
+		if (closing_position == string::npos)
+			return false;
+
+		result.after_quote = closing_position + closing.size();
+		result.suffix = source.substr(result.after_quote);
+		size_t cursor = opening_parenthesis + 1;
+		while (cursor < closing_position)
+		{
+			size_t end;
+			int codepoint = DecodeUtf8At(source, cursor, end);
+			if (codepoint < 0 || end > closing_position)
+				return false;
+			StringElement element;
+			element.codepoint = static_cast<uint32_t>(codepoint);
+			element.numeric_escape = false;
+			result.elements.push_back(element);
+			cursor = end;
+		}
+		return true;
+	}
+
+	size_t cursor = quote + 1;
+	while (cursor < source.size())
+	{
+		if (source[cursor] == '"')
+		{
+			result.after_quote = cursor + 1;
+			result.suffix = source.substr(result.after_quote);
+			result.empty_ordinary = result.prefix.empty() &&
+				result.elements.empty();
+			return true;
+		}
+
+		if (source[cursor] == '\\')
+		{
+			StringElement element;
+			if (!ParseStringEscape(source, cursor, element))
+				return false;
+			result.elements.push_back(element);
+			continue;
+		}
+
+		size_t end;
+		int codepoint = DecodeUtf8At(source, cursor, end);
+		if (codepoint < 0)
+			return false;
+		StringElement element;
+		element.codepoint = static_cast<uint32_t>(codepoint);
+		element.numeric_escape = false;
+		result.elements.push_back(element);
+		cursor = end;
+	}
+
+	return false;
+}
+
+struct EncodedString
+{
+	EFundamentalType type;
+	size_t num_elements;
+	size_t element_size;
+	vector<unsigned char> bytes;
+};
+
+template<typename T>
+void AppendEncodedStringElement(EncodedString& result, T value)
+{
+	const unsigned char* first =
+		reinterpret_cast<const unsigned char*>(&value);
+	result.bytes.insert(result.bytes.end(), first, first + sizeof(value));
+	result.num_elements++;
+	result.element_size = sizeof(value);
+}
+
+bool EncodeStringElements(const vector<uint32_t>& codepoints,
+	const vector<unsigned char>& numeric, const string& prefix,
+	EncodedString& result)
+{
+	result.num_elements = 0;
+	result.element_size = 0;
+	result.bytes.clear();
+	if (codepoints.size() != numeric.size())
+		return false;
+
+	if (prefix.empty() || prefix == "u8")
+		result.type = FT_CHAR;
+	else if (prefix == "u")
+		result.type = FT_CHAR16_T;
+	else if (prefix == "U")
+		result.type = FT_CHAR32_T;
+	else if (prefix == "L")
+		result.type = FT_WCHAR_T;
+	else
+		return false;
+
+	for (size_t i = 0; i < codepoints.size(); ++i)
+	{
+		const uint32_t value = codepoints[i];
+		const bool numeric_escape = numeric[i] != 0;
+		if (result.type == FT_CHAR)
+		{
+			if (numeric_escape)
+			{
+				if (value > 0xFF)
+					return false;
+				AppendEncodedStringElement(result,
+					static_cast<char>(value));
+			}
+			else
+			{
+				const string utf8 = EncodeUtf8(static_cast<int>(value));
+				for (size_t j = 0; j < utf8.size(); ++j)
+					AppendEncodedStringElement(result, utf8[j]);
+			}
+		}
+		else if (result.type == FT_CHAR16_T)
+		{
+			if (numeric_escape)
+			{
+				if (value > 0xFFFF)
+					return false;
+				AppendEncodedStringElement(result,
+					static_cast<char16_t>(value));
+			}
+			else if (value <= 0xFFFF)
+			{
+				AppendEncodedStringElement(result,
+					static_cast<char16_t>(value));
+			}
+			else
+			{
+				const uint32_t adjusted = value - 0x10000;
+				AppendEncodedStringElement(result, static_cast<char16_t>(
+					0xD800 + (adjusted >> 10)));
+				AppendEncodedStringElement(result, static_cast<char16_t>(
+					0xDC00 + (adjusted & 0x3FF)));
+			}
+		}
+		else if (result.type == FT_CHAR32_T)
+		{
+			AppendEncodedStringElement(result,
+				static_cast<char32_t>(value));
+		}
+		else
+		{
+			AppendEncodedStringElement(result, static_cast<wchar_t>(value));
+		}
+	}
+
+	switch (result.type)
+	{
+	case FT_CHAR:
+		AppendEncodedStringElement(result, static_cast<char>(0));
+		break;
+	case FT_CHAR16_T:
+		AppendEncodedStringElement(result, static_cast<char16_t>(0));
+		break;
+	case FT_CHAR32_T:
+		AppendEncodedStringElement(result, static_cast<char32_t>(0));
+		break;
+	case FT_WCHAR_T:
+		AppendEncodedStringElement(result, static_cast<wchar_t>(0));
+		break;
+	default:
+		return false;
+	}
+	return true;
+}
+
 bool ParseCharacterLiteral(const string& source,
 	CharacterLiteralClassification& result)
 {
@@ -789,8 +1118,172 @@ void EmitUserDefinedCharacterLiteralValue(IPostTokenOutputStream& output,
 } // namespace
 
 PostTokenStream::PostTokenStream(IPostTokenOutputStream& output)
-	: output_(output)
+	: output_(output),
+		pending_string_token_count_(0),
+		pending_string_sequence_active_(false),
+		pending_string_invalid_(false),
+		pending_string_has_ud_suffix_(false),
+		pending_string_ud_suffix_valid_(true),
+		pending_string_operator_candidate_(false),
+		pending_string_empty_ordinary_(false),
+		operator_pending_(false)
 {
+}
+
+void PostTokenStream::reset_string_sequence()
+{
+	pending_string_source_.clear();
+	pending_string_prefix_.clear();
+	pending_string_ud_suffix_.clear();
+	pending_string_codepoints_.clear();
+	pending_string_numeric_.clear();
+	pending_string_token_count_ = 0;
+	pending_string_sequence_active_ = false;
+	pending_string_invalid_ = false;
+	pending_string_has_ud_suffix_ = false;
+	pending_string_ud_suffix_valid_ = true;
+	pending_string_operator_candidate_ = false;
+	pending_string_empty_ordinary_ = false;
+}
+
+void PostTokenStream::append_string_token(const string& data,
+	bool user_defined)
+{
+	const bool first_token = !pending_string_sequence_active_;
+	if (first_token)
+	{
+		pending_string_sequence_active_ = true;
+		pending_string_source_ = data;
+		pending_string_operator_candidate_ = operator_pending_;
+		pending_string_empty_ordinary_ = false;
+		operator_pending_ = false;
+	}
+	else
+	{
+		pending_string_source_ += " ";
+		pending_string_source_ += data;
+		if (pending_string_has_ud_suffix_ &&
+			!pending_string_ud_suffix_valid_)
+			pending_string_invalid_ = true;
+	}
+	++pending_string_token_count_;
+
+	StringLiteralClassification classification;
+	if (!ParseStringLiteral(data, classification))
+	{
+		pending_string_invalid_ = true;
+		if (user_defined)
+		{
+			pending_string_has_ud_suffix_ = true;
+			pending_string_ud_suffix_valid_ = false;
+		}
+		return;
+	}
+
+	if (first_token)
+		pending_string_empty_ordinary_ = classification.empty_ordinary;
+
+	if (!user_defined && !classification.suffix.empty())
+		pending_string_invalid_ = true;
+
+	if (user_defined)
+	{
+		const bool had_ud_suffix = pending_string_has_ud_suffix_;
+		const bool valid_ud_suffix = !classification.suffix.empty() &&
+			IsUDSuffix(classification.suffix);
+		pending_string_has_ud_suffix_ = true;
+		if (!valid_ud_suffix)
+		{
+			pending_string_ud_suffix_valid_ = false;
+			if (!(first_token && pending_string_operator_candidate_ &&
+				classification.empty_ordinary))
+				pending_string_invalid_ = true;
+			if (!had_ud_suffix)
+				pending_string_ud_suffix_ = classification.suffix;
+		}
+		else
+		{
+			if (!had_ud_suffix)
+				pending_string_ud_suffix_ = classification.suffix;
+			else if (!pending_string_ud_suffix_valid_ ||
+				pending_string_ud_suffix_ != classification.suffix)
+				pending_string_invalid_ = true;
+		}
+	}
+
+	if (!classification.prefix.empty())
+	{
+		if (pending_string_prefix_.empty())
+			pending_string_prefix_ = classification.prefix;
+		else if (pending_string_prefix_ != classification.prefix)
+			pending_string_invalid_ = true;
+	}
+
+	for (size_t i = 0; i < classification.elements.size(); ++i)
+	{
+		pending_string_codepoints_.push_back(
+			classification.elements[i].codepoint);
+		pending_string_numeric_.push_back(
+			classification.elements[i].numeric_escape ? 1 : 0);
+	}
+}
+
+void PostTokenStream::flush_string_sequence()
+{
+	if (!pending_string_sequence_active_)
+		return;
+
+	const bool split_operator_suffix =
+		pending_string_operator_candidate_ &&
+		pending_string_token_count_ == 1 &&
+		pending_string_empty_ordinary_ &&
+		pending_string_has_ud_suffix_ &&
+		!pending_string_ud_suffix_valid_ &&
+		!pending_string_ud_suffix_.empty() &&
+		!pending_string_invalid_;
+	if (split_operator_suffix)
+	{
+		EncodedString encoded;
+		if (!EncodeStringElements(pending_string_codepoints_,
+			pending_string_numeric_, pending_string_prefix_, encoded))
+		{
+			output_.emit_invalid(pending_string_source_);
+		}
+		else
+		{
+			const size_t suffix_size = pending_string_ud_suffix_.size();
+			const string literal_source = pending_string_source_.substr(0,
+				pending_string_source_.size() - suffix_size);
+			output_.emit_literal_array(literal_source,
+				encoded.num_elements, encoded.type, encoded.bytes.data(),
+				encoded.bytes.size());
+			output_.emit_identifier(pending_string_ud_suffix_);
+		}
+		reset_string_sequence();
+		return;
+	}
+
+	EncodedString encoded;
+	if (pending_string_invalid_ ||
+		!EncodeStringElements(pending_string_codepoints_,
+			pending_string_numeric_, pending_string_prefix_, encoded))
+	{
+		output_.emit_invalid(pending_string_source_);
+	}
+	else if (pending_string_has_ud_suffix_)
+	{
+		output_.emit_user_defined_literal_string_array(
+			pending_string_source_, pending_string_ud_suffix_,
+			encoded.num_elements, encoded.type, encoded.bytes.data(),
+			encoded.bytes.size());
+	}
+	else
+	{
+		output_.emit_literal_array(pending_string_source_,
+			encoded.num_elements, encoded.type, encoded.bytes.data(),
+			encoded.bytes.size());
+	}
+	reset_string_sequence();
 }
 
 void PostTokenStream::emit_whitespace_sequence()
@@ -803,21 +1296,29 @@ void PostTokenStream::emit_new_line()
 
 void PostTokenStream::emit_header_name(const string& data)
 {
+	flush_string_sequence();
+	operator_pending_ = false;
 	output_.emit_invalid(data);
 }
 
 void PostTokenStream::emit_identifier(const string& data)
 {
+	flush_string_sequence();
+	operator_pending_ = false;
 	unordered_map<string, ETokenType>::const_iterator it =
 		StringToTokenTypeMap.find(data);
 	if (it == StringToTokenTypeMap.end())
 		output_.emit_identifier(data);
 	else
 		output_.emit_simple(data, it->second);
+	if (data == "operator")
+		operator_pending_ = true;
 }
 
 void PostTokenStream::emit_pp_number(const string& data)
 {
+	flush_string_sequence();
+	operator_pending_ = false;
 	PPNumberClassification classification = ClassifyPPNumber(data);
 	switch (classification.kind)
 	{
@@ -843,6 +1344,8 @@ void PostTokenStream::emit_pp_number(const string& data)
 
 void PostTokenStream::emit_character_literal(const string& data)
 {
+	flush_string_sequence();
+	operator_pending_ = false;
 	CharacterLiteralClassification classification;
 	if (!AnalyzeCharacterLiteral(data, classification) ||
 		classification.after_quote != data.size())
@@ -855,6 +1358,8 @@ void PostTokenStream::emit_character_literal(const string& data)
 
 void PostTokenStream::emit_user_defined_character_literal(const string& data)
 {
+	flush_string_sequence();
+	operator_pending_ = false;
 	CharacterLiteralClassification classification;
 	if (!AnalyzeCharacterLiteral(data, classification))
 	{
@@ -874,16 +1379,18 @@ void PostTokenStream::emit_user_defined_character_literal(const string& data)
 
 void PostTokenStream::emit_string_literal(const string& data)
 {
-	output_.emit_invalid(data);
+	append_string_token(data, false);
 }
 
 void PostTokenStream::emit_user_defined_string_literal(const string& data)
 {
-	output_.emit_invalid(data);
+	append_string_token(data, true);
 }
 
 void PostTokenStream::emit_preprocessing_op_or_punc(const string& data)
 {
+	flush_string_sequence();
+	operator_pending_ = false;
 	unordered_map<string, ETokenType>::const_iterator it =
 		StringToTokenTypeMap.find(data);
 	if (it == StringToTokenTypeMap.end())
@@ -894,10 +1401,13 @@ void PostTokenStream::emit_preprocessing_op_or_punc(const string& data)
 
 void PostTokenStream::emit_non_whitespace_char(const string& data)
 {
+	flush_string_sequence();
+	operator_pending_ = false;
 	output_.emit_invalid(data);
 }
 
 void PostTokenStream::emit_eof()
 {
+	flush_string_sequence();
 	output_.emit_eof();
 }
