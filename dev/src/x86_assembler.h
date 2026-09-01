@@ -44,6 +44,7 @@ enum X86Mnemonic
 enum X86OperandKind
 {
 	X86_REGISTER_OPERAND,
+	X86_HIGH_BYTE_REGISTER_OPERAND,
 	X86_MEMORY_OPERAND,
 	X86_IMMEDIATE_OPERAND,
 	X86_RELATIVE_OPERAND
@@ -57,18 +58,21 @@ struct X86Operand
 	std::int64_t displacement;
 	std::uint64_t immediate;
 	unsigned width;
+	bool force_full_width;
 
 	X86Operand()
 		: kind(X86_IMMEDIATE_OPERAND), reg(XR_RAX), base(XR_RAX),
-			displacement(0), immediate(0), width(0)
+			displacement(0), immediate(0), width(0), force_full_width(false)
 	{
 	}
 };
 
 X86Operand X86Reg(X64Register reg, unsigned width);
+X86Operand X86HighByte(X64Register reg);
 X86Operand X86Mem(X64Register base, std::int64_t displacement,
 	unsigned width);
 X86Operand X86Imm(std::uint64_t value, unsigned width);
+X86Operand X86ImmFullWidth(std::uint64_t value, unsigned width);
 X86Operand X86Rel(std::int64_t displacement);
 
 struct X86Instruction

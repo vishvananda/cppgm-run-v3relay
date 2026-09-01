@@ -157,10 +157,17 @@ NotImplementedException; nothing exists yet). By unblocking component:
   Progress proof: `make test-pa9` reports 14/18 tests passing, with failures
   reduced 18 → 4 (400, 500, 501, 600); `test-report-through-pa8` reports
   414/414 and the pa9 file audit passes.
-- CP2 — multiply/divide/modulus: one-operand MUL/IMUL/DIV/IDIV with
-  widening (xor rdx / cqo family; 8-bit uses ax with al/ah split).
-  Progress proof: 4 → 3 failing when 400-integer-calculator is complete;
-  retain the 14 CP1 passes and all malformed grammar witnesses.
+- CP2 — multiply/divide/modulus (COMPLETED): one-operand MUL/IMUL/DIV/IDIV
+  with widening (xor rdx / cqo family; 8-bit uses ax with al/ah split),
+  fixed-width character-array immediates, and compact literal immediates
+  for the hot integer paths.
+  Progress proof: `make test-pa9` reports 15/18, reducing the turn-start
+  4 failures to 3 (`500-to-float80`, `501-from-float80`, `600-float`);
+  the 400-integer-calculator output is byte-for-byte identical to its
+  checked-in reference, `make test-report-through-pa8` reports 414/414,
+  and the pa9 file audit passes. The specified 300 calculator probe, with
+  output redirected to `/dev/null`, is 0.479 s (<5 s); all prior integer and
+  malformed grammar witnesses stay green.
 - CP3 — x87 float80: conversions, arithmetic, comparisons (FCOMIP flag
   idiom: order operands so flt→setb, fle→setbe, fgt/fge by swap; feq/fne
   → sete/setne), move80 (10-byte copy), red-zone bounce buffers.
@@ -168,19 +175,19 @@ NotImplementedException; nothing exists yet). By unblocking component:
 - CP4 — stage close: `make test-report-through-pa9` clean, file audit
   clean, perf probe recorded, architecture notes appended here.
 
-## Active Checkpoint: CP2 — multiply/divide/modulus
+## Active Checkpoint: CP3 — x87 float80
 
 Implementation Packet:
 
-- Files/symbols: `dev/src/x86_assembler.cpp` one-operand
-  `MUL/IMUL/DIV/IDIV` encoding and `dev/src/cy86_codegen.cpp`
-  `TranslateMultiply`, `TranslateDivide`, and high-half setup; preserve
-  the fixed rax/rdx discipline and handle the 8-bit AX/AL/AH case.
-- Regression fixtures: keep all 14 current passes green; target
-  `pa9/tests/400-integer-calculator.t.1` while retaining the three malformed
+- Files/symbols: `dev/src/x86_assembler.cpp` x87 register/instruction
+  encoding and `dev/src/cy86_codegen.cpp` float conversion, arithmetic,
+  comparison, `move80`, and red-zone bounce-buffer lowering.
+- Regression fixtures: keep all 15 current passes green and close
+  `pa9/tests/500-to-float80.t.1`, `pa9/tests/501-from-float80.t.1`, and
+  `pa9/tests/600-float-calculator.t.1` while retaining the three malformed
   course grammar witnesses.
-- Required scope: preserve the fixed-width integer operand lowering and
-  all 14 existing passes while closing multiply/divide/modulus semantics.
+- Required scope: preserve integer lowering, data alignment, and the fixed
+  register discipline while implementing the x87 float80 checkpoint.
 - Focused command: `make -C dev cy86`; representative run is
   `time ./300-binary-calculator.my.program < 300-binary-calculator.stdin`,
   with wall time below 5 s. Required gates remain `make test-pa9`,

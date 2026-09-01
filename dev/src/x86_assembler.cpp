@@ -92,6 +92,55 @@ bool IsByteRegister(unsigned code)
 	return code >= 4;
 }
 
+unsigned HighByteCode(X64Register reg)
+{
+	const unsigned code = Code(reg);
+	if (code > 3)
+		throw runtime_error("x86 high-byte register must be legacy AX, CX, DX, or BX");
+	return code + 4;
+}
+
+bool IsLegacyByteRm(const X86Operand& operand)
+{
+	if (operand.kind == X86_REGISTER_OPERAND)
+		return Code(operand.reg) <= 3;
+	if (operand.kind == X86_MEMORY_OPERAND)
+		return Code(operand.base) <= 7;
+	return false;
+}
+
+void EncodeHighByteMove(vector<unsigned char>& out, unsigned width,
+	const vector<X86Operand>& operands)
+{
+	if (width != 8 || operands.size() != 2)
+		throw runtime_error("high-byte moves require two byte operands");
+	const X86Operand& dst = operands[0];
+	const X86Operand& src = operands[1];
+	if (dst.kind == X86_HIGH_BYTE_REGISTER_OPERAND)
+	{
+		const unsigned high = HighByteCode(dst.reg);
+		if (src.kind == X86_IMMEDIATE_OPERAND)
+		{
+			Prefix(out, width);
+			Byte(out, 0xb0 + high);
+			Byte(out, static_cast<unsigned>(src.immediate));
+			return;
+		}
+		if (!IsLegacyByteRm(src))
+			throw runtime_error("high-byte move source requires a legacy byte operand");
+		Prefix(out, width);
+		Byte(out, 0x8a);
+		ModRM(out, high, src);
+		return;
+	}
+	if (src.kind != X86_HIGH_BYTE_REGISTER_OPERAND ||
+		!IsLegacyByteRm(dst))
+		throw runtime_error("high-byte move destination requires a legacy byte operand");
+	Prefix(out, width);
+	Byte(out, 0x88);
+	ModRM(out, HighByteCode(src.reg), dst);
+}
+
 void EncodeMov(vector<unsigned char>& out, unsigned width,
 	const vector<X86Operand>& operands)
 {
@@ -99,8 +148,33 @@ void EncodeMov(vector<unsigned char>& out, unsigned width,
 		throw runtime_error("MOV requires two operands");
 	const X86Operand& dst = operands[0];
 	const X86Operand& src = operands[1];
+	if (dst.kind == X86_HIGH_BYTE_REGISTER_OPERAND ||
+		src.kind == X86_HIGH_BYTE_REGISTER_OPERAND)
+	{
+		EncodeHighByteMove(out, width, operands);
+		return;
+	}
 	if (dst.kind == X86_REGISTER_OPERAND && src.kind == X86_IMMEDIATE_OPERAND)
 	{
+		if (width == 64 && !src.force_full_width)
+		{
+			const unsigned reg = Code(dst.reg);
+			if (src.immediate <= numeric_limits<uint32_t>::max())
+			{
+				REX(out, 32, 0, reg);
+				Byte(out, 0xb8 + (reg & 7));
+				Bytes(out, src.immediate, 4);
+				return;
+			}
+			if (src.immediate >= uint64_t(0xffffffff80000000ULL))
+			{
+				REX(out, width, 0, reg);
+				Byte(out, 0xc7);
+				ModRM(out, 0, dst);
+				Bytes(out, src.immediate, 4);
+				return;
+			}
+		}
 		Prefix(out, width);
 		const unsigned reg = Code(dst.reg);
 		const bool force = width == 8 && IsByteRegister(reg);
@@ -177,6 +251,77 @@ unsigned BinaryOpcode(X86Mnemonic mnemonic, unsigned width, bool reg_to_rm)
 	}
 }
 
+unsigned BinaryImmediateGroup(X86Mnemonic mnemonic)
+{
+	switch (mnemonic)
+	{
+	case X86_ADD: return 0;
+	case X86_OR:  return 1;
+	case X86_AND: return 4;
+	case X86_SUB: return 5;
+	case X86_XOR: return 6;
+	case X86_CMP: return 7;
+	default: throw runtime_error("not an x86 immediate binary mnemonic");
+	}
+}
+
+uint64_t WidthMask(unsigned width)
+{
+	if (width >= 64)
+		return numeric_limits<uint64_t>::max();
+	return (uint64_t(1) << width) - 1;
+}
+
+bool FitsSignExtendedImmediate(uint64_t value, unsigned width,
+	unsigned immediate_width)
+{
+	const uint64_t mask = WidthMask(width);
+	int64_t signed_value;
+	if (immediate_width == 8)
+		signed_value = static_cast<int8_t>(value);
+	else
+		signed_value = static_cast<int32_t>(value);
+	return (value & mask) ==
+		(static_cast<uint64_t>(signed_value) & mask);
+}
+
+void EncodeBinaryImmediate(vector<unsigned char>& out, X86Mnemonic mnemonic,
+	unsigned width, const vector<X86Operand>& operands)
+{
+	if (operands.size() != 2 || operands[1].kind != X86_IMMEDIATE_OPERAND ||
+		(operands[0].kind != X86_REGISTER_OPERAND &&
+			operands[0].kind != X86_MEMORY_OPERAND))
+		throw runtime_error("invalid x86 immediate binary operands");
+	const unsigned group = BinaryImmediateGroup(mnemonic);
+	unsigned opcode;
+	unsigned immediate_bytes;
+	if (width == 8)
+	{
+		opcode = 0x80;
+		immediate_bytes = 1;
+	}
+	else if (FitsSignExtendedImmediate(operands[1].immediate, width, 8))
+	{
+		opcode = 0x83;
+		immediate_bytes = 1;
+	}
+	else
+	{
+		opcode = 0x81;
+		immediate_bytes = width == 16 ? 2 : 4;
+		if (width == 64 &&
+			!FitsSignExtendedImmediate(operands[1].immediate, width, 32))
+			throw runtime_error("x86 64-bit binary immediate is too large");
+	}
+	Prefix(out, width);
+	const unsigned rm = operands[0].kind == X86_REGISTER_OPERAND ?
+		Code(operands[0].reg) : Code(operands[0].base);
+	REX(out, width, 0, rm, width == 8 && IsByteRegister(rm));
+	Byte(out, opcode);
+	ModRM(out, group, operands[0]);
+	Bytes(out, operands[1].immediate, immediate_bytes);
+}
+
 void EncodeBinary(vector<unsigned char>& out, X86Mnemonic mnemonic,
 	unsigned width, const vector<X86Operand>& operands)
 {
@@ -184,6 +329,11 @@ void EncodeBinary(vector<unsigned char>& out, X86Mnemonic mnemonic,
 		throw runtime_error("binary x86 instruction requires two operands");
 	const X86Operand& dst = operands[0];
 	const X86Operand& src = operands[1];
+	if (src.kind == X86_IMMEDIATE_OPERAND)
+	{
+		EncodeBinaryImmediate(out, mnemonic, width, operands);
+		return;
+	}
 	if (src.kind == X86_REGISTER_OPERAND &&
 		(dst.kind == X86_REGISTER_OPERAND || dst.kind == X86_MEMORY_OPERAND))
 	{
@@ -251,17 +401,31 @@ void EncodeUnaryMultiply(vector<unsigned char>& out, X86Mnemonic mnemonic,
 {
 	if (operands.size() != 1 ||
 		(operands[0].kind != X86_REGISTER_OPERAND &&
+		operands[0].kind != X86_HIGH_BYTE_REGISTER_OPERAND &&
 		operands[0].kind != X86_MEMORY_OPERAND))
 		throw runtime_error("invalid x86 multiply/divide operands");
+	if (operands[0].kind == X86_HIGH_BYTE_REGISTER_OPERAND && width != 8)
+		throw runtime_error("x86 high-byte multiply/divide requires byte width");
 	Prefix(out, width);
 	const unsigned group = mnemonic == X86_MUL ? 4 :
 		(mnemonic == X86_IMUL ? 5 :
 		(mnemonic == X86_DIV ? 6 : 7));
 	const unsigned rm = operands[0].kind == X86_REGISTER_OPERAND ?
-		Code(operands[0].reg) : Code(operands[0].base);
-	REX(out, width, 0, rm, width == 8 && IsByteRegister(rm));
+		Code(operands[0].reg) :
+		(operands[0].kind == X86_HIGH_BYTE_REGISTER_OPERAND ?
+			HighByteCode(operands[0].reg) : Code(operands[0].base));
+	if (operands[0].kind != X86_HIGH_BYTE_REGISTER_OPERAND)
+		REX(out, width, 0, rm, width == 8 && IsByteRegister(rm));
 	Byte(out, width == 8 ? 0xf6 : 0xf7);
-	ModRM(out, group, operands[0]);
+	if (operands[0].kind == X86_HIGH_BYTE_REGISTER_OPERAND)
+	{
+		X86Operand encoded = operands[0];
+		encoded.kind = X86_REGISTER_OPERAND;
+		encoded.reg = static_cast<X64Register>(rm);
+		ModRM(out, group, encoded);
+	}
+	else
+		ModRM(out, group, operands[0]);
 }
 
 void EncodeNoOperand(vector<unsigned char>& out, X86Mnemonic mnemonic)
@@ -292,6 +456,15 @@ X86Operand X86Reg(X64Register reg, unsigned width)
 	return operand;
 }
 
+X86Operand X86HighByte(X64Register reg)
+{
+	X86Operand operand;
+	operand.kind = X86_HIGH_BYTE_REGISTER_OPERAND;
+	operand.reg = reg;
+	operand.width = 8;
+	return operand;
+}
+
 X86Operand X86Mem(X64Register base, int64_t displacement, unsigned width)
 {
 	X86Operand operand;
@@ -308,6 +481,13 @@ X86Operand X86Imm(uint64_t value, unsigned width)
 	operand.kind = X86_IMMEDIATE_OPERAND;
 	operand.immediate = value;
 	operand.width = width;
+	return operand;
+}
+
+X86Operand X86ImmFullWidth(uint64_t value, unsigned width)
+{
+	X86Operand operand = X86Imm(value, width);
+	operand.force_full_width = true;
 	return operand;
 }
 

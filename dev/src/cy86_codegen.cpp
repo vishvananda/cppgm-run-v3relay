@@ -71,8 +71,13 @@ uint64_t ReadLiteral(const Cy86Literal& literal)
 uint64_t ConvertLiteral(const Cy86Literal& literal, unsigned width,
 	bool negated)
 {
-	if (!Cy86IsIntegral(literal.type) || literal.is_array ||
-		literal.num_elements > 1 || width == 0 || width > 64)
+	const bool packed_character_array = literal.is_array &&
+		literal.type == FT_CHAR && literal.num_elements == literal.bytes.size();
+	if (!Cy86IsIntegral(literal.type) ||
+		(!packed_character_array &&
+			(literal.is_array || literal.num_elements > 1)) ||
+		(packed_character_array && literal.bytes.size() > sizeof(uint64_t)) ||
+		width == 0 || width > 64)
 		throw Cy86Error("literal cannot be used as an integer immediate");
 	const size_t source_bytes = literal.bytes.size();
 	const unsigned source_width = static_cast<unsigned>(min<size_t>(
@@ -135,6 +140,14 @@ unsigned OpcodeWidth(const string& opcode)
 bool StartsWith(const string& value, const string& prefix)
 {
 	return value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool CanUseBinaryImmediate(unsigned width, uint64_t value)
+{
+	if (width < 64)
+		return true;
+	return value <= static_cast<uint64_t>(numeric_limits<int32_t>::max()) ||
+		value >= uint64_t(0xffffffff80000000ULL);
 }
 
 void EmitMoveImmediate(ByteVector& output, X64Register reg, uint64_t value)
@@ -237,6 +250,19 @@ void TranslateBinary(ByteVector& output, const Cy86Statement& statement,
 	unsigned width, const map<string, uint64_t>& labels)
 {
 	LoadOperand(output, statement.operands[1], width, XR_RAX, labels);
+	if (statement.operands[2].kind == CY86_IMMEDIATE_OPERAND &&
+		!statement.operands[2].immediate.label)
+	{
+		const uint64_t value = ImmediateValue(statement.operands[2].immediate,
+			width, labels);
+		if (CanUseBinaryImmediate(width, value))
+		{
+			Emit(output, BinaryMnemonic(statement.opcode), width,
+				Two(X86Reg(XR_RAX, width), X86Imm(value, width)));
+			StoreOperand(output, statement.operands[0], width, XR_RAX, labels);
+			return;
+		}
+	}
 	LoadOperand(output, statement.operands[2], width, XR_RBX, labels);
 	Emit(output, BinaryMnemonic(statement.opcode), width,
 		Two(X86Reg(XR_RAX, width), X86Reg(XR_RBX, width)));
@@ -262,6 +288,21 @@ void TranslateCompare(ByteVector& output, const Cy86Statement& statement,
 	unsigned width, const map<string, uint64_t>& labels)
 {
 	LoadOperand(output, statement.operands[1], width, XR_RAX, labels);
+	if (statement.operands[2].kind == CY86_IMMEDIATE_OPERAND &&
+		!statement.operands[2].immediate.label)
+	{
+		const uint64_t value = ImmediateValue(statement.operands[2].immediate,
+			width, labels);
+		if (CanUseBinaryImmediate(width, value))
+		{
+			Emit(output, X86_CMP, width,
+				Two(X86Reg(XR_RAX, width), X86Imm(value, width)));
+			Emit(output, X86_SETCC, 8, CompareCondition(statement.opcode),
+				One(X86Reg(XR_RAX, 8)));
+			StoreOperand(output, statement.operands[0], 8, XR_RAX, labels);
+			return;
+		}
+	}
 	LoadOperand(output, statement.operands[2], width, XR_RBX, labels);
 	Emit(output, X86_CMP, width,
 			Two(X86Reg(XR_RAX, width), X86Reg(XR_RBX, width)));
@@ -347,9 +388,34 @@ void TranslateUnary(ByteVector& output, const Cy86Statement& statement,
 
 void ClearHighHalf(ByteVector& output, unsigned width)
 {
-	const unsigned clear_width = width == 16 ? 16 : (width == 32 ? 32 : 32);
+	const unsigned clear_width = width == 16 ? 16 : 32;
 	Emit(output, X86_XOR, clear_width,
 		Two(X86Reg(XR_RDX, clear_width), X86Reg(XR_RDX, clear_width)));
+}
+
+void PrepareDivideDividend(ByteVector& output, unsigned width,
+	bool signed_op)
+{
+	if (width == 8)
+	{
+		if (signed_op)
+			Emit(output, X86_CBW, 0, vector<X86Operand>());
+		else
+			Emit(output, X86_MOV, 8,
+				Two(X86HighByte(XR_RAX), X86Imm(0, 8)));
+		return;
+	}
+	if (signed_op)
+	{
+		if (width == 16)
+			Emit(output, X86_CWD, 0, vector<X86Operand>());
+		else if (width == 32)
+			Emit(output, X86_CDQ, 0, vector<X86Operand>());
+		else
+			Emit(output, X86_CQO, 0, vector<X86Operand>());
+	}
+	else
+		ClearHighHalf(output, width);
 }
 
 void TranslateMultiply(ByteVector& output, const Cy86Statement& statement,
@@ -366,28 +432,24 @@ void TranslateMultiply(ByteVector& output, const Cy86Statement& statement,
 void TranslateDivide(ByteVector& output, const Cy86Statement& statement,
 	unsigned width, const map<string, uint64_t>& labels)
 {
-	if (width == 8)
-		throw Cy86Error("8-bit division is not supported by this checkpoint");
 	const bool signed_op = StartsWith(statement.opcode, "sdiv") ||
 		StartsWith(statement.opcode, "smod");
+	const bool remainder = StartsWith(statement.opcode, "smod") ||
+		StartsWith(statement.opcode, "umod");
 	LoadOperand(output, statement.operands[1], width, XR_RAX, labels);
 	LoadOperand(output, statement.operands[2], width, XR_RBX, labels);
-	if (signed_op)
-	{
-		if (width == 16)
-			Emit(output, X86_CWD, 0, vector<X86Operand>());
-		else if (width == 32)
-			Emit(output, X86_CDQ, 0, vector<X86Operand>());
-		else
-			Emit(output, X86_CQO, 0, vector<X86Operand>());
-	}
-	else
-		ClearHighHalf(output, width);
+	PrepareDivideDividend(output, width, signed_op);
 	Emit(output, signed_op ? X86_IDIV : X86_DIV, width,
 		One(X86Reg(XR_RBX, width)));
-	StoreOperand(output, statement.operands[0], width,
-		StartsWith(statement.opcode, "smod") || StartsWith(statement.opcode, "umod")
-			? XR_RDX : XR_RAX, labels);
+	if (remainder && width == 8)
+	{
+		Emit(output, X86_MOV, 8,
+			Two(X86Reg(XR_RDX, 8), X86HighByte(XR_RAX)));
+		StoreOperand(output, statement.operands[0], 8, XR_RDX, labels);
+	}
+	else
+		StoreOperand(output, statement.operands[0], width,
+			remainder ? XR_RDX : XR_RAX, labels);
 }
 
 ByteVector MaterializeData(const Cy86Statement& statement)
@@ -544,7 +606,8 @@ vector<unsigned char> Cy86ToX86Translator::Stub(uint64_t entry)
 			Two(X86Reg(zeroed[i], 32), X86Reg(zeroed[i], 32)));
 	Emit(output, X86_MOV, 64,
 		Two(X86Reg(XR_RBP, 64), X86Reg(XR_RSP, 64)));
-	EmitMoveImmediate(output, XR_RAX, entry);
+	Emit(output, X86_MOV, 64,
+		Two(X86Reg(XR_RAX, 64), X86ImmFullWidth(entry, 64)));
 	Emit(output, X86_JMP, 64, One(X86Reg(XR_RAX, 64)));
 	if (output.size() != 27)
 		throw Cy86Error("CY86 bootstrap size changed");
