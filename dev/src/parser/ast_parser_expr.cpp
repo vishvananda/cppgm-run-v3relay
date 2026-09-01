@@ -378,9 +378,16 @@ AstId Pa10Parser::parse_unary_expression()
 {
 	if (is_simple(KW_SIZEOF) || is_simple(KW_ALIGNOF) ||
 		is_simple(KW_NOEXCEPT) || is_simple(KW_TYPEID))
-		return parse_type_trait_expression();
-	if (is_simple(KW_NEW))
-		return parse_new_expression();
+	{
+		AstId expression = parse_type_trait_expression();
+		return expression == 0 ? 0 : parse_postfix_suffixes(expression);
+	}
+	if (is_simple(KW_NEW) ||
+		(is_simple(OP_COLON2) && is_simple(KW_NEW, pos_ + 1)))
+	{
+		AstId expression = parse_new_expression();
+		return expression == 0 ? 0 : parse_postfix_suffixes(expression);
+	}
 	if (is_simple(KW_DELETE))
 		return parse_delete_expression();
 	if (is_simple(OP_PLUS) || is_simple(OP_MINUS) || is_simple(OP_LNOT) ||
@@ -402,10 +409,15 @@ AstId Pa10Parser::parse_unary_expression()
 
 AstId Pa10Parser::parse_postfix_expression()
 {
-	const Mark saved = mark();
 	AstId expression = parse_postfix_root();
 	if (expression == 0)
 		return 0;
+	return parse_postfix_suffixes(expression);
+}
+
+AstId Pa10Parser::parse_postfix_suffixes(AstId expression)
+{
+	const Mark saved = mark();
 	while (true)
 	{
 		if (is_simple(OP_LPAREN))
@@ -469,6 +481,15 @@ AstId Pa10Parser::parse_postfix_expression()
 		break;
 	}
 	return expression;
+}
+
+AstId Pa10Parser::parse_pack_expansion(AstId expression)
+{
+	if (!consume_simple(OP_DOTS))
+		return expression;
+	const AstId result = make(AST_PACK_EXPANSION_EXPRESSION);
+	add(result, expression);
+	return result;
 }
 
 AstId Pa10Parser::parse_postfix_root()
@@ -601,7 +622,7 @@ AstId Pa10Parser::parse_argument_list(AstKind kind)
 			restore(saved);
 			return 0;
 		}
-		add(result, argument);
+		add(result, parse_pack_expansion(argument));
 		if (!consume_simple(OP_COMMA))
 			break;
 	}
@@ -627,15 +648,22 @@ AstId Pa10Parser::parse_type_trait_expression()
 	const Pa6Token& first = token(pos_);
 	const BindKind* binding = first.kind == PA6_IDENTIFIER_TOKEN ?
 		scopes_.Lookup(first.spelling) : 0;
-	if ((first.kind == PA6_SIMPLE_TOKEN &&
+	const bool functional_cast = first.kind == PA6_IDENTIFIER_TOKEN &&
+		is_simple(OP_LPAREN, pos_ + 1);
+	if (!functional_cast &&
+		((first.kind == PA6_SIMPLE_TOKEN &&
 			(is_builtin_type(first.simple_type) || is_cv_qualifier(first.simple_type))) ||
-		(first.kind == PA6_IDENTIFIER_TOKEN && binding != 0 &&
+		 (first.kind == PA6_SIMPLE_TOKEN &&
+			(first.IsSimple(KW_CLASS) || first.IsSimple(KW_STRUCT) ||
+			 first.IsSimple(KW_UNION) || first.IsSimple(KW_ENUM) ||
+			 first.IsSimple(KW_DECLTYPE))) ||
+		 (first.kind == PA6_IDENTIFIER_TOKEN && binding != 0 &&
 			(*binding == BIND_TYPE || *binding == BIND_TEMPLATE)) ||
-		(first.kind == PA6_IDENTIFIER_TOKEN &&
+		 (first.kind == PA6_IDENTIFIER_TOKEN &&
 			(is_simple(OP_STAR, pos_ + 1) || is_simple(OP_AMP, pos_ + 1) ||
-			 is_simple(OP_LAND, pos_ + 1))))
+			 is_simple(OP_LAND, pos_ + 1)))))
 	{
-		type = parse_type_id();
+			type = parse_type_id();
 		if (type != 0 && leave_bracket(OP_RPAREN))
 		{
 			const AstId result = make(op == "KW_SIZEOF:sizeof" ?
@@ -662,11 +690,16 @@ AstId Pa10Parser::parse_type_trait_expression()
 AstId Pa10Parser::parse_new_expression()
 {
 	const Mark saved = mark();
+	const bool global_scope = consume_simple(OP_COLON2);
 	if (!consume_simple(KW_NEW))
 		return 0;
 	const AstId result = make(AST_NEW_EXPRESSION);
-		if (is_simple(OP_LPAREN))
-		{
+	if (global_scope)
+	{
+		add(result, make(AST_GLOBAL_SCOPE));
+	}
+	if (is_simple(OP_LPAREN))
+	{
 		const Mark placement_mark = mark();
 		AstId placement_args = parse_argument_list(AST_PAREN_ARGUMENT_LIST);
 		if (placement_args != 0 && (is_builtin_type(token(pos_).simple_type) ||
@@ -697,7 +730,7 @@ AstId Pa10Parser::parse_new_expression()
 		}
 	}
 	if (type == 0)
-		type = parse_type_id();
+		type = parse_type_id(false);
 	if (type == 0)
 	{
 		restore(saved);
@@ -712,11 +745,11 @@ AstId Pa10Parser::parse_new_expression()
 			restore(saved);
 			return 0;
 		}
-			const AstId wrapped = make(AST_INITIALIZER);
-			add(wrapped, initializer);
-			add(result, wrapped);
+		const AstId wrapped = make(AST_INITIALIZER);
+		add(wrapped, initializer);
+		add(result, wrapped);
 	}
-		else if (is_simple(OP_LBRACE))
+	else if (is_simple(OP_LBRACE))
 	{
 		AstId initializer = parse_braced_init_list();
 		if (initializer == 0)
@@ -724,9 +757,9 @@ AstId Pa10Parser::parse_new_expression()
 			restore(saved);
 			return 0;
 		}
-			const AstId wrapped = make(AST_INITIALIZER);
-			add(wrapped, initializer);
-			add(result, wrapped);
+		const AstId wrapped = make(AST_INITIALIZER);
+		add(wrapped, initializer);
+		add(result, wrapped);
 	}
 	return result;
 }

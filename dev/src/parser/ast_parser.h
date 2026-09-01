@@ -88,7 +88,7 @@ private:
 	AstId parse_type_specifier_seq();
 	AstId parse_type_specifier();
 	AstId parse_decltype_specifier(bool type_context);
-	AstId parse_type_id();
+	AstId parse_type_id(bool allow_function_abstract = true);
 	AstId parse_declarator(bool allow_abstract = false);
 	AstId parse_ptr_operator();
 	AstId parse_declarator_id();
@@ -133,6 +133,8 @@ private:
 	AstId parse_cast_expression();
 	AstId parse_unary_expression();
 	AstId parse_postfix_expression();
+	AstId parse_postfix_suffixes(AstId expression);
+	AstId parse_pack_expansion(AstId expression);
 	AstId parse_postfix_root();
 	AstId parse_primary_expression();
 	AstId parse_id_expression();

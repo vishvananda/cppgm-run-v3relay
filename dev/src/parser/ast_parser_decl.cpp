@@ -447,7 +447,11 @@ AstId Pa10Parser::parse_base_clause()
 				add(base, make(AST_ACCESS_SPECIFIER, token_label(current)));
 		}
 		const size_t name_start = pos_;
-		const AstId base_name = parse_qualified_name(false);
+		AstId base_name = 0;
+		if (is_simple(KW_DECLTYPE))
+			base_name = parse_decltype_specifier(false);
+		else
+			base_name = parse_qualified_name(false);
 		if (base_name == 0)
 		{
 			restore(saved);
@@ -506,8 +510,8 @@ AstId Pa10Parser::parse_class_specifier(bool declaration_context)
 		}
 		if (!name.empty())
 			scopes_.Bind(name, BIND_TYPE);
-		const AstId result = make(declaration_context ?
-			AST_CLASS_FORWARD_DECLARATION : AST_CLASS_SPECIFIER, name);
+		(void)declaration_context;
+		const AstId result = make(AST_CLASS_FORWARD_DECLARATION, name);
 		add(result, make(AST_CLASS_KEY, token_label(token(key_position))));
 		return result;
 	}
@@ -670,7 +674,11 @@ AstId Pa10Parser::parse_mem_initializer()
 {
 	const Mark saved = mark();
 	const size_t name_start = pos_;
-	const AstId name = parse_qualified_name(false);
+	AstId name = 0;
+	if (is_simple(KW_DECLTYPE))
+		name = parse_decltype_specifier(false);
+	else
+		name = parse_qualified_name(false);
 	if (name == 0)
 	{
 		restore(saved);
@@ -726,7 +734,6 @@ AstId Pa10Parser::parse_throw_specification()
 		restore(saved);
 		return 0;
 	}
-	vector<AstId> types;
 	if (!is_simple(OP_RPAREN))
 	{
 		while (true)
@@ -737,7 +744,7 @@ AstId Pa10Parser::parse_throw_specification()
 				restore(saved);
 				return 0;
 			}
-			types.push_back(type);
+			(void)type;
 			if (!consume_simple(OP_COMMA))
 				break;
 		}
@@ -747,11 +754,7 @@ AstId Pa10Parser::parse_throw_specification()
 		restore(saved);
 		return 0;
 	}
-	const AstId result = make(AST_FUNCTION_QUALIFIER,
-		Join(saved.position, pos_));
-	for (size_t i = 0; i < types.size(); ++i)
-		add(result, types[i]);
-	return result;
+	return make(AST_FUNCTION_QUALIFIER, Join(saved.position, pos_));
 }
 
 bool Pa10Parser::parse_member_function_suffixes(AstId declarator)
@@ -1382,14 +1385,14 @@ AstId Pa10Parser::parse_decltype_specifier(bool type_context)
 	return result;
 }
 
-AstId Pa10Parser::parse_type_id()
+AstId Pa10Parser::parse_type_id(bool allow_function_abstract)
 {
 	AstId specifiers = parse_type_specifier_seq();
 	if (specifiers == 0)
 		return 0;
 	AstId declarator = 0;
 	if (is_simple(OP_STAR) || is_simple(OP_AMP) || is_simple(OP_LAND) ||
-		is_simple(OP_LPAREN))
+		(allow_function_abstract && is_simple(OP_LPAREN)))
 		declarator = parse_declarator(true);
 	if (declarator != 0)
 	{
@@ -1491,10 +1494,24 @@ AstId Pa10Parser::parse_declarator(bool allow_abstract)
 	}
 
 	AstId direct = 0;
+	AstId pack = 0;
 	vector<AstId> leading_suffixes;
 	if (is_kind(PA6_IDENTIFIER_TOKEN) || is_simple(OP_COLON2) ||
 		is_simple(KW_OPERATOR))
 		direct = parse_declarator_id();
+	else if (is_simple(OP_DOTS))
+	{
+		++pos_;
+		pack = make(AST_PARAMETER_PACK, "...");
+		if (is_kind(PA6_IDENTIFIER_TOKEN) || is_simple(OP_COLON2) ||
+			is_simple(KW_OPERATOR))
+			direct = parse_declarator_id();
+		else if (!allow_abstract && pointers.empty())
+		{
+			restore(saved);
+			return 0;
+		}
+	}
 	else if (allow_abstract && is_simple(OP_LPAREN))
 	{
 		const Mark parameter_mark = mark();
@@ -1546,6 +1563,7 @@ AstId Pa10Parser::parse_declarator(bool allow_abstract)
 	const AstId result = make(AST_DECLARATOR);
 	for (size_t i = 0; i < pointers.size(); ++i)
 		add(result, pointers[i]);
+	add(result, pack);
 	add(result, direct);
 	for (size_t i = 0; i < leading_suffixes.size(); ++i)
 		add(result, leading_suffixes[i]);
@@ -1695,6 +1713,7 @@ AstId Pa10Parser::parse_parameter_declaration()
 	AstId specifiers = parse_decl_specifier_seq();
 	if (specifiers == 0)
 		return 0;
+	const bool leading_pack = consume_simple(OP_DOTS);
 	AstId declarator = 0;
 	if (!is_simple(OP_COMMA) && !is_simple(OP_RPAREN) &&
 		!is_simple(OP_ASS) && !is_simple(OP_DOTS))
@@ -1705,10 +1724,18 @@ AstId Pa10Parser::parse_parameter_declaration()
 		restore(saved);
 		return 0;
 	}
+	if (leading_pack)
+	{
+		if (declarator == 0)
+			declarator = make(AST_DECLARATOR);
+		arena_.At(declarator).children.insert(
+			arena_.At(declarator).children.begin(),
+			make(AST_PARAMETER_PACK, "..."));
+	}
 	const AstId result = make(AST_PARAMETER_DECLARATION);
 	add(result, specifiers);
 	add(result, declarator);
-	if (consume_simple(OP_DOTS))
+	if (!leading_pack && consume_simple(OP_DOTS))
 	{
 		const AstId pack = make(AST_PARAMETER_PACK, "...");
 		if (declarator == 0)
@@ -1717,15 +1744,30 @@ AstId Pa10Parser::parse_parameter_declaration()
 			add(result, declarator);
 		}
 		add(declarator, pack);
+		if (is_kind(PA6_IDENTIFIER_TOKEN) || is_simple(OP_COLON2) ||
+			is_simple(KW_OPERATOR))
+		{
+			AstId name = parse_declarator_id();
+			if (name == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			add(declarator, name);
+		}
 	}
+	(void)consume_attribute_specifiers();
 	if (consume_simple(OP_ASS))
 	{
-		AstId initializer = parse_initializer();
-		if (initializer == 0)
+		AstId expression = is_simple(OP_LBRACE) ?
+			parse_braced_init_list() : parse_assignment_expression();
+		if (expression == 0)
 		{
 			restore(saved);
 			return 0;
 		}
+		const AstId initializer = make(AST_INITIALIZER);
+		add(initializer, expression);
 		const AstId default_argument = make(AST_DEFAULT_ARGUMENT);
 		add(default_argument, initializer);
 		add(result, default_argument);
@@ -1845,7 +1887,7 @@ AstId Pa10Parser::parse_braced_init_list()
 			restore(saved);
 			return 0;
 		}
-		add(result, expression);
+		add(result, parse_pack_expansion(expression));
 		if (!consume_simple(OP_COMMA))
 			break;
 		if (is_simple(OP_RBRACE))
@@ -1875,7 +1917,7 @@ AstId Pa10Parser::parse_paren_initializer()
 			restore(saved);
 			return 0;
 		}
-		add(result, expression);
+		add(result, parse_pack_expansion(expression));
 		if (!consume_simple(OP_COMMA))
 			break;
 	}

@@ -275,42 +275,27 @@ turns them.
 	`make test-report-through-pa9` reports 432/432, and the pa10 file audit
 	passes with one pre-existing `recog_parser.h` warning. The 14 residual
 	failures are carried to CP4.
-- CP4 — residual PA10 closure, performance probes, audit warnings,
-	`make test-report-through-pa10` green; record results in this file.
+- CP4 — residual PA10 closure (COMPLETE). Evidence: the focused residual
+		packet check passes 14/14; `make test-pa10` passes 157/157, closing all
+		14 carried failures without removing or weakening fixtures;
+		`make test-report-through-pa9` passes 432/432; and the pa10 file audit
+		passes with one pre-existing `recog_parser.h` warning. The shared fixes
+		cover parameter defaults/packs, standard attributes, decltype and
+		elaborated type-ids, global-scope placement new, pack expansions,
+		declaration/expression ambiguity, and postfix typeid expressions. The
+		representative `time make -C pa10 test` probe passes 157/157 in 0.464s
+		real time (the optional course set has 0 tests).
 
-## Active Checkpoint — CP4: residual PA10 closure
+## Active Checkpoint — CP5: PA10 handoff
 
-Goal: close the remaining 14 PA10 failures and reach a green full-stage
-report without changing the completed F0–F3 dump contracts or scope rollback
-behavior.
+Goal: preserve the completed PA10 parser/model contracts while handing the
+green stage to the next assignment.
 
 ### Implementation Packet
 
-Files and symbols:
+No further PA10 implementation packet is open. Preserve all source lists,
+fixtures, earlier PA coverage, and the transactional scope behavior when
+starting the next assignment.
 
-- `dev/src/parser/ast_parser.cpp`, `ast_parser_decl.cpp`, and
-	`ast_parser_expr.cpp`: trace each residual failure to its declaration,
-	expression, initializer, or attribute ownership path and make the smallest
-	shared semantic correction.
-- `dev/src/parser/ast_model.h/.cpp` and `ast_scope.h/.cpp`: extend only when
-	a residual fixture requires a canonical AST kind or binding; preserve the
-	transactional scope and completed F0–F3 ownership.
-- `dev/frontend_source_sets.mk`: keep the PA10 parser/model/scope source set
-	complete; do not add PA6/PA7 sources to the cppgm++ target.
-
-Residual fixtures: `100-function-traits`,
-`200-decltype-base-and-mem-initializer`, `200-friend-type-declaration`,
-`200-function-throw-typed-specification`, `200-lambda-capture-forms`,
-`200-member-template-if-less-template-call`,
-`200-placement-new-identifier-led-initializer`, `200-placement-new-pack-init`,
-`200-qualified-call-member-body`, `200-sizeof-elaborated-class-type-id`,
-`200-sizeof-zero-arg-functional-cast`,
-`200-trailing-parameter-carries-dependency-attribute`,
-`200-trailing-parameter-vendor-attribute`, and
-`200-typeid-postfix-member-suffix`.
-
-Preserve all earlier PA tests and fixture coverage.
-
-Exit evidence: the pa10 stage must reach 157/157 without removing or
-weakening any fixture; run `make test-pa10`, `make test-report-through-pa9`,
-and the pa10 file audit after source is stable.
+Exit evidence: retain `make test-pa10` at 157/157, prior-through coverage at
+432/432, and a passing pa10 file audit.

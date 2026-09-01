@@ -357,33 +357,67 @@ bool Pa10Parser::can_start_declaration() const
 bool Pa10Parser::consume_attribute_specifiers()
 {
 	bool consumed = false;
-	while ((is_kind(PA6_IDENTIFIER_TOKEN) &&
-			(token(pos_).spelling == "__attribute__" ||
-			 token(pos_).spelling == "__declspec")) ||
-		is_simple(KW_ALIGNAS))
+	while (true)
 	{
-		consumed = true;
-		++pos_;
-		if (!consume_simple(OP_LPAREN))
-			return false;
-		unsigned depth = 1;
-		while (depth != 0)
+		if (is_simple(OP_LSQUARE) && is_simple(OP_LSQUARE, pos_ + 1))
 		{
-			if (at_end())
-				return false;
-			if (is_simple(OP_LPAREN))
+			const Mark attribute = mark();
+			pos_ += 2;
+			unsigned depth = 1;
+			while (depth != 0)
 			{
-				++depth;
-				++pos_;
+				if (at_end())
+				{
+					restore(attribute);
+					return false;
+				}
+				if (is_simple(OP_LSQUARE) && is_simple(OP_LSQUARE, pos_ + 1))
+				{
+					++depth;
+					pos_ += 2;
+				}
+				else if (is_simple(OP_RSQUARE) &&
+					is_simple(OP_RSQUARE, pos_ + 1))
+				{
+					--depth;
+					pos_ += 2;
+				}
+				else
+					++pos_;
 			}
-			else if (is_simple(OP_RPAREN))
-			{
-				--depth;
-				++pos_;
-			}
-			else
-				++pos_;
+			consumed = true;
+			continue;
 		}
+		if ((is_kind(PA6_IDENTIFIER_TOKEN) &&
+				(token(pos_).spelling == "__attribute__" ||
+				 token(pos_).spelling == "__declspec")) ||
+			is_simple(KW_ALIGNAS))
+		{
+			consumed = true;
+			++pos_;
+			if (!consume_simple(OP_LPAREN))
+				return false;
+			unsigned depth = 1;
+			while (depth != 0)
+			{
+				if (at_end())
+					return false;
+				if (is_simple(OP_LPAREN))
+				{
+					++depth;
+					++pos_;
+				}
+				else if (is_simple(OP_RPAREN))
+				{
+					--depth;
+					++pos_;
+				}
+				else
+					++pos_;
+			}
+			continue;
+		}
+		break;
 	}
 	return consumed;
 }
@@ -640,6 +674,20 @@ AstId Pa10Parser::parse_statement()
 	{
 		const BindKind* binding = is_kind(PA6_IDENTIFIER_TOKEN) ?
 			scopes_.Lookup(token(pos_).spelling) : 0;
+		if (is_kind(PA6_IDENTIFIER_TOKEN) &&
+			(binding == 0 || *binding == BIND_NAMESPACE))
+		{
+			const Mark expression_mark = mark();
+			AstId expression = parse_expression();
+			if (expression != 0 && node_has_kind(expression, AST_CALL_EXPRESSION) &&
+				consume_simple(OP_SEMICOLON))
+			{
+				const AstId result = make(AST_EXPRESSION_STATEMENT);
+				add(result, expression);
+				return result;
+			}
+			restore(expression_mark);
+		}
 		if (binding == 0 || *binding != BIND_VALUE ||
 			is_simple(OP_COLON2, pos_ + 1))
 		{

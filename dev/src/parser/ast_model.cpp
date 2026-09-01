@@ -81,6 +81,7 @@ const char* Names[] =
 	"sizeof-expression",
 	"type-trait-expression",
 	"new-expression",
+	"global-scope",
 	"delete-expression",
 	"array-delete",
 	"lambda-expression",
