@@ -1,22 +1,45 @@
 // (C) 2013 CPPGM Foundation www.cppgm.org.  All rights reserved.
 
-#include <vector>
-#include <string>
-#include <stdexcept>
-#include <iostream>
+#include <ctime>
 #include <fstream>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace std;
 
 #include "exceptions.h"
+#include "preproc_engine.h"
+#include "parser/nsdecl_model.h"
+#include "parser/nsdecl_parser.h"
+#include "parser/nsinit_image.h"
+#include "parser/recog_token.h"
+
+extern "C" long int syscall(long int n, ...) throw ();
+
+bool PA5GetFileId(const string& path, PA5FileId& out_fileid)
+{
+	struct
+	{
+		unsigned long int dev;
+		unsigned long int ino;
+		long int unused[16];
+	} data;
+
+	int res = syscall(4, path.c_str(), &data);
+	out_fileid = make_pair(data.dev, data.ino);
+	return res == 0;
+}
 
 bool HasBatchStdinArg(int argc, char** argv)
 {
-	for (int i = 1; i < argc; i++)
-	{
+	for (int i = 1; i < argc; ++i)
 		if (string(argv[i]) == "--batch-stdin")
 			return true;
-	}
 	return false;
 }
 
@@ -31,6 +54,38 @@ int RunNotImplementedBatchMode()
 	return EXIT_SUCCESS;
 }
 
+shared_ptr<Pa7Namespace> AnalyzeTranslationUnit(const string& srcfile)
+{
+	time_t now = time(nullptr);
+	tm* local_time = localtime(&now);
+	if (!local_time)
+		throw runtime_error("unable to obtain build time");
+	const char* asctime_snapshot = asctime(local_time);
+	if (!asctime_snapshot)
+		throw runtime_error("unable to obtain build time");
+	const string build_stamp(asctime_snapshot);
+	if (build_stamp.size() < 24)
+		throw runtime_error("invalid build time");
+
+	PreprocBuildInfo build_info;
+	build_info.date = build_stamp.substr(4, 7) +
+		build_stamp.substr(20, 4);
+	build_info.time = build_stamp.substr(11, 8);
+	build_info.author = "Vishvananda";
+
+	ostringstream discarded_preproc_output;
+	PreprocEngine preprocessor(discarded_preproc_output, PA5GetFileId,
+		build_info);
+	Pa6TokenCollector collector;
+	preprocessor.RunSingleFile(srcfile, collector);
+
+	shared_ptr<Pa7Namespace> global(new Pa7Namespace);
+	Pa7Parser parser(collector.tokens, global.get(), true);
+	if (!parser.ParseTranslationUnit())
+		throw runtime_error("declaration parsing failed");
+	return global;
+}
+
 int main(int argc, char** argv)
 {
 	try
@@ -39,34 +94,24 @@ int main(int argc, char** argv)
 			return RunNotImplementedBatchMode();
 
 		vector<string> args;
-
-		for (int i = 1; i < argc; i++)
-			args.emplace_back(argv[i]);
-
+		for (int i = 1; i < argc; ++i)
+			args.push_back(argv[i]);
 		if (args.size() < 3 || args[0] != "-o")
 			throw logic_error("invalid usage");
 
-		string outfile = args[1];
-		size_t nsrcfiles = args.size() - 2;
+		vector<shared_ptr<Pa7Namespace> > globals;
+		for (size_t i = 2; i < args.size(); ++i)
+			globals.push_back(AnalyzeTranslationUnit(args[i]));
 
-		throw NotImplementedException();
-
-		vector<char> program_image;
-
-		for (size_t i = 0; i < nsrcfiles; i++)
-		{
-			string srcfile = args[i+2];
-
-			ifstream in(srcfile);
-
-			// ...
-
-			program_image.push_back('?');
-		}
-
-		ofstream out(outfile);
-
-		out.write(program_image.data(), program_image.size());
+		Pa8ImageBuilder image_builder(globals);
+		const vector<unsigned char> image = image_builder.Build();
+		ofstream out(args[1].c_str(), ios::out | ios::binary | ios::trunc);
+		if (!out)
+			throw runtime_error("unable to open output file");
+		if (!image.empty())
+			out.write(reinterpret_cast<const char*>(image.data()), image.size());
+		if (!out)
+			throw runtime_error("unable to write output file");
 	}
 	catch (const NotImplementedException& e)
 	{
@@ -78,4 +123,5 @@ int main(int argc, char** argv)
 		cerr << "ERROR: " << e.what() << endl;
 		return EXIT_FAILURE;
 	}
+	return EXIT_SUCCESS;
 }

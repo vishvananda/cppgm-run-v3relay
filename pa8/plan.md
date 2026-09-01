@@ -1,8 +1,9 @@
 # PA8 Plan — nsinit (initialization, linking, mock program image)
 
-State: 0/60 pa8 fixtures pass (all EXIT_NOT_IMPLEMENTED — `dev/nsinit.cpp` is
-the handout stub). Through-pa7 is green (354/354) and the pa8 file audit
-passes. Harness: `text_t1` mode — all `NNN-name.t.*` files are passed to
+State: CP1 complete — 57/60 pa8 fixtures pass; through-pa7 is green (354/354)
+and the pa8 file audit passes. The three remaining pa8 failures are the
+deferred valid array-string and reference paths. Harness: `text_t1` mode — all
+`NNN-name.t.*` files are passed to
 `nsinit -o <out>` in sorted order; exit status always graded; outfile compared
 byte-wise only when the ref exits EXIT_SUCCESS; 10 s/test timeout.
 
@@ -126,12 +127,12 @@ By owning boundary once the envelope exists:
 
 ## Checkpoint Ledger
 
-- CP1 (ACTIVE) — semantic core end-to-end: grammar extension, annotated
-  expressions, constant evaluation, scalar/pointer initialization +
-  conversions, 3.5 linking, layout + writer (BLOCK1 + static_assert; BLOCK2/3
-  present but exercised only trivially). Progress proof: ≥25 of the 60 pa8
-  failures clear (scalar/linkage/function/static_assert groups above);
-  through-pa7 stays 354/354.
+- CP1 (COMPLETE) — semantic core end-to-end: grammar extension, annotated
+	 expressions, constant evaluation, scalar/pointer initialization +
+	 conversions, 3.5 linking, layout + writer (BLOCK1 + static_assert; BLOCK2/3
+	 remain intentionally deferred). Evidence: `make test-pa8` is 57/60,
+	 `make test-report-through-pa7` is 354/354, and the pa8 source audit passes
+	 (one pre-existing warning in `recog_parser.h`).
 - CP2 — references + lifetime-extended temporaries (BLOCK2), arrays +
   char-array init + string literals (BLOCK3), function-to-pointer and
   remaining conversion diagnostics. Progress proof: reference/array/string
@@ -141,7 +142,7 @@ By owning boundary once the envelope exists:
   Progress proof: 60/60 `make test-pa8`, clean
   `make test-report-through-pa8`, audit notes in `pa8/audit.md`.
 
-## Active Checkpoint — CP1: semantic core end-to-end
+## Completed Checkpoint — CP1: semantic core end-to-end
 
 Build the full nsinit pipeline (parse → annotate → link → layout → write) with
 initialization/conversion/linking semantics for fundamentals and pointers,
@@ -262,3 +263,27 @@ Known uncertainties (probe with nsinit-ref, then pin in code + audit.md):
 - Exact diagnosis point for `signed float` and friends: pa7 built Table 10
   combination validation already; verify it rejects in pa8 mode rather than
   silently defaulting (course 300-invalid-fundamental-specifiers-bad).
+
+## Active Checkpoint — CP2: references, arrays, and remaining image data
+
+Extend the existing semantic and image ownership path for lifetime-extended
+reference temporaries (BLOCK2), array/string initialization (BLOCK3), and the
+remaining valid function-pointer/reference conversions. Preserve the 57/60
+baseline and close the three currently failing valid fixtures.
+
+### Implementation Packet
+
+Files/symbols to touch:
+- `dev/src/parser/nsdecl_parser.h/.cpp`: initializer lists, array bounds and
+  reference-binding expressions; retain qualified/unqualified lookup scopes.
+- `dev/src/parser/nsinit_sema.h/.cpp`: reference binding and temporary
+  entities, array/string value construction, cv-safe conversions, and literal
+  ordering.
+- `dev/src/parser/nsinit_image.h/.cpp`: BLOCK2/BLOCK3 placement and
+  relocations, including alignment and lifetime-extended temporary identity.
+
+Focused fixtures: `pa8/tests/310-array-str-lit.t.1`,
+`pa8/tests/450-reference.t.1`, `pa8/tests/700-reference-to-reference.t.1`,
+then the remaining course reference/conversion fixtures. Exit evidence is
+`make test-pa8` at 60/60 with `make test-report-through-pa7` still 354/354 and
+the pa8 source audit passing.

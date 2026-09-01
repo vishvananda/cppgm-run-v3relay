@@ -17,7 +17,10 @@ FRONTEND_OBJ_BASENAMES_recog := parser/recog_parser parser/recog_parser_cp2 pars
 FRONTEND_OBJ_BASENAMES_nsdecl := parser/nsdecl_parser parser/nsdecl_model parser/recog_token \
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer \
 	posttoken_stream posttoken_tables unicode
-FRONTEND_OBJ_BASENAMES_nsinit :=
+FRONTEND_OBJ_BASENAMES_nsinit := parser/nsdecl_parser parser/nsdecl_model \
+	parser/nsinit_sema parser/nsinit_image parser/recog_token \
+	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer \
+	posttoken_stream posttoken_tables unicode
 FRONTEND_OBJ_BASENAMES_cy86 :=
 FRONTEND_OBJ_BASENAMES_cppgm++ :=
 FRONTEND_OBJ_BASENAMES_lowiropt :=

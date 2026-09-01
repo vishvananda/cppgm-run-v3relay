@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 
+#include "nsinit_sema.h"
+
 using namespace std;
 
 namespace
@@ -59,6 +61,29 @@ bool Pa7Parser::FundamentalSpec::HasType() const
 		have_signed || have_unsigned || short_count != 0 || long_count != 0;
 }
 
+bool Pa7Parser::FundamentalSpec::Valid() const
+{
+	const unsigned primary_count =
+		(have_char ? 1u : 0u) + (have_char16 ? 1u : 0u) +
+		(have_char32 ? 1u : 0u) + (have_wchar ? 1u : 0u) +
+		(have_bool ? 1u : 0u) + (have_float ? 1u : 0u) +
+		(have_double ? 1u : 0u) + (have_void ? 1u : 0u);
+	if (primary_count > 1 || short_count > 1 || long_count > 2)
+		return false;
+	if (have_signed && have_unsigned)
+		return false;
+	if (have_float || have_void || have_bool || have_char16 ||
+		have_char32 || have_wchar)
+		return !have_signed && !have_unsigned && short_count == 0 &&
+			long_count == 0;
+	if (have_double)
+		return !have_signed && !have_unsigned && short_count == 0 &&
+			long_count <= 1;
+	if (have_char)
+		return short_count == 0 && long_count == 0;
+	return short_count <= 1;
+}
+
 Pa7TypePtr Pa7Parser::FundamentalSpec::Finish() const
 {
 	if (have_char)
@@ -103,8 +128,10 @@ Pa7TypePtr Pa7Parser::FundamentalSpec::Finish() const
 	return MakeFundamental(FT_INT);
 }
 
-Pa7Parser::Pa7Parser(const vector<Pa6Token>& tokens, Pa7Namespace* global)
-	: tokens_(tokens), pos_(0), global_(global)
+Pa7Parser::Pa7Parser(const vector<Pa6Token>& tokens, Pa7Namespace* global,
+	bool strict_mode)
+	: tokens_(tokens), pos_(0), global_(global), strict_mode_(strict_mode),
+		next_order_(0)
 {
 	if (!global_)
 		throw runtime_error("null global namespace");
@@ -208,6 +235,11 @@ void Pa7Parser::ParseDeclaration()
 		ParseUsingDeclaration();
 		return;
 	}
+	if (IsSimple(KW_STATIC_ASSERT))
+	{
+		ParseStaticAssertDeclaration();
+		return;
+	}
 	ParseSimpleDeclaration();
 }
 
@@ -307,6 +339,8 @@ void Pa7Parser::ParseUsingDeclaration()
 		PA7_FIND_ANY);
 	if (!source)
 		throw runtime_error("using-declaration target not found");
+	if (strict_mode_ && source->kind == PA7_DECL_NAMESPACE)
+		throw runtime_error("using-declaration cannot name a namespace");
 	scopes_.back()->AddUsingDeclaration(path.parts.back(), *source);
 }
 
@@ -319,6 +353,7 @@ void Pa7Parser::ParseSimpleDeclaration()
 		return;
 	}
 
+	bool saw_function_definition = false;
 	for (;;)
 	{
 		Declarator declarator = ParseDeclarator(spec.type, DECL_NAMED);
@@ -326,52 +361,119 @@ void Pa7Parser::ParseSimpleDeclaration()
 			throw runtime_error("declaration has no name");
 
 		Pa7Namespace* destination = scopes_.back();
-		if (declarator.path.absolute || declarator.path.parts.size() > 1)
-		{
-			vector<string> namespace_parts(declarator.path.parts.begin(),
-				declarator.path.parts.end() - 1);
-			destination = ResolveRelativeNamespace(scopes_.back(),
+			if (declarator.path.absolute || declarator.path.parts.size() > 1)
+			{
+				vector<string> namespace_parts(declarator.path.parts.begin(),
+					declarator.path.parts.end() - 1);
+				if (strict_mode_ && !declarator.path.absolute &&
+					scopes_.back() != global_ && !namespace_parts.empty())
+				{
+					bool enclosing = false;
+					for (Pa7Namespace* enclosing_scope = scopes_.back();
+						enclosing_scope && enclosing_scope != global_;
+						enclosing_scope = enclosing_scope->parent)
+						if (enclosing_scope->name == namespace_parts[0])
+							enclosing = true;
+					if (!enclosing)
+						throw runtime_error(
+							"qualified declarator namespace is not enclosing");
+				}
+				destination = ResolveRelativeNamespace(scopes_.back(),
 				namespace_parts, declarator.path.absolute);
 			if (!destination)
 				throw runtime_error("qualified declarator namespace not found");
 		}
 
 		const string& name = declarator.path.parts.back();
-		if (spec.is_typedef)
-			destination->AddTypedef(name, declarator.type);
+			SetTypeExpressionScope(declarator.type, destination);
+			if (spec.is_typedef)
+			{
+				destination->AddTypedef(name, declarator.type);
+				if (ConsumeSimple(OP_COMMA))
+					continue;
+				break;
+			}
+			if (spec.is_constexpr)
+			declarator.type = ApplyCV(PA7_CV_CONST, declarator.type);
+
+		const bool function = IsFunction(declarator.type);
+		const bool has_initializer = ConsumeSimple(OP_ASS);
+		if (has_initializer && function)
+			throw runtime_error("function declarator has an initializer");
+		const bool function_definition = function &&
+			IsSimple(OP_LBRACE);
+		saw_function_definition = saw_function_definition || function_definition;
+		if (function_definition && spec.has_named_type && strict_mode_)
+			throw runtime_error("function typedef cannot define a function");
+		const bool definition = function ? function_definition :
+			has_initializer ||
+			(spec.storage & PA7_STORAGE_EXTERN) == 0;
+		if (strict_mode_ && spec.is_constexpr && !function &&
+			!has_initializer)
+			throw runtime_error("constexpr object needs an initializer");
+		if (strict_mode_ && spec.is_const && !function &&
+			!has_initializer &&
+			(spec.storage & PA7_STORAGE_EXTERN) == 0)
+			throw runtime_error("const object needs an initializer");
+		if (strict_mode_ && !function &&
+			(declarator.type->kind == PA7_TYPE_LVALUE_REFERENCE ||
+			 declarator.type->kind == PA7_TYPE_RVALUE_REFERENCE) &&
+			!has_initializer)
+			throw runtime_error("reference needs an initializer");
+
+		Pa7DeclAttributes attributes = MakeAttributes(spec, definition,
+			next_order_++);
+		const bool qualified = declarator.path.absolute ||
+			declarator.path.parts.size() > 1;
+		Pa7Decl* visible = qualified ? const_cast<Pa7Decl*>(
+			destination->FindDirectOrInline(name, function ?
+				PA7_FIND_FUNCTION : PA7_FIND_VARIABLE)) : 0;
+		Pa7Namespace* merge_scope = destination;
+		if (visible)
+		{
+			if (visible->kind == PA7_DECL_VARIABLE && visible->variable &&
+				!function)
+				merge_scope = visible->variable->owner;
+			else if (visible->kind == PA7_DECL_FUNCTION && visible->function &&
+				function)
+				merge_scope = visible->function->owner;
+			else
+				throw runtime_error("declaration kind conflict");
+		}
+		if (function)
+		{
+			shared_ptr<Pa7Function> entity = merge_scope->AddOrMergeFunction(
+				name, declarator.type, attributes, strict_mode_);
+			if (function_definition)
+				ParseFunctionBody();
+			(void)entity;
+		}
 		else
 		{
-			const bool qualified = declarator.path.absolute ||
-				declarator.path.parts.size() > 1;
-			unsigned filter = IsFunction(declarator.type) ?
-				PA7_FIND_FUNCTION : PA7_FIND_VARIABLE;
-			// A qualified declarator-id matches members of the named
-			// namespace and its inline set only; using-directives do not
-			// contribute members (nsdecl-ref declares a fresh entity).
-			Pa7Decl* visible = qualified ? const_cast<Pa7Decl*>(
-				destination->FindDirectOrInline(name, filter)) : 0;
-			if (visible)
+			shared_ptr<Pa7Variable> entity = merge_scope->AddOrMergeVariable(
+				name, declarator.type, attributes, strict_mode_);
+			if (has_initializer)
 			{
-				if (visible->kind == PA7_DECL_FUNCTION &&
-					visible->function)
-					visible->function->type = MergeTypes(
-						visible->function->type, declarator.type);
-				else if (visible->kind == PA7_DECL_VARIABLE &&
-					visible->variable)
-					visible->variable->type = MergeTypes(
-						visible->variable->type, declarator.type);
-				else
-					throw runtime_error("declaration kind conflict");
+				if (!strict_mode_)
+					throw runtime_error("initializers unsupported in nsdecl");
+				Pa8ExprPtr initializer = ParseExpression();
+				SetExpressionScope(initializer, destination);
+				entity->initializer_expression = initializer;
 			}
-			else if (IsFunction(declarator.type))
-				destination->AddOrMergeFunction(name, declarator.type);
-			else
-				destination->AddOrMergeVariable(name, declarator.type);
 		}
 
 		if (!ConsumeSimple(OP_COMMA))
 			break;
+		if (function_definition)
+			throw runtime_error("function definition cannot declare another entity");
 	}
+	if (saw_function_definition)
+	{
+		ConsumeSimple(OP_SEMICOLON);
+		return;
+	}
+	if (IsSimple(OP_LBRACE))
+		throw runtime_error("unexpected function body");
 	ExpectEndOfDeclaration();
 }
 
@@ -394,6 +496,7 @@ Pa7Parser::DeclSpec Pa7Parser::ParseDeclSpecifierSeq()
 			named_type = LookupTypedef(path);
 			if (!named_type)
 				throw runtime_error("unknown typedef name");
+			result.has_named_type = true;
 			consumed = true;
 			continue;
 		}
@@ -414,8 +517,30 @@ Pa7Parser::DeclSpec Pa7Parser::ParseDeclSpecifierSeq()
 			consumed = true;
 			continue;
 		}
+		if (type == KW_CONSTEXPR)
+		{
+			if (result.is_constexpr && strict_mode_)
+				throw runtime_error("duplicate constexpr specifier");
+			result.is_constexpr = true;
+			++pos_;
+			consumed = true;
+			continue;
+		}
+		if (type == KW_INLINE)
+		{
+			result.is_inline = true;
+			++pos_;
+			consumed = true;
+			continue;
+		}
 		if (IsStorageSpecifier(type))
 		{
+			if (type == KW_STATIC)
+				result.storage |= PA7_STORAGE_STATIC;
+			else if (type == KW_EXTERN)
+				result.storage |= PA7_STORAGE_EXTERN;
+			else
+				result.storage |= PA7_STORAGE_THREAD_LOCAL;
 			++pos_;
 			consumed = true;
 			continue;
@@ -445,9 +570,14 @@ Pa7Parser::DeclSpec Pa7Parser::ParseDeclSpecifierSeq()
 
 	if (!consumed || (!fundamental.HasType() && !named_type))
 		throw runtime_error("missing declaration specifier");
+	if (strict_mode_ && fundamental.HasType() && !fundamental.Valid())
+		throw runtime_error("invalid fundamental type specifier sequence");
 	result.type = named_type ? named_type : fundamental.Finish();
 	if (cv != PA7_CV_NONE)
 		result.type = ApplyCV(cv, result.type);
+	result.is_const = (cv & PA7_CV_CONST) != 0;
+	if (!result.is_const && result.type && result.type->kind == PA7_TYPE_CV)
+		result.is_const = (result.type->cv & PA7_CV_CONST) != 0;
 	return result;
 }
 
@@ -491,13 +621,20 @@ Pa7Parser::Declarator Pa7Parser::ParsePtrDeclarator(const Pa7TypePtr& base,
 			working = ApplyCV(wrap.cv, MakePointer(working));
 			break;
 		case PA7_TYPE_LVALUE_REFERENCE:
+			if (strict_mode_ && working &&
+				working->kind == PA7_TYPE_LVALUE_REFERENCE)
+				throw runtime_error("reference to reference is not accepted here");
 			working = MakeReference(false, working);
 			break;
 		case PA7_TYPE_RVALUE_REFERENCE:
+			if (strict_mode_ && working &&
+				working->kind == PA7_TYPE_LVALUE_REFERENCE)
+				throw runtime_error("reference to reference is not accepted here");
 			working = MakeReference(true, working);
 			break;
 		case PA7_TYPE_ARRAY:
-			working = MakeArray(wrap.has_bound, wrap.bound, working);
+			working = MakeArray(wrap.has_bound, wrap.bound, working,
+				wrap.bound_expression);
 			break;
 		default:
 			working = MakeFunction(wrap.parameters.types,
@@ -584,11 +721,22 @@ void Pa7Parser::ParseDeclaratorChain(vector<TypeWrapper>& chain,
 			suffix.has_bound = !IsSimple(OP_RSQUARE);
 			if (suffix.has_bound)
 			{
-				if (!ConsumeLiteral(&literal) || !literal.lit_scalar ||
-					literal.lit_type > FT_BOOL || literal.lit_value == 0)
-					throw runtime_error(
-						"array bound is not a positive integral literal");
-				suffix.bound = literal.lit_value;
+				if (strict_mode_)
+				{
+					suffix.bound_expression = ParseExpression();
+					if (suffix.bound_expression->kind == PA8_EXPR_LITERAL &&
+						suffix.bound_expression->literal.lit_scalar &&
+						suffix.bound_expression->literal.lit_type <= FT_BOOL)
+						suffix.bound = suffix.bound_expression->literal.lit_value;
+				}
+				else
+				{
+					if (!ConsumeLiteral(&literal) || !literal.lit_scalar ||
+						literal.lit_type > FT_BOOL || literal.lit_value == 0)
+						throw runtime_error(
+							"array bound is not a positive integral literal");
+					suffix.bound = literal.lit_value;
+				}
 			}
 			ExpectSimple(OP_RSQUARE);
 		}
@@ -807,6 +955,7 @@ bool Pa7Parser::IsDeclSpecifierStart(size_t at) const
 {
 	const ETokenType type = Token(at).simple_type;
 	return IsCVSpecifier(type) || type == KW_TYPEDEF ||
+		type == KW_CONSTEXPR || type == KW_INLINE ||
 		IsStorageSpecifier(type) || IsFundamentalSpecifier(type);
 }
 
@@ -872,4 +1021,199 @@ bool Pa7Parser::TryRedundantParentheses(const Pa7TypePtr& base,
 	result.has_name = true;
 	result.path = candidate;
 	return true;
+}
+
+Pa8ExprPtr Pa7Parser::MakeExpression(Pa8ExprKind kind)
+{
+	Pa8ExprPtr result(new Pa8Expr);
+	result->kind = kind;
+	result->lookup_scope = scopes_.back();
+	result->token_index = pos_;
+	return result;
+}
+
+Pa8ExprPtr Pa7Parser::ParsePrimaryExpression()
+{
+	Pa6Token literal(PA6_EOF_TOKEN, "");
+	if (ConsumeLiteral(&literal))
+	{
+		Pa8ExprPtr result = MakeExpression(PA8_EXPR_LITERAL);
+		result->literal = literal;
+		return result;
+	}
+	if (IsSimple(KW_TRUE) || IsSimple(KW_FALSE) ||
+		IsSimple(KW_NULLPTR))
+	{
+		const Pa6Token token = Token(pos_);
+		++pos_;
+		Pa8ExprPtr result = MakeExpression(PA8_EXPR_LITERAL);
+		result->literal = token;
+		return result;
+	}
+	if (IsKind(PA6_IDENTIFIER_TOKEN) || IsSimple(OP_COLON2))
+	{
+		NamePath path = ParseNamePath();
+		Pa8ExprPtr result = MakeExpression(PA8_EXPR_IDENTIFIER);
+		result->absolute = path.absolute;
+		result->path = path.parts;
+		return result;
+	}
+	if (ConsumeSimple(OP_LPAREN))
+	{
+		Pa8ExprPtr result = ParseExpression();
+		ExpectSimple(OP_RPAREN);
+		return result;
+	}
+	throw runtime_error("missing expression operand");
+}
+
+Pa8ExprPtr Pa7Parser::ParseUnaryExpression()
+{
+	if (IsSimple(OP_PLUS) || IsSimple(OP_MINUS) || IsSimple(OP_LNOT) ||
+		IsSimple(OP_COMPL) || IsSimple(OP_AMP) || IsSimple(OP_STAR))
+	{
+		const ETokenType op = Token(pos_).simple_type;
+		++pos_;
+		Pa8ExprPtr result = MakeExpression(PA8_EXPR_UNARY);
+		result->op = op;
+		result->left = ParseUnaryExpression();
+		return result;
+	}
+	return ParsePrimaryExpression();
+}
+
+int Pa7Parser::BinaryPrecedence(ETokenType type) const
+{
+	switch (type)
+	{
+	case OP_LOR: return 1;
+	case OP_LAND: return 2;
+	case OP_BOR: return 3;
+	case OP_XOR: return 4;
+	case OP_AMP: return 5;
+	case OP_EQ:
+	case OP_NE: return 6;
+	case OP_LT:
+	case OP_GT:
+	case OP_LE:
+	case OP_GE: return 7;
+	case OP_LSHIFT:
+	case OP_RSHIFT: return 8;
+	case OP_PLUS:
+	case OP_MINUS: return 9;
+	case OP_STAR:
+	case OP_DIV:
+	case OP_MOD: return 10;
+	default: return 0;
+	}
+}
+
+Pa8ExprPtr Pa7Parser::ParseExpression(unsigned minimum_precedence)
+{
+	Pa8ExprPtr left = ParseUnaryExpression();
+	for (;;)
+	{
+		const int precedence = BinaryPrecedence(Token(pos_).simple_type);
+		if (precedence < static_cast<int>(minimum_precedence))
+			break;
+		const ETokenType op = Token(pos_).simple_type;
+		++pos_;
+		Pa8ExprPtr right = ParseExpression(static_cast<unsigned>(precedence + 1));
+		Pa8ExprPtr combined = MakeExpression(PA8_EXPR_BINARY);
+		combined->op = op;
+		combined->left = left;
+		combined->right = right;
+		left = combined;
+	}
+	if (minimum_precedence == 1 && ConsumeSimple(OP_QMARK))
+	{
+		Pa8ExprPtr when_true = ParseExpression();
+		ExpectSimple(OP_COLON);
+		Pa8ExprPtr when_false = ParseExpression();
+		Pa8ExprPtr result = MakeExpression(PA8_EXPR_CONDITIONAL);
+		result->left = left;
+		result->right = when_true;
+		result->third = when_false;
+		left = result;
+	}
+	return left;
+}
+
+bool Pa7Parser::IsExpressionStart(size_t at) const
+{
+	const Pa6Token& token = Token(at);
+	if (token.kind == PA6_LITERAL_TOKEN ||
+		token.kind == PA6_IDENTIFIER_TOKEN)
+		return true;
+	return token.IsSimple(OP_COLON2) || token.IsSimple(OP_LPAREN) ||
+		token.IsSimple(KW_TRUE) || token.IsSimple(KW_FALSE) ||
+		token.IsSimple(KW_NULLPTR) || token.IsSimple(OP_PLUS) ||
+		token.IsSimple(OP_MINUS) || token.IsSimple(OP_LNOT) ||
+		token.IsSimple(OP_COMPL) || token.IsSimple(OP_AMP) ||
+		token.IsSimple(OP_STAR);
+}
+
+void Pa7Parser::ParseStaticAssertDeclaration()
+{
+	ExpectSimple(KW_STATIC_ASSERT);
+	ExpectSimple(OP_LPAREN);
+	Pa8ExprPtr condition = ParseExpression();
+	SetExpressionScope(condition, scopes_.back());
+	if (ConsumeSimple(OP_COMMA))
+	{
+		Pa6Token message(PA6_EOF_TOKEN, "");
+		if (!ConsumeLiteral(&message) || message.lit_scalar)
+			throw runtime_error("static_assert message is not a string literal");
+	}
+	ExpectSimple(OP_RPAREN);
+	ExpectEndOfDeclaration();
+	global_->static_assertions.push_back(condition);
+}
+
+void Pa7Parser::ParseFunctionBody()
+{
+	ExpectSimple(OP_LBRACE);
+	if (!ConsumeSimple(OP_RBRACE))
+		throw runtime_error("only an empty function body is supported");
+}
+
+Pa7DeclAttributes Pa7Parser::MakeAttributes(const DeclSpec& spec,
+	bool defined, size_t order) const
+{
+	Pa7DeclAttributes result;
+	result.storage = spec.storage;
+	result.is_const = spec.is_const || spec.is_constexpr;
+	result.is_constexpr = spec.is_constexpr;
+	result.is_inline = spec.is_inline;
+	result.defined = defined;
+	result.order = order;
+	result.linkage_explicit =
+		(spec.storage & (PA7_STORAGE_STATIC | PA7_STORAGE_EXTERN)) != 0;
+	if (spec.storage & PA7_STORAGE_STATIC)
+		result.linkage = PA7_LINKAGE_INTERNAL;
+	else if (spec.storage & PA7_STORAGE_EXTERN)
+		result.linkage = PA7_LINKAGE_EXTERNAL;
+	return result;
+}
+
+void Pa7Parser::SetExpressionScope(const Pa8ExprPtr& expression,
+	Pa7Namespace* scope) const
+{
+	if (!expression)
+		return;
+	expression->lookup_scope = scope;
+	SetExpressionScope(expression->left, scope);
+	SetExpressionScope(expression->right, scope);
+	SetExpressionScope(expression->third, scope);
+}
+
+void Pa7Parser::SetTypeExpressionScope(const Pa7TypePtr& type,
+	Pa7Namespace* scope) const
+{
+	if (!type)
+		return;
+	SetExpressionScope(type->bound_expression, scope);
+	for (size_t i = 0; i < type->children.size(); ++i)
+		SetTypeExpressionScope(type->children[i], scope);
+	SetTypeExpressionScope(type->return_type, scope);
 }

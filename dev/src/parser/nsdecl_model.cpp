@@ -54,7 +54,10 @@ bool SameTypeImpl(const Pa7TypePtr& left, const Pa7TypePtr& right)
 			SameTypeImpl(left->children[0], right->children[0]);
 	case PA7_TYPE_ARRAY:
 		return left->has_bound == right->has_bound &&
-			(!left->has_bound || left->bound == right->bound) &&
+			(!left->has_bound ||
+			 (left->bound_expression || right->bound_expression ?
+				left->bound_expression == right->bound_expression :
+				left->bound == right->bound)) &&
 			left->children.size() == 1 && right->children.size() == 1 &&
 			SameTypeImpl(left->children[0], right->children[0]);
 	case PA7_TYPE_FUNCTION:
@@ -84,14 +87,16 @@ Pa7TypePtr MergeTypeImpl(const Pa7TypePtr& first, const Pa7TypePtr& second)
 	case PA7_TYPE_ARRAY:
 	{
 		const bool has_bound = first->has_bound || second->has_bound;
-		const unsigned long long bound = first->has_bound ? first->bound :
-			second->bound;
+		const Pa8ExprPtr bound_expression = first->bound_expression ?
+			first->bound_expression : second->bound_expression;
+		const unsigned long long bound = bound_expression ? 0 :
+			(first->has_bound ? first->bound : second->bound);
 		Pa7TypePtr first_element = first->children.empty() ? Pa7TypePtr() :
 			first->children[0];
 		Pa7TypePtr second_element = second->children.empty() ? Pa7TypePtr() :
 			second->children[0];
 		return MakeArray(has_bound, bound,
-			MergeTypeImpl(first_element, second_element));
+			MergeTypeImpl(first_element, second_element), bound_expression);
 	}
 	case PA7_TYPE_CV:
 		if (first->cv == second->cv && first->children.size() == 1 &&
@@ -138,11 +143,100 @@ void PrintNamespace(ostream& out, const Pa7Namespace& ns, bool global)
 	out << "end namespace" << endl;
 }
 
+bool RedeclarationTypesAgree(const Pa7TypePtr& first, const Pa7TypePtr& second)
+{
+	if (SameType(first, second))
+		return true;
+	if (!first || !second || first->kind != second->kind)
+		return false;
+	if (first->kind == PA7_TYPE_ARRAY &&
+		first->children.size() == 1 && second->children.size() == 1)
+	{
+		return (!first->has_bound || !second->has_bound ||
+			(first->bound_expression || second->bound_expression ?
+				first->bound_expression == second->bound_expression :
+				first->bound == second->bound)) &&
+			RedeclarationTypesAgree(first->children[0], second->children[0]);
+	}
+	return false;
+}
+
+void CheckDeclarationAttributes(const Pa7Variable& prior,
+	const Pa7DeclAttributes& next, bool strict)
+{
+	if (!strict)
+		return;
+	const bool prior_static = (prior.storage & PA7_STORAGE_STATIC) != 0;
+	const bool next_static = (next.storage & PA7_STORAGE_STATIC) != 0;
+	if (prior_static != next_static && (prior_static || next_static))
+		throw runtime_error("static storage does not agree across redeclarations");
+	const bool prior_thread =
+		(prior.storage & PA7_STORAGE_THREAD_LOCAL) != 0;
+	const bool next_thread =
+		(next.storage & PA7_STORAGE_THREAD_LOCAL) != 0;
+	if (prior_thread != next_thread)
+		throw runtime_error("thread_local does not agree across redeclarations");
+	if (prior.linkage != PA7_LINKAGE_UNSPECIFIED &&
+		next.linkage_explicit && prior.linkage != next.linkage)
+		throw runtime_error("linkage does not agree across redeclarations");
+	if (prior.defined && next.defined)
+		throw runtime_error("more than one definition");
+}
+
+void ApplyVariableAttributes(Pa7Variable& variable,
+	const Pa7DeclAttributes& attributes)
+{
+	if (attributes.storage != PA7_STORAGE_NONE || variable.storage ==
+		PA7_STORAGE_NONE)
+		variable.storage = attributes.storage;
+	if (attributes.linkage != PA7_LINKAGE_UNSPECIFIED)
+		variable.linkage = attributes.linkage;
+	variable.is_const = variable.is_const || attributes.is_const;
+	variable.is_constexpr = variable.is_constexpr || attributes.is_constexpr;
+	variable.defined = variable.defined || attributes.defined;
+}
+
+void CheckDeclarationAttributes(const Pa7Function& prior,
+	const Pa7DeclAttributes& next, bool strict)
+{
+	if (!strict)
+		return;
+	const bool prior_static = (prior.storage & PA7_STORAGE_STATIC) != 0;
+	const bool next_static = (next.storage & PA7_STORAGE_STATIC) != 0;
+	if (prior_static != next_static && (prior_static || next_static))
+		throw runtime_error("static storage does not agree across redeclarations");
+	const bool prior_thread =
+		(prior.storage & PA7_STORAGE_THREAD_LOCAL) != 0;
+	const bool next_thread =
+		(next.storage & PA7_STORAGE_THREAD_LOCAL) != 0;
+	if (prior_thread != next_thread)
+		throw runtime_error("thread_local does not agree across redeclarations");
+	if (prior.linkage != PA7_LINKAGE_UNSPECIFIED &&
+		next.linkage_explicit && prior.linkage != next.linkage)
+		throw runtime_error("linkage does not agree across redeclarations");
+	if (prior.defined && next.defined && !prior.is_inline &&
+		!next.is_inline)
+		throw runtime_error("more than one definition");
+}
+
+void ApplyFunctionAttributes(Pa7Function& function,
+	const Pa7DeclAttributes& attributes)
+{
+	if (attributes.storage != PA7_STORAGE_NONE || function.storage ==
+		PA7_STORAGE_NONE)
+		function.storage = attributes.storage;
+	if (attributes.linkage != PA7_LINKAGE_UNSPECIFIED)
+		function.linkage = attributes.linkage;
+	function.is_inline = function.is_inline || attributes.is_inline;
+	function.defined = function.defined || attributes.defined;
+}
+
 } // namespace
 
 Pa7Type::Pa7Type()
 	: kind(PA7_TYPE_FUNDAMENTAL), fundamental(FT_INT), cv(PA7_CV_NONE),
-		has_bound(false), bound(0), varargs(false), return_type()
+		has_bound(false), bound(0), bound_expression(), varargs(false),
+		return_type()
 {
 }
 
@@ -162,7 +256,7 @@ Pa7TypePtr ApplyCV(unsigned cv, const Pa7TypePtr& type)
 		return type;
 	if (type->kind == PA7_TYPE_ARRAY && type->children.size() == 1)
 		return MakeArray(type->has_bound, type->bound,
-			ApplyCV(cv, type->children[0]));
+			ApplyCV(cv, type->children[0]), type->bound_expression);
 	if (type->kind == PA7_TYPE_CV && type->children.size() == 1)
 		return ApplyCV(type->cv | cv, type->children[0]);
 	return MakeCV(cv, type);
@@ -170,6 +264,9 @@ Pa7TypePtr ApplyCV(unsigned cv, const Pa7TypePtr& type)
 
 Pa7TypePtr MakePointer(const Pa7TypePtr& inner)
 {
+	Pa7TypePtr stripped = StripCV(inner);
+	if (stripped && IsReferenceKind(stripped->kind))
+		throw runtime_error("pointer to reference is not a type");
 	Pa7TypePtr result(new Pa7Type);
 	result->kind = PA7_TYPE_POINTER;
 	result->children.push_back(inner);
@@ -178,6 +275,10 @@ Pa7TypePtr MakePointer(const Pa7TypePtr& inner)
 
 Pa7TypePtr MakeReference(bool is_rvalue, const Pa7TypePtr& inner)
 {
+	Pa7TypePtr stripped = StripCV(inner);
+	if (stripped && stripped->kind == PA7_TYPE_FUNDAMENTAL &&
+		stripped->fundamental == FT_VOID)
+		throw runtime_error("reference to void is not a type");
 	if (inner && IsReferenceKind(inner->kind) &&
 		inner->children.size() == 1)
 		return MakeReference(is_rvalue &&
@@ -192,12 +293,13 @@ Pa7TypePtr MakeReference(bool is_rvalue, const Pa7TypePtr& inner)
 }
 
 Pa7TypePtr MakeArray(bool has_bound, unsigned long long bound,
-	const Pa7TypePtr& element)
+	const Pa7TypePtr& element, const Pa8ExprPtr& bound_expression)
 {
 	Pa7TypePtr result(new Pa7Type);
 	result->kind = PA7_TYPE_ARRAY;
 	result->has_bound = has_bound;
 	result->bound = bound;
+	result->bound_expression = bound_expression;
 	result->children.push_back(element);
 	return result;
 }
@@ -306,6 +408,14 @@ Pa7TypePtr MergeTypes(const Pa7TypePtr& first, const Pa7TypePtr& second)
 	return MergeTypeImpl(first, second);
 }
 
+Pa7DeclAttributes::Pa7DeclAttributes()
+	: storage(PA7_STORAGE_NONE), linkage(PA7_LINKAGE_UNSPECIFIED),
+		linkage_explicit(false), is_const(false), is_constexpr(false),
+		is_inline(false), defined(false),
+		order(std::numeric_limits<std::size_t>::max())
+{
+}
+
 Pa7Decl::Pa7Decl()
 	: kind(PA7_DECL_VARIABLE), origin(PA7_DECL_OWNED), namespace_entity(0)
 {
@@ -329,13 +439,22 @@ bool Pa7Decl::Matches(unsigned filter) const
 	return false;
 }
 
-Pa7Variable::Pa7Variable(const string& variable_name, const Pa7TypePtr& value)
-	: name(variable_name), type(value)
+Pa7Variable::Pa7Variable(const string& variable_name, const Pa7TypePtr& value,
+	Pa7Namespace* namespace_owner)
+	: name(variable_name), type(value), owner(namespace_owner),
+		storage(PA7_STORAGE_NONE), linkage(PA7_LINKAGE_UNSPECIFIED),
+		is_const(false), is_constexpr(false), defined(false),
+		order(std::numeric_limits<std::size_t>::max()),
+		initializer_expression(), initializer()
 {
 }
 
-Pa7Function::Pa7Function(const string& function_name, const Pa7TypePtr& value)
-	: name(function_name), type(value)
+Pa7Function::Pa7Function(const string& function_name, const Pa7TypePtr& value,
+	Pa7Namespace* namespace_owner)
+	: name(function_name), type(value), owner(namespace_owner),
+		storage(PA7_STORAGE_NONE), linkage(PA7_LINKAGE_UNSPECIFIED),
+		is_inline(false), defined(false),
+		order(std::numeric_limits<std::size_t>::max())
 {
 }
 
@@ -501,20 +620,31 @@ void Pa7Namespace::AddUsingDeclaration(const string& declaration_name,
 }
 
 shared_ptr<Pa7Variable> Pa7Namespace::AddOrMergeVariable(
-	const string& variable_name, const Pa7TypePtr& type)
+	const string& variable_name, const Pa7TypePtr& type,
+	const Pa7DeclAttributes& attributes, bool strict)
 {
 	map<string, Pa7Decl>::iterator existing = declarations.find(variable_name);
 	if (existing != declarations.end())
 	{
 		if (existing->second.origin != PA7_DECL_OWNED ||
-			existing->second.kind != PA7_DECL_VARIABLE ||
-			!existing->second.variable)
+				existing->second.kind != PA7_DECL_VARIABLE ||
+				!existing->second.variable)
 			throw runtime_error("declaration kind conflict");
+		if (!RedeclarationTypesAgree(existing->second.variable->type, type))
+			throw runtime_error("variable type does not agree across redeclarations");
+		CheckDeclarationAttributes(*existing->second.variable, attributes, strict);
 		existing->second.variable->type = MergeTypes(
 			existing->second.variable->type, type);
+		ApplyVariableAttributes(*existing->second.variable, attributes);
 		return existing->second.variable;
 	}
-	shared_ptr<Pa7Variable> result(new Pa7Variable(variable_name, type));
+	shared_ptr<Pa7Variable> result(new Pa7Variable(variable_name, type, this));
+	result->storage = attributes.storage;
+	result->linkage = attributes.linkage;
+	result->is_const = attributes.is_const;
+	result->is_constexpr = attributes.is_constexpr;
+	result->defined = attributes.defined;
+	result->order = attributes.order;
 	Pa7Decl decl;
 	decl.kind = PA7_DECL_VARIABLE;
 	decl.variable = result;
@@ -524,21 +654,50 @@ shared_ptr<Pa7Variable> Pa7Namespace::AddOrMergeVariable(
 }
 
 shared_ptr<Pa7Function> Pa7Namespace::AddOrMergeFunction(
-	const string& function_name, const Pa7TypePtr& type)
+	const string& function_name, const Pa7TypePtr& type,
+	const Pa7DeclAttributes& attributes, bool strict)
 {
 	map<string, Pa7Decl>::iterator existing = declarations.find(function_name);
 	if (existing != declarations.end())
 	{
 		if (existing->second.origin != PA7_DECL_OWNED ||
-			existing->second.kind != PA7_DECL_FUNCTION ||
-			!existing->second.function)
+				existing->second.kind != PA7_DECL_FUNCTION ||
+				!existing->second.function)
 			throw runtime_error("declaration kind conflict");
-		return existing->second.function;
+		vector<shared_ptr<Pa7Function> >& overloads =
+			existing->second.function_overloads;
+		if (overloads.empty())
+			overloads.push_back(existing->second.function);
+		for (size_t i = 0; i < overloads.size(); ++i)
+		{
+			if (!SameType(overloads[i]->type, type))
+				continue;
+			CheckDeclarationAttributes(*overloads[i], attributes, strict);
+			overloads[i]->type = MergeTypes(overloads[i]->type, type);
+			ApplyFunctionAttributes(*overloads[i], attributes);
+			return overloads[i];
+		}
+		shared_ptr<Pa7Function> result(new Pa7Function(function_name, type,
+			this));
+		result->storage = attributes.storage;
+		result->linkage = attributes.linkage;
+		result->is_inline = attributes.is_inline;
+		result->defined = attributes.defined;
+		result->order = attributes.order;
+		overloads.push_back(result);
+		functions.push_back(result);
+		return result;
 	}
-	shared_ptr<Pa7Function> result(new Pa7Function(function_name, type));
+	shared_ptr<Pa7Function> result(new Pa7Function(function_name, type, this));
+	result->storage = attributes.storage;
+	result->linkage = attributes.linkage;
+	result->is_inline = attributes.is_inline;
+	result->defined = attributes.defined;
+	result->order = attributes.order;
 	Pa7Decl decl;
 	decl.kind = PA7_DECL_FUNCTION;
 	decl.function = result;
+	decl.function_overloads.push_back(result);
 	declarations[function_name] = decl;
 	functions.push_back(result);
 	return result;

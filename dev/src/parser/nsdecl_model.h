@@ -3,10 +3,25 @@
 #include <map>
 #include <memory>
 #include <ostream>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "posttoken_types.h"
+
+struct Pa8Expr;
+struct Pa8Value;
+typedef std::shared_ptr<Pa8Expr> Pa8ExprPtr;
+typedef std::shared_ptr<Pa8Value> Pa8ValuePtr;
+
+enum Pa8ExprKind
+{
+	PA8_EXPR_LITERAL,
+	PA8_EXPR_IDENTIFIER,
+	PA8_EXPR_UNARY,
+	PA8_EXPR_BINARY,
+	PA8_EXPR_CONDITIONAL
+};
 
 enum Pa7TypeKind
 {
@@ -33,6 +48,7 @@ struct Pa7Type
 	unsigned cv;
 	bool has_bound;
 	unsigned long long bound;
+	Pa8ExprPtr bound_expression;
 	bool varargs;
 	std::vector<std::shared_ptr<Pa7Type> > children;
 	std::shared_ptr<Pa7Type> return_type;
@@ -47,7 +63,8 @@ Pa7TypePtr ApplyCV(unsigned cv, const Pa7TypePtr& type);
 Pa7TypePtr MakePointer(const Pa7TypePtr& inner);
 Pa7TypePtr MakeReference(bool is_rvalue, const Pa7TypePtr& inner);
 Pa7TypePtr MakeArray(bool has_bound, unsigned long long bound,
-	const Pa7TypePtr& element);
+	const Pa7TypePtr& element,
+	const Pa8ExprPtr& bound_expression = Pa8ExprPtr());
 Pa7TypePtr MakeFunction(const std::vector<Pa7TypePtr>& params, bool varargs,
 	const Pa7TypePtr& ret);
 
@@ -78,6 +95,35 @@ enum Pa7DeclOrigin
 	PA7_DECL_USING
 };
 
+enum Pa7StorageFlags
+{
+	PA7_STORAGE_NONE = 0,
+	PA7_STORAGE_STATIC = 1u << 0,
+	PA7_STORAGE_EXTERN = 1u << 1,
+	PA7_STORAGE_THREAD_LOCAL = 1u << 2
+};
+
+enum Pa7Linkage
+{
+	PA7_LINKAGE_UNSPECIFIED,
+	PA7_LINKAGE_INTERNAL,
+	PA7_LINKAGE_EXTERNAL
+};
+
+struct Pa7DeclAttributes
+{
+	unsigned storage;
+	Pa7Linkage linkage;
+	bool linkage_explicit;
+	bool is_const;
+	bool is_constexpr;
+	bool is_inline;
+	bool defined;
+	std::size_t order;
+
+	Pa7DeclAttributes();
+};
+
 enum Pa7DeclFilter
 {
 	PA7_FIND_ANY = 0,
@@ -93,6 +139,7 @@ struct Pa7Decl
 	Pa7DeclOrigin origin;
 	std::shared_ptr<Pa7Variable> variable;
 	std::shared_ptr<Pa7Function> function;
+	std::vector<std::shared_ptr<Pa7Function> > function_overloads;
 	std::shared_ptr<Pa7Typedef> typedef_entity;
 	// Namespaces are owned by the parent's member vectors; declaration map
 	// entries (including aliases and using imports) only reference them.
@@ -106,16 +153,33 @@ struct Pa7Variable
 {
 	std::string name;
 	Pa7TypePtr type;
+	Pa7Namespace* owner;
+	unsigned storage;
+	Pa7Linkage linkage;
+	bool is_const;
+	bool is_constexpr;
+	bool defined;
+	std::size_t order;
+	Pa8ExprPtr initializer_expression;
+	Pa8ValuePtr initializer;
 
-	Pa7Variable(const std::string& name, const Pa7TypePtr& type);
+	Pa7Variable(const std::string& name, const Pa7TypePtr& type,
+		Pa7Namespace* owner = 0);
 };
 
 struct Pa7Function
 {
 	std::string name;
 	Pa7TypePtr type;
+	Pa7Namespace* owner;
+	unsigned storage;
+	Pa7Linkage linkage;
+	bool is_inline;
+	bool defined;
+	std::size_t order;
 
-	Pa7Function(const std::string& name, const Pa7TypePtr& type);
+	Pa7Function(const std::string& name, const Pa7TypePtr& type,
+		Pa7Namespace* owner = 0);
 };
 
 struct Pa7Typedef
@@ -139,6 +203,7 @@ struct Pa7Namespace
 	std::vector<std::shared_ptr<Pa7Namespace> > namespaces;
 	std::vector<Pa7Namespace*> using_directives;
 	std::shared_ptr<Pa7Namespace> unnamed_child;
+	std::vector<Pa8ExprPtr> static_assertions;
 
 	Pa7Namespace(const std::string& name = std::string(),
 		Pa7Namespace* parent = 0, bool inline_namespace = false,
@@ -158,9 +223,13 @@ struct Pa7Namespace
 	void AddUsingDirective(Pa7Namespace* target);
 	void AddUsingDeclaration(const std::string& name, const Pa7Decl& source);
 	std::shared_ptr<Pa7Variable> AddOrMergeVariable(const std::string& name,
-		const Pa7TypePtr& type);
+		const Pa7TypePtr& type,
+		const Pa7DeclAttributes& attributes = Pa7DeclAttributes(),
+		bool strict = false);
 	std::shared_ptr<Pa7Function> AddOrMergeFunction(const std::string& name,
-		const Pa7TypePtr& type);
+		const Pa7TypePtr& type,
+		const Pa7DeclAttributes& attributes = Pa7DeclAttributes(),
+		bool strict = false);
 	std::shared_ptr<Pa7Typedef> AddTypedef(const std::string& name,
 		const Pa7TypePtr& type);
 };

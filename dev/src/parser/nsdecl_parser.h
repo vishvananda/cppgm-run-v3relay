@@ -11,7 +11,8 @@
 class Pa7Parser
 {
 public:
-	Pa7Parser(const std::vector<Pa6Token>& tokens, Pa7Namespace* global);
+	Pa7Parser(const std::vector<Pa6Token>& tokens, Pa7Namespace* global,
+		bool strict_mode = false);
 
 	bool ParseTranslationUnit();
 
@@ -44,8 +45,15 @@ private:
 	{
 		Pa7TypePtr type;
 		bool is_typedef;
+		unsigned storage;
+		bool is_const;
+		bool is_constexpr;
+		bool is_inline;
+		bool has_named_type;
 
-		DeclSpec() : is_typedef(false) {}
+		DeclSpec()
+			: is_typedef(false), storage(PA7_STORAGE_NONE), is_const(false),
+				is_constexpr(false), is_inline(false), has_named_type(false) {}
 	};
 
 	struct Parameters
@@ -64,11 +72,12 @@ private:
 		unsigned cv;
 		bool has_bound;
 		unsigned long long bound;
+		Pa8ExprPtr bound_expression;
 		Parameters parameters;
 
 		TypeWrapper()
 			: kind(PA7_TYPE_POINTER), cv(PA7_CV_NONE), has_bound(false),
-				bound(0) {}
+				bound(0), bound_expression() {}
 	};
 
 	struct FundamentalSpec
@@ -89,6 +98,7 @@ private:
 
 		FundamentalSpec();
 		bool HasType() const;
+		bool Valid() const;
 		Pa7TypePtr Finish() const;
 	};
 
@@ -97,6 +107,7 @@ private:
 	void ParseNamespaceAliasDefinition();
 	void ParseUsingDeclaration();
 	void ParseSimpleDeclaration();
+	void ParseStaticAssertDeclaration();
 
 	DeclSpec ParseDeclSpecifierSeq();
 	Pa7TypePtr ParseTypeId();
@@ -107,6 +118,19 @@ private:
 		Declarator& result, DeclaratorMode mode);
 	Parameters ParseParametersAndQualifiers();
 	Declarator ParseParameterDeclaration();
+	Pa8ExprPtr ParseExpression(unsigned minimum_precedence = 1);
+	Pa8ExprPtr ParseUnaryExpression();
+	Pa8ExprPtr ParsePrimaryExpression();
+	Pa8ExprPtr MakeExpression(Pa8ExprKind kind);
+	void ParseFunctionBody();
+	Pa7DeclAttributes MakeAttributes(const DeclSpec& spec,
+		bool defined, std::size_t order) const;
+	void SetExpressionScope(const Pa8ExprPtr& expression,
+		Pa7Namespace* scope) const;
+	void SetTypeExpressionScope(const Pa7TypePtr& type,
+		Pa7Namespace* scope) const;
+	bool IsExpressionStart(std::size_t at) const;
+	int BinaryPrecedence(ETokenType type) const;
 
 	NamePath ParseNamePath();
 	Pa7TypePtr LookupTypedef(const NamePath& path) const;
@@ -143,4 +167,6 @@ private:
 	std::size_t pos_;
 	Pa7Namespace* global_;
 	std::vector<Pa7Namespace*> scopes_;
+	bool strict_mode_;
+	std::size_t next_order_;
 };
