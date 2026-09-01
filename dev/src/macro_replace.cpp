@@ -97,7 +97,12 @@ void ValidateMacro(const string& name, const Macro& macro)
 			token.data == "__VA_ARGS__" && !macro.variadic)
 			throw MacroError("__VA_ARGS__ outside variadic macro");
 
-		if (macro.function_like && token.data == "#")
+		// A # in a function-like replacement list must be followed by a
+		// parameter, but only when the macro has parameters to name. A
+		// zero-parameter macro's # instead stringizes its next replacement
+		// token at invocation time (reference-pinned).
+		if (macro.function_like && token.data == "#" &&
+			(macro.variadic || !macro.params.empty()))
 		{
 			if (i + 1 >= macro.replacement.size())
 				throw MacroError("stringize operator without parameter");
@@ -196,21 +201,31 @@ bool TakeInvocation(deque<PPToken>& pending, Invocation& invocation)
 	return true;
 }
 
-void ValidateArgumentCount(const Macro& macro, vector<vector<PPToken> >& args)
+void NormalizeArguments(const Macro& macro, Invocation& invocation)
 {
-	if (!macro.variadic)
-	{
-		if (args.empty() && !macro.params.empty())
-			args.push_back(vector<PPToken>());
-		if (args.size() != macro.params.size())
-			throw MacroError("wrong number of macro arguments");
-		return;
-	}
-
+	vector<vector<PPToken> >& args = invocation.arguments;
 	if (args.empty() && !macro.params.empty())
 		args.push_back(vector<PPToken>());
 	if (args.size() < macro.params.size())
 		throw MacroError("not enough macro arguments");
+	if (macro.variadic || args.size() == macro.params.size())
+		return;
+
+	// Excess arguments to a non-variadic macro merge, commas included,
+	// into the last named parameter; a zero-parameter macro accepts only
+	// an empty argument list (reference-pinned).
+	if (macro.params.empty())
+		throw MacroError("wrong number of macro arguments");
+	const size_t last = macro.params.size() - 1;
+	vector<PPToken>& merged = args[last];
+	for (size_t i = last + 1; i < args.size(); ++i)
+	{
+		if (i - 1 >= invocation.commas.size())
+			throw MacroError("missing macro argument separator");
+		merged.push_back(invocation.commas[i - 1]);
+		merged.insert(merged.end(), args[i].begin(), args[i].end());
+	}
+	args.resize(macro.params.size());
 }
 
 void Prepend(deque<PPToken>& pending, const vector<PPToken>& tokens)
@@ -518,11 +533,19 @@ public:
 					throw MacroError("stringize operator without parameter");
 				bool varargs;
 				size_t index;
-				if (!FindParameter(macro_.replacement[i + 1], varargs,
-					index))
-					throw MacroError("stringize operator without parameter");
-				const vector<PPToken>& argument = RawArgument(varargs, index);
-				PPToken stringized = StringizeArgument(argument);
+				// In a zero-parameter macro the operand is never a
+				// parameter; # stringizes the next replacement token
+				// itself, even a # or ## token (reference-pinned).
+				vector<PPToken> literal_operand;
+				const vector<PPToken>* argument;
+				if (FindParameter(macro_.replacement[i + 1], varargs, index))
+					argument = &RawArgument(varargs, index);
+				else
+				{
+					literal_operand.push_back(macro_.replacement[i + 1]);
+					argument = &literal_operand;
+				}
+				PPToken stringized = StringizeArgument(*argument);
 				stringized.preceded_by_ws = source.preceded_by_ws;
 				PPToken transformed = FunctionReplacementToken(stringized, head_,
 					invocation_.closing, head_.data,
@@ -708,20 +731,11 @@ void ReplayToken(PostTokenStream& output, const PPToken& token)
 	}
 }
 
-void ValidateTextTokens(const vector<PPToken>& tokens)
-{
-	for (size_t i = 0; i < tokens.size(); ++i)
-		if (tokens[i].kind == PP_TOKEN_IDENTIFIER &&
-			tokens[i].data == "__VA_ARGS__")
-			throw MacroError("__VA_ARGS__ outside variadic macro");
-}
-
 void FlushText(const vector<PPToken>& text, const MacroTable& table,
 	PostTokenStream& output)
 {
 	if (text.empty())
 		return;
-	ValidateTextTokens(text);
 	MacroExpander expander(table);
 	expander.Expand(text, [&output](const PPToken& token)
 	{
@@ -965,6 +979,13 @@ void MacroExpander::Expand(const vector<PPToken>& input,
 			continue;
 		}
 
+		// __VA_ARGS__ is an error exactly when the rescan examines it as
+		// an expansion candidate. Occurrences consumed whole by # or ##,
+		// or collected into an argument that is never rescanned, are
+		// legal spellings (reference-pinned).
+		if (head.data == "__VA_ARGS__")
+			throw MacroError("__VA_ARGS__ outside variadic macro");
+
 		const Macro* macro = table_.Lookup(head.data);
 		if (macro == 0 || head.noninvokable ||
 			PaintContains(head.paint, head.data))
@@ -988,7 +1009,7 @@ void MacroExpander::Expand(const vector<PPToken>& input,
 			continue;
 		}
 
-		ValidateArgumentCount(*macro, invocation.arguments);
+		NormalizeArguments(*macro, invocation);
 		Prepend(pending, BuildFunctionReplacement(*macro, invocation, head,
 			table_));
 	}
@@ -1022,6 +1043,16 @@ void MacroProcessFile(const string& input, IPostTokenOutputStream& output)
 			FlushText(text, table, posttoken_output);
 			text.clear();
 			ProcessUndef(line, table);
+		}
+		else if (!line.empty() && IsData(line[0], "#"))
+		{
+			// A line-initial # always starts a directive. The null
+			// directive is a no-op; any other unrecognized directive is
+			// an error (reference-pinned).
+			FlushText(text, table, posttoken_output);
+			text.clear();
+			if (line.size() != 1)
+				throw MacroError("invalid preprocessing directive");
 		}
 		else
 		{

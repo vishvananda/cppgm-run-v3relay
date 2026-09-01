@@ -1,0 +1,28 @@
+simple [ OP_LSQUARE
+literal 1 int 01000000
+simple , OP_COMMA
+literal 2 int 02000000
+simple ] OP_RSQUARE
+simple [ OP_LSQUARE
+literal 1 int 01000000
+simple , OP_COMMA
+literal 2 int 02000000
+simple , OP_COMMA
+literal 3 int 03000000
+simple ] OP_RSQUARE
+simple [ OP_LSQUARE
+literal 1 int 01000000
+simple ] OP_RSQUARE
+simple [ OP_LSQUARE
+literal 2 int 02000000
+simple , OP_COMMA
+literal 3 int 03000000
+simple ] OP_RSQUARE
+simple [ OP_LSQUARE
+literal 1 int 01000000
+simple , OP_COMMA
+simple ] OP_RSQUARE
+literal "1, 2" u8"x" array of 6 char 312C20327800
+simple , OP_COMMA
+identifier _s
+eof

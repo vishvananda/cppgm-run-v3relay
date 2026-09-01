@@ -1,0 +1,4 @@
+literal "__VA_ARGS__" array of 12 char 5F5F56415F415247535F5F00
+identifier x
+identifier __VA_ARGS__y
+eof

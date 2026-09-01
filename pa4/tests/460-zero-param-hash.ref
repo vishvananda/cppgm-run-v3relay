@@ -1,0 +1,9 @@
+literal "M" array of 2 char 4D00
+identifier q
+literal "#" array of 2 char 2300
+identifier x
+literal "##" array of 3 char 232300
+identifier y
+literal "\"s\\n\"" array of 6 char 22735C6E2200
+identifier w
+eof

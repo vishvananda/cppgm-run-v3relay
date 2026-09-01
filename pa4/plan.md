@@ -1,215 +1,73 @@
-# PA4 Plan — macro (phases 1–6 + phase-7 tokenization with #define/#undef)
+# PA4 Plan — macro (phases 1–6 + phase-7 tokenization with #define/#undef) [COMPLETE]
 
-State at CP2 completion: 72/72 pa4 fixtures pass; through-pa3 reports 104/104
-and through-pa4 reports 176/176. The pa4 file audit reports 23 files checked;
-the 100k-expansion probe completed in 1.81s. Oracle: `.ref` files; failing
-fixtures compare exit status only.
+Final state: 184/184 fixtures pass through `make test-report-through-pa4`
+(53 pa1 + 28 pa2 + 23 pa3 + 47 pa4 local including eight boundary fixtures
+added at CP3 + 33 pa4 course); file audit passes (23 files). Architecture
+review, findings, performance evidence, and conformance validation are
+consolidated in `pa4/audit.md`.
 
-## Stage Design
+## Stage Design (as built)
 
 Owning boundary: macro owns splitting the phase-1–3 pp-token stream into
 directives and text-sequences, the macro table, and 16.3 replacement
-(spec.md [cpp.replace] 16.3.1–16.3.5 plus the course deviations below).
+(spec.md [cpp.replace] plus the course deviations recorded in the audit).
 PA1 `PPTokenize` and PA2 `PostTokenStream` are reused untouched. Pipeline:
 
     stdin → PPTokenize → PPTokenCollector (vector<PPToken>)
-          → directive carve → MacroTable updates | text-sequence expansion
+          → line carve: #define/#undef/null-#/#-error | text accumulation
+          → MacroTable updates | MacroExpander deque rescan
           → replay all output tokens into ONE PostTokenStream
           → DebugPostTokenOutputStream → stdout
 
-- `PPToken` value struct: kind (one enumerator per IPPTokenStream data event
-  + NEW_LINE + internal PLACEMARKER), spelling, `preceded_by_ws` flag
-  (whitespace-sequences collapse into the flag; new-lines stay tokens until
-  text-sequence expansion collapses them into flags too), paint set,
-  noninvokable flag.
-- Directive carve happens BEFORE any replacement, on raw lines only:
-  (start-of-file | new-line) [ws] `#` … new-line. `#` mid-line is text
-  (150-hash-outside), `#` produced by expansion never starts a directive
-  (600-hash-from-macro), directive-shaped tokens mid-line inside an
-  invocation are plain text (300-directive-tokens-from-macro-argument).
-- Text-sequences are maximal non-directive runs. Invocations span new-lines,
-  blank lines, and comments (400-fun-macro-define, 200-whitespaces) but never
-  a directive: a fn-like name pending at a directive boundary is emitted as a
-  plain identifier (400-fun-macro-define first `A`).
-- ONE PostTokenStream instance consumes the entire file's replaced output, so
-  PA2 phase-6 string concatenation crosses source lines and text-sequence
-  boundaries (700-strlit-q: `"vers2.h"` + `"hello"` concatenate); `emit_eof`
-  once at end. `#`/`##`/`@` in output surface as `invalid …` lines with
-  EXIT_SUCCESS (150-hash-outside, 200-invalid-token-macro-replacement).
-- Errors throw a `MacroError : std::runtime_error`; main catches → 
-  EXIT_FAILURE (stdout irrelevant for failing fixtures).
+- `dev/src/macro_replace.h/.cpp` —
+  - `PPToken` value struct: kind enum (one per `IPPTokenStream` data event +
+    `NEW_LINE` + internal `PLACEMARKER`), spelling, `preceded_by_ws` flag
+    (whitespace collapses at collection; new-lines stay tokens), paint set
+    (sorted `vector<string>`), noninvokable flag.
+  - `MacroTable::Define` parses and validates the whole directive line:
+    fn-like by `(`-adjacency, parameter list, must-whitespace, `##` never at
+    a boundary, `#` before a parameter when the macro has named parameters
+    or is variadic (zero-parameter `#` is deferred to invocation),
+    redefinition equivalence on kind/params/spellings/interior-ws flags.
+  - `MacroExpander::Expand` — stack rescan over a deque; paint per the
+    audit's model (incl. the helper-head boundary, rule 4a); `__VA_ARGS__`
+    errors exactly when examined as an expansion candidate.
+    `NormalizeArguments`: `M()` is one empty arg for 1+-param macros, too
+    few args error, excess args merge (commas included) into the last named
+    parameter, variadic tail → `__VA_ARGS__`.
+    `FunctionReplacementBuilder`: lazy memoized per-parameter pre-expansion;
+    `#` stringizes raw args (zero-param: the next replacement token
+    itself); `##` uses raw args, placemarkers for empty ones, GNU
+    `, ## __VA_ARGS__`; paste re-lexes via `PPTokenize` and rescans.
+  - Directive dispatch: line-initial `#` always starts a directive —
+    define, undef, lone-`#` no-op, otherwise error. Directives terminate
+    text-sequences (a pending fn-like name is emitted plain; a directive
+    inside active argument collection errors — deliberate, audit item 5).
+- `dev/macro.cpp` — thin adapter: batch-stdin guard, stdin →
+  `MacroProcessFile`, `MacroError`/exception → EXIT_FAILURE.
+- `dev/src/posttoken_debug.h` — PA2 debug output formatting shared by
+  `posttoken.cpp` and `macro.cpp` (single production implementation).
+- `dev/frontend_source_sets.mk` — macro links `macro_replace pptoken_lexer
+  posttoken_stream posttoken_tables unicode`.
 
-### Paint (blue-paint) model — course-specific, fixture-validated
-
-Hand-verified against 600-recurse, 650-recurse, 900-recurse, 910-recurse2,
-600-macro-rescan-boundaries, 600-{parameter-selected,pasted-helper,
-tail-helper}-macro-rescans, 600-unavailable-paint-through-function-replacement,
-920-deferred-helper-argument-prescan. It is Prosser's hide-set algorithm with
-ONE deviation. Let head token T carry paint HS; for fn-like invocations let
-HSr be the paint of the closing `)` token of the invocation:
-
-1. Candidate check: identifier whose own name ∈ its paint is noninvokable —
-   emitted as a plain identifier, permanently.
-2. Object-like replacement: replacement-copy tokens get HS ∪ {T}
-   (chain accumulation; 600-recurse).
-3. Fn-like replacement-list copies AND ##-paste results get
-   (HS ∩ HSr) ∪ {T}. The intersection is mandatory: source-origin parens
-   (empty paint) strip inherited paint, which is what keeps `CAT` alive in
-   600-pasted-helper and `IIF` alive in 600-parameter-selected, and what
-   kills the re-pasted `G0` in 600-unavailable-paint (parens there come from
-   a replacement and carry {G0}).
-4. COURSE DEVIATION: substituted argument tokens (raw or pre-expanded) get
-   own_paint ∪ HS ∪ {T} — NO intersection. This makes `g(f)(g)(3)` yield
-   `2 1 g ( 3 )` (910-recurse2, README trace) and `g ( 3 )`
-   (600-macro-rescan-boundaries group 3) where pure Prosser/gcc would expand
-   the final g. Paint acquired during argument pre-expansion persists through
-   substitution (README z example; IDENTITY(RECUR(x))).
-5. Paste results additionally union both operand tokens' paint
-   (conservative; all fixtures pass either way — see Uncertainties).
-6. Argument pre-expansion = same algorithm run on the argument token list in
-   isolation, lazily per parameter (only parameters with an ordinary
-   occurrence expand; memoize once per parameter): 250-stringized-argument-
-   not-expanded succeeds while 300-nonstringized-invalid-macro-argument must
-   fail (expanding `max(0)` → wrong arg count → error).
-
-Rescan is a stack: pop head, on invocation push replacement back; replacement
-output may consume following source tokens (README `f(g)b)`). Fn-like
-lookahead for `(` inspects the next non-ws/non-newline UNEXPANDED token
-(`CALL OPEN )` → `CALL ( )`, never reconsidered).
-
-### Directive semantics (fixture-pinned)
-
-- `#define name` obj-like: must-whitespace before a nonempty replacement;
-  `(` immediately after name (no ws) → fn-like (`#define f (x)` is
-  obj-like). `#define X(a,)` / `Y(a,,b)` → error (300-identifier-missing).
-- Define-time validation: fn-like — every `#` in replacement must be followed
-  (ws allowed between: `# a` legal per 500-tricky-join) by a parameter name
-  or `__VA_ARGS__`-if-variadic, else error (300-badhash1-1/2/3); `##` at
-  either end of any replacement list → error (300-badhash2-1..4). Obj-like
-  `#` is unrestricted (600-hash-from-macro).
-- `__VA_ARGS__` anywhere outside a variadic replacement list → EXIT_FAILURE:
-  obj repl, non-variadic fn repl, as macro name, bare in text, as parameter,
-  in #undef (250-badvargs1-4, 250-badvaargs-param, 250-badvaargs-undef).
-- Redefinition must match: kind, exact parameter NAMES (700-redeferr3/4),
-  replacement spellings, and interior whitespace-PRESENCE flags
-  (`(1-1)` vs `(1 - 1)` errs — 700-redeferr2; `D E` vs `D  E` equal —
-  300-macro-redefinition-whitespace). Ignored: first-replacement-token flag
-  (700-redef2 `)( ` vs `)    (`), trailing ws, all param-list ws; comments
-  count as ws. Obj/fn mismatch errs (300-object-function-macro-redefinition).
-- `#undef`: undefined name OK, trailing ws OK (100-undef-simple); any extra
-  token → error (300-undef-extra). `#define X(a` unterminated → error
-  (300-unterminated-function-macro-parameter[s], -after-comma).
-
-### Invocation & operators (fixture-pinned)
-
-- Args: paren-balanced, top-level commas split (250-nested-macro-argument-
-  commas); named count must match exactly, else EXIT_FAILURE; `M()` is one
-  empty arg for 1-param macros, zero args for 0-param (250-empty-function-
-  macro-argument); EOF during collection → error. Variadic: trailing args
-  incl. commas become `__VA_ARGS__` (250-goodvaargs → `3 , 4`); empty
-  varargs OK (`CALL()`).
-- Substitution: ordinary → expanded arg; `#p` → stringized RAW arg;
-  `##`-adjacent → RAW arg. Multi-token raw arg: paste uses only its
-  first/last token, middle tokens pass through
-  (300-token-paste-multiple-parameter-tokens → `aA . Bb`). Only `##` copied
-  from the replacement list pastes; `##` arriving via arguments or produced
-  by paste is an ordinary (invalid-on-output) token (150-hash-outside
-  `f(##)`, call_triple + hash_hash → `pP ## Qq`).
-- Placemarkers for empty args in `##` context: pm##X→X, X##pm→X, pm##pm→pm,
-  survivors deleted after substitution (250-join, 800-placemarker-q).
-- GNU comma-paste: replacement-list `, ## __VA_ARGS__` — empty varargs
-  deletes the comma; non-empty: no paste at all, comma + args verbatim
-  (300-gnu-variadic-comma-paste ref: `target ( 1 )` / `target ( 1 , alpha ,
-  beta )`).
-- Paste: concatenate the two spellings, re-lex via PPTokenize (append `\n`,
-  expect exactly one data token before eof, else error); result is rescanned
-  (600-pasted-helper `CALL_0`, tail-helper `FILLER_1_END`). Must handle
-  `#`+`#`→`##` (500-tricky-join), raw-string assembly `R` ## `"abc(…)abc"`
-  ## `_id` → UD raw string (500-raw-string-token-paste), u8/L prefixes and
-  `̀` identifier continuation (300-double-hash).
-- Stringize: raw arg spellings joined with one space exactly where the
-  token's `preceded_by_ws` flag is set; no outer spaces; escape `\` and `"`
-  only within string/char-literal spellings; raw-string spelling verbatim
-  (410-trigraph → `"R\"(??=)\""`); empty arg → `""`. Flag propagation:
-  expansion's first token inherits the macro-name token's flag, substituted
-  param's first token inherits the occurrence's flag, paste result inherits
-  left operand's, others keep their own (evidence: `"x ## y"` 500-tricky-join,
-  `"A . ."` 200-whitespaces, `"strncmp(…) == 0"` 700-strlit-q spacing).
-
-## Failure Map
-
-All 72 failures = one stub; ownership after CP1 split:
-
-- Directive layer + table (CP1): 100-*, 200-onedef, 300-identifier-missing,
-  300-undef-extra, 300-unterminated-*, 300-redef, 300-define-missing-macro-
-  name, 300-object-function-macro-redefinition, 300-macro-redefinition-
-  whitespace, 700-redef2, 700-redeferr1-4, define-time halves of 300-badhash*
-  and 250-badvargs/badvaargs*.
-- Expansion core + paint (CP1): 150-max, 200-fnlike, 200-function-macro-
-  invocation-boundaries, 250-empty/nested-*, 300-directive-tokens-from-
-  macro-argument, 400-fun-macro-define, 600-recurse, 600-hash-from-macro,
-  650-recurse, 700-redef-a, 900-recurse, 910-recurse2, pass-through text
-  (700-strlit-a/a2, 800-placemarker-a, 850-varargs-a, 500-hello-world,
-  200-invalid-token-*, 410-trigraph).
-- Operators/varargs (CP2): 150-hash-outside, 200-whitespaces, 250-join,
-  250-goodvaargs, 250-stringized-*, 300-nonstringized-*, 300-double-hash,
-  300-token-paste-*, 300-gnu-variadic-comma-paste, 500-tricky-join,
-  500-raw-string-token-paste, 600-*-macro-rescans, 600-unavailable-paint-*,
-  600-macro-rescan-boundaries (group 2 variadic), 700-redef-q, 700-strlit-q,
-  800-placemarker-q, 850-varargs-q, 920-deferred-*.
-
-## Performance Risks
-
-- Paint sets copied per produced token. Bounded: a chain can only grow a
-  paint set by names of distinct macros, so |paint| ≤ #defined macros; store
-  as sorted `vector<string>` (or interned ids) with set-union helpers; share
-  the per-invocation replacement set. Optimize only if the probe fails.
-- Stack rescan re-examines replacement output; BOOST_PP-style fixtures (920,
-  600-*) are the worst present cases and are small. Guard against accidental
-  O(n²) in token-vector splicing: expansion should append to a deque/stack,
-  never insert into the middle of a vector.
-- Whole-file token buffering is fine at fixture scale; probe with 100k-line
-  input to confirm linear behavior (< 2s, matching pa3 probe budgets).
+Output: one `PostTokenStream` consumes the entire file's replaced output, so
+phase-6 string concatenation crosses lines and text-sequence boundaries;
+`#`/`##`/`@` in output surface as `invalid …` with EXIT_SUCCESS.
 
 ## Checkpoint Ledger
 
-- CP1 (COMPLETE) — directive layer, macro table with full define-time
-  validation, expansion core with paint model, arg collection + lazy
-  pre-expansion + ordinary substitution (no #/##/__VA_ARGS__ substitution
-  yet), single-PostTokenStream replay, tool main. Proof: `make test-pa4`
-  reports 51/72, with the 21 remaining failures confined to the deferred
-  #/##/varargs substitution groups; `make test-report-through-pa3` reports
-  104/104; `make test-report-through-pa4` reports 155/176; file audit passes.
-- CP2 (COMPLETE) — stringize, paste + re-lex, placemarkers, variadics + GNU
-  comma rule, and ws-flag propagation polish. Proof: `make test-pa4` reports
-  72/72; `make test-report-through-pa3` reports 104/104;
-  `make test-report-through-pa4` reports 176/176; the file audit passes and
-  the 100k-expansion probe completes in 1.81s.
-- CP3 (ACTIVE) — architecture audit + cleanup: optional differential run
-  against `pa4/macro-ref` on generated inputs (observation only), consolidate
-  findings in `pa4/audit.md`. Proof pending: clean through-pa4, audit script,
-  and git status.
-
-## Active Checkpoint: CP3
-
-Audit the completed macro replacement boundary and record cleanup findings
-without weakening directive/table ownership, deque rescan, paint handling, or
-the single `PostTokenStream` replay.
-
-### Implementation Packet
-
-Files/symbols:
-
-- REVIEW `dev/src/macro_replace.h` / `macro_replace.cpp` for ownership,
-  bounded expansion behavior, and cleanup opportunities exposed by CP2.
-- RECORD the audit and any observation-only differential findings in
-  `pa4/audit.md`; do not regenerate or edit checked-in fixtures.
-- Preserve the existing directive/table validation, deque rescan,
-  helper-head paint boundary, replacement-operator semantics, and one
-  `PostTokenStream` replay.
-
-Commands:
-- broad: `make test-report-through-pa4`
-- audit: `perl scripts/cppgm_file_audit.pl --stage pa4 --paths dev/src`
-- optional observation: compare generated inputs with `pa4/macro-ref`
-- final: `git status --short`
+- CP1 (DONE) — directive layer, macro table with define-time validation,
+  expansion core with paint model, arg collection + lazy pre-expansion,
+  single-PostTokenStream replay. Proof: 51/72 pa4 (remaining failures
+  confined to deferred #/##/varargs groups); 104/104 through-pa3; audit pass.
+- CP2 (DONE) — stringize, paste + re-lex, placemarkers, variadics + GNU
+  comma rule, ws-flag propagation. Proof: 72/72 pa4; 176/176 through-pa4;
+  file audit pass; 100k-expansion probe 1.81s.
+- CP3 (DONE) — final architecture audit + cleanup: moved `__VA_ARGS__`
+  validation to its owning layer (the rescan), reference-pinned
+  excess-argument merge, zero-parameter `#`, and line-initial `#` directive
+  dispatch; documented the helper-head paint boundary; measured the
+  nesting/paint-chain envelope against the reference. Proof: 184/184 with
+  eight new fixtures (450/455/460/465/470/475/480/485); 3000-seed
+  differential fuzz clean; linear 25k/50k/100k scaling; details in
+  `pa4/audit.md`.
