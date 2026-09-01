@@ -1,0 +1,21 @@
+user-defined-literal 1.2_ _ floating 1.2
+user-defined-literal 123_ _ integer 123
+user-defined-literal 0x1_ _ integer 0x1
+user-defined-literal 0x12_p3 _p3 integer 0x12
+user-defined-literal "abc"_ _ string array of 4 char 61626300
+user-defined-literal 'a'_ _ character char 61
+invalid 1lul
+invalid 1LuL
+invalid 1Ll
+invalid 1lL
+literal 1llu unsigned long long int 0100000000000000
+literal 1ull unsigned long long int 0100000000000000
+literal 1uLL unsigned long long int 0100000000000000
+literal 1llU unsigned long long int 0100000000000000
+literal 1lu unsigned long int 0100000000000000
+simple operator KW_OPERATOR
+user-defined-literal ""_ _ string array of 1 char 00
+simple ; OP_SEMICOLON
+user-defined-literal ""_ _ string array of 1 char 00
+simple ; OP_SEMICOLON
+eof

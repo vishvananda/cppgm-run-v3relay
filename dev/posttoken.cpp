@@ -59,19 +59,19 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 	// output: invalid <source>
 	void emit_invalid(const string& source) override
 	{
-		cout << "invalid " << source << endl;
+		cout << "invalid " << source << "\n";
 	}
 
 	// output: simple <source> <token_type>
 	void emit_simple(const string& source, ETokenType token_type) override
 	{
-		cout << "simple " << source << " " << TokenTypeToStringMap.at(token_type) << endl;
+		cout << "simple " << source << " " << TokenTypeToStringMap.at(token_type) << "\n";
 	}
 
 	// output: identifier <source>
 	void emit_identifier(const string& source) override
 	{
-		cout << "identifier " << source << endl;
+		cout << "identifier " << source << "\n";
 	}
 
 	// output: literal <source> <type> <hexdump(data,nbytes)>
@@ -80,7 +80,7 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 	{
 		cout << "literal " << source << " "
 			<< FundamentalTypeToStringMap.at(type) << " "
-			<< HexDump(data, nbytes) << endl;
+			<< HexDump(data, nbytes) << "\n";
 	}
 
 	// output: literal <source> array of <num_elements> <type> <hexdump(data,nbytes)>
@@ -89,7 +89,7 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 	{
 		cout << "literal " << source << " array of " << num_elements << " "
 			<< FundamentalTypeToStringMap.at(type) << " "
-			<< HexDump(data, nbytes) << endl;
+			<< HexDump(data, nbytes) << "\n";
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> character <type> <hexdump(data,nbytes)>
@@ -99,7 +99,7 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 	{
 		cout << "user-defined-literal " << source << " " << ud_suffix
 			<< " character " << FundamentalTypeToStringMap.at(type) << " "
-			<< HexDump(data, nbytes) << endl;
+			<< HexDump(data, nbytes) << "\n";
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> string array of <num_elements> <type> <hexdump(data, nbytes)>
@@ -110,7 +110,7 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 		cout << "user-defined-literal " << source << " " << ud_suffix
 			<< " string array of " << num_elements << " "
 			<< FundamentalTypeToStringMap.at(type) << " "
-			<< HexDump(data, nbytes) << endl;
+			<< HexDump(data, nbytes) << "\n";
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> <prefix>
@@ -118,7 +118,7 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 		const string& ud_suffix, const string& prefix) override
 	{
 		cout << "user-defined-literal " << source << " " << ud_suffix
-			<< " integer " << prefix << endl;
+			<< " integer " << prefix << "\n";
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> <prefix>
@@ -126,13 +126,13 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 		const string& ud_suffix, const string& prefix) override
 	{
 		cout << "user-defined-literal " << source << " " << ud_suffix
-			<< " floating " << prefix << endl;
+			<< " floating " << prefix << "\n";
 	}
 
 	// output : eof
 	void emit_eof() override
 	{
-		cout << "eof" << endl;
+		cout << "eof" << "\n";
 	}
 };
 

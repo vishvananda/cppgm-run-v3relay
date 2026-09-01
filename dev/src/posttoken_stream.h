@@ -35,6 +35,16 @@ struct IPostTokenOutputStream
 	virtual ~IPostTokenOutputStream() {}
 };
 
+// One element of a string-literal body: a code point from source text,
+// a UCN, or a simple escape; or a raw code-unit value from a numeric
+// (octal/hex) escape, which is width-checked against the sequence's
+// element type instead of being re-encoded.
+struct StringSequenceElement
+{
+	std::uint32_t codepoint;
+	bool numeric_escape;
+};
+
 struct PostTokenStream : IPPTokenStream
 {
 	explicit PostTokenStream(IPostTokenOutputStream& output);
@@ -61,8 +71,7 @@ private:
 	std::string pending_string_source_;
 	std::string pending_string_prefix_;
 	std::string pending_string_ud_suffix_;
-	std::vector<std::uint32_t> pending_string_codepoints_;
-	std::vector<unsigned char> pending_string_numeric_;
+	std::vector<StringSequenceElement> pending_string_elements_;
 	std::size_t pending_string_token_count_;
 	bool pending_string_sequence_active_;
 	bool pending_string_invalid_;

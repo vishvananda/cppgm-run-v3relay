@@ -1,6 +1,7 @@
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -22,11 +23,18 @@ enum EPPNumberKind
 	PP_NUMBER_UD_FLOATING
 };
 
+struct IntegerSuffix
+{
+	bool has_unsigned;
+	int long_rank;
+};
+
 struct PPNumberClassification
 {
 	EPPNumberKind kind;
 	size_t body_end;
 	string suffix;
+	IntegerSuffix integer_suffix;
 	int base;
 };
 
@@ -58,7 +66,7 @@ bool IsIdentifierContinuationByte(unsigned char c)
 
 bool IsUDSuffix(const string& suffix)
 {
-	if (suffix.size() < 2 || suffix[0] != '_')
+	if (suffix.empty() || suffix[0] != '_')
 		return false;
 
 	for (size_t i = 1; i < suffix.size(); ++i)
@@ -67,12 +75,6 @@ bool IsUDSuffix(const string& suffix)
 			return false;
 	return true;
 }
-
-struct IntegerSuffix
-{
-	bool has_unsigned;
-	int long_rank;
-};
 
 bool ParseIntegerSuffix(const string& suffix, IntegerSuffix& result)
 {
@@ -83,6 +85,7 @@ bool ParseIntegerSuffix(const string& suffix, IntegerSuffix& result)
 
 	int unsigned_count = 0;
 	int long_count = 0;
+	size_t last_long = 0;
 	char first_long = '\0';
 	for (size_t i = 0; i < suffix.size(); ++i)
 	{
@@ -94,10 +97,12 @@ bool ParseIntegerSuffix(const string& suffix, IntegerSuffix& result)
 		}
 		if (c == 'l' || c == 'L')
 		{
+			// ll-suffix is two adjacent same-case characters (2.14.2)
 			if (first_long == '\0')
 				first_long = c;
-			else if (c != first_long)
+			else if (c != first_long || i != last_long + 1)
 				return false;
+			last_long = i;
 			++long_count;
 			continue;
 		}
@@ -224,6 +229,8 @@ PPNumberClassification ClassifyPPNumber(const string& source)
 	PPNumberClassification result;
 	result.kind = PP_NUMBER_INVALID;
 	result.body_end = 0;
+	result.integer_suffix.has_unsigned = false;
+	result.integer_suffix.long_rank = 0;
 	result.base = 0;
 
 	size_t body_end;
@@ -231,7 +238,6 @@ PPNumberClassification ClassifyPPNumber(const string& source)
 	if (ParseIntegerBody(source, body_end, base))
 	{
 		string suffix = source.substr(body_end);
-		IntegerSuffix parsed_suffix;
 		if (IsUDSuffix(suffix))
 		{
 			result.kind = PP_NUMBER_UD_INTEGER;
@@ -240,7 +246,7 @@ PPNumberClassification ClassifyPPNumber(const string& source)
 			result.base = base;
 			return result;
 		}
-		if (ParseIntegerSuffix(suffix, parsed_suffix))
+		if (ParseIntegerSuffix(suffix, result.integer_suffix))
 		{
 			result.kind = PP_NUMBER_INTEGER;
 			result.body_end = body_end;
@@ -294,11 +300,46 @@ bool AccumulateInteger(const string& source, size_t begin, size_t end,
 	return true;
 }
 
-struct IntegerCandidate
+// ABI width in bytes of the scalar literal types (System V AMD64 3.1)
+size_t ScalarWidth(EFundamentalType type)
 {
-	EFundamentalType type;
-	uint64_t maximum;
+	switch (type)
+	{
+	case FT_CHAR:
+		return 1;
+	case FT_CHAR16_T:
+		return 2;
+	case FT_INT:
+	case FT_UNSIGNED_INT:
+	case FT_CHAR32_T:
+	case FT_WCHAR_T:
+		return 4;
+	case FT_LONG_INT:
+	case FT_UNSIGNED_LONG_INT:
+	case FT_LONG_LONG_INT:
+	case FT_UNSIGNED_LONG_LONG_INT:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+struct ScalarBytes
+{
+	unsigned char bytes[8];
+	size_t size;
 };
+
+// Render a scalar literal value into its ABI representation: multibyte
+// types are stored byte-wise little-endian.
+ScalarBytes EncodeScalar(EFundamentalType type, uint64_t value)
+{
+	ScalarBytes result;
+	result.size = ScalarWidth(type);
+	for (size_t i = 0; i < result.size; ++i)
+		result.bytes[i] = static_cast<unsigned char>(value >> (8 * i));
+	return result;
+}
 
 uint64_t CandidateMaximum(EFundamentalType type)
 {
@@ -322,187 +363,88 @@ uint64_t CandidateMaximum(EFundamentalType type)
 	}
 }
 
-void AddIntegerCandidate(vector<IntegerCandidate>& candidates,
-	EFundamentalType type)
+struct IntegerCandidateList
 {
-	IntegerCandidate candidate;
-	candidate.type = type;
-	candidate.maximum = CandidateMaximum(type);
-	candidates.push_back(candidate);
-}
+	const EFundamentalType* types;
+	size_t count;
+};
 
-vector<IntegerCandidate> IntegerCandidates(int base,
-	const IntegerSuffix& suffix)
+// Candidate type lists of 2.14.2: decimal unsuffixed literals stay signed;
+// octal/hex also try the unsigned type at each rank; a `u` suffix restricts
+// to unsigned; `l`/`ll` set the starting rank.
+IntegerCandidateList IntegerCandidates(int base, const IntegerSuffix& suffix)
 {
-	vector<IntegerCandidate> candidates;
-	const bool is_decimal = base == 10;
+	static const EFundamentalType Unsigned[] =
+		{FT_UNSIGNED_INT, FT_UNSIGNED_LONG_INT, FT_UNSIGNED_LONG_LONG_INT};
+	static const EFundamentalType SignedDecimal[] =
+		{FT_INT, FT_LONG_INT, FT_LONG_LONG_INT};
+	static const EFundamentalType EitherSign[] =
+		{FT_INT, FT_UNSIGNED_INT, FT_LONG_INT, FT_UNSIGNED_LONG_INT,
+		 FT_LONG_LONG_INT, FT_UNSIGNED_LONG_LONG_INT};
 
-	if (is_decimal)
+	IntegerCandidateList result;
+	if (suffix.has_unsigned)
 	{
-		if (suffix.has_unsigned)
-		{
-			if (suffix.long_rank == 0)
-			{
-				AddIntegerCandidate(candidates, FT_UNSIGNED_INT);
-				AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_INT);
-				AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_LONG_INT);
-			}
-			else if (suffix.long_rank == 1)
-			{
-				AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_INT);
-				AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_LONG_INT);
-			}
-			else
-			{
-				AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_LONG_INT);
-			}
-		}
-		else if (suffix.long_rank == 0)
-		{
-			AddIntegerCandidate(candidates, FT_INT);
-			AddIntegerCandidate(candidates, FT_LONG_INT);
-			AddIntegerCandidate(candidates, FT_LONG_LONG_INT);
-		}
-		else if (suffix.long_rank == 1)
-		{
-			AddIntegerCandidate(candidates, FT_LONG_INT);
-			AddIntegerCandidate(candidates, FT_LONG_LONG_INT);
-		}
-		else
-		{
-			AddIntegerCandidate(candidates, FT_LONG_LONG_INT);
-		}
-		return candidates;
+		result.types = Unsigned + suffix.long_rank;
+		result.count = 3 - suffix.long_rank;
 	}
-
-	if (suffix.long_rank == 0 && !suffix.has_unsigned)
+	else if (base == 10)
 	{
-		AddIntegerCandidate(candidates, FT_INT);
-		AddIntegerCandidate(candidates, FT_UNSIGNED_INT);
-		AddIntegerCandidate(candidates, FT_LONG_INT);
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_INT);
-		AddIntegerCandidate(candidates, FT_LONG_LONG_INT);
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_LONG_INT);
-	}
-	else if (suffix.long_rank == 0)
-	{
-		AddIntegerCandidate(candidates, FT_UNSIGNED_INT);
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_INT);
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_LONG_INT);
-	}
-	else if (suffix.long_rank == 1 && !suffix.has_unsigned)
-	{
-		AddIntegerCandidate(candidates, FT_LONG_INT);
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_INT);
-		AddIntegerCandidate(candidates, FT_LONG_LONG_INT);
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_LONG_INT);
-	}
-	else if (suffix.long_rank == 1)
-	{
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_INT);
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_LONG_INT);
-	}
-	else if (!suffix.has_unsigned)
-	{
-		AddIntegerCandidate(candidates, FT_LONG_LONG_INT);
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_LONG_INT);
+		result.types = SignedDecimal + suffix.long_rank;
+		result.count = 3 - suffix.long_rank;
 	}
 	else
 	{
-		AddIntegerCandidate(candidates, FT_UNSIGNED_LONG_LONG_INT);
+		result.types = EitherSign + 2 * suffix.long_rank;
+		result.count = 6 - 2 * suffix.long_rank;
 	}
-	return candidates;
-}
-
-template<typename T>
-void EmitIntegerValue(IPostTokenOutputStream& output, const string& source,
-	EFundamentalType type, uint64_t value)
-{
-	T typed_value = static_cast<T>(value);
-	output.emit_literal(source, type, &typed_value, sizeof(typed_value));
+	return result;
 }
 
 void EmitInteger(IPostTokenOutputStream& output, const string& source,
 	const PPNumberClassification& classification)
 {
-	IntegerSuffix suffix;
-	if (!ParseIntegerSuffix(classification.suffix, suffix))
-	{
-		output.emit_invalid(source);
-		return;
-	}
-
-	const string body = source.substr(0, classification.body_end);
 	size_t value_begin = classification.base == 16 ? 2 : 0;
 	uint64_t value;
-	if (!AccumulateInteger(body, value_begin, body.size(),
+	if (!AccumulateInteger(source, value_begin, classification.body_end,
 		classification.base, value))
 	{
 		output.emit_invalid(source);
 		return;
 	}
 
-	const vector<IntegerCandidate> candidates =
-		IntegerCandidates(classification.base, suffix);
-	for (size_t i = 0; i < candidates.size(); ++i)
+	const IntegerCandidateList candidates =
+		IntegerCandidates(classification.base, classification.integer_suffix);
+	for (size_t i = 0; i < candidates.count; ++i)
 	{
-		if (value > candidates[i].maximum)
+		const EFundamentalType type = candidates.types[i];
+		if (value > CandidateMaximum(type))
 			continue;
-
-		switch (candidates[i].type)
-		{
-		case FT_INT:
-			EmitIntegerValue<int>(output, source, FT_INT, value);
-			return;
-		case FT_UNSIGNED_INT:
-			EmitIntegerValue<unsigned int>(output, source, FT_UNSIGNED_INT,
-				value);
-			return;
-		case FT_LONG_INT:
-			EmitIntegerValue<long>(output, source, FT_LONG_INT, value);
-			return;
-		case FT_UNSIGNED_LONG_INT:
-			EmitIntegerValue<unsigned long>(output, source,
-				FT_UNSIGNED_LONG_INT, value);
-			return;
-		case FT_LONG_LONG_INT:
-			EmitIntegerValue<long long>(output, source, FT_LONG_LONG_INT,
-				value);
-			return;
-		case FT_UNSIGNED_LONG_LONG_INT:
-			EmitIntegerValue<unsigned long long>(output, source,
-				FT_UNSIGNED_LONG_LONG_INT, value);
-			return;
-		default:
-			break;
-		}
+		const ScalarBytes bytes = EncodeScalar(type, value);
+		output.emit_literal(source, type, bytes.bytes, bytes.size);
+		return;
 	}
 	output.emit_invalid(source);
 }
 
-// use these 3 functions to scan `floating-literals` (see PA2)
+// use these 3 functions to scan `floating-literals` (see PA2).  The starter
+// kit reads through istringstream, whose C++11 num_get stores the largest
+// finite value on overflow; the reference implementation overflows to
+// infinity.  strtof/strtod/strtold keep in-range results bit-identical and
+// overflow to infinity.
 float PA2Decode_float(const string& source)
 {
-	istringstream iss(source);
-	float value;
-	iss >> value;
-	return value;
+	return strtof(source.c_str(), 0);
 }
 
 double PA2Decode_double(const string& source)
 {
-	istringstream iss(source);
-	double value;
-	iss >> value;
-	return value;
+	return strtod(source.c_str(), 0);
 }
 
 long double PA2Decode_long_double(const string& source)
 {
-	istringstream iss(source);
-	long double value;
-	iss >> value;
-	return value;
+	return strtold(source.c_str(), 0);
 }
 
 void EmitFloating(IPostTokenOutputStream& output, const string& source,
@@ -517,8 +459,13 @@ void EmitFloating(IPostTokenOutputStream& output, const string& source,
 	else if (classification.suffix == "l" ||
 		classification.suffix == "L")
 	{
-		long double value = PA2Decode_long_double(body);
-		output.emit_literal(source, FT_LONG_DOUBLE, &value, sizeof(value));
+		// the 16-byte long double object holds an 80-bit x87 value; the
+		// ABI leaves the top 6 bytes undefined, so zero them for
+		// deterministic output
+		const long double value = PA2Decode_long_double(body);
+		unsigned char bytes[sizeof(value)] = {};
+		memcpy(bytes, &value, 10);
+		output.emit_literal(source, FT_LONG_DOUBLE, bytes, sizeof(bytes));
 	}
 	else
 	{
@@ -554,82 +501,16 @@ bool DecodeSimpleEscape(char escaped, int& codepoint)
 	}
 }
 
-bool ParseCharacterEscape(const string& source, size_t& cursor,
-	int& codepoint)
+struct EscapeValue
 {
-	if (cursor >= source.size() || source[cursor] != '\\' ||
-		cursor + 1 >= source.size())
-		return false;
-
-	char escaped = source[cursor + 1];
-	if (DecodeSimpleEscape(escaped, codepoint))
-	{
-		cursor += 2;
-		return true;
-	}
-
-	if (escaped == 'x')
-	{
-		size_t first_digit = cursor + 2;
-		size_t end = first_digit;
-		unsigned long long value = 0;
-		bool too_large = false;
-		while (end < source.size() && IsHexDigit(source[end]))
-		{
-			int digit = HexDigitValue(source[end]);
-			if (!too_large)
-			{
-				if (value > (0x10FFFFULL -
-					static_cast<unsigned long long>(digit)) / 16)
-				{
-					too_large = true;
-					value = 0x110000ULL;
-				}
-				else
-					value = value * 16 + static_cast<unsigned long long>(digit);
-			}
-			++end;
-		}
-		if (end == first_digit)
-			return false;
-		cursor = end;
-		codepoint = static_cast<int>(value);
-		return true;
-	}
-
-	if (escaped >= '0' && escaped <= '7')
-	{
-		size_t end = cursor + 1;
-		int value = 0;
-		for (int digits = 0; digits < 3 && end < source.size() &&
-			source[end] >= '0' && source[end] <= '7'; ++digits, ++end)
-			value = value * 8 + source[end] - '0';
-		cursor = end;
-		codepoint = value;
-		return true;
-	}
-
-	return false;
-}
-
-struct StringElement
-{
-	uint32_t codepoint;
+	uint64_t value;
 	bool numeric_escape;
 };
 
-struct StringLiteralClassification
-{
-	string prefix;
-	string suffix;
-	vector<StringElement> elements;
-	size_t after_quote;
-	bool raw;
-	bool empty_ordinary;
-};
-
-bool ParseStringEscape(const string& source, size_t& cursor,
-	StringElement& element)
+// Decode one escape-sequence (2.14.3.3): simple escapes name a character;
+// octal and hex escapes are numeric.  Hex values that cannot fit any code
+// unit (above 32 bits) fail the parse.
+bool ParseEscape(const string& source, size_t& cursor, EscapeValue& result)
 {
 	if (cursor >= source.size() || source[cursor] != '\\' ||
 		cursor + 1 >= source.size())
@@ -640,8 +521,8 @@ bool ParseStringEscape(const string& source, size_t& cursor,
 	if (DecodeSimpleEscape(escaped, simple_codepoint))
 	{
 		cursor += 2;
-		element.codepoint = static_cast<uint32_t>(simple_codepoint);
-		element.numeric_escape = false;
+		result.value = static_cast<uint64_t>(simple_codepoint);
+		result.numeric_escape = false;
 		return true;
 	}
 
@@ -654,24 +535,17 @@ bool ParseStringEscape(const string& source, size_t& cursor,
 		while (end < source.size() && IsHexDigit(source[end]))
 		{
 			int digit = HexDigitValue(source[end]);
-			if (!too_large)
-			{
-				if (value > (0xFFFFFFFFULL -
-					static_cast<uint64_t>(digit)) / 16)
-				{
-					too_large = true;
-					value = 0x100000000ULL;
-				}
-				else
-					value = value * 16 + static_cast<uint64_t>(digit);
-			}
+			if (value > (0xFFFFFFFFULL - static_cast<uint64_t>(digit)) / 16)
+				too_large = true;
+			else
+				value = value * 16 + static_cast<uint64_t>(digit);
 			++end;
 		}
 		if (end == first_digit || too_large)
 			return false;
 		cursor = end;
-		element.codepoint = static_cast<uint32_t>(value);
-		element.numeric_escape = true;
+		result.value = value;
+		result.numeric_escape = true;
 		return true;
 	}
 
@@ -683,13 +557,23 @@ bool ParseStringEscape(const string& source, size_t& cursor,
 			source[end] >= '0' && source[end] <= '7'; ++digits, ++end)
 			value = value * 8 + static_cast<uint32_t>(source[end] - '0');
 		cursor = end;
-		element.codepoint = value;
-		element.numeric_escape = true;
+		result.value = value;
+		result.numeric_escape = true;
 		return true;
 	}
 
 	return false;
 }
+
+struct StringLiteralClassification
+{
+	string prefix;
+	string suffix;
+	vector<StringSequenceElement> elements;
+	size_t after_quote;
+	bool raw;
+	bool empty_ordinary;
+};
 
 bool ParseStringLiteral(const string& source,
 	StringLiteralClassification& result)
@@ -784,7 +668,7 @@ bool ParseStringLiteral(const string& source,
 			int codepoint = DecodeUtf8At(source, cursor, end);
 			if (codepoint < 0 || end > closing_position)
 				return false;
-			StringElement element;
+			StringSequenceElement element;
 			element.codepoint = static_cast<uint32_t>(codepoint);
 			element.numeric_escape = false;
 			result.elements.push_back(element);
@@ -807,9 +691,12 @@ bool ParseStringLiteral(const string& source,
 
 		if (source[cursor] == '\\')
 		{
-			StringElement element;
-			if (!ParseStringEscape(source, cursor, element))
+			EscapeValue escape;
+			if (!ParseEscape(source, cursor, escape))
 				return false;
+			StringSequenceElement element;
+			element.codepoint = static_cast<uint32_t>(escape.value);
+			element.numeric_escape = escape.numeric_escape;
 			result.elements.push_back(element);
 			continue;
 		}
@@ -818,7 +705,7 @@ bool ParseStringLiteral(const string& source,
 		int codepoint = DecodeUtf8At(source, cursor, end);
 		if (codepoint < 0)
 			return false;
-		StringElement element;
+		StringSequenceElement element;
 		element.codepoint = static_cast<uint32_t>(codepoint);
 		element.numeric_escape = false;
 		result.elements.push_back(element);
@@ -836,26 +723,19 @@ struct EncodedString
 	vector<unsigned char> bytes;
 };
 
-template<typename T>
-void AppendEncodedStringElement(EncodedString& result, T value)
+void AppendCodeUnit(EncodedString& result, uint32_t value)
 {
-	const unsigned char* first =
-		reinterpret_cast<const unsigned char*>(&value);
-	result.bytes.insert(result.bytes.end(), first, first + sizeof(value));
+	for (size_t i = 0; i < result.element_size; ++i)
+		result.bytes.push_back(static_cast<unsigned char>(value >> (8 * i)));
 	result.num_elements++;
-	result.element_size = sizeof(value);
 }
 
-bool EncodeStringElements(const vector<uint32_t>& codepoints,
-	const vector<unsigned char>& numeric, const string& prefix,
-	EncodedString& result)
+// Encode the sequence body once its prefix is known.  Code points encode
+// per the target encoding; a numeric escape contributes exactly one code
+// unit and must fit the element type's unsigned range.
+bool EncodeStringElements(const vector<StringSequenceElement>& elements,
+	const string& prefix, EncodedString& result)
 {
-	result.num_elements = 0;
-	result.element_size = 0;
-	result.bytes.clear();
-	if (codepoints.size() != numeric.size())
-		return false;
-
 	if (prefix.empty() || prefix == "u8")
 		result.type = FT_CHAR;
 	else if (prefix == "u")
@@ -867,77 +747,40 @@ bool EncodeStringElements(const vector<uint32_t>& codepoints,
 	else
 		return false;
 
-	for (size_t i = 0; i < codepoints.size(); ++i)
+	result.num_elements = 0;
+	result.element_size = ScalarWidth(result.type);
+	result.bytes.clear();
+
+	for (size_t i = 0; i < elements.size(); ++i)
 	{
-		const uint32_t value = codepoints[i];
-		const bool numeric_escape = numeric[i] != 0;
-		if (result.type == FT_CHAR)
+		const uint32_t value = elements[i].codepoint;
+		if (elements[i].numeric_escape)
 		{
-			if (numeric_escape)
-			{
-				if (value > 0xFF)
-					return false;
-				AppendEncodedStringElement(result,
-					static_cast<char>(value));
-			}
-			else
-			{
-				const string utf8 = EncodeUtf8(static_cast<int>(value));
-				for (size_t j = 0; j < utf8.size(); ++j)
-					AppendEncodedStringElement(result, utf8[j]);
-			}
+			const uint64_t unit_maximum =
+				(1ULL << (8 * result.element_size)) - 1;
+			if (value > unit_maximum)
+				return false;
+			AppendCodeUnit(result, value);
 		}
-		else if (result.type == FT_CHAR16_T)
+		else if (result.type == FT_CHAR)
 		{
-			if (numeric_escape)
-			{
-				if (value > 0xFFFF)
-					return false;
-				AppendEncodedStringElement(result,
-					static_cast<char16_t>(value));
-			}
-			else if (value <= 0xFFFF)
-			{
-				AppendEncodedStringElement(result,
-					static_cast<char16_t>(value));
-			}
-			else
-			{
-				const uint32_t adjusted = value - 0x10000;
-				AppendEncodedStringElement(result, static_cast<char16_t>(
-					0xD800 + (adjusted >> 10)));
-				AppendEncodedStringElement(result, static_cast<char16_t>(
-					0xDC00 + (adjusted & 0x3FF)));
-			}
+			const string utf8 = EncodeUtf8(static_cast<int>(value));
+			for (size_t j = 0; j < utf8.size(); ++j)
+				AppendCodeUnit(result, static_cast<unsigned char>(utf8[j]));
 		}
-		else if (result.type == FT_CHAR32_T)
+		else if (result.type == FT_CHAR16_T && value > 0xFFFF)
 		{
-			AppendEncodedStringElement(result,
-				static_cast<char32_t>(value));
+			const uint32_t adjusted = value - 0x10000;
+			AppendCodeUnit(result, 0xD800 + (adjusted >> 10));
+			AppendCodeUnit(result, 0xDC00 + (adjusted & 0x3FF));
 		}
 		else
 		{
-			AppendEncodedStringElement(result, static_cast<wchar_t>(value));
+			AppendCodeUnit(result, value);
 		}
 	}
 
-	switch (result.type)
-	{
-	case FT_CHAR:
-		AppendEncodedStringElement(result, static_cast<char>(0));
-		break;
-	case FT_CHAR16_T:
-		AppendEncodedStringElement(result, static_cast<char16_t>(0));
-		break;
-	case FT_CHAR32_T:
-		AppendEncodedStringElement(result, static_cast<char32_t>(0));
-		break;
-	case FT_WCHAR_T:
-		AppendEncodedStringElement(result, static_cast<wchar_t>(0));
-		break;
-	default:
-		return false;
-	}
+	AppendCodeUnit(result, 0);
 	return true;
 }
 
@@ -975,8 +818,12 @@ bool ParseCharacterLiteral(const string& source,
 	int codepoint;
 	if (source[cursor] == '\\')
 	{
-		if (!ParseCharacterEscape(source, cursor, codepoint))
+		// numeric escapes are code points here, unlike in strings; values
+		// past the Unicode range can never be a scalar value, so reject
+		EscapeValue escape;
+		if (!ParseEscape(source, cursor, escape) || escape.value > 0x10FFFF)
 			return false;
+		codepoint = static_cast<int>(escape.value);
 	}
 	else
 	{
@@ -1036,85 +883,6 @@ bool AnalyzeCharacterLiteral(const string& source,
 		SelectCharacterType(result.prefix, result.codepoint, result.type);
 }
 
-template<typename T>
-void EmitCharacterValue(IPostTokenOutputStream& output, const string& source,
-	EFundamentalType type, int codepoint)
-{
-	T value = static_cast<T>(codepoint);
-	output.emit_literal(source, type, &value, sizeof(value));
-}
-
-void EmitCharacterLiteralValue(IPostTokenOutputStream& output,
-	const string& source, const CharacterLiteralClassification& classification)
-{
-	switch (classification.type)
-	{
-	case FT_CHAR:
-		EmitCharacterValue<char>(output, source, FT_CHAR,
-			classification.codepoint);
-		return;
-	case FT_INT:
-		EmitCharacterValue<int>(output, source, FT_INT,
-			classification.codepoint);
-		return;
-	case FT_CHAR16_T:
-		EmitCharacterValue<char16_t>(output, source, FT_CHAR16_T,
-			classification.codepoint);
-		return;
-	case FT_CHAR32_T:
-		EmitCharacterValue<char32_t>(output, source, FT_CHAR32_T,
-			classification.codepoint);
-		return;
-	case FT_WCHAR_T:
-		EmitCharacterValue<wchar_t>(output, source, FT_WCHAR_T,
-			classification.codepoint);
-		return;
-	default:
-		return;
-	}
-}
-
-template<typename T>
-void EmitUserDefinedCharacterValue(IPostTokenOutputStream& output,
-	const string& source, const string& suffix, EFundamentalType type,
-	int codepoint)
-{
-	T value = static_cast<T>(codepoint);
-	output.emit_user_defined_literal_character(source, suffix, type, &value,
-		sizeof(value));
-}
-
-void EmitUserDefinedCharacterLiteralValue(IPostTokenOutputStream& output,
-	const string& source, const string& suffix,
-	const CharacterLiteralClassification& classification)
-{
-	switch (classification.type)
-	{
-	case FT_CHAR:
-		EmitUserDefinedCharacterValue<char>(output, source, suffix, FT_CHAR,
-			classification.codepoint);
-		return;
-	case FT_INT:
-		EmitUserDefinedCharacterValue<int>(output, source, suffix, FT_INT,
-			classification.codepoint);
-		return;
-	case FT_CHAR16_T:
-		EmitUserDefinedCharacterValue<char16_t>(output, source, suffix,
-			FT_CHAR16_T, classification.codepoint);
-		return;
-	case FT_CHAR32_T:
-		EmitUserDefinedCharacterValue<char32_t>(output, source, suffix,
-			FT_CHAR32_T, classification.codepoint);
-		return;
-	case FT_WCHAR_T:
-		EmitUserDefinedCharacterValue<wchar_t>(output, source, suffix,
-			FT_WCHAR_T, classification.codepoint);
-		return;
-	default:
-		return;
-	}
-}
-
 } // namespace
 
 PostTokenStream::PostTokenStream(IPostTokenOutputStream& output)
@@ -1135,8 +903,7 @@ void PostTokenStream::reset_string_sequence()
 	pending_string_source_.clear();
 	pending_string_prefix_.clear();
 	pending_string_ud_suffix_.clear();
-	pending_string_codepoints_.clear();
-	pending_string_numeric_.clear();
+	pending_string_elements_.clear();
 	pending_string_token_count_ = 0;
 	pending_string_sequence_active_ = false;
 	pending_string_invalid_ = false;
@@ -1219,13 +986,8 @@ void PostTokenStream::append_string_token(const string& data,
 			pending_string_invalid_ = true;
 	}
 
-	for (size_t i = 0; i < classification.elements.size(); ++i)
-	{
-		pending_string_codepoints_.push_back(
-			classification.elements[i].codepoint);
-		pending_string_numeric_.push_back(
-			classification.elements[i].numeric_escape ? 1 : 0);
-	}
+	pending_string_elements_.insert(pending_string_elements_.end(),
+		classification.elements.begin(), classification.elements.end());
 }
 
 void PostTokenStream::flush_string_sequence()
@@ -1244,8 +1006,8 @@ void PostTokenStream::flush_string_sequence()
 	if (split_operator_suffix)
 	{
 		EncodedString encoded;
-		if (!EncodeStringElements(pending_string_codepoints_,
-			pending_string_numeric_, pending_string_prefix_, encoded))
+		if (!EncodeStringElements(pending_string_elements_,
+			pending_string_prefix_, encoded))
 		{
 			output_.emit_invalid(pending_string_source_);
 		}
@@ -1265,8 +1027,8 @@ void PostTokenStream::flush_string_sequence()
 
 	EncodedString encoded;
 	if (pending_string_invalid_ ||
-		!EncodeStringElements(pending_string_codepoints_,
-			pending_string_numeric_, pending_string_prefix_, encoded))
+		!EncodeStringElements(pending_string_elements_,
+			pending_string_prefix_, encoded))
 	{
 		output_.emit_invalid(pending_string_source_);
 	}
@@ -1353,7 +1115,9 @@ void PostTokenStream::emit_character_literal(const string& data)
 		output_.emit_invalid(data);
 		return;
 	}
-	EmitCharacterLiteralValue(output_, data, classification);
+	const ScalarBytes bytes = EncodeScalar(classification.type,
+		static_cast<uint64_t>(classification.codepoint));
+	output_.emit_literal(data, classification.type, bytes.bytes, bytes.size);
 }
 
 void PostTokenStream::emit_user_defined_character_literal(const string& data)
@@ -1373,8 +1137,10 @@ void PostTokenStream::emit_user_defined_character_literal(const string& data)
 		output_.emit_invalid(data);
 		return;
 	}
-	EmitUserDefinedCharacterLiteralValue(output_, data, suffix,
-		classification);
+	const ScalarBytes bytes = EncodeScalar(classification.type,
+		static_cast<uint64_t>(classification.codepoint));
+	output_.emit_user_defined_literal_character(data, suffix,
+		classification.type, bytes.bytes, bytes.size);
 }
 
 void PostTokenStream::emit_string_literal(const string& data)
