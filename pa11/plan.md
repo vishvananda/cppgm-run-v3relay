@@ -203,8 +203,10 @@ boundary:
   extents and qualified enum names — COMPLETE (66/68; the two remaining
   failures are the deferred CP3 template fixtures; through-pa10 is 589/589;
   file audit passes).
-- CP3 template-parameter scopes and template-id rejection — ACTIVE (target
-  68/68; `make test-report-through-pa11` clean).
+- CP3 template-parameter scopes and template-id rejection — COMPLETE (68/68;
+  through-pa10 is 589/589; through-pa11 is 657/657; file audit passes with
+  2 existing warnings; the 200-namespace probe is sub-second and scales
+  linearly to the doubled input).
 - CP4 architecture cleanup, audit, performance evidence in `audit.md` —
   PENDING.
 
@@ -343,10 +345,24 @@ through-pa10 is 589/589, and the pa11 file audit passes. The 200-namespace
 probe measured 0.37 s / 56,936 KB and its doubled input 0.80 s / 110,524 KB,
 with linear scaling in time.
 
-## Active Checkpoint: CP3 — template parameter scopes and template-id rejection
+## Completed Checkpoint: CP3 — template parameter scopes and template-id rejection
 
-Implement template-parameter scope ownership and the remaining template-id
-rejection boundary in the parser/sema path. Preserve CP1/CP2 behavior and
-finish `tests/spec/200-template-parameter-scope.t` and
-`tests/general/200-template-template-parameter.t`, then prove 68/68 stage
-tests, clean through-pa11, and a passing file audit.
+Template declarations now own a semantic template-parameter scope. Type and
+template-template parameters receive canonical `TemplateParam` types before
+the wrapped declaration is built, so template members resolve through the
+same scope chain as other declarations. The parser and semantic builder both
+reject using-declarations whose target contains a template-id.
+
+Evidence: the two deferred fixtures pass, the existing
+`300-using-declaration-template-id-bad` fixture remains passing, `make test-pa11`
+reports 68/68, through-pa10 reports 589/589, and
+`make test-report-through-pa11` reports 657/657. The file audit passes with
+the existing two warnings. The specified probe measured 0.44 s / 57480 KB;
+the doubled input measured 0.58 s / 110472 KB, with approximately linear
+time and memory growth.
+
+## Active Checkpoint: CP4 — architecture cleanup, audit, performance evidence
+
+Consolidate the PA11 implementation structure, resolve the remaining audit
+findings where appropriate, and keep the verified performance evidence in
+`audit.md` while preserving the complete through-pa11 suite.

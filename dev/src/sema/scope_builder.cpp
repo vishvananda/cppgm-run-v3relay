@@ -51,10 +51,98 @@ void ScopeBuilder::BuildNode(AstId node, ScopeId scope)
     BuildStaticAssert(node, scope);
     return;
   case AST_TEMPLATE_DECLARATION:
+    BuildTemplate(node, scope);
+    return;
   case AST_EXPLICIT_INSTANTIATION_DECLARATION:
     throw std::runtime_error("unsupported pa11 declaration");
   default:
     return;
+  }
+}
+
+void ScopeBuilder::BuildTemplate(AstId node, ScopeId scope)
+{
+  const AstNode& value = arena_.At(node);
+  AstId clause = 0;
+  AstId declaration = 0;
+  for (std::size_t i = 0; i < value.children.size(); ++i)
+  {
+    const AstId child = value.children[i];
+    const AstKind kind = arena_.At(child).kind;
+    if (kind == AST_TEMPLATE_PARAMETER_CLAUSE)
+      clause = child;
+    else if (declaration == 0)
+      declaration = child;
+  }
+  if (clause == 0 || declaration == 0)
+    throw std::runtime_error("invalid template declaration");
+
+  const ScopeId template_scope = model_.CreateScope(
+      SCOPE_TEMPLATE_PARAMETERS, std::string(), scope);
+  BuildTemplateParameters(clause, template_scope);
+  BuildNode(declaration, template_scope);
+}
+
+void ScopeBuilder::BuildTemplateParameters(AstId clause, ScopeId scope)
+{
+  const AstNode& value = arena_.At(clause);
+  for (std::size_t i = 0; i < value.children.size(); ++i)
+  {
+    const AstNode& child = arena_.At(value.children[i]);
+    if (child.kind != AST_TEMPLATE_PARAMETER_LIST)
+      continue;
+    for (std::size_t p = 0; p < child.children.size(); ++p)
+      BuildTemplateParameter(child.children[p], scope);
+  }
+}
+
+void ScopeBuilder::BuildTemplateParameter(AstId parameter, ScopeId scope)
+{
+  const AstNode& value = arena_.At(parameter);
+  if (value.kind == AST_TYPE_PARAMETER)
+  {
+    bool template_template = false;
+    std::string name;
+    std::string keyword;
+    for (std::size_t i = 0; i < value.children.size(); ++i)
+    {
+      const AstNode& child = arena_.At(value.children[i]);
+      if (child.kind == AST_TEMPLATE_TEMPLATE_PARAMETER)
+        template_template = true;
+      else if (child.kind == AST_IDENTIFIER)
+        name = IdentifierName(value.children[i]);
+      else if (child.kind == AST_PARAMETER_KEY &&
+               child.first < tokens_.size())
+        keyword = tokens_[child.first].spelling;
+    }
+    if (name.empty())
+      return;
+    const TypeId type = types_.TemplateParam(
+        name, template_template ? "template-parameter" : keyword);
+    model_.AddBinding(scope, name, BINDING_TYPE, type);
+    return;
+  }
+
+  if (value.kind == AST_NON_TYPE_TEMPLATE_PARAMETER)
+  {
+    AstId specifiers = 0;
+    AstId declarator = 0;
+    for (std::size_t i = 0; i < value.children.size(); ++i)
+    {
+      const AstKind kind = arena_.At(value.children[i]).kind;
+      if (kind == AST_DECL_SPECIFIER_SEQ)
+        specifiers = value.children[i];
+      else if (kind == AST_DECLARATOR)
+        declarator = value.children[i];
+    }
+    if (specifiers == 0)
+      throw std::runtime_error("template parameter has no type");
+    const TypeId base = BuildSpecifierType(specifiers, scope);
+    const TypeId type = declarator == 0 ? base :
+        BuildDeclaratorType(declarator, base, scope);
+    const std::string name = IdentifierName(FindIdentifier(declarator));
+    if (!name.empty())
+      model_.AddBinding(scope, name, BINDING_VARIABLE, type);
   }
 }
 
@@ -129,6 +217,9 @@ void ScopeBuilder::BuildUsingDeclaration(AstId node, ScopeId scope)
     throw std::runtime_error("using-declaration has no target");
   const AstId target_node = value.children[0];
   const vector<string> name = NameComponents(target_node);
+  for (std::size_t i = 0; i < name.size(); ++i)
+    if (name[i].find('<') != string::npos)
+      throw std::runtime_error("using-declaration names a template-id");
   const BindingId target = ResolveName(scope, name, LOOKUP_ANY);
   if (target == 0 || model_.BindingAt(target).kind == BINDING_NAMESPACE)
     throw std::runtime_error("using-declaration target not found");

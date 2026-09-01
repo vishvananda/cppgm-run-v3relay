@@ -29,6 +29,9 @@ private:
   };
 
   void BuildNode(AstId node, ScopeId scope);
+  void BuildTemplate(AstId node, ScopeId scope);
+  void BuildTemplateParameters(AstId clause, ScopeId scope);
+  void BuildTemplateParameter(AstId parameter, ScopeId scope);
   void BuildNamespace(AstId node, ScopeId scope);
   void BuildNamespaceAlias(AstId node, ScopeId scope);
   void BuildUsingDirective(AstId node, ScopeId scope);

@@ -54,7 +54,8 @@ void PrintScope(std::ostream& out, const SemaModel& model, ScopeId id,
   const Scope& scope = model.ScopeAt(id);
   Indent(out, depth);
   out << "scope " << ScopeName(scope.kind);
-  if (scope.kind != SCOPE_BLOCK)
+  if (scope.kind != SCOPE_BLOCK && scope.kind != SCOPE_TEMPLATE_PARAMETERS &&
+      !scope.name.empty())
     out << ' ' << scope.name;
   out << '\n';
   for (std::size_t i = 0; i < scope.bindings.size(); ++i)

@@ -360,7 +360,18 @@ AstId Pa10Parser::parse_using_declaration()
 		return 0;
 	}
 	const size_t target_start = pos_;
-	if (parse_qualified_name() == 0 || !consume_simple(OP_SEMICOLON))
+	if (parse_qualified_name() == 0)
+	{
+		restore(saved);
+		return 0;
+	}
+	for (size_t i = target_start; i < pos_; ++i)
+		if (token(i).IsSimple(OP_LT))
+		{
+			restore(saved);
+			return 0;
+		}
+	if (!consume_simple(OP_SEMICOLON))
 	{
 		restore(saved);
 		return 0;
