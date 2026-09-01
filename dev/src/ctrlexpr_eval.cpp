@@ -54,9 +54,9 @@ std::uint64_t ReadScalar(const void* data, std::size_t nbytes,
 	return value;
 }
 
-EvalResult ErrorResult()
+EvalResult ErrorResult(bool is_unsigned = false)
 {
-	return EvalResult(false, 0, true);
+	return EvalResult(is_unsigned, 0, true);
 }
 
 class ControllingExpressionParser
@@ -64,13 +64,18 @@ class ControllingExpressionParser
 public:
 	ControllingExpressionParser(const vector<CtrlExprToken>& tokens,
 		const CtrlExprIsDefined& is_defined)
-		: tokens_(tokens), is_defined_(is_defined), position_(0) {}
+		: tokens_(tokens), is_defined_(is_defined), position_(0),
+		  syntax_error_(false) {}
 
 	EvalResult Parse()
 	{
 		if (tokens_.empty())
 			return ErrorResult();
-		return ParseUnary();
+
+		EvalResult result = ParseConditional(true);
+		if (syntax_error_)
+			result.error = true;
+		return result;
 	}
 
 	std::size_t position() const
@@ -86,7 +91,242 @@ private:
 			tokens_[position_].op == op;
 	}
 
-	EvalResult ParseUnary()
+	int BinaryPrecedence(ETokenType op) const
+	{
+		switch (op)
+		{
+		case OP_STAR:
+		case OP_DIV:
+		case OP_MOD:
+			return 10;
+		case OP_PLUS:
+		case OP_MINUS:
+			return 9;
+		case OP_LSHIFT:
+		case OP_RSHIFT:
+			return 8;
+		case OP_LT:
+		case OP_GT:
+		case OP_LE:
+		case OP_GE:
+			return 7;
+		case OP_EQ:
+		case OP_NE:
+			return 6;
+		case OP_AMP:
+			return 5;
+		case OP_XOR:
+			return 4;
+		case OP_BOR:
+			return 3;
+		case OP_LAND:
+			return 2;
+		case OP_LOR:
+			return 1;
+		default:
+			return -1;
+		}
+	}
+
+	EvalResult ParseConditional(bool evaluate)
+	{
+		EvalResult condition = ParseBinary(1, evaluate);
+		if (!IsOperator(OP_QMARK))
+			return condition;
+
+		++position_;
+		const bool condition_valid = !condition.error && !syntax_error_;
+		const bool condition_true = condition.value != 0;
+		EvalResult true_value = ParseConditional(
+			evaluate && condition_valid && condition_true);
+
+		if (!IsOperator(OP_COLON))
+		{
+			syntax_error_ = true;
+			return ErrorResult(true_value.is_unsigned);
+		}
+		++position_;
+
+		EvalResult false_value = ParseConditional(
+			evaluate && condition_valid && !condition_true);
+		const bool is_unsigned =
+			true_value.is_unsigned || false_value.is_unsigned;
+		EvalResult result(is_unsigned,
+			condition_true ? true_value.value : false_value.value, false);
+		if (evaluate && (condition.error ||
+			(condition_true ? true_value.error : false_value.error)))
+			result.error = true;
+		return result;
+	}
+
+	EvalResult ParseBinary(int minimum_precedence, bool evaluate)
+	{
+		EvalResult left = ParseUnary(evaluate);
+		for (;;)
+		{
+			if (position_ >= tokens_.size() ||
+				tokens_[position_].kind != CtrlExprToken::KIND_OPERATOR)
+				break;
+
+			const ETokenType op = tokens_[position_].op;
+			const int precedence = BinaryPrecedence(op);
+			if (precedence < minimum_precedence)
+				break;
+
+			++position_;
+			bool evaluate_right = evaluate;
+			if (op == OP_LAND)
+				evaluate_right = evaluate && !left.error &&
+					left.value != 0;
+			else if (op == OP_LOR)
+				evaluate_right = evaluate && !left.error &&
+					left.value == 0;
+
+			EvalResult right = ParseBinary(precedence + 1, evaluate_right);
+			left = ApplyBinary(op, left, right, evaluate);
+		}
+		return left;
+	}
+
+	EvalResult ApplyBinary(ETokenType op, const EvalResult& left,
+		const EvalResult& right, bool evaluate)
+	{
+		if (op == OP_LAND || op == OP_LOR)
+		{
+			const bool value = op == OP_LAND
+				? (left.value != 0 && right.value != 0)
+				: (left.value != 0 || right.value != 0);
+			return EvalResult(false, value ? 1 : 0,
+				evaluate && (left.error || right.error));
+		}
+
+		const bool is_unsigned = left.is_unsigned || right.is_unsigned;
+		bool error = evaluate && (left.error || right.error);
+		std::uint64_t value = 0;
+
+		switch (op)
+		{
+		case OP_STAR:
+			value = left.value * right.value;
+			break;
+		case OP_PLUS:
+			value = left.value + right.value;
+			break;
+		case OP_MINUS:
+			value = left.value - right.value;
+			break;
+		case OP_AMP:
+			value = left.value & right.value;
+			break;
+		case OP_XOR:
+			value = left.value ^ right.value;
+			break;
+		case OP_BOR:
+			value = left.value | right.value;
+			break;
+		case OP_DIV:
+		case OP_MOD:
+			if (right.value == 0)
+			{
+				if (evaluate)
+					error = true;
+			}
+			else if (!is_unsigned &&
+				left.value == (static_cast<std::uint64_t>(1) << 63) &&
+				right.value == static_cast<std::uint64_t>(-1))
+			{
+				if (evaluate)
+					error = true;
+			}
+			else if (!error)
+			{
+				if (is_unsigned)
+				{
+					value = op == OP_DIV ? left.value / right.value
+						: left.value % right.value;
+				}
+				else
+				{
+					const std::int64_t left_signed =
+						static_cast<std::int64_t>(left.value);
+					const std::int64_t right_signed =
+						static_cast<std::int64_t>(right.value);
+					value = static_cast<std::uint64_t>(op == OP_DIV
+						? left_signed / right_signed
+						: left_signed % right_signed);
+				}
+			}
+			break;
+		case OP_LSHIFT:
+		case OP_RSHIFT:
+		{
+			const bool negative_shift = !right.is_unsigned &&
+				static_cast<std::int64_t>(right.value) < 0;
+			const bool invalid_shift = negative_shift || right.value >= 64;
+			if (evaluate && invalid_shift)
+				error = true;
+			else if (!error && !invalid_shift)
+			{
+				const unsigned int count = static_cast<unsigned int>(right.value);
+				if (op == OP_LSHIFT)
+					value = left.value << count;
+				else if (left.is_unsigned)
+					value = left.value >> count;
+				else
+					value = static_cast<std::uint64_t>(
+						static_cast<std::int64_t>(left.value) >> count);
+			}
+			return EvalResult(left.is_unsigned, value, error);
+		}
+		case OP_LT:
+		case OP_GT:
+		case OP_LE:
+		case OP_GE:
+		case OP_EQ:
+		case OP_NE:
+		{
+			bool comparison = false;
+			if (is_unsigned)
+			{
+				switch (op)
+				{
+				case OP_LT: comparison = left.value < right.value; break;
+				case OP_GT: comparison = left.value > right.value; break;
+				case OP_LE: comparison = left.value <= right.value; break;
+				case OP_GE: comparison = left.value >= right.value; break;
+				case OP_EQ: comparison = left.value == right.value; break;
+				case OP_NE: comparison = left.value != right.value; break;
+				default: break;
+				}
+			}
+			else
+			{
+				const std::int64_t left_signed =
+					static_cast<std::int64_t>(left.value);
+				const std::int64_t right_signed =
+					static_cast<std::int64_t>(right.value);
+				switch (op)
+				{
+				case OP_LT: comparison = left_signed < right_signed; break;
+				case OP_GT: comparison = left_signed > right_signed; break;
+				case OP_LE: comparison = left_signed <= right_signed; break;
+				case OP_GE: comparison = left_signed >= right_signed; break;
+				case OP_EQ: comparison = left_signed == right_signed; break;
+				case OP_NE: comparison = left_signed != right_signed; break;
+				default: break;
+				}
+			}
+			return EvalResult(false, comparison ? 1 : 0, error);
+		}
+		default:
+			syntax_error_ = true;
+			return ErrorResult(is_unsigned);
+		}
+
+		return EvalResult(is_unsigned, value, error);
+	}
+
+	EvalResult ParseUnary(bool evaluate)
 	{
 		if (position_ < tokens_.size() &&
 			tokens_[position_].kind == CtrlExprToken::KIND_OPERATOR &&
@@ -97,37 +337,39 @@ private:
 		{
 			const ETokenType op = tokens_[position_].op;
 			++position_;
-			EvalResult operand = ParseUnary();
+			EvalResult operand = ParseUnary(evaluate);
+			const bool error = evaluate && operand.error;
 			switch (op)
 			{
 			case OP_PLUS:
-				return operand;
+				return EvalResult(operand.is_unsigned, operand.value, error);
 			case OP_MINUS:
-				operand.value = static_cast<std::uint64_t>(0) - operand.value;
-				return operand;
+				return EvalResult(operand.is_unsigned,
+					static_cast<std::uint64_t>(0) - operand.value, error);
 			case OP_LNOT:
-				operand.is_unsigned = false;
-				operand.value = operand.value == 0 ? 1 : 0;
-				return operand;
+				return EvalResult(false, operand.value == 0 ? 1 : 0, error);
 			case OP_COMPL:
-				operand.value = ~operand.value;
-				return operand;
+				return EvalResult(operand.is_unsigned, ~operand.value, error);
 			default:
 				return ErrorResult();
 			}
 		}
-		return ParsePrimary();
+		return ParsePrimary(evaluate);
 	}
 
-	EvalResult ParsePrimary()
+	EvalResult ParsePrimary(bool evaluate)
 	{
 		if (position_ >= tokens_.size())
+		{
+			syntax_error_ = true;
 			return ErrorResult();
+		}
 
 		const CtrlExprToken& token = tokens_[position_];
 		if (token.kind == CtrlExprToken::KIND_BAD)
 		{
 			++position_;
+			syntax_error_ = true;
 			return ErrorResult();
 		}
 
@@ -153,10 +395,10 @@ private:
 		if (IsOperator(OP_LPAREN))
 		{
 			++position_;
-			EvalResult result = ParseUnary();
+			EvalResult result = ParseConditional(evaluate);
 			if (!IsOperator(OP_RPAREN))
 			{
-				result.error = true;
+				syntax_error_ = true;
 				return result;
 			}
 			++position_;
@@ -164,6 +406,7 @@ private:
 		}
 
 		++position_;
+		syntax_error_ = true;
 		return ErrorResult();
 	}
 
@@ -171,7 +414,10 @@ private:
 	{
 		++position_; // defined
 		if (position_ >= tokens_.size())
+		{
+			syntax_error_ = true;
 			return ErrorResult();
+		}
 
 		if (tokens_[position_].kind == CtrlExprToken::KIND_IDENTIFIER)
 		{
@@ -181,16 +427,25 @@ private:
 		}
 
 		if (!IsOperator(OP_LPAREN))
+		{
+			syntax_error_ = true;
 			return ErrorResult();
+		}
 		++position_;
 		if (position_ >= tokens_.size() ||
 			tokens_[position_].kind != CtrlExprToken::KIND_IDENTIFIER)
+		{
+			syntax_error_ = true;
 			return ErrorResult();
+		}
 
 		const string name = tokens_[position_].text;
 		++position_;
 		if (!IsOperator(OP_RPAREN))
+		{
+			syntax_error_ = true;
 			return ErrorResult();
+		}
 		++position_;
 		return DefinedValue(name);
 	}
@@ -201,9 +456,10 @@ private:
 		return EvalResult(false, defined ? 1 : 0, false);
 	}
 
-	const vector<CtrlExprToken>& tokens_;
+		const vector<CtrlExprToken>& tokens_;
 	const CtrlExprIsDefined& is_defined_;
 	std::size_t position_;
+	bool syntax_error_;
 };
 
 void PrintResult(ostream& output, const EvalResult& result)

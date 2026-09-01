@@ -100,41 +100,21 @@ Single root cause today (stub). By owning checkpoint once the pipeline exists:
   packet fixture groups match; `make test-pa3` is 9/20 (down from 0/20 at
   turn start), pa1/pa2 are 81/81, the pa3 source audit checks 20 files, and
   the 100k-line parenthesis probe completes under 5s.
-- CP2 (ACTIVE) — binary precedence climb + `?:` + full arithmetic/error
-  semantics. Proof target: `make test-pa3` 20/20; `make
-  test-report-through-pa3` clean.
-- CP3 — audit + cleanup: file audit clean, stub remnants pruned, plan marked
-  complete.
+- CP2 (COMPLETE) — binary precedence climb + `?:` + full arithmetic/error
+  semantics. Proof: all packet fixtures match, the 100k-line probe completes
+  under 5s, `make test-pa3` is 20/20, the prior-through-pa2 report is 81/81,
+  and the pa3 source audit checks 20 files.
+- CP3 (ACTIVE) — final audit + cleanup: prune any remaining stub remnants and
+  mark the pa3 plan complete after the final gates.
 
-## Active Checkpoint: CP2 — binary ladder + conditional + arithmetic
+## Active Checkpoint: CP3 — final audit + cleanup
 
-Extend the completed line pipeline and unary parser to the full controlling
-expression grammar. Keep the existing token ownership and per-line replay;
-insert precedence-climbing binary levels and the right-associative conditional
-operator between the top rule and unary at the established seam.
+Close out pa3 after the completed expression evaluator checkpoint. Preserve
+the existing token ownership, per-line replay, and prior-assignment behavior.
 
 ### Implementation Packet
 
-- Files/symbols: extend `ControllingExpressionParser` and
-  `EvaluateControllingExpression` in `dev/src/ctrlexpr_eval.cpp`; preserve
-  `CtrlExprTokenCollector` and `CtrlExprLineSplitter` ownership. No new
-  frontend interface is needed.
-- Fixtures: pa3/tests/{200-ops,200-ops-alts,250-eval-order,260-cond-ret-type,
-  300-triple}.t and cppgm.tests/course/pa3/{200-adjacent-subtraction,
-  200-chained-multiplicative,200-chained-shifts,200-operator-precedence,
-  200-signed-unsigned-comparison,300-incomplete-expression-bad,
-  300-logical-line-error-isolation,300-unconsumed-expression-tokens-bad,
-  500-integer-overflow}.t.
-- Required facts: precedence and associativity for all binary levels;
-  conditional `?:` with static result-type propagation; UAC for arithmetic,
-  comparisons, and conditional arms; eager flagged evaluation with
-  short-circuit error suppression for `&&`, `||`, and `?:`; wrapping 64-bit
-  arithmetic; and the specified divide/modulo, shift, and signed-minimum
-  errors. Preserve CP1 behavior and final `eof`/line isolation.
-- Focused checks: `make -C dev ctrlexpr`; exercise the 200/250/260 fixture
-  groups directly while editing. Required gates after stabilization:
-  `make test-pa3`, the prior-through-pa3 report, and
-  `perl scripts/cppgm_file_audit.pl --stage pa3 --paths dev/src`.
-- Performance probe: `perl -e 'print "((((5))))*3+4\n" x 100000' | timeout 5
-  ./dev/ctrlexpr > /dev/null`; keep parsing linear per line and avoid AST or
-  cross-line buffering.
+- Files/symbols: audit the pa3-owned changes in `dev/src/ctrlexpr_eval.cpp`
+  and this plan; remove only confirmed dead checkpoint residue.
+- Required gates: `make test-pa3`, the prior-through-pa2 report, and
+  `perl scripts/cppgm_file_audit.pl --stage pa3 --paths dev/src` remain clean.
