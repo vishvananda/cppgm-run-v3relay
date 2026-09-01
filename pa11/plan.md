@@ -200,9 +200,11 @@ boundary:
   (45/68 stage tests; all 35 packet fixtures pass; through-pa10 is 589/589;
   file audit passes).
 - CP2 enums, constant evaluation, sizeof/alignof, static_assert, parser
-  extents and qualified enum names — ACTIVE (target 64/68).
-- CP3 template-parameter scopes and template-id rejection — PENDING
-  (target 68/68; `make test-report-through-pa11` clean).
+  extents and qualified enum names — COMPLETE (66/68; the two remaining
+  failures are the deferred CP3 template fixtures; through-pa10 is 589/589;
+  file audit passes).
+- CP3 template-parameter scopes and template-id rejection — ACTIVE (target
+  68/68; `make test-report-through-pa11` clean).
 - CP4 architecture cleanup, audit, performance evidence in `audit.md` —
   PENDING.
 
@@ -329,18 +331,22 @@ Known uncertainties (decide by the listed default, note in `audit.md`):
   which the PA10 AST does not record; CP2 adds it (parser change) — CP1
   must not print such declarations and may throw on them.
 
-## Active Checkpoint: CP2 — enums and constant evaluation
+## Completed Checkpoint: CP2 — enums and constant evaluation
 
-Implement the next coherent boundary in `dev/src/sema/const_eval.*`,
-`scope_builder.*`, `type_builder.cpp`, and the minimal parser extent support
-needed by the qualified-enum and anonymous-union fixtures. Add canonical enum
-entities/types and enumerator bindings/scopes; extend constant evaluation for
-literal, identifier, unary/binary, conditional, cast, `sizeof`, and `alignof`
-expressions with short-circuiting and checked integer behavior; consume those
-values for array bounds, enumerators, and `static_assert`. Preserve all CP1
-behavior and reject malformed enum, reference, and bound cases with failure.
-Progress proof: raise the stage to at least 64/68 while through-pa10 remains
-589/589 and the file audit passes. Focused starting fixtures are
-`tests/spec/200-const-int-static-assert.t`, `tests/spec/200-enum-scoped.t`,
-and `tests/general/200-sizeof-qualified-type-idexpr.t`; template parameter
-and template-id fixtures remain CP3.
+Enum entities now own canonical enum scopes, enumerator bindings, underlying
+types, and constant values. Constant evaluation covers the packet operators,
+short-circuiting, checked signed arithmetic, casts, `sizeof`, and `alignof`;
+those values feed array bounds, enumerators, and `static_assert`. Parser
+extents support qualified enum definitions and stable anonymous-union scopes.
+The focused CP2 fixtures and negative cases pass; `make test-pa11` is 66/68,
+through-pa10 is 589/589, and the pa11 file audit passes. The 200-namespace
+probe measured 0.37 s / 56,936 KB and its doubled input 0.80 s / 110,524 KB,
+with linear scaling in time.
+
+## Active Checkpoint: CP3 — template parameter scopes and template-id rejection
+
+Implement template-parameter scope ownership and the remaining template-id
+rejection boundary in the parser/sema path. Preserve CP1/CP2 behavior and
+finish `tests/spec/200-template-parameter-scope.t` and
+`tests/general/200-template-template-parameter.t`, then prove 68/68 stage
+tests, clean through-pa11, and a passing file audit.

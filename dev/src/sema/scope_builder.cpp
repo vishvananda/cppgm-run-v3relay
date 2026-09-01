@@ -1,5 +1,7 @@
 #include "sema/scope_builder.h"
 
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 
 using std::string;
@@ -32,6 +34,9 @@ void ScopeBuilder::BuildNode(AstId node, ScopeId scope)
   case AST_ALIAS_DECLARATION: BuildAlias(node, scope); return;
   case AST_SIMPLE_DECLARATION: BuildSimpleDeclaration(node, scope); return;
   case AST_FUNCTION_DEFINITION: BuildFunctionDefinition(node, scope); return;
+  case AST_ENUM_SPECIFIER:
+    (void)BuildEnumType(node, scope);
+    return;
   case AST_CLASS_SPECIFIER:
     (void)BuildClassSpecifier(node, scope);
     return;
@@ -42,8 +47,9 @@ void ScopeBuilder::BuildNode(AstId node, ScopeId scope)
     return;
   case AST_EMPTY_DECLARATION:
     return;
-  case AST_ENUM_SPECIFIER:
   case AST_STATIC_ASSERT_DECLARATION:
+    BuildStaticAssert(node, scope);
+    return;
   case AST_TEMPLATE_DECLARATION:
   case AST_EXPLICIT_INSTANTIATION_DECLARATION:
     throw std::runtime_error("unsupported pa11 declaration");
@@ -127,8 +133,12 @@ void ScopeBuilder::BuildUsingDeclaration(AstId node, ScopeId scope)
   if (target == 0 || model_.BindingAt(target).kind == BINDING_NAMESPACE)
     throw std::runtime_error("using-declaration target not found");
   const Binding& binding = model_.BindingAt(target);
-  model_.AddBinding(scope, name.back(), binding.kind, binding.type,
-                    binding.target_scope, true, binding.class_entity);
+  const BindingId imported = model_.AddBinding(
+      scope, name.back(), binding.kind, binding.type, binding.target_scope,
+      true, binding.class_entity, binding.enum_entity);
+  Binding& imported_binding = model_.BindingAt(imported);
+  imported_binding.has_const_value = binding.has_const_value;
+  imported_binding.const_value = binding.const_value;
 }
 
 void ScopeBuilder::BuildAlias(AstId node, ScopeId scope)
@@ -191,7 +201,34 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
       type = AddCv(type, true, false);
     const BindingKind binding_kind = is_typedef ? BINDING_TYPE_ALIAS :
         kind == TYPE_FUNCTION ? BINDING_FUNCTION : BINDING_VARIABLE;
-    model_.AddBinding(target_scope, name, binding_kind, type);
+    const BindingId binding = model_.AddBinding(target_scope, name,
+                                                binding_kind, type);
+    bool is_const_object = is_constexpr;
+    TypeId value_type = type;
+    while (types_.Kind(value_type) == TYPE_CV)
+    {
+      const TypeNode& cv = types_.At(value_type);
+      is_const_object = is_const_object || cv.is_const;
+      value_type = cv.base;
+    }
+    if (!is_typedef && binding_kind == BINDING_VARIABLE &&
+        is_const_object && (types_.Kind(value_type) == TYPE_FUNDAMENTAL ||
+                            types_.Kind(value_type) == TYPE_ENUM))
+    {
+      const AstId initializer = FindInitializer(items[i]);
+      if (initializer != 0)
+      {
+        const AstNode& init = arena_.At(initializer);
+        if (init.children.size() != 1)
+          throw std::runtime_error("invalid constant initializer");
+        Binding& stored = model_.BindingAt(binding);
+        stored.const_value = const_eval_.Evaluate(init.children[0],
+                                                   target_scope);
+        stored.has_const_value = true;
+      }
+      else if (is_constexpr)
+        throw std::runtime_error("constexpr variable has no initializer");
+    }
   }
 }
 
@@ -224,6 +261,219 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   (void)BuildCompound(body, function_scope);
 }
 
+TypeId ScopeBuilder::BuildEnumType(AstId node, ScopeId scope,
+                                   const string& anonymous_name)
+{
+  const AstNode& value = arena_.At(node);
+  bool scoped = false;
+  AstId underlying_node = 0;
+  vector<AstId> enumerators;
+  for (std::size_t i = 0; i < value.children.size(); ++i)
+  {
+    const AstId child = value.children[i];
+    const AstKind kind = arena_.At(child).kind;
+    if (kind == AST_ENUM_KEY)
+      scoped = true;
+    else if (kind == AST_TYPE_ID)
+      underlying_node = child;
+    else if (kind == AST_ENUMERATOR)
+      enumerators.push_back(child);
+  }
+  bool has_definition = !enumerators.empty();
+  for (std::size_t i = value.first; i < value.last && i < tokens_.size(); ++i)
+    if (tokens_[i].IsSimple(OP_RBRACE))
+      has_definition = true;
+
+  vector<string> components;
+  if (!value.text.empty())
+  {
+    string component;
+    for (std::size_t i = 0; i < value.text.size(); ++i)
+    {
+      if (i + 1 < value.text.size() && value.text[i] == ':' &&
+          value.text[i + 1] == ':')
+      {
+        if (!component.empty())
+        {
+          components.push_back(component);
+          component.clear();
+        }
+        ++i;
+      }
+      else
+        component += value.text[i];
+    }
+    if (!component.empty())
+      components.push_back(component);
+  }
+  if (components.empty())
+  {
+    string name = anonymous_name;
+    if (name.empty())
+    {
+      if (value.first >= value.last)
+        throw std::runtime_error("unnamed enum requires a declaration name");
+      std::ostringstream generated;
+      generated << "__anonymous_enum_type__" << value.first << '_'
+                << value.last;
+      name = generated.str();
+    }
+    components.push_back(name);
+  }
+
+  ScopeId parent = scope;
+  if (components.size() > 1)
+  {
+    vector<string> prefix(components.begin(), components.end() - 1);
+    const BindingId qualifier = ResolveName(scope, prefix, LOOKUP_QUALIFIER);
+    if (qualifier == 0 || model_.BindingAt(qualifier).target_scope == 0)
+      throw std::runtime_error("qualified enum scope not found");
+    parent = model_.BindingAt(qualifier).target_scope;
+  }
+  const string name = components.back();
+  string full_name = components[0];
+  for (std::size_t i = 1; i < components.size(); ++i)
+    full_name += "::" + components[i];
+
+  const BindingId existing_binding = model_.DirectBinding(
+      parent, name, LOOKUP_TYPES);
+  BindingId inherited_binding = existing_binding;
+  if (inherited_binding == 0 && components.size() == 1 && !has_definition)
+    inherited_binding = model_.LookupTypeName(scope, name);
+  EnumEntityId entity_id = 0;
+  if (inherited_binding != 0 &&
+      model_.BindingAt(inherited_binding).enum_entity != 0)
+    entity_id = model_.BindingAt(inherited_binding).enum_entity;
+  if (!has_definition && !scoped && underlying_node == 0 && entity_id == 0)
+    throw std::runtime_error("unscoped enum needs an underlying type");
+  if (!has_definition && entity_id == 0 && inherited_binding != 0)
+    throw std::runtime_error("enum name does not name an enum");
+  if (entity_id == 0)
+    entity_id = model_.GetOrCreateEnum(parent, name);
+
+  EnumEntity& entity = model_.EnumAt(entity_id);
+  TypeId underlying = underlying_node == 0 ? types_.Fundamental(FT_INT) :
+      BuildTypeId(underlying_node, scope);
+  TypeId unqualified_underlying = underlying;
+  while (types_.Kind(unqualified_underlying) == TYPE_CV)
+    unqualified_underlying = types_.At(unqualified_underlying).base;
+  if (types_.Kind(unqualified_underlying) != TYPE_FUNDAMENTAL)
+    throw std::runtime_error("enum underlying type is not integral");
+  const EFundamentalType underlying_kind =
+      types_.At(unqualified_underlying).fundamental;
+  switch (underlying_kind)
+  {
+  case FT_FLOAT: case FT_DOUBLE: case FT_LONG_DOUBLE: case FT_VOID:
+  case FT_NULLPTR_T:
+    throw std::runtime_error("enum underlying type is not integral");
+  default: break;
+  }
+  if (entity.type != 0)
+  {
+    if (entity.scoped != scoped || entity.underlying != underlying)
+      throw std::runtime_error("enum redeclaration disagrees with its type");
+    if (has_definition && entity.defined)
+      throw std::runtime_error("enum redefinition");
+  }
+  else
+  {
+    entity.scoped = scoped;
+    entity.underlying = underlying;
+    entity.type = types_.Enum(full_name, scoped, underlying);
+  }
+  if (!has_definition)
+  {
+    if (entity.scoped && entity.enum_scope == 0)
+      entity.enum_scope = model_.CreateScope(SCOPE_ENUM, full_name, scope);
+    if (inherited_binding == 0)
+    {
+      const ScopeId target = entity.enum_scope;
+      model_.AddBinding(parent, name, BINDING_TYPE, entity.type, target, true,
+                        0, entity_id);
+    }
+    else if (model_.BindingAt(inherited_binding).enum_entity != entity_id)
+      throw std::runtime_error("enum name does not name this enum");
+    return entity.type;
+  }
+
+  const bool qualified_definition = components.size() > 1;
+  if (qualified_definition && entity.enum_scope != 0 &&
+      model_.ScopeAt(entity.enum_scope).parent != scope)
+  {
+    entity.enum_scope = 0;
+  }
+  if (entity.scoped && entity.enum_scope == 0)
+    entity.enum_scope = model_.CreateScope(
+        SCOPE_ENUM, full_name, qualified_definition ? scope : parent);
+
+  TypeId enum_type = entity.type;
+  if (qualified_definition)
+  {
+    // A qualified out-of-class definition has a declaration spelling of its
+    // fully-qualified name while the member declaration retains its local
+    // spelling.  Keep both bindings tied to the same entity and underlying
+    // type contract; the qualified view is the one printed at namespace scope.
+    enum_type = types_.Enum(full_name, scoped, underlying);
+    entity.type = enum_type;
+    if (existing_binding != 0)
+      model_.BindingAt(existing_binding).target_scope = entity.enum_scope;
+    const BindingId qualified = model_.DirectBinding(
+        scope, full_name, LOOKUP_TYPES);
+    if (qualified == 0)
+      model_.AddBinding(scope, full_name, BINDING_TYPE, enum_type,
+                        entity.enum_scope, true, 0, entity_id);
+  }
+  else if (existing_binding == 0)
+  {
+    model_.AddBinding(parent, name, BINDING_TYPE, enum_type,
+                      entity.enum_scope, true, 0, entity_id);
+  }
+  entity.defined = true;
+
+  const ScopeId value_scope = entity.scoped ? entity.enum_scope : parent;
+  long long previous = 0;
+  bool have_previous = false;
+  for (std::size_t i = 0; i < enumerators.size(); ++i)
+  {
+    const AstNode& enumerator = arena_.At(enumerators[i]);
+    long long value_value = 0;
+    if (enumerator.children.empty())
+    {
+      if (have_previous)
+      {
+        if (previous == std::numeric_limits<long long>::max())
+          throw std::runtime_error("enumerator value overflows");
+        value_value = previous + 1;
+      }
+    }
+    else
+      value_value = const_eval_.Evaluate(enumerator.children[0], value_scope);
+    const string enumerator_name = enumerator.text;
+    if (enumerator_name.empty())
+      throw std::runtime_error("enumerator has no name");
+    if (model_.DirectBinding(value_scope, enumerator_name) != 0)
+      throw std::runtime_error("duplicate enumerator");
+    const BindingId binding = model_.AddBinding(
+        value_scope, enumerator_name, BINDING_ENUMERATOR, enum_type);
+    Binding& stored = model_.BindingAt(binding);
+    stored.enum_entity = entity_id;
+    stored.has_const_value = true;
+    stored.const_value = value_value;
+    previous = value_value;
+    have_previous = true;
+  }
+  return enum_type;
+}
+
+void ScopeBuilder::BuildStaticAssert(AstId node, ScopeId scope)
+{
+  const AstNode& value = arena_.At(node);
+  if (value.children.empty())
+    throw std::runtime_error("static_assert has no expression");
+  if (const_eval_.Evaluate(value.children[0], scope) == 0)
+    throw std::runtime_error("static_assert failed");
+}
+
 void ScopeBuilder::BuildClassForward(AstId node, ScopeId scope)
 {
   const AstNode& value = arena_.At(node);
@@ -251,10 +501,21 @@ TypeId ScopeBuilder::BuildClassType(AstId node, ScopeId scope,
                                     const string& anonymous_name)
 {
   const AstNode& value = arena_.At(node);
-  const string name = value.text.empty() ? anonymous_name : value.text;
+  string name = value.text.empty() ? anonymous_name : value.text;
+  const string key = ClassKey(node);
+  const bool injected_anonymous_union = value.text.empty() &&
+      anonymous_name.empty() && key == "union";
+  if (name.empty() && injected_anonymous_union)
+  {
+    if (value.first >= value.last)
+      throw std::runtime_error("anonymous union has no source extent");
+    std::ostringstream generated;
+    generated << "__anonymous_union_type__" << value.first << '_'
+              << value.last;
+    name = generated.str();
+  }
   if (name.empty())
     throw std::runtime_error("unnamed class requires a declaration name");
-  const string key = ClassKey(node);
   const ClassEntityId entity = model_.GetOrCreateClass(scope, name);
   ClassEntity& class_entity = model_.ClassAt(entity);
   if (class_entity.defined)
@@ -263,10 +524,14 @@ TypeId ScopeBuilder::BuildClassType(AstId node, ScopeId scope,
   class_entity.current_type = type;
   class_entity.class_key = key;
   class_entity.defined = true;
-  const BindingId binding = model_.AddBinding(
-      scope, name, BINDING_TYPE, type, 0, true, entity);
   class_entity.class_scope = model_.CreateScope(SCOPE_CLASS, name, scope);
-  model_.BindingAt(binding).target_scope = class_entity.class_scope;
+  if (!injected_anonymous_union)
+  {
+    const BindingId binding = model_.AddBinding(
+        scope, name, BINDING_TYPE, type, class_entity.class_scope, true,
+        entity);
+    model_.BindingAt(binding).target_scope = class_entity.class_scope;
+  }
   for (std::size_t i = 0; i < value.children.size(); ++i)
   {
     const AstKind kind = arena_.At(value.children[i]).kind;
@@ -274,6 +539,22 @@ TypeId ScopeBuilder::BuildClassType(AstId node, ScopeId scope,
         kind == AST_ACCESS_SPECIFIER)
       continue;
     BuildNode(value.children[i], class_entity.class_scope);
+  }
+  if (injected_anonymous_union)
+  {
+    const Scope& members = model_.ScopeAt(class_entity.class_scope);
+    for (std::size_t i = 0; i < members.bindings.size(); ++i)
+    {
+      const Binding& member = model_.BindingAt(members.bindings[i]);
+      if (!member.print)
+        continue;
+      const BindingId injected = model_.AddBinding(
+          scope, member.name, member.kind, member.type, member.target_scope,
+          true, member.class_entity, member.enum_entity);
+      Binding& stored = model_.BindingAt(injected);
+      stored.has_const_value = member.has_const_value;
+      stored.const_value = member.const_value;
+    }
   }
   return type;
 }
@@ -360,6 +641,17 @@ AstId ScopeBuilder::FindIdentifier(AstId declarator) const
         return found;
     }
   }
+  return 0;
+}
+
+AstId ScopeBuilder::FindInitializer(AstId init_declarator) const
+{
+  if (init_declarator == 0)
+    return 0;
+  const AstNode& value = arena_.At(init_declarator);
+  for (std::size_t i = 0; i < value.children.size(); ++i)
+    if (arena_.At(value.children[i]).kind == AST_INITIALIZER)
+      return value.children[i];
   return 0;
 }
 

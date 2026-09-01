@@ -130,12 +130,13 @@ TypeId TypeTable::Class(const std::string& name, const std::string& class_key)
   return Add(node);
 }
 
-TypeId TypeTable::Enum(const std::string& name, bool scoped)
+TypeId TypeTable::Enum(const std::string& name, bool scoped, TypeId underlying)
 {
   TypeNode node;
   node.kind = TYPE_ENUM;
   node.name = name;
   node.class_key = scoped ? "class" : "";
+  node.base = underlying == 0 ? Fundamental(FT_INT) : underlying;
   return Add(node);
 }
 
@@ -262,7 +263,7 @@ std::size_t TypeTable::SizeOf(TypeId id) const
   case TYPE_CV: return SizeOf(node.base);
   case TYPE_POINTER: case TYPE_REFERENCE: return 8;
   case TYPE_ARRAY: return SizeOf(node.base) * node.array_bound;
-  case TYPE_ENUM: return 4;
+  case TYPE_ENUM: return SizeOf(node.base);
   case TYPE_CLASS: case TYPE_FUNCTION: case TYPE_TEMPLATE_PARAM: break;
   case TYPE_INVALID: break;
   }

@@ -9,7 +9,7 @@ using std::vector;
 ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens, AstArena& arena,
                            TypeTable& types, SemaModel& model)
     : tokens_(tokens), arena_(arena), types_(types), model_(model),
-      const_eval_(tokens, arena)
+      const_eval_(tokens, arena, model, types)
 {
 }
 
@@ -159,6 +159,8 @@ TypeId ScopeBuilder::BuildTypeNode(AstId node, ScopeId lookup_scope,
   if (value.kind == AST_CLASS_FORWARD_DECLARATION)
     return BuildForwardType(node, lookup_scope,
                             allow_elaborated_declaration);
+  if (value.kind == AST_ENUM_SPECIFIER)
+    return BuildEnumType(node, lookup_scope, active_anonymous_name_);
   if (value.kind == AST_DECLTYPE_SPECIFIER ||
       (value.kind == AST_DECL_SPECIFIER && !value.children.empty()))
   {
@@ -260,7 +262,8 @@ TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
     {
       if (node.children.empty() || node.children[0] == 0)
         throw std::runtime_error("incomplete array type");
-      const long long bound = const_eval_.Evaluate(node.children[0]);
+      const long long bound = const_eval_.Evaluate(node.children[0],
+                                                   lookup_scope);
       if (bound <= 0)
         throw std::runtime_error("array bound must be positive");
       result = types_.Array(result, static_cast<std::size_t>(bound));
@@ -361,7 +364,8 @@ TypeId ScopeBuilder::BuildExpressionType(AstId expression,
     if (binding == 0 || model_.BindingAt(binding).type == 0)
       throw std::runtime_error("unknown decltype name");
     const Binding& value = model_.BindingAt(binding);
-    lvalue = value.kind != BINDING_FUNCTION;
+    lvalue = value.kind != BINDING_FUNCTION &&
+        value.kind != BINDING_ENUMERATOR;
     return value.type;
   }
   if (node.kind == AST_LITERAL && node.first < tokens_.size())

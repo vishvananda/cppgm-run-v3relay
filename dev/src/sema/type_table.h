@@ -54,7 +54,7 @@ public:
   TypeId Function(TypeId result, const std::vector<TypeId>& parameters,
                   bool variadic = false);
   TypeId Class(const std::string& name, const std::string& class_key);
-  TypeId Enum(const std::string& name, bool scoped);
+  TypeId Enum(const std::string& name, bool scoped, TypeId underlying = 0);
   TypeId TemplateParam(const std::string& name, const std::string& keyword);
 
   const TypeNode& At(TypeId id) const;

@@ -5,7 +5,7 @@
 
 Binding::Binding()
     : kind(BINDING_VARIABLE), type(0), target_scope(0), class_entity(0),
-      print(true)
+      enum_entity(0), has_const_value(false), const_value(0), print(true)
 {
 }
 
@@ -20,7 +20,8 @@ ClassEntity::ClassEntity()
 }
 
 EnumEntity::EnumEntity()
-    : parent_scope(0), type(0)
+    : parent_scope(0), type(0), underlying(0), enum_scope(0), scoped(false),
+      defined(false)
 {
 }
 
@@ -80,7 +81,8 @@ static bool IsOrdinaryObjectBinding(BindingKind kind)
 BindingId SemaModel::AddBinding(ScopeId scope, const std::string& name,
                                 BindingKind kind, TypeId type,
                                 ScopeId target_scope, bool print,
-                                ClassEntityId class_entity)
+                                ClassEntityId class_entity,
+                                EnumEntityId enum_entity)
 {
   if (scope >= scopes_.size())
     throw std::out_of_range("invalid binding scope");
@@ -102,6 +104,7 @@ BindingId SemaModel::AddBinding(ScopeId scope, const std::string& name,
   binding.type = type;
   binding.target_scope = target_scope;
   binding.class_entity = class_entity;
+  binding.enum_entity = enum_entity;
   binding.print = print;
   bindings_.push_back(binding);
   const BindingId id = bindings_.size() - 1;
@@ -301,6 +304,9 @@ ScopeId SemaModel::TargetScopeForType(TypeId type) const
   for (std::size_t i = 1; i < classes_.size(); ++i)
     if (classes_[i].current_type == type && classes_[i].class_scope != 0)
       return classes_[i].class_scope;
+  for (std::size_t i = 1; i < enums_.size(); ++i)
+    if (enums_[i].type == type && enums_[i].enum_scope != 0)
+      return enums_[i].enum_scope;
   return 0;
 }
 

@@ -534,9 +534,13 @@ AstId Pa10Parser::parse_enum_specifier()
 	AstId result = 0;
 	if (is_kind(PA6_IDENTIFIER_TOKEN))
 	{
-		result = make_span(AST_ENUM_SPECIFIER, pos_, pos_ + 1,
-			token(pos_).spelling);
-		++pos_;
+		const size_t name_start = pos_;
+		if (parse_qualified_name() == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+		result = make_join(AST_ENUM_SPECIFIER, name_start, pos_);
 	}
 	else
 		result = make(AST_ENUM_SPECIFIER);
@@ -550,6 +554,9 @@ AstId Pa10Parser::parse_enum_specifier()
 			return 0;
 		}
 	}
+	// Scoped enumerators belong to the enum scope, which is created by sema;
+	// keeping them out of the parser's enclosing scope also preserves the
+	// declaration/expression distinction for a later same-spelled name.
 	scopes_.Bind(declared_identifier(result), BIND_TYPE);
 	if (scoped)
 		add(result, make_token(AST_ENUM_KEY, key_at));
@@ -586,12 +593,21 @@ AstId Pa10Parser::parse_enum_specifier()
 		restore(saved);
 		return 0;
 	}
-	// Enumerators are values in the enclosing scope.
-	const vector<AstId>& members = arena_.At(result).children;
-	for (size_t i = 0; i < members.size(); ++i)
-		if (arena_.At(members[i]).kind == AST_ENUMERATOR)
-			scopes_.Bind(token(arena_.At(members[i]).first).spelling,
-				BIND_VALUE);
+	// Keep the name spelling in text while extending the source extent to the
+	// closing brace.  Sema uses that extent to distinguish a definition from
+	// an opaque declaration, including an empty enum body.
+	arena_.At(result).last = pos_;
+	// Unscoped enumerators are values in the enclosing scope.  Scoped
+	// enumerators are deliberately not visible to the parser outside the
+	// enum; semantic lookup supplies their actual enum scope later.
+	if (!scoped)
+	{
+		const vector<AstId>& members = arena_.At(result).children;
+		for (size_t i = 0; i < members.size(); ++i)
+			if (arena_.At(members[i]).kind == AST_ENUMERATOR)
+				scopes_.Bind(token(arena_.At(members[i]).first).spelling,
+					BIND_VALUE);
+	}
 	return result;
 }
 

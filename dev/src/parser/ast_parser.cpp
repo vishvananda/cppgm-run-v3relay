@@ -671,7 +671,19 @@ AstId Pa10Parser::parse_specified_declaration(bool member_context)
 			if (kind == AST_CLASS_SPECIFIER ||
 				kind == AST_CLASS_FORWARD_DECLARATION ||
 				kind == AST_ENUM_SPECIFIER)
+			{
+				// Anonymous class/enum specifiers have no declarator-id from
+				// which later semantic passes can derive a stable identity.  The
+				// complete declaration extent is sufficient for that identity and
+				// remains invisible in the normal named-node spelling.
+				AstNode& anonymous = arena_.At(children[0]);
+				if (anonymous.text.empty() && anonymous.first == anonymous.last)
+				{
+					anonymous.first = saved.position;
+					anonymous.last = pos_;
+				}
 				return children[0];
+			}
 		}
 		const AstId result = make(AST_SIMPLE_DECLARATION);
 		add(result, specifiers);

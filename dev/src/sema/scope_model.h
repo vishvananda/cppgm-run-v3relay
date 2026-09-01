@@ -52,6 +52,9 @@ struct Binding
   TypeId type;
   ScopeId target_scope;
   ClassEntityId class_entity;
+  EnumEntityId enum_entity;
+  bool has_const_value;
+  long long const_value;
   bool print;
 
   Binding();
@@ -87,6 +90,10 @@ struct EnumEntity
   ScopeId parent_scope;
   std::string name;
   TypeId type;
+  TypeId underlying;
+  ScopeId enum_scope;
+  bool scoped;
+  bool defined;
 
   EnumEntity();
 };
@@ -105,7 +112,8 @@ public:
   BindingId AddBinding(ScopeId scope, const std::string& name,
                        BindingKind kind, TypeId type = 0,
                        ScopeId target_scope = 0, bool print = true,
-                       ClassEntityId class_entity = 0);
+                       ClassEntityId class_entity = 0,
+                       EnumEntityId enum_entity = 0);
   void AddUsingDirective(ScopeId scope, ScopeId target);
   Binding& BindingAt(BindingId id);
   const Binding& BindingAt(BindingId id) const;

@@ -42,7 +42,10 @@ void PrintBinding(std::ostream& out, const SemaModel& model,
   case BINDING_PARAMETER: out << "parameter "; break;
   case BINDING_NAMESPACE: return;
   }
-  out << binding.name << ' ' << model.Types().Spell(binding.type) << '\n';
+  out << binding.name << ' ' << model.Types().Spell(binding.type);
+  if (binding.kind == BINDING_ENUMERATOR && binding.has_const_value)
+    out << ' ' << binding.const_value;
+  out << '\n';
 }
 
 void PrintScope(std::ostream& out, const SemaModel& model, ScopeId id,

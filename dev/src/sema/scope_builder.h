@@ -36,6 +36,9 @@ private:
   void BuildAlias(AstId node, ScopeId scope);
   void BuildSimpleDeclaration(AstId node, ScopeId scope);
   void BuildFunctionDefinition(AstId node, ScopeId scope);
+  TypeId BuildEnumType(AstId node, ScopeId scope,
+                       const std::string& anonymous_name = std::string());
+  void BuildStaticAssert(AstId node, ScopeId scope);
   TypeId BuildClassSpecifier(AstId node, ScopeId scope,
                              const std::string& anonymous_name = std::string());
   void BuildClassForward(AstId node, ScopeId scope);
@@ -61,6 +64,7 @@ private:
   void BuildParameters(AstId clause, ScopeId lookup_scope,
                        std::vector<ParameterInfo>& parameters, bool& variadic);
   AstId FindIdentifier(AstId declarator) const;
+  AstId FindInitializer(AstId init_declarator) const;
   AstId FindParameterClause(AstId declarator) const;
   std::string IdentifierName(AstId identifier) const;
   std::vector<std::string> NameComponents(std::size_t first,
