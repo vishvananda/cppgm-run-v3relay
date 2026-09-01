@@ -31,31 +31,6 @@ bool PA5GetFileId(const string& path, PA5FileId& out_fileid)
 	return res == 0;
 }
 
-bool PA6_IsClassName(const string& identifier)
-{
-	return (NameCategoryMask(identifier) & PA6_NAME_CLASS_FLAG) != 0;
-}
-
-bool PA6_IsTemplateName(const string& identifier)
-{
-	return (NameCategoryMask(identifier) & PA6_NAME_TEMPLATE_FLAG) != 0;
-}
-
-bool PA6_IsTypedefName(const string& identifier)
-{
-	return (NameCategoryMask(identifier) & PA6_NAME_TYPEDEF_FLAG) != 0;
-}
-
-bool PA6_IsEnumName(const string& identifier)
-{
-	return (NameCategoryMask(identifier) & PA6_NAME_ENUM_FLAG) != 0;
-}
-
-bool PA6_IsNamespaceName(const string& identifier)
-{
-	return (NameCategoryMask(identifier) & PA6_NAME_NAMESPACE_FLAG) != 0;
-}
-
 bool HasBatchStdinArg(int argc, char** argv)
 {
 	for (int i = 1; i < argc; i++)

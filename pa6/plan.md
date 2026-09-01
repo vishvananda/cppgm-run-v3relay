@@ -1,146 +1,89 @@
-# PA6 Plan — recog (syntactic recognition of translation-unit)
+# PA6 Plan — recog (syntactic recognition of translation-unit) [COMPLETE]
 
-Goal: `recog -o <outfile> <srcfiles...>` preprocesses each srcfile with the
-PA5 pipeline, tokenizes, and recognizes the token sequence against
-`pa6.gram` (197 nonterminals). Outfile: first line `recog <N>`, then one
-`<srcfile> OK|BAD` line per srcfile. Any per-file failure (open error,
-preprocess/lex error, invalid token, parse failure) → `BAD` for that file
-only; tool exits EXIT_SUCCESS. Harness compares exit status + byte-exact
-outfile (`compare_text`); stdout is never compared, so the parse-tree dump
-is optional. Per-test runner timeout: 10s (`test_runner.cpp`).
+Final state: 313/313 fixtures pass through `make test-report-through-pa6`
+(260 through-pa5 + 38 pa6 local including six fixtures added at CP3 +
+15 pa6 course); pa6 file audit passes. Architecture review, findings,
+performance evidence, differential-probe results, and the divergence
+envelope are consolidated in `pa6/audit.md`.
 
-## Stage Design
+`recog -o <outfile> <srcfiles...>` preprocesses each srcfile with the PA5
+pipeline, tokenizes, and recognizes the token sequence against `pa6.gram`
+(197 nonterminals). Outfile: `recog <N>` then one `<srcfile> OK|BAD` line
+per srcfile; any per-file failure → BAD for that file only; tool exits
+EXIT_SUCCESS. Only exit status + outfile are graded; per-test runner
+timeout 10 s.
 
-Owning boundaries (spec.md §1: one production pipeline; the PA6 parser is
-the seed of the production parser, later stages extend it — no parallel
-parser later):
+## Stage Design (as built)
 
-- `dev/src/preproc_engine.h/.cpp` — token production. Add a public
-  per-srcfile entry that feeds a caller-supplied `IPostTokenOutputStream`
-  instead of the PA5 text writer. PA5 output path stays byte-identical.
-- `dev/src/parser/recog_token.h/.cpp` (new) — PA6 terminal layer. A
-  `Pa6Token` carries typed classification computed once at construction
-  (spec.md §2): `ETokenType` for simple tokens, kind tags for
-  identifier/literal/ST_RSHIFT_1/ST_RSHIFT_2/ST_EOF, spelling, a name
-  category bitmask (letters C/T/Y/E/N → class/template/typedef/enum/
-  namespace-name), and `is_empty_string` (spelling `""`), `is_zero`
-  (spelling `0`), `is_final`/`is_override` flags. A collector implementing
-  `IPostTokenOutputStream` builds `vector<Pa6Token>`: `emit_simple` splits
-  OP_RSHIFT into ST_RSHIFT_1 + ST_RSHIFT_2, `emit_invalid` throws,
-  `emit_eof` appends ST_EOF. Name classification is a single helper so
-  later PAs can swap real name lookup for the mock mask.
-- `dev/src/parser/recog_parser.h/.cpp` (new) — recursive-descent
-  recognizer `Pa6Parser` over `vector<Pa6Token>`: one `parse_foo` per
-  nonterminal, bool result; success advances `pos_`, failure restores it.
-  Recognition-only for PA6 (no AST; graded artifact is OK/BAD), but keep
-  one-function-per-nonterminal boundaries so pa7+ can return typed nodes.
-- `dev/recog.cpp` — thin adapter: argv, build-info snapshot (as
-  `dev/preproc.cpp`), per-srcfile engine run → collector → parser → OK/BAD
-  line, per-file `catch (exception&)` → BAD, outer envelope, EXIT_SUCCESS.
-- `dev/frontend_source_sets.mk` — recog gains parser + full preproc set.
+Owning boundaries (spec.md §1: the PA6 parser is the seed of the
+production parser; later stages extend it):
 
-Core semantic rules the grammar alone does not express:
+- `dev/src/preproc_engine.h/.cpp` — token production.
+  `RunSingleFile(srcfile, sink)` feeds a caller-supplied
+  `IPostTokenOutputStream`, sharing per-srcfile reset and the token
+  pipeline with the PA5 text writer (whose output stays byte-identical).
+- `dev/src/parser/recog_token.h/.cpp` — PA6 terminal layer. `Pa6Token`
+  is classified once at construction: kind (simple/identifier/literal/
+  rshift-half/eof), `ETokenType`, and a flags bitmask holding the mock
+  name-lookup categories (C/T/Y/E/N via `NameCategoryMask`, the single
+  classification authority), final/override, and the empty-string/zero
+  literal facts. The collector splits OP_RSHIFT into ST_RSHIFT_1 +
+  ST_RSHIFT_2, throws on invalid posttokens, and appends ST_EOF.
+- `dev/src/parser/recog_parser.h/.cpp/_cp2.cpp` — recursive-descent
+  recognizer, one `parse_foo` per nonterminal returning bool; success
+  advances `pos_`, failure restores position + bracket depth.
+  Recognition-only for PA6, but per-nonterminal boundaries are kept so
+  pa7+ can return typed nodes.
+- `dev/recog.cpp` — thin adapter: argv, build-info snapshot, fresh
+  engine + collector + parser per srcfile, per-file catch → BAD.
+- `dev/frontend_source_sets.mk` — recog links parser + full preproc set.
 
-1. decl-specifier-seq type commitment: while parsing `decl-specifier+`, a
-   type-name (category identifier or simple-template-id) is accepted as a
-   type-specifier iff no previous type-specifier other than cv-qualifiers
-   was seen. Thread a `seen_type` flag as a parameter (keeps memo sound).
-2. close-angle-bracket (14.2.3): maintain a bracket-context stack
-   (`() [] {} <>`). While the innermost open bracket is `<`, refuse to
-   match OP_GT / ST_RSHIFT_1 / ST_RSHIFT_2 as relational/shift operators;
-   they are reserved for `close-angle-bracket`. `(`/`[`/`{` push a
-   non-angle context that re-enables them. Each ST_RSHIFT half closes one
-   angle level (`TC1<TC2<6>>` — halves close inner then outer).
-3. template-name angle commitment: when an identifier with the T category
-   (or an operator/literal-operator-id in template-id position) is
-   directly followed by OP_LT, commit to template-argument-list; on
-   failure do NOT fall back to `<` as an operator. Proof fixture:
-   `course/pa6/500-template-name-angle-commit-bad.t` (`int x = T1 < 2;` →
-   BAD).
-4. 6.8 statement disambiguation: in `parse_statement`, try
-   declaration-statement before expression-statement (after labeled/
-   keyword-led alternatives); expression wins only if declaration fails.
-5. 8.2 declarator disambiguation: in noptr-declarator-suffix and
-   parameter parsing, try `( parameter-declaration-clause )` before
-   treating `(...)` as an initializer; type-id before expression in
-   template-argument, then id-expression (ordered alternatives).
-6. Greedy `foo*`/`foo+` matching, no shorter-sequence retry (README
-   design notes); factor shared `attribute-specifier*` prefixes once.
+Semantic rules beyond the grammar (all reference/fixture-pinned):
 
-## Failure Map
+1. decl-specifier-seq type commitment (7.1.6.2p2): once a non-cv
+   type-specifier is seen, an identifier/`::` ends the seq (it can only
+   be the declarator). Enforced inside the memoized seq parse.
+2. close-angle-bracket (14.2.3): one bracket stack; `<` pushes an angle
+   context only at committed template points; while the innermost
+   bracket is an angle, `>`/`>>`-halves are reserved for
+   close-angle-bracket; each ST_RSHIFT half closes one level.
+3. Template angle commitment: a T-category name (or operator/literal-id)
+   directly followed by `<` commits to a template-argument-list; failure
+   is a hard failure with no operator-`<` fallback (course 500 fixture).
+4. 6.8: statements try declaration-statement before expression-statement.
+5. 8.2: parameters before initializers, type-id before expression in
+   template arguments and sizeof/alignof.
+6. Greedy `foo*`/`foo+` matching, no shorter-sequence retry; a
+   ptr-operator-free noptr-declarator followed by `->` takes a trailing
+   return type (no other continuation is grammatical).
 
-Single root cause: `DoRecog` is the handout stub throwing
-`NotImplementedException` → all 47 pa6 tests fail with
-EXIT_NOT_IMPLEMENTED (32 in `pa6/tests/`, 15 in `pa6/course/pa6/`).
-No prior-stage failures: through-pa5 is 0-fail; fileAudit passes.
-Ownership of the fix: token acquisition seam (preproc_engine), terminal
-layer + parser (new `dev/src/parser/`), tool envelope (recog.cpp).
-
-Fixture groups: 1xx smoke (empty/main/bad-token); 12x–20x expressions
-(primary, id-expression, lambda, postfix, unary, cast, pm, binops,
-condexpr); 15x statements/attributes; 25x–30x declarations/declarators/
-enum/members; 180/400/450 linkage/exceptions/dots/templates; 270 typeid;
-5xx angle brackets (3 tests + 3 course); 600/700 ambiguity (6.8/8.2);
-course `-bad` negatives (empty case expr, invalid token in balanced scan,
-try without handler, ellipsis without comma, deep template failure).
-
-## Performance Risks
-
-- Exponential backtracking on nested template arguments:
-  `course/pa6/500-deep-template-argument-failure-bad.t` nests `TC1<` ~96
-  deep and fails; template-argument tries constant-expression / type-id /
-  id-expression, each re-descending into the same nested
-  simple-template-id → 3^depth without memoization. Mitigation: memo
-  table keyed `(rule_id, pos, angle_refusal_flag)` → `{ok, end_pos}` via
-  a common wrapper on the hot family (simple-template-id,
-  template-argument-list, type-id, expression entry points; uniform
-  application is acceptable). Bound: O(rules × tokens × 2). The angle
-  flag MUST be in the key or the 5xx angle fixtures flip.
-- Do not memoize context-parameterized rules (decl-specifier-seq family
-  with `seen_type`) unless the flag is part of the key.
-- Budget: fixtures are < 2KB; every test must finish far under the 10s
-  runner cap — target < 100ms each; deep-template probe is the canary.
-- File audit caps (`cppgm_file_audit.pl`): source ≤ 3000 lines, function
-  ≤ 240 lines, duplicate-block detector — 197 parse functions will need
-  the parser split across `dev/src/parser/` files (e.g. expressions vs
-  declarations) and shared helpers for repeated shapes (bracketed lists,
-  ordered alternatives).
+Performance design: memo keyed `(rule_id, pos, angle_refusal)` over six
+net-zero-bracket rules — simple-template-id, expression,
+constant-expression, type-id, template-argument (bounds the 3^depth
+deep-template backtracking) and decl-specifier-seq (bounds the 2^depth
+function-definition→simple-declaration re-parse of nested class bodies).
+Key soundness rests on deterministic angle pushes (rule 3); the
+angle-refusal bit covers template-argument extent. Evidence and scaling
+measurements in `pa6/audit.md`.
 
 ## Checkpoint Ledger
 
 - CP1 (COMPLETE) — token pipeline + parser core: engine seam, terminal
   layer, recog envelope, parser infra (backtracking, bracket/angle
-  context, memo), expression + statement + simple-declaration spine
-  (declarators, parameters, initializers, attributes, new/delete,
-  function-definition). Evidence: final `make test-pa6` is 34/47 (13
-  deferred CP2 failures) from 0/47 at checkpoint start; all named CP1
-  groups pass, the deep-template probe is 0.009s, prior-through-pa5 is
-  260/260, and the pa6 source audit passes.
-- CP2 (COMPLETE) — declaration breadth: class-specifier/members/base clauses,
-  enum, namespace/using/linkage/asm/alias, template-declaration + explicit
-  inst/spec, operator/conversion/literal-operator ids, exceptions, and full
-  lambda. Evidence: `make test-pa6` is 47/47 (13/13 packet fixtures flipped),
-  prior-through-pa5 is 260/260, the deep-template probe is 0.07s, and the
-  pa6 source audit passes (one non-fatal header-division warning).
-- CP3 (ACTIVE) — disambiguation and hardening: exact 6.8/8.2 and
-  angle-commit behavior on all fixtures, deep-template performance in budget,
-  differential probes on grey ill-formed-but-syntactic cases, final
-  `make test-report-through-pa6` 0-fail. New fixtures only for a real gap.
-
-## Active Checkpoint — CP3: disambiguation and hardening
-
-Harden declaration-vs-expression and type-id-vs-expression ordering, template
-angle commitment, malformed balanced input, and memoized failure behavior
-without regressing the completed declaration breadth.
-
-### Implementation Packet
-
-Files/symbols to edit:
-- `dev/src/parser/recog_parser.cpp` and `dev/src/parser/recog_parser_cp2.cpp`:
-  trace and harden ordered alternatives, angle-context keys, and failure
-  restoration; add focused coverage only when a semantic gap is demonstrated.
-- Named proof inputs: pa6 angle/ambiguity and malformed course fixtures;
-  keep the preprocessor/token envelope unchanged.
-
-Proof targets: prior-through-pa5, full pa6, file audit, and the deep-template
-probe remain clean; then finish with `make test-report-through-pa6`.
+  context, memo), expression + statement + simple-declaration spine.
+  Evidence: 34/47 pa6 from 0/47; through-pa5 260/260; deep-template
+  probe 0.009 s; pa6 source audit passes.
+- CP2 (COMPLETE) — declaration breadth: class/members/base clauses,
+  enum, namespace/using/linkage/asm/alias, template declarations and
+  explicit inst/spec, operator/conversion/literal-operator ids,
+  exceptions, full lambda. Evidence: 47/47 pa6; through-pa5 260/260;
+  deep-template 0.07 s; audit passes.
+- CP3 (COMPLETE) — final architecture audit and hardening: implemented
+  the missing decl-specifier commitment rule, block-declaration
+  statements (+ namespace-alias extraction, two restore bugs), trailing
+  return types, statement attributes, noptr-new-declarator; memoized
+  decl-specifier-seq to kill the exponential nested-class re-parse;
+  moved name classification into token construction; deduplicated memo
+  ids and removed dead code. Evidence: 313/313 with six new fixtures;
+  ~150 differential probes clean modulo the recorded leniency envelope;
+  linear scaling on 20k-line probes; audit passes.

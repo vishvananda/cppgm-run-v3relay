@@ -10,9 +10,11 @@ using std::string;
 #include "IPPTokenStream.h"
 #include "posttoken_stream.h"
 
-// The recognizer deliberately keeps the post-token spelling alongside the
-// token category.  The grammar uses the category for terminals and the
-// spelling for the PA6 mock name lookup.
+// The recognizer classifies each token once at construction: the PA6 mock
+// name lookup (letter categories), final/override, and the empty-string and
+// zero literal facts all land in the flags bitmask, so the parser never
+// re-derives facts from the spelling.  The spelling is retained only for
+// diagnostics.
 enum Pa6TokenKind
 {
 	PA6_SIMPLE_TOKEN,

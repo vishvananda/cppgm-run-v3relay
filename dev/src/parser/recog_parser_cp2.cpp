@@ -2,11 +2,6 @@
 
 using namespace std;
 
-namespace
-{
-const unsigned MemoTemplateArgument = 5;
-}
-
 bool Pa6Parser::parse_template_argument_dots()
 {
 	if (!parse_template_argument())
@@ -17,7 +12,7 @@ bool Pa6Parser::parse_template_argument_dots()
 
 bool Pa6Parser::parse_template_argument()
 {
-	return try_memoized(MemoTemplateArgument,
+	return try_memoized(MEMO_TEMPLATE_ARGUMENT,
 		&Pa6Parser::parse_template_argument_impl);
 }
 
@@ -250,37 +245,45 @@ fail:
 	return false;
 }
 
+bool Pa6Parser::parse_namespace_alias_definition()
+{
+	const size_t start = pos_;
+	const size_t context = brackets_.size();
+	if (!consume_simple(KW_NAMESPACE) || !consume_identifier() ||
+		!consume_simple(OP_ASS))
+		goto fail;
+	{
+		const size_t qualified = pos_;
+		const size_t qualified_context = brackets_.size();
+		if (parse_nested_name_specifier())
+		{
+			if (!parse_namespace_name())
+				goto fail;
+		}
+		else
+		{
+			restore(qualified, qualified_context);
+			if (!parse_namespace_name())
+				goto fail;
+		}
+	}
+	if (!consume_simple(OP_SEMICOLON))
+		goto fail;
+	return true;
+fail:
+	restore(start, context);
+	return false;
+}
+
 bool Pa6Parser::parse_namespace_definition()
 {
 	const size_t start = pos_;
 	const size_t context = brackets_.size();
 	consume_simple(KW_INLINE);
 	if (!consume_simple(KW_NAMESPACE))
-		return false;
-	const bool named = token(pos_).IsIdentifier();
-	if (named)
-	{
+		goto fail;
+	if (token(pos_).IsIdentifier())
 		++pos_;
-		if (consume_simple(OP_ASS))
-		{
-			const size_t qualified = pos_;
-			const size_t qualified_context = brackets_.size();
-			if (parse_nested_name_specifier())
-			{
-				if (!parse_namespace_name())
-					goto fail;
-			}
-			else
-			{
-				restore(qualified, qualified_context);
-				if (!parse_namespace_name())
-					goto fail;
-			}
-			if (!consume_simple(OP_SEMICOLON))
-				goto fail;
-			return true;
-		}
-	}
 	if (!enter_bracket(OP_LBRACE))
 		goto fail;
 	while (!is_simple(OP_RBRACE))
@@ -346,7 +349,7 @@ bool Pa6Parser::parse_linkage_specification()
 	const size_t start = pos_;
 	const size_t context = brackets_.size();
 	if (!consume_simple(KW_EXTERN) || !consume_literal())
-		return false;
+		goto fail;
 	if (enter_bracket(OP_LBRACE))
 	{
 		while (!is_simple(OP_RBRACE))
@@ -372,7 +375,10 @@ bool Pa6Parser::parse_alias_declaration()
 	const size_t start = pos_;
 	const size_t context = brackets_.size();
 	if (!consume_simple(KW_USING) || !consume_identifier())
+	{
+		restore(start, context);
 		return false;
+	}
 	while (parse_attribute_specifier())
 	{
 	}
@@ -670,8 +676,7 @@ bool Pa6Parser::parse_member_declaration()
 			restore(start, context);
 			return false;
 		}
-		if (is_simple(OP_COLON) ||
-			(start != pos_ && token(pos_ - 1).IsSimple(OP_COLON)))
+		if (start != pos_ && token(pos_ - 1).IsSimple(OP_COLON))
 		{
 			if (!parse_constant_expression())
 			{

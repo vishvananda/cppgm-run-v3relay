@@ -9,7 +9,7 @@ unsigned TokenFlags(Pa6TokenKind kind, const string& spelling)
 {
 	if (kind == PA6_IDENTIFIER_TOKEN)
 	{
-		unsigned flags = 0;
+		unsigned flags = NameCategoryMask(spelling);
 		if (spelling == "final")
 			flags |= PA6_FINAL_FLAG;
 		if (spelling == "override")

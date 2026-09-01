@@ -23,6 +23,19 @@ private:
 		BRACKET_ANGLE
 	};
 
+	// Single authority for memo rule ids shared by all parser translation
+	// units.  Every memoized rule must key on (rule, position, angle refusal)
+	// and be net-zero on the bracket stack.
+	enum MemoRule
+	{
+		MEMO_SIMPLE_TEMPLATE_ID = 1,
+		MEMO_EXPRESSION,
+		MEMO_CONSTANT_EXPRESSION,
+		MEMO_TYPE_ID,
+		MEMO_TEMPLATE_ARGUMENT,
+		MEMO_DECL_SPECIFIER_SEQ
+	};
+
 	struct MemoEntry
 	{
 		bool ok;
@@ -65,6 +78,7 @@ private:
 	bool parse_new_placement();
 	bool parse_new_type_id();
 	bool parse_new_declarator();
+	bool parse_noptr_new_declarator();
 	bool parse_new_initializer();
 	bool parse_delete_expression();
 	bool parse_noexcept_expression();
@@ -104,7 +118,8 @@ private:
 	bool parse_declaration_statement();
 
 	bool parse_decl_specifier();
-	bool parse_decl_specifier_seq(bool* seen_type = 0);
+	bool parse_decl_specifier_seq();
+	bool parse_decl_specifier_seq_impl();
 	bool parse_storage_class_specifier();
 	bool parse_function_specifier();
 	bool parse_type_specifier();
@@ -174,6 +189,7 @@ private:
 	bool parse_class_specifier();
 	bool parse_enum_specifier();
 	bool parse_namespace_definition();
+	bool parse_namespace_alias_definition();
 	bool parse_template_declaration();
 	bool parse_explicit_instantiation();
 	bool parse_explicit_specialization();
@@ -210,7 +226,6 @@ private:
 	bool try_memoized(unsigned rule_id, bool (Pa6Parser::*implementation)());
 	std::uint64_t memo_key(unsigned rule_id) const;
 	bool is_name_category(unsigned category) const;
-	bool is_type_start() const;
 	bool is_assignment_operator_token() const;
 	bool is_simple_type_token() const;
 

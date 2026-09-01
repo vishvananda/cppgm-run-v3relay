@@ -112,14 +112,30 @@ bool IsOperatorFunctionToken(ETokenType type)
 	}
 }
 
-enum MemoRule
+// 7.1.6.2p2: these may appear in a decl-specifier-seq without committing it
+// to a type; only a type-specifier other than a cv-qualifier commits.
+bool IsNonCommittingSpecifier(ETokenType type)
 {
-	MEMO_SIMPLE_TEMPLATE_ID = 1,
-	MEMO_EXPRESSION,
-	MEMO_CONSTANT_EXPRESSION,
-	MEMO_TYPE_ID,
-	MEMO_TEMPLATE_ARGUMENT
-};
+	switch (type)
+	{
+	case KW_CONST:
+	case KW_VOLATILE:
+	case KW_REGISTER:
+	case KW_STATIC:
+	case KW_THREAD_LOCAL:
+	case KW_EXTERN:
+	case KW_MUTABLE:
+	case KW_INLINE:
+	case KW_VIRTUAL:
+	case KW_EXPLICIT:
+	case KW_FRIEND:
+	case KW_TYPEDEF:
+	case KW_CONSTEXPR:
+		return true;
+	default:
+		return false;
+	}
+}
 
 } // namespace
 
@@ -249,11 +265,10 @@ bool Pa6Parser::try_memoized(unsigned rule_id,
 		return found->second.ok;
 	}
 
-	const bool hard_before = hard_failure_;
 	const bool ok = (this->*implementation)();
 	if (!ok)
 		restore(start, context);
-	if (!hard_before && !hard_failure_)
+	if (!hard_failure_)
 	{
 		MemoEntry entry;
 		entry.ok = ok;
@@ -265,8 +280,8 @@ bool Pa6Parser::try_memoized(unsigned rule_id,
 
 bool Pa6Parser::is_name_category(unsigned category) const
 {
-	return token(pos_).IsIdentifier() &&
-		(NameCategoryMask(token(pos_).spelling) & category) != 0;
+	// Name-category bits are set only on identifier tokens.
+	return (token(pos_).flags & category) != 0;
 }
 
 bool Pa6Parser::is_simple_type_token() const
@@ -274,18 +289,6 @@ bool Pa6Parser::is_simple_type_token() const
 	return token(pos_).kind == PA6_SIMPLE_TOKEN &&
 		(IsBuiltinType(token(pos_).simple_type) ||
 		 IsCVQualifier(token(pos_).simple_type));
-}
-
-bool Pa6Parser::is_type_start() const
-{
-	if (is_simple_type_token() || is_simple(KW_DECLTYPE) ||
-		is_simple(KW_TYPENAME) || is_simple(KW_CLASS) ||
-		is_simple(KW_STRUCT) || is_simple(KW_UNION) || is_simple(KW_ENUM))
-		return true;
-	return token(pos_).IsIdentifier() &&
-		(NameCategoryMask(token(pos_).spelling) &
-		 (PA6_NAME_CLASS_FLAG | PA6_NAME_TEMPLATE_FLAG |
-		  PA6_NAME_TYPEDEF_FLAG | PA6_NAME_ENUM_FLAG)) != 0;
 }
 
 bool Pa6Parser::is_assignment_operator_token() const
@@ -330,13 +333,13 @@ bool Pa6Parser::parse_declaration()
 	if (hard_failure_)
 		return false;
 	restore(start, context);
-	if (parse_simple_declaration() || parse_empty_declaration() ||
-		parse_attribute_declaration() || parse_static_assert_declaration())
+	if (parse_block_declaration() || parse_empty_declaration() ||
+		parse_attribute_declaration())
 		return true;
 	if (hard_failure_)
 		return false;
 	restore(start, context);
-	if (parse_block_declaration() || parse_template_declaration() ||
+	if (parse_template_declaration() ||
 		parse_explicit_instantiation() || parse_explicit_specialization() ||
 		parse_linkage_specification() || parse_namespace_definition())
 		return true;
@@ -450,6 +453,7 @@ bool Pa6Parser::parse_block_declaration()
 	const size_t context = brackets_.size();
 	if (parse_alias_declaration() || parse_using_declaration() ||
 		parse_using_directive() || parse_asm_definition() ||
+		parse_namespace_alias_definition() ||
 		parse_static_assert_declaration() || parse_simple_declaration())
 		return true;
 	restore(start, context);
@@ -540,9 +544,7 @@ bool Pa6Parser::parse_simple_template_id_impl()
 {
 	const size_t start = pos_;
 	const size_t context = brackets_.size();
-	if (!token(pos_).IsIdentifier() ||
-		(NameCategoryMask(token(pos_).spelling) &
-		 PA6_NAME_TEMPLATE_FLAG) == 0)
+	if ((token(pos_).flags & PA6_NAME_TEMPLATE_FLAG) == 0)
 		return false;
 	++pos_;
 	if (!is_simple(OP_LT))
@@ -628,8 +630,8 @@ bool Pa6Parser::parse_unqualified_id()
 	}
 	if (!token(pos_).IsIdentifier())
 		return false;
-	if ((NameCategoryMask(token(pos_).spelling) &
-		 PA6_NAME_TEMPLATE_FLAG) != 0 && is_simple(OP_LT, pos_ + 1))
+	if ((token(pos_).flags & PA6_NAME_TEMPLATE_FLAG) != 0 &&
+		is_simple(OP_LT, pos_ + 1))
 	{
 		if (parse_simple_template_id())
 			return true;
@@ -726,17 +728,11 @@ bool Pa6Parser::parse_operator_function_id()
 		return false;
 	if (consume_simple(KW_NEW) || consume_simple(KW_DELETE))
 	{
+		const size_t after_key = pos_;
 		if (enter_bracket(OP_LSQUARE) && leave_bracket(OP_RSQUARE))
 			return true;
-		restore(start, context);
-		// The non-array form is valid too; restore the keyword consumption
-		// without requiring a second parse of the operator token.
-		if (!consume_simple(KW_OPERATOR) ||
-			(!consume_simple(KW_NEW) && !consume_simple(KW_DELETE)))
-		{
-			restore(start, context);
-			return false;
-		}
+		// The non-array form is valid too.
+		restore(after_key, context);
 		return true;
 	}
 	if (is_kind(PA6_RSHIFT_1_TOKEN) &&
@@ -855,36 +851,40 @@ bool Pa6Parser::parse_decl_specifier()
 	return false;
 }
 
-bool Pa6Parser::parse_decl_specifier_seq(bool* seen_type)
+// Memoized: the seq is re-parsed whenever the function-definition attempt
+// falls back to simple-declaration (and likewise per member), so without a
+// memo each class-specifier nesting level doubles the parse of its subtree.
+bool Pa6Parser::parse_decl_specifier_seq()
 {
-	const size_t start = pos_;
-	const size_t context = brackets_.size();
+	return try_memoized(MEMO_DECL_SPECIFIER_SEQ,
+		&Pa6Parser::parse_decl_specifier_seq_impl);
+}
+
+bool Pa6Parser::parse_decl_specifier_seq_impl()
+{
 	bool any = false;
-	bool type_seen = false;
+	bool committed = false;
 	for (;;)
 	{
-		const bool candidate = is_type_start();
+		// README/7.1.6.2p2: a type-name is part of the decl-specifier-seq
+		// only if no previous type-specifier other than a cv-qualifier was
+		// seen.  An identifier or qualified name here can only match via
+		// type-name, so once committed it belongs to the declarator.
+		if (committed &&
+			(token(pos_).IsIdentifier() || is_simple(OP_COLON2)))
+			break;
 		const size_t before = pos_;
 		if (!parse_decl_specifier())
 			break;
 		any = true;
-		if (candidate || (before != pos_ &&
-			(token(before).kind == PA6_SIMPLE_TOKEN &&
-			 (IsBuiltinType(token(before).simple_type) ||
-			  IsCVQualifier(token(before).simple_type)))))
-			type_seen = true;
+		if (token(before).kind != PA6_SIMPLE_TOKEN ||
+			!IsNonCommittingSpecifier(token(before).simple_type))
+			committed = true;
 	}
 	while (parse_attribute_specifier())
 	{
 	}
-	if (!any)
-	{
-		restore(start, context);
-		return false;
-	}
-	if (seen_type != 0)
-		*seen_type = type_seen;
-	return true;
+	return any;
 }
 
 bool Pa6Parser::parse_storage_class_specifier()
@@ -1151,14 +1151,9 @@ bool Pa6Parser::parse_postfix_suffix()
 	{
 		if (parse_pseudo_destructor_name())
 			return true;
-		restore(start, context);
-		if (consume_simple(OP_DOT) || consume_simple(OP_ARROW))
-		{
-			const bool has_template_keyword = consume_simple(KW_TEMPLATE);
-			if ((!has_template_keyword || parse_id_expression()) &&
-				(has_template_keyword || parse_id_expression()))
-				return true;
-		}
+		consume_simple(KW_TEMPLATE);
+		if (parse_id_expression())
+			return true;
 		restore(start, context);
 	}
 
@@ -1199,15 +1194,16 @@ bool Pa6Parser::parse_unary_expression()
 	restore(start, context);
 	if (consume_simple(KW_SIZEOF))
 	{
+		const size_t after_sizeof = pos_;
 		if (consume_simple(OP_DOTS) && enter_bracket(OP_LPAREN) &&
 			consume_identifier() && leave_bracket(OP_RPAREN))
 			return true;
-		restore(start, context);
-		if (consume_simple(KW_SIZEOF) && enter_bracket(OP_LPAREN) &&
-			parse_type_id() && leave_bracket(OP_RPAREN))
+		restore(after_sizeof, context);
+		if (enter_bracket(OP_LPAREN) && parse_type_id() &&
+			leave_bracket(OP_RPAREN))
 			return true;
-		restore(start, context);
-		if (consume_simple(KW_SIZEOF) && parse_unary_expression())
+		restore(after_sizeof, context);
+		if (parse_unary_expression())
 			return true;
 		restore(start, context);
 	}
@@ -1304,12 +1300,43 @@ bool Pa6Parser::parse_new_declarator()
 	bool any = false;
 	while (parse_ptr_operator())
 		any = true;
-	if (parse_noptr_declarator())
+	if (parse_noptr_new_declarator())
 		return true;
 	if (any)
 		return true;
 	restore(start, context);
 	return false;
+}
+
+bool Pa6Parser::parse_noptr_new_declarator()
+{
+	const size_t start = pos_;
+	const size_t context = brackets_.size();
+	if (!enter_bracket(OP_LSQUARE) || !parse_expression() ||
+		!leave_bracket(OP_RSQUARE))
+	{
+		restore(start, context);
+		return false;
+	}
+	while (parse_attribute_specifier())
+	{
+	}
+	for (;;)
+	{
+		const size_t next = pos_;
+		const size_t next_context = brackets_.size();
+		if (enter_bracket(OP_LSQUARE) && parse_constant_expression() &&
+			leave_bracket(OP_RSQUARE))
+		{
+			while (parse_attribute_specifier())
+			{
+			}
+			continue;
+		}
+		restore(next, next_context);
+		break;
+	}
+	return true;
 }
 
 bool Pa6Parser::parse_new_initializer()
@@ -1665,7 +1692,13 @@ bool Pa6Parser::parse_statement()
 	if (hard_failure_)
 		return false;
 	restore(start, context);
-	if (parse_labeled_statement() || parse_expression_statement() ||
+	if (parse_labeled_statement())
+		return true;
+	restore(start, context);
+	while (parse_attribute_specifier())
+	{
+	}
+	if (parse_expression_statement() ||
 		parse_compound_statement() || parse_selection_statement() ||
 		parse_iteration_statement() || parse_jump_statement() ||
 		parse_try_block())
@@ -1900,15 +1933,13 @@ bool Pa6Parser::parse_jump_statement()
 	restore(start, context);
 	if (consume_simple(KW_RETURN))
 	{
+		const size_t after_return = pos_;
 		if (parse_braced_init_list() && consume_simple(OP_SEMICOLON))
 			return true;
-		restore(start, context);
-		if (consume_simple(KW_RETURN))
-		{
-			if ((is_simple(OP_SEMICOLON) || parse_expression()) &&
-				consume_simple(OP_SEMICOLON))
-				return true;
-		}
+		restore(after_return, context);
+		if ((is_simple(OP_SEMICOLON) || parse_expression()) &&
+			consume_simple(OP_SEMICOLON))
+			return true;
 	}
 	restore(start, context);
 	if (consume_simple(KW_GOTO) && consume_identifier() &&
@@ -1920,13 +1951,7 @@ bool Pa6Parser::parse_jump_statement()
 
 bool Pa6Parser::parse_declaration_statement()
 {
-	const size_t start = pos_;
-	const size_t context = brackets_.size();
-	if (parse_simple_declaration() || parse_static_assert_declaration() ||
-		parse_empty_declaration() || parse_attribute_declaration())
-		return true;
-	restore(start, context);
-	return false;
+	return parse_block_declaration();
 }
 
 bool Pa6Parser::parse_attribute_specifier()
@@ -2135,13 +2160,22 @@ bool Pa6Parser::parse_declarator()
 {
 	const size_t start = pos_;
 	const size_t context = brackets_.size();
-	if (parse_ptr_declarator())
-		return true;
-	restore(start, context);
-	if (parse_noptr_declarator() && parse_trailing_return_type())
-		return true;
-	restore(start, context);
-	return false;
+	bool any_ptr = false;
+	while (parse_ptr_operator())
+		any_ptr = true;
+	if (!parse_noptr_declarator())
+	{
+		restore(start, context);
+		return false;
+	}
+	// declarator: noptr-declarator trailing-return-type (no ptr prefix).
+	// An OP_ARROW can follow a declarator only as a trailing return type.
+	if (!any_ptr && is_simple(OP_ARROW) && !parse_trailing_return_type())
+	{
+		restore(start, context);
+		return false;
+	}
+	return true;
 }
 
 bool Pa6Parser::parse_ptr_declarator()
@@ -2327,13 +2361,18 @@ bool Pa6Parser::parse_abstract_declarator()
 {
 	const size_t start = pos_;
 	const size_t context = brackets_.size();
+	// noptr-abstract-declarator? trailing-return-type: longest match first,
+	// since a bare noptr parse would strand the OP_ARROW.
+	if (parse_noptr_abstract_declarator() && parse_trailing_return_type())
+		return true;
+	restore(start, context);
+	if (parse_trailing_return_type())
+		return true;
+	restore(start, context);
 	if (parse_ptr_abstract_declarator() || parse_abstract_pack_declarator())
 		return true;
 	restore(start, context);
 	if (parse_noptr_abstract_declarator())
-		return true;
-	restore(start, context);
-	if (parse_trailing_return_type())
 		return true;
 	restore(start, context);
 	return false;
