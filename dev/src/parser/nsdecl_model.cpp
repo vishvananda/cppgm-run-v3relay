@@ -32,6 +32,16 @@ bool IsReferenceKind(Pa7TypeKind kind)
 		kind == PA7_TYPE_RVALUE_REFERENCE;
 }
 
+// A bound spelled as a non-literal constant expression has value 0 until the
+// semantic pass evaluates it; two such bounds compare equal only if they are
+// the same expression.  Known (nonzero) bounds compare by value.
+bool SameArrayBound(const Pa7TypePtr& left, const Pa7TypePtr& right)
+{
+	if (left->bound != 0 && right->bound != 0)
+		return left->bound == right->bound;
+	return left->bound_expression == right->bound_expression;
+}
+
 bool SameTypeImpl(const Pa7TypePtr& left, const Pa7TypePtr& right)
 {
 	if (left == right)
@@ -54,10 +64,7 @@ bool SameTypeImpl(const Pa7TypePtr& left, const Pa7TypePtr& right)
 			SameTypeImpl(left->children[0], right->children[0]);
 	case PA7_TYPE_ARRAY:
 		return left->has_bound == right->has_bound &&
-			(!left->has_bound ||
-			 (left->bound_expression || right->bound_expression ?
-				left->bound_expression == right->bound_expression :
-				left->bound == right->bound)) &&
+			(!left->has_bound || SameArrayBound(left, right)) &&
 			left->children.size() == 1 && right->children.size() == 1 &&
 			SameTypeImpl(left->children[0], right->children[0]);
 	case PA7_TYPE_FUNCTION:
@@ -122,6 +129,25 @@ Pa7TypePtr MergeTypeImpl(const Pa7TypePtr& first, const Pa7TypePtr& second)
 	}
 }
 
+// 3.5: a function signature is its name and parameter types.  Two same-name
+// declarations whose parameter lists agree name one entity, so any remaining
+// type difference (the return type) is a redeclaration conflict, not an
+// overload.
+bool SameSignature(const Pa7TypePtr& first, const Pa7TypePtr& second)
+{
+	Pa7TypePtr left = StripCV(first);
+	Pa7TypePtr right = StripCV(second);
+	if (!left || !right || left->kind != PA7_TYPE_FUNCTION ||
+		right->kind != PA7_TYPE_FUNCTION ||
+		left->varargs != right->varargs ||
+		left->children.size() != right->children.size())
+		return false;
+	for (size_t i = 0; i < left->children.size(); ++i)
+		if (!SameTypeImpl(left->children[i], right->children[i]))
+			return false;
+	return true;
+}
+
 void PrintNamespace(ostream& out, const Pa7Namespace& ns, bool global)
 {
 	if (global || ns.unnamed)
@@ -143,6 +169,8 @@ void PrintNamespace(ostream& out, const Pa7Namespace& ns, bool global)
 	out << "end namespace" << endl;
 }
 
+} // namespace
+
 bool RedeclarationTypesAgree(const Pa7TypePtr& first, const Pa7TypePtr& second)
 {
 	if (SameType(first, second))
@@ -152,14 +180,19 @@ bool RedeclarationTypesAgree(const Pa7TypePtr& first, const Pa7TypePtr& second)
 	if (first->kind == PA7_TYPE_ARRAY &&
 		first->children.size() == 1 && second->children.size() == 1)
 	{
+		// Bounds still awaiting constant evaluation (value 0 with a retained
+		// expression) are accepted here; the semantic pass re-checks every
+		// declared type once bounds are evaluated.
 		return (!first->has_bound || !second->has_bound ||
-			(first->bound_expression || second->bound_expression ?
-				first->bound_expression == second->bound_expression :
-				first->bound == second->bound)) &&
+			first->bound == 0 || second->bound == 0 ||
+			first->bound == second->bound) &&
 			RedeclarationTypesAgree(first->children[0], second->children[0]);
 	}
 	return false;
 }
+
+namespace
+{
 
 void CheckDeclarationAttributes(const Pa7Variable& prior,
 	const Pa7DeclAttributes& next, bool strict)
@@ -214,8 +247,10 @@ void CheckDeclarationAttributes(const Pa7Function& prior,
 	if (prior.linkage != PA7_LINKAGE_UNSPECIFIED &&
 		next.linkage_explicit && prior.linkage != next.linkage)
 		throw runtime_error("linkage does not agree across redeclarations");
-	if (prior.defined && next.defined && !prior.is_inline &&
-		!next.is_inline)
+	// 3.2p1: no translation unit contains more than one definition; an
+	// inline function may be redefined in another unit, never in the same
+	// one (probe p86).
+	if (prior.defined && next.defined)
 		throw runtime_error("more than one definition");
 }
 
@@ -386,6 +421,18 @@ bool IsFunction(const Pa7TypePtr& type)
 	return StripCV(type) && StripCV(type)->kind == PA7_TYPE_FUNCTION;
 }
 
+bool IsConstQualified(const Pa7TypePtr& type)
+{
+	if (!type)
+		return false;
+	if (type->kind == PA7_TYPE_CV)
+		return (type->cv & PA7_CV_CONST) != 0 ||
+			(!type->children.empty() && IsConstQualified(type->children[0]));
+	if (type->kind == PA7_TYPE_ARRAY && !type->children.empty())
+		return IsConstQualified(type->children[0]);
+	return false;
+}
+
 Pa7TypePtr AdjustParameter(const Pa7TypePtr& type)
 {
 	Pa7TypePtr adjusted = StripCV(type);
@@ -444,8 +491,9 @@ Pa7Variable::Pa7Variable(const string& variable_name, const Pa7TypePtr& value,
 	: name(variable_name), type(value), owner(namespace_owner),
 		storage(PA7_STORAGE_NONE), linkage(PA7_LINKAGE_UNSPECIFIED),
 		is_const(false), is_constexpr(false), defined(false),
+		initially_defined(false),
 		order(std::numeric_limits<std::size_t>::max()),
-		initializer_expression(), initializer()
+		initializer_expression(), declared_types()
 {
 }
 
@@ -636,6 +684,8 @@ shared_ptr<Pa7Variable> Pa7Namespace::AddOrMergeVariable(
 		existing->second.variable->type = MergeTypes(
 			existing->second.variable->type, type);
 		ApplyVariableAttributes(*existing->second.variable, attributes);
+		if (strict)
+			existing->second.variable->declared_types.push_back(type);
 		return existing->second.variable;
 	}
 	shared_ptr<Pa7Variable> result(new Pa7Variable(variable_name, type, this));
@@ -644,7 +694,10 @@ shared_ptr<Pa7Variable> Pa7Namespace::AddOrMergeVariable(
 	result->is_const = attributes.is_const;
 	result->is_constexpr = attributes.is_constexpr;
 	result->defined = attributes.defined;
+	result->initially_defined = attributes.defined;
 	result->order = attributes.order;
+	if (strict)
+		result->declared_types.push_back(type);
 	Pa7Decl decl;
 	decl.kind = PA7_DECL_VARIABLE;
 	decl.variable = result;
@@ -677,6 +730,11 @@ shared_ptr<Pa7Function> Pa7Namespace::AddOrMergeFunction(
 			ApplyFunctionAttributes(*overloads[i], attributes);
 			return overloads[i];
 		}
+		if (strict)
+			for (size_t i = 0; i < overloads.size(); ++i)
+				if (SameSignature(overloads[i]->type, type))
+					throw runtime_error(
+						"function redeclaration differs only in return type");
 		shared_ptr<Pa7Function> result(new Pa7Function(function_name, type,
 			this));
 		result->storage = attributes.storage;

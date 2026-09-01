@@ -43,9 +43,11 @@ void ApplyRelocations(vector<unsigned char>& image, size_t source_offset,
 		const Pa8Relocation& relocation = value.relocs[i];
 		map<string, size_t>::const_iterator target = addresses.find(
 			relocation.symbol);
-		if (target == addresses.end())
-			throw runtime_error("unresolved relocation");
-		const int64_t address = static_cast<int64_t>(target->second);
+		// A symbol with no image object (a declared-but-undefined variable,
+		// or a static_assert string literal) resolves to address 0, matching
+		// the reference (probes p43/p59/p82).
+		const int64_t address = target == addresses.end() ? 0 :
+			static_cast<int64_t>(target->second);
 		const int64_t relocated = address +
 			static_cast<int64_t>(relocation.addend);
 		StoreLittleEndian(image, source_offset + relocation.offset,

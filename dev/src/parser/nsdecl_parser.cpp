@@ -361,39 +361,39 @@ void Pa7Parser::ParseSimpleDeclaration()
 			throw runtime_error("declaration has no name");
 
 		Pa7Namespace* destination = scopes_.back();
-			if (declarator.path.absolute || declarator.path.parts.size() > 1)
+		if (declarator.path.absolute || declarator.path.parts.size() > 1)
+		{
+			vector<string> namespace_parts(declarator.path.parts.begin(),
+				declarator.path.parts.end() - 1);
+			if (strict_mode_ && !declarator.path.absolute &&
+				scopes_.back() != global_ && !namespace_parts.empty())
 			{
-				vector<string> namespace_parts(declarator.path.parts.begin(),
-					declarator.path.parts.end() - 1);
-				if (strict_mode_ && !declarator.path.absolute &&
-					scopes_.back() != global_ && !namespace_parts.empty())
-				{
-					bool enclosing = false;
-					for (Pa7Namespace* enclosing_scope = scopes_.back();
-						enclosing_scope && enclosing_scope != global_;
-						enclosing_scope = enclosing_scope->parent)
-						if (enclosing_scope->name == namespace_parts[0])
-							enclosing = true;
-					if (!enclosing)
-						throw runtime_error(
-							"qualified declarator namespace is not enclosing");
-				}
-				destination = ResolveRelativeNamespace(scopes_.back(),
+				bool enclosing = false;
+				for (Pa7Namespace* enclosing_scope = scopes_.back();
+					enclosing_scope && enclosing_scope != global_;
+					enclosing_scope = enclosing_scope->parent)
+					if (enclosing_scope->name == namespace_parts[0])
+						enclosing = true;
+				if (!enclosing)
+					throw runtime_error(
+						"qualified declarator namespace is not enclosing");
+			}
+			destination = ResolveRelativeNamespace(scopes_.back(),
 				namespace_parts, declarator.path.absolute);
 			if (!destination)
 				throw runtime_error("qualified declarator namespace not found");
 		}
 
 		const string& name = declarator.path.parts.back();
-			SetTypeExpressionScope(declarator.type, destination);
-			if (spec.is_typedef)
-			{
-				destination->AddTypedef(name, declarator.type);
-				if (ConsumeSimple(OP_COMMA))
-					continue;
-				break;
-			}
-			if (spec.is_constexpr)
+		SetTypeExpressionScope(declarator.type, destination);
+		if (spec.is_typedef)
+		{
+			destination->AddTypedef(name, declarator.type);
+			if (ConsumeSimple(OP_COMMA))
+				continue;
+			break;
+		}
+		if (spec.is_constexpr)
 			declarator.type = ApplyCV(PA7_CV_CONST, declarator.type);
 
 		const bool function = IsFunction(declarator.type);
@@ -411,11 +411,10 @@ void Pa7Parser::ParseSimpleDeclaration()
 		if (strict_mode_ && spec.is_constexpr && !function &&
 			!has_initializer)
 			throw runtime_error("constexpr object needs an initializer");
-		if (strict_mode_ && spec.is_const && !function &&
-			!has_initializer &&
-			(spec.storage & PA7_STORAGE_EXTERN) == 0)
+		if (strict_mode_ && !function && definition && !has_initializer &&
+			IsConstQualified(declarator.type))
 			throw runtime_error("const object needs an initializer");
-		if (strict_mode_ && !function &&
+		if (strict_mode_ && !function && definition &&
 			(declarator.type->kind == PA7_TYPE_LVALUE_REFERENCE ||
 			 declarator.type->kind == PA7_TYPE_RVALUE_REFERENCE) &&
 			!has_initializer)
@@ -1029,10 +1028,16 @@ Pa8ExprPtr Pa7Parser::MakeExpression(Pa8ExprKind kind)
 	result->kind = kind;
 	result->lookup_scope = scopes_.back();
 	result->token_index = pos_;
+	// 3.4: only names declared before this point are visible; the semantic
+	// pass resolves identifiers after parsing, so it filters candidates by
+	// this declaration-count snapshot.
+	result->decl_epoch = next_order_;
 	return result;
 }
 
-Pa8ExprPtr Pa7Parser::ParsePrimaryExpression()
+// pa8.gram expression: a literal (including true/false/nullptr), an
+// id-expression, or a parenthesization thereof.
+Pa8ExprPtr Pa7Parser::ParseExpression()
 {
 	Pa6Token literal(PA6_EOF_TOKEN, "");
 	if (ConsumeLiteral(&literal))
@@ -1065,92 +1070,6 @@ Pa8ExprPtr Pa7Parser::ParsePrimaryExpression()
 		return result;
 	}
 	throw runtime_error("missing expression operand");
-}
-
-Pa8ExprPtr Pa7Parser::ParseUnaryExpression()
-{
-	if (IsSimple(OP_PLUS) || IsSimple(OP_MINUS) || IsSimple(OP_LNOT) ||
-		IsSimple(OP_COMPL) || IsSimple(OP_AMP) || IsSimple(OP_STAR))
-	{
-		const ETokenType op = Token(pos_).simple_type;
-		++pos_;
-		Pa8ExprPtr result = MakeExpression(PA8_EXPR_UNARY);
-		result->op = op;
-		result->left = ParseUnaryExpression();
-		return result;
-	}
-	return ParsePrimaryExpression();
-}
-
-int Pa7Parser::BinaryPrecedence(ETokenType type) const
-{
-	switch (type)
-	{
-	case OP_LOR: return 1;
-	case OP_LAND: return 2;
-	case OP_BOR: return 3;
-	case OP_XOR: return 4;
-	case OP_AMP: return 5;
-	case OP_EQ:
-	case OP_NE: return 6;
-	case OP_LT:
-	case OP_GT:
-	case OP_LE:
-	case OP_GE: return 7;
-	case OP_LSHIFT:
-	case OP_RSHIFT: return 8;
-	case OP_PLUS:
-	case OP_MINUS: return 9;
-	case OP_STAR:
-	case OP_DIV:
-	case OP_MOD: return 10;
-	default: return 0;
-	}
-}
-
-Pa8ExprPtr Pa7Parser::ParseExpression(unsigned minimum_precedence)
-{
-	Pa8ExprPtr left = ParseUnaryExpression();
-	for (;;)
-	{
-		const int precedence = BinaryPrecedence(Token(pos_).simple_type);
-		if (precedence < static_cast<int>(minimum_precedence))
-			break;
-		const ETokenType op = Token(pos_).simple_type;
-		++pos_;
-		Pa8ExprPtr right = ParseExpression(static_cast<unsigned>(precedence + 1));
-		Pa8ExprPtr combined = MakeExpression(PA8_EXPR_BINARY);
-		combined->op = op;
-		combined->left = left;
-		combined->right = right;
-		left = combined;
-	}
-	if (minimum_precedence == 1 && ConsumeSimple(OP_QMARK))
-	{
-		Pa8ExprPtr when_true = ParseExpression();
-		ExpectSimple(OP_COLON);
-		Pa8ExprPtr when_false = ParseExpression();
-		Pa8ExprPtr result = MakeExpression(PA8_EXPR_CONDITIONAL);
-		result->left = left;
-		result->right = when_true;
-		result->third = when_false;
-		left = result;
-	}
-	return left;
-}
-
-bool Pa7Parser::IsExpressionStart(size_t at) const
-{
-	const Pa6Token& token = Token(at);
-	if (token.kind == PA6_LITERAL_TOKEN ||
-		token.kind == PA6_IDENTIFIER_TOKEN)
-		return true;
-	return token.IsSimple(OP_COLON2) || token.IsSimple(OP_LPAREN) ||
-		token.IsSimple(KW_TRUE) || token.IsSimple(KW_FALSE) ||
-		token.IsSimple(KW_NULLPTR) || token.IsSimple(OP_PLUS) ||
-		token.IsSimple(OP_MINUS) || token.IsSimple(OP_LNOT) ||
-		token.IsSimple(OP_COMPL) || token.IsSimple(OP_AMP) ||
-		token.IsSimple(OP_STAR);
 }
 
 void Pa7Parser::ParseStaticAssertDeclaration()
@@ -1199,12 +1118,8 @@ Pa7DeclAttributes Pa7Parser::MakeAttributes(const DeclSpec& spec,
 void Pa7Parser::SetExpressionScope(const Pa8ExprPtr& expression,
 	Pa7Namespace* scope) const
 {
-	if (!expression)
-		return;
-	expression->lookup_scope = scope;
-	SetExpressionScope(expression->left, scope);
-	SetExpressionScope(expression->right, scope);
-	SetExpressionScope(expression->third, scope);
+	if (expression)
+		expression->lookup_scope = scope;
 }
 
 void Pa7Parser::SetTypeExpressionScope(const Pa7TypePtr& type,

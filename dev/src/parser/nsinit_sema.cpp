@@ -39,22 +39,6 @@ bool IsFloatingFundamental(EFundamentalType type)
 		type == FT_LONG_DOUBLE;
 }
 
-bool CompatibleTypes(const Pa7TypePtr& first, const Pa7TypePtr& second)
-{
-	if (SameType(first, second))
-		return true;
-	if (!first || !second || first->kind != second->kind)
-		return false;
-	if (first->kind == PA7_TYPE_ARRAY && first->children.size() == 1 &&
-		second->children.size() == 1)
-		return (!first->has_bound || !second->has_bound ||
-			(first->bound_expression || second->bound_expression ?
-				first->bound_expression == second->bound_expression :
-				first->bound == second->bound)) &&
-			CompatibleTypes(first->children[0], second->children[0]);
-	return false;
-}
-
 bool IsInternalVariable(const Pa7Variable& variable)
 {
 	if (variable.linkage == PA7_LINKAGE_INTERNAL)
@@ -112,13 +96,12 @@ Pa8Value::Pa8Value()
 }
 
 Pa8Temporary::Pa8Temporary()
-	: symbol(), type(), value(), first_use(numeric_limits<size_t>::max())
+	: symbol(), type(), value()
 {
 }
 
 Pa8StringLiteral::Pa8StringLiteral()
-	: symbol(), bytes(), alignment(1),
-		first_use(numeric_limits<size_t>::max())
+	: symbol(), bytes(), alignment(1)
 {
 }
 
@@ -133,8 +116,10 @@ Pa8ProgramEntity::Pa8ProgramEntity()
 Pa8ProgramSema::Pa8ProgramSema(
 	const vector<shared_ptr<Pa7Namespace> >& globals)
 	: globals_(globals), entities_(), temporaries_(), strings_(), entity_by_key_(),
-		variable_entities_(), function_entities_(), variable_states_(),
-		string_symbols_(), next_temporary_id_(0), next_string_id_(0)
+		linked_variables_(), variable_entities_(), function_entities_(),
+		variable_states_(), temporary_by_symbol_(), string_by_symbol_(),
+		string_symbols_(), next_temporary_id_(0), next_string_id_(0),
+		collect_strings_(true)
 {
 }
 
@@ -272,24 +257,58 @@ Pa8ProgramEntity* Pa8ProgramSema::FindOrCreateEntity(const string& key,
 void Pa8ProgramSema::AddVariable(Pa7Variable* variable, size_t unit)
 {
 	const string key = MakeVariableKey(variable, unit);
-	Pa8ProgramEntity* entity = FindOrCreateEntity(key, false, unit,
-		variable->order);
-	entity->variables.push_back(variable);
-	if (!entity->variable)
-		entity->variable = variable;
-	if (!entity->type)
-		entity->type = variable->type;
-	else if (!CompatibleTypes(entity->type, variable->type))
-		throw runtime_error("variable type does not agree across translation units");
-	else
-		entity->type = MergeTypes(entity->type, variable->type);
+	vector<size_t>& linked = linked_variables_[key];
+	// The reference binds a variable first declared without defining to the
+	// first linked entity of the name, while one whose first declaration is
+	// a definition binds only to a still-undefined entity and otherwise
+	// starts a new one (probes p71/p84/p85): duplicate such definitions
+	// coexist in the image.
+	size_t index = entities_.size();
+	if (variable->defined && variable->initially_defined)
+	{
+		for (size_t i = 0; i < linked.size(); ++i)
+			if (!entities_[linked[i]].defined)
+			{
+				index = linked[i];
+				break;
+			}
+	}
+	else if (!linked.empty())
+		index = linked[0];
+	if (index == entities_.size())
+	{
+		Pa8ProgramEntity entity;
+		entity.key = linked.empty() ? key :
+			key + "|" + to_string(linked.size());
+		entity.first_unit = unit;
+		entity.first_order = variable->order;
+		entities_.push_back(entity);
+		entity_by_key_[entities_[index].key] = index;
+		linked.push_back(index);
+	}
+	Pa8ProgramEntity& entity = entities_[index];
+	if (unit < entity.first_unit ||
+		(unit == entity.first_unit && variable->order < entity.first_order))
+	{
+		entity.first_unit = unit;
+		entity.first_order = variable->order;
+	}
+	entity.variables.push_back(variable);
+	if (!entity.variable)
+		entity.variable = variable;
+	// 3.5 links declarations by name and linkage only; the reference does
+	// not require cross-unit type agreement, and the defining declaration's
+	// type governs layout and initialization.
 	if (variable->defined)
 	{
-		if (entity->defined)
+		if (entity.defined)
 			throw runtime_error("more than one variable definition");
-		entity->defined = true;
-		entity->variable = variable;
+		entity.defined = true;
+		entity.variable = variable;
+		entity.type = variable->type;
 	}
+	else if (!entity.type)
+		entity.type = variable->type;
 }
 
 void Pa8ProgramSema::AddFunction(Pa7Function* function, size_t unit)
@@ -300,11 +319,11 @@ void Pa8ProgramSema::AddFunction(Pa7Function* function, size_t unit)
 	entity->functions.push_back(function);
 	if (!entity->function)
 		entity->function = function;
+	// Cross-unit duplicate function definitions link to the one entity with
+	// no diagnostic (probe p83); a same-unit duplicate is rejected by the
+	// model when the redeclaration merges.
 	if (function->defined)
 	{
-		if (entity->defined && !(entity->function && entity->function->is_inline &&
-			function->is_inline))
-			throw runtime_error("more than one function definition");
 		entity->defined = true;
 		if (!entity->function->defined)
 			entity->function = function;
@@ -467,6 +486,24 @@ size_t Pa8ProgramSema::TypeSize(const Pa7TypePtr& type)
 	throw runtime_error("function is not an object type");
 }
 
+namespace
+{
+
+// Resolution runs after the whole translation unit is parsed, so a candidate
+// declared at or after the expression's snapshot is not visible to it (3.4).
+bool DeclaredBeforeExpression(const Pa7Decl* declaration, size_t epoch)
+{
+	if (!declaration)
+		return false;
+	if (declaration->kind == PA7_DECL_VARIABLE && declaration->variable)
+		return declaration->variable->order < epoch;
+	if (declaration->kind == PA7_DECL_FUNCTION && declaration->function)
+		return declaration->function->order < epoch;
+	return true;
+}
+
+} // namespace
+
 Pa8ProgramSema::ResolvedDecl Pa8ProgramSema::ResolveExpression(
 	const Pa8Expr& expression) const
 {
@@ -480,7 +517,7 @@ Pa8ProgramSema::ResolvedDecl Pa8ProgramSema::ResolveExpression(
 		{
 			Pa7Decl* found = LookupInNamespace(scope, expression.path[0],
 				PA7_FIND_VARIABLE | PA7_FIND_FUNCTION);
-			if (found)
+			if (found && DeclaredBeforeExpression(found, expression.decl_epoch))
 			{
 				result.declaration = found;
 				result.scope = const_cast<Pa7Namespace*>(scope);
@@ -522,7 +559,7 @@ Pa8ProgramSema::ResolvedDecl Pa8ProgramSema::ResolveExpression(
 	}
 	Pa7Decl* found = LookupInNamespace(current, expression.path.back(),
 		PA7_FIND_VARIABLE | PA7_FIND_FUNCTION);
-	if (found)
+	if (found && DeclaredBeforeExpression(found, expression.decl_epoch))
 	{
 		result.declaration = found;
 		result.scope = current;
@@ -649,8 +686,12 @@ Pa8Value Pa8ProgramSema::LoadLvalue(const Pa8Value& source,
 			throw runtime_error("expression is not a constant expression");
 		return source;
 	}
-	if (!source.is_constant)
+	if (require_constant && !source.is_constant)
 		throw runtime_error("lvalue-to-rvalue conversion is not constant");
+	// Empty bytes mean no definition supplied a value anywhere in the
+	// program, so even relaxed initializer folding cannot read the object.
+	if (source.bytes.empty())
+		throw runtime_error("value of the object is not known");
 	Pa8Value result = source;
 	result.is_lvalue = false;
 	result.address_relocs.clear();
@@ -664,15 +705,9 @@ Pa8Value Pa8ProgramSema::EvaluateVariable(Pa7Variable* variable)
 	if (index == variable_entities_.end())
 		throw runtime_error("variable is not in the program model");
 	Pa8ProgramEntity& entity = entities_[index->second];
-	Pa7Variable* definition = 0;
-	for (size_t i = 0; i < entity.variables.size(); ++i)
-		if (entity.variables[i]->defined)
-		{
-			definition = entity.variables[i];
-			break;
-		}
-	if (!definition)
-		throw runtime_error("variable is odr-used without a definition");
+	if (!entity.defined)
+		throw runtime_error("variable is used without a definition");
+	Pa7Variable* definition = entity.variable;
 	EvalState& state = variable_states_[definition];
 	if (state.complete)
 		return state.value;
@@ -692,7 +727,6 @@ Pa8Value Pa8ProgramSema::EvaluateVariable(Pa7Variable* variable)
 	state.value = value;
 	state.complete = true;
 	state.active = false;
-	definition->initializer.reset(new Pa8Value(value));
 	entity.value = value;
 	return value;
 }
@@ -711,179 +745,37 @@ Pa8Value Pa8ProgramSema::EvaluateReferencedValue(const Pa8Value& reference,
 		if (entity.is_function || !entity.defined || !entity.variable)
 			return Pa8Value();
 		Pa8Value result = EvaluateVariable(entity.variable);
-		// A reference preserves the address of a non-const object, but
-		// reading that object is not a constant expression merely because
-		// its zero-initialized image is known here.
-		if (!entity.variable->is_const && !entity.variable->is_constexpr &&
-			!IsConstType(entity.type))
+		// 5.19: reading the object is a constant expression only if it is
+		// constexpr or const-qualified; the image value of any defined
+		// variable is still known for relaxed initializer folding.
+		if (!entity.variable->is_constexpr && !IsConstQualified(entity.type))
 			result.is_constant = false;
 		result.type = type;
 		return result;
 	}
-	for (size_t i = 0; i < temporaries_.size(); ++i)
-		if (temporaries_[i].symbol == relocation.symbol)
-		{
-			Pa8Value result = temporaries_[i].value;
-			result.type = type;
-			return result;
-		}
-	for (size_t i = 0; i < strings_.size(); ++i)
-		if (strings_[i].symbol == relocation.symbol)
-		{
-			Pa8Value result;
-			result.type = type;
-			result.bytes = strings_[i].bytes;
-			result.is_constant = true;
-			result.is_string_literal = true;
-			result.string_symbol = strings_[i].symbol;
-			return result;
-		}
+	map<string, size_t>::const_iterator temporary =
+		temporary_by_symbol_.find(relocation.symbol);
+	if (temporary != temporary_by_symbol_.end())
+	{
+		Pa8Value result = temporaries_[temporary->second].value;
+		result.type = type;
+		return result;
+	}
+	map<string, size_t>::const_iterator literal =
+		string_by_symbol_.find(relocation.symbol);
+	if (literal != string_by_symbol_.end())
+	{
+		Pa8Value result;
+		result.type = type;
+		result.bytes = strings_[literal->second].bytes;
+		result.is_constant = true;
+		result.is_string_literal = true;
+		result.string_symbol = strings_[literal->second].symbol;
+		return result;
+	}
 	return Pa8Value();
 }
 
-Pa8Value Pa8ProgramSema::EvaluateUnary(const Pa8Expr& expression)
-{
-	Pa8Value child = EvaluateExpression(expression.left, false);
-	if (expression.op == OP_AMP)
-	{
-		if (!child.is_lvalue || child.address_relocs.empty())
-			throw runtime_error("address-of requires an lvalue");
-		Pa8Value result;
-		result.type = MakePointer(child.type);
-		result.bytes.assign(8, 0);
-		result.relocs = child.address_relocs;
-		result.is_constant = true;
-		return result;
-	}
-	if (expression.op == OP_STAR)
-	{
-		child = LoadLvalue(child, false);
-		Pa7TypePtr pointed = Pointee(child.type);
-		if (!pointed || (child.relocs.empty() && IsZero(child)))
-			throw runtime_error("dereference of non-pointer expression");
-		Pa8Value result;
-		result.type = pointed;
-		result.address_relocs = child.relocs;
-		result.is_lvalue = true;
-		result.is_constant = false;
-		return result;
-	}
-	child = LoadLvalue(child, false);
-	if (!child.is_constant)
-		throw runtime_error("non-constant unary expression");
-	Numeric number = DecodeNumeric(child);
-	if (!number.valid)
-		throw runtime_error("unary operator requires an arithmetic operand");
-	if (expression.op == OP_LNOT)
-	{
-		Pa8Value result;
-		result.type = MakeFundamental(FT_BOOL);
-		result.bytes.push_back((number.floating ? number.floating_value != 0 :
-			(number.signed_value != 0 || number.unsigned_value != 0)) ? 0 : 1);
-		result.is_constant = true;
-		return result;
-	}
-	if (expression.op == OP_MINUS)
-	{
-		if (number.floating)
-			number.floating_value = -number.floating_value;
-		else if (number.signed_value != 0 || number.unsigned_value == 0)
-			number.signed_value = -number.signed_value;
-		else
-			number.unsigned_value = 0 - number.unsigned_value;
-	}
-	else if (expression.op == OP_COMPL)
-	{
-		if (number.floating)
-			throw runtime_error("complement of floating expression");
-		number.unsigned_value = ~ReadLittleEndian(child.bytes);
-		number.signed_value = static_cast<long long>(number.unsigned_value);
-	}
-	return EncodeNumeric(number, child.type);
-}
-
-Pa8Value Pa8ProgramSema::EvaluateBinary(const Pa8Expr& expression)
-{
-	Pa8Value left = LoadLvalue(EvaluateExpression(expression.left, false),
-		false);
-	Pa8Value right = LoadLvalue(EvaluateExpression(expression.right, false),
-		false);
-	if (!left.is_constant || !right.is_constant)
-		throw runtime_error("non-constant binary expression");
-	Numeric a = DecodeNumeric(left);
-	Numeric b = DecodeNumeric(right);
-	if (!a.valid || !b.valid)
-		throw runtime_error("binary operator requires arithmetic operands");
-	const ETokenType op = expression.op;
-	if (op == OP_LAND || op == OP_LOR || op == OP_EQ || op == OP_NE ||
-		op == OP_LT || op == OP_GT || op == OP_LE || op == OP_GE)
-	{
-		long double av = a.floating ? a.floating_value :
-			static_cast<long double>(a.signed_value);
-		long double bv = b.floating ? b.floating_value :
-			static_cast<long double>(b.signed_value);
-		bool value = false;
-		switch (op)
-		{
-		case OP_LAND: value = (av != 0) && (bv != 0); break;
-		case OP_LOR: value = (av != 0) || (bv != 0); break;
-		case OP_EQ: value = av == bv; break;
-		case OP_NE: value = av != bv; break;
-		case OP_LT: value = av < bv; break;
-		case OP_GT: value = av > bv; break;
-		case OP_LE: value = av <= bv; break;
-		case OP_GE: value = av >= bv; break;
-		default: break;
-		}
-		Pa8Value result;
-		result.type = MakeFundamental(FT_BOOL);
-		result.bytes.push_back(value ? 1 : 0);
-		result.is_constant = true;
-		return result;
-	}
-	Numeric result_number;
-	result_number.valid = true;
-	result_number.floating = a.floating || b.floating;
-	if (result_number.floating)
-	{
-		const long double av = a.floating ? a.floating_value :
-			static_cast<long double>(a.signed_value);
-		const long double bv = b.floating ? b.floating_value :
-			static_cast<long double>(b.signed_value);
-		switch (op)
-		{
-		case OP_PLUS: result_number.floating_value = av + bv; break;
-		case OP_MINUS: result_number.floating_value = av - bv; break;
-		case OP_STAR: result_number.floating_value = av * bv; break;
-		case OP_DIV: result_number.floating_value = av / bv; break;
-		default: throw runtime_error("invalid floating binary operator");
-		}
-		return EncodeNumeric(result_number, left.type);
-	}
-	const long long av = a.signed_value;
-	const long long bv = b.signed_value;
-	switch (op)
-	{
-	case OP_PLUS: result_number.signed_value = av + bv; break;
-	case OP_MINUS: result_number.signed_value = av - bv; break;
-	case OP_STAR: result_number.signed_value = av * bv; break;
-	case OP_DIV:
-		if (bv == 0) throw runtime_error("division by zero");
-		result_number.signed_value = av / bv;
-		break;
-	case OP_MOD:
-		if (bv == 0) throw runtime_error("modulo by zero");
-		result_number.signed_value = av % bv;
-		break;
-	case OP_LSHIFT: result_number.signed_value = av << bv; break;
-	case OP_RSHIFT: result_number.signed_value = av >> bv; break;
-	case OP_BOR: result_number.signed_value = av | bv; break;
-	case OP_XOR: result_number.signed_value = av ^ bv; break;
-	case OP_AMP: result_number.signed_value = av & bv; break;
-	default: throw runtime_error("invalid integer binary operator");
-	}
-	return EncodeNumeric(result_number, left.type);
-}
 
 Pa8Value Pa8ProgramSema::EvaluateExpression(const Pa8ExprPtr& expression,
 	bool require_constant)
@@ -938,20 +830,27 @@ Pa8Value Pa8ProgramSema::EvaluateExpression(const Pa8ExprPtr& expression,
 				result.is_lvalue = true;
 				result.address_relocs.push_back(Pa8Relocation(0,
 					SymbolFor(variable), 0));
-				if (entity.defined &&
-					(IsConstType(variable_type) || variable->is_const ||
-					 variable->is_constexpr))
+				// The image value of every defined variable is known during
+				// translation; 5.19 constancy additionally requires constexpr
+				// or a const-qualified object type.
+				if (entity.defined)
 				{
 					Pa8Value value = EvaluateVariable(variable);
 					result.bytes = value.bytes;
 					result.relocs = value.relocs;
-					result.is_constant = value.is_constant;
+					result.is_constant = value.is_constant &&
+						(variable->is_constexpr ||
+						 IsConstQualified(variable_type));
 				}
 			}
 		}
 		else if (resolved.declaration->kind == PA7_DECL_FUNCTION &&
 			resolved.declaration->function)
 		{
+			// The reference rejects an overloaded name in an expression even
+			// when only one overload would match the initialization target.
+			if (resolved.declaration->function_overloads.size() > 1)
+				throw runtime_error("overloaded function name in expression");
 			Pa7Function* function = resolved.declaration->function.get();
 			result.type = function->type;
 			result.is_lvalue = true;
@@ -963,30 +862,9 @@ Pa8Value Pa8ProgramSema::EvaluateExpression(const Pa8ExprPtr& expression,
 			throw runtime_error("identifier is not an expression");
 		break;
 	}
-	case PA8_EXPR_UNARY:
-		result = EvaluateUnary(*expression);
-		break;
-	case PA8_EXPR_BINARY:
-		result = EvaluateBinary(*expression);
-		break;
-	case PA8_EXPR_CONDITIONAL:
-	{
-		Pa8Value condition = LoadLvalue(EvaluateExpression(expression->left,
-			false), false);
-		if (!condition.is_constant)
-			throw runtime_error("non-constant conditional expression");
-		Numeric number = DecodeNumeric(condition);
-		result = EvaluateExpression(number.floating ?
-			(number.floating_value != 0 ? expression->right : expression->third) :
-			((number.signed_value != 0 || number.unsigned_value != 0) ?
-				expression->right : expression->third), false);
-		break;
-	}
 	}
 	if (require_constant && !result.is_constant)
 		throw runtime_error("expression is not a constant expression");
-	expression->annotated_type = result.type;
-	expression->lvalue = result.is_lvalue;
 	return result;
 }
 
@@ -1111,18 +989,33 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 	Pa7TypePtr stripped_target = StripCV(target);
 	if (!stripped_target)
 		throw runtime_error("invalid initialization target");
+	Pa7TypePtr stripped_source = StripCV(source.type);
+	const bool source_decays = stripped_source &&
+		(stripped_source->kind == PA7_TYPE_ARRAY ||
+		 stripped_source->kind == PA7_TYPE_FUNCTION) &&
+		(source.is_lvalue || source.is_string_literal);
 	if (stripped_target->kind == PA7_TYPE_FUNDAMENTAL &&
 		stripped_target->fundamental == FT_BOOL &&
-		IsPointerLike(source.type))
+		(IsPointerLike(source.type) || source_decays))
 	{
-		Pa8Value value = LoadLvalue(source, require_constant);
-		if (require_constant && !value.is_constant)
-			throw runtime_error("pointer-to-bool conversion is not constant");
 		Pa8Value result;
 		result.type = target;
+		if (source_decays)
+		{
+			// Array-to-pointer or function-to-pointer decay yields the
+			// object's address, which is never null.
+			result.bytes.push_back(1);
+			result.is_constant = source.is_constant;
+			return result;
+		}
+		Pa8Value value = LoadLvalue(source, require_constant);
+		// The reference accepts a pointer in a boolean context only when its
+		// value is a constant expression (probes p31/p47).
+		if (!value.is_constant)
+			throw runtime_error("pointer-to-bool conversion is not constant");
 		result.bytes.push_back((!value.relocs.empty() || !IsZero(value)) ?
 			1 : 0);
-		result.is_constant = value.is_constant;
+		result.is_constant = true;
 		return result;
 	}
 	if (stripped_target->kind == PA7_TYPE_LVALUE_REFERENCE ||
@@ -1136,8 +1029,7 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 			throw runtime_error("rvalue reference cannot bind an lvalue");
 		if (source.is_lvalue)
 		{
-			if (!CompatibleTypes(StripCV(source.type),
-				StripCV(target_referred)))
+			if (!SameType(StripCV(source.type), StripCV(target_referred)))
 				throw runtime_error("reference initializer type mismatch");
 			if (!IsConstType(target_referred) &&
 				IsConstType(source.type))
@@ -1167,12 +1059,19 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 	if (stripped_target->kind == PA7_TYPE_POINTER)
 	{
 		Pa8Value value = source;
-		Pa7TypePtr source_type = StripCV(value.type);
+		Pa7TypePtr source_type = stripped_source;
 		if (value.is_string_literal)
 		{
+			// 4.2p2: only the literal's own element type (made const) is a
+			// valid pointee for string-literal decay.
 			Pa7TypePtr target_element = Pointee(target);
+			Pa7TypePtr source_element = source_type &&
+				!source_type->children.empty() ?
+				StripCV(source_type->children[0]) : Pa7TypePtr();
 			if (!target_element || !IsConstType(target_element))
 				throw runtime_error("string literal cannot initialize mutable pointer");
+			if (!SameType(StripCV(target_element), source_element))
+				throw runtime_error("string literal element type does not agree");
 			Pa8Value result;
 			result.type = target;
 			result.bytes.assign(8, 0);
@@ -1183,6 +1082,10 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 		if (source_type && source_type->kind == PA7_TYPE_ARRAY &&
 			value.is_lvalue)
 		{
+			if (source_type->children.size() != 1 ||
+				!PointerConvertible(MakePointer(source_type->children[0]),
+					target))
+				throw runtime_error("array element does not match pointer target");
 			Pa8Value result;
 			result.type = target;
 			result.bytes.assign(8, 0);
@@ -1192,6 +1095,8 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 		}
 		if (source_type && source_type->kind == PA7_TYPE_FUNCTION)
 		{
+			if (!SameType(StripCV(Pointee(target)), source_type))
+				throw runtime_error("function type does not match pointer target");
 			Pa8Value result;
 			result.type = target;
 			result.bytes.assign(8, 0);
@@ -1201,9 +1106,22 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 		}
 		if (source_type && source_type->kind == PA7_TYPE_POINTER)
 		{
+			if (!PointerConvertible(value.type, target))
+				throw runtime_error("pointer conversion drops qualifiers or changes type");
+			if (value.is_lvalue)
+			{
+				// The reference realizes a pointer copied from a pointer
+				// lvalue as the source object's address (probes p60/p76).
+				if (value.address_relocs.empty())
+					throw runtime_error("pointer initializer has no address");
+				Pa8Value result;
+				result.type = target;
+				result.bytes.assign(8, 0);
+				result.relocs = value.address_relocs;
+				result.is_constant = true;
+				return result;
+			}
 			value = LoadLvalue(value, require_constant);
-			if (require_constant && !value.is_constant)
-				throw runtime_error("pointer initializer is not constant");
 			value.type = target;
 			return value;
 		}
@@ -1214,6 +1132,10 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 		Numeric number = DecodeNumeric(value);
 		if (!number.valid || !IsIntegralType(value.type))
 			throw runtime_error("invalid pointer initializer");
+		// 4.10p1: only a constant expression of integer type that evaluates
+		// to zero is a null pointer constant.
+		if (!value.is_constant)
+			throw runtime_error("integer-to-pointer initializer is not constant");
 		if (number.signed_value != 0 || number.unsigned_value != 0)
 			throw runtime_error("nonzero integer is not a null pointer constant");
 		return NullValue(target);
@@ -1223,17 +1145,31 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 		if (!source.is_string_literal)
 			throw runtime_error("array initializer is not supported");
 		if (stripped_target->children.size() != 1 ||
-			StripCV(source.type) == Pa7TypePtr() ||
-			StripCV(source.type)->kind != PA7_TYPE_ARRAY ||
-			StripCV(source.type)->children.size() != 1)
+			!stripped_source || stripped_source->kind != PA7_TYPE_ARRAY ||
+			stripped_source->children.size() != 1)
 			throw runtime_error("invalid string literal array type");
-		const size_t source_element_size = TypeSize(
-			StripCV(source.type)->children[0]);
+		// 8.5.2p1: an ordinary string literal initializes arrays of char,
+		// signed char, or unsigned char; u/U/L literals initialize only
+		// their own element type.
+		Pa7TypePtr source_element = StripCV(stripped_source->children[0]);
+		Pa7TypePtr target_element = StripCV(stripped_target->children[0]);
+		if (!source_element || !target_element ||
+			source_element->kind != PA7_TYPE_FUNDAMENTAL ||
+			target_element->kind != PA7_TYPE_FUNDAMENTAL)
+			throw runtime_error("invalid string literal array type");
+		const EFundamentalType source_kind = source_element->fundamental;
+		const EFundamentalType target_kind = target_element->fundamental;
+		const bool element_agrees = source_kind == FT_CHAR ?
+			(target_kind == FT_CHAR || target_kind == FT_SIGNED_CHAR ||
+			 target_kind == FT_UNSIGNED_CHAR) :
+			target_kind == source_kind;
+		if (!element_agrees)
+			throw runtime_error("string literal element type does not agree");
 		const size_t target_element_size = TypeSize(
 			stripped_target->children[0]);
-		if (!source_element_size || source_element_size != target_element_size ||
+		if (!target_element_size ||
 			source.bytes.size() % target_element_size != 0)
-			throw runtime_error("string literal element type does not agree");
+			throw runtime_error("string literal element size does not agree");
 		if (!stripped_target->has_bound)
 		{
 			stripped_target->has_bound = true;
@@ -1254,13 +1190,46 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 		stripped_target->fundamental == FT_VOID ||
 		stripped_target->fundamental == FT_NULLPTR_T)
 		throw runtime_error("invalid scalar initialization target");
+	// The mock image has no runtime, so every defined variable's value is
+	// known during translation and arithmetic initializers fold even when
+	// they are not 5.19 constant expressions (probes p1/p48/p55).
 	Pa8Value value = LoadLvalue(source, require_constant);
-	if (!value.is_constant)
-		throw runtime_error("scalar initializer is not constant");
 	Numeric number = DecodeNumeric(value);
 	if (!number.valid)
 		throw runtime_error("scalar initializer is not arithmetic");
-	return EncodeNumeric(number, target);
+	Pa8Value result = EncodeNumeric(number, target);
+	result.is_constant = value.is_constant;
+	return result;
+}
+
+// 4.4: T1* converts to T2* when both point at the same type modulo
+// cv-qualifiers, no qualifier is dropped at any level, and any level that
+// adds qualifiers has const at every level above it.
+bool Pa8ProgramSema::PointerConvertible(const Pa7TypePtr& source,
+	const Pa7TypePtr& target) const
+{
+	Pa7TypePtr from = StripCV(source);
+	Pa7TypePtr to = StripCV(target);
+	bool const_above = true;
+	while (from && to && from->kind == PA7_TYPE_POINTER &&
+		to->kind == PA7_TYPE_POINTER &&
+		from->children.size() == 1 && to->children.size() == 1)
+	{
+		const Pa7TypePtr& from_pointee = from->children[0];
+		const Pa7TypePtr& to_pointee = to->children[0];
+		const unsigned from_cv = from_pointee &&
+			from_pointee->kind == PA7_TYPE_CV ? from_pointee->cv : 0;
+		const unsigned to_cv = to_pointee &&
+			to_pointee->kind == PA7_TYPE_CV ? to_pointee->cv : 0;
+		if ((from_cv & ~to_cv) != 0)
+			return false;
+		if (from_cv != to_cv && !const_above)
+			return false;
+		const_above = (to_cv & PA7_CV_CONST) != 0;
+		from = StripCV(from_pointee);
+		to = StripCV(to_pointee);
+	}
+	return SameType(from, to);
 }
 
 bool Pa8ProgramSema::IsZero(const Pa8Value& value) const
@@ -1316,8 +1285,8 @@ string Pa8ProgramSema::RegisterTemporary(const Pa7TypePtr& type,
 	temporary.value.type = type;
 	temporary.value.is_lvalue = false;
 	temporary.value.address_relocs.clear();
-	temporary.first_use = next_temporary_id_ - 1;
 	temporaries_.push_back(temporary);
+	temporary_by_symbol_[temporary.symbol] = temporaries_.size() - 1;
 	return temporary.symbol;
 }
 
@@ -1396,6 +1365,11 @@ string Pa8ProgramSema::RegisterStringLiteral(const Pa8Expr& expression)
 		return existing->second;
 	ostringstream symbol;
 	symbol << "@string" << next_string_id_++;
+	// static_assert operands still decay and compare non-null, but their
+	// literal objects are not part of the image (probe p82); the dangling
+	// symbol resolves to address 0.
+	if (!collect_strings_)
+		return symbol.str();
 	Pa8StringLiteral literal;
 	literal.symbol = symbol.str();
 	literal.bytes = DecodeString(expression.literal.spelling);
@@ -1403,10 +1377,33 @@ string Pa8ProgramSema::RegisterStringLiteral(const Pa8Expr& expression)
 	const string prefix = expression.literal.spelling.substr(0, quote);
 	literal.alignment = prefix == "u" ? 2 :
 		(prefix == "U" || prefix == "L" ? 4 : 1);
-	literal.first_use = expression.token_index;
 	strings_.push_back(literal);
+	string_by_symbol_[literal.symbol] = strings_.size() - 1;
 	string_symbols_[&expression] = literal.symbol;
 	return literal.symbol;
+}
+
+// Every declared type of one variable (one entity within one translation
+// unit) must agree once expression-spelled array bounds are evaluated; the
+// parser can only compare literal bounds (probes p41/p42/p78).
+void Pa8ProgramSema::CheckDeclaredTypeAgreement()
+{
+	for (size_t i = 0; i < entities_.size(); ++i)
+	{
+		if (entities_[i].is_function)
+			continue;
+		for (size_t j = 0; j < entities_[i].variables.size(); ++j)
+		{
+			Pa7Variable* variable = entities_[i].variables[j];
+			for (size_t k = 0; k < variable->declared_types.size(); ++k)
+				ResolveArrayBounds(variable->declared_types[k]);
+			for (size_t k = 1; k < variable->declared_types.size(); ++k)
+				if (!RedeclarationTypesAgree(variable->declared_types[0],
+					variable->declared_types[k]))
+					throw runtime_error(
+						"variable type does not agree across redeclarations");
+		}
+	}
 }
 
 void Pa8ProgramSema::Analyze()
@@ -1415,12 +1412,16 @@ void Pa8ProgramSema::Analyze()
 	temporaries_.clear();
 	strings_.clear();
 	entity_by_key_.clear();
+	linked_variables_.clear();
 	variable_entities_.clear();
 	function_entities_.clear();
 	variable_states_.clear();
+	temporary_by_symbol_.clear();
+	string_by_symbol_.clear();
 	string_symbols_.clear();
 	next_temporary_id_ = 0;
 	next_string_id_ = 0;
+	collect_strings_ = true;
 	for (size_t i = 0; i < globals_.size(); ++i)
 		CollectNamespace(globals_[i].get(), i);
 	stable_sort(entities_.begin(), entities_.end(),
@@ -1443,9 +1444,11 @@ void Pa8ProgramSema::Analyze()
 		if (entities_[i].type)
 			ResolveArrayBounds(entities_[i].type);
 	}
+	CheckDeclaredTypeAgreement();
 	for (size_t i = 0; i < entities_.size(); ++i)
 		if (!entities_[i].is_function && entities_[i].defined)
 			EvaluateVariable(entities_[i].variable);
+	collect_strings_ = false;
 	for (size_t i = 0; i < globals_.size(); ++i)
 		for (size_t j = 0; j < globals_[i]->static_assertions.size(); ++j)
 		{

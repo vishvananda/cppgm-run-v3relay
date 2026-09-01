@@ -10,17 +10,12 @@
 #include "posttoken_types.h"
 
 struct Pa8Expr;
-struct Pa8Value;
 typedef std::shared_ptr<Pa8Expr> Pa8ExprPtr;
-typedef std::shared_ptr<Pa8Value> Pa8ValuePtr;
 
 enum Pa8ExprKind
 {
 	PA8_EXPR_LITERAL,
-	PA8_EXPR_IDENTIFIER,
-	PA8_EXPR_UNARY,
-	PA8_EXPR_BINARY,
-	PA8_EXPR_CONDITIONAL
+	PA8_EXPR_IDENTIFIER
 };
 
 enum Pa7TypeKind
@@ -71,9 +66,16 @@ Pa7TypePtr MakeFunction(const std::vector<Pa7TypePtr>& params, bool varargs,
 std::string DescribeType(const Pa7TypePtr& type);
 bool IsVoid(const Pa7TypePtr& type);
 bool IsFunction(const Pa7TypePtr& type);
+// 3.9.3: the object is const-qualified if its type is top-level const or it
+// is an array of const-qualified elements.
+bool IsConstQualified(const Pa7TypePtr& type);
 Pa7TypePtr AdjustParameter(const Pa7TypePtr& type);
 bool SameType(const Pa7TypePtr& left, const Pa7TypePtr& right);
 Pa7TypePtr MergeTypes(const Pa7TypePtr& first, const Pa7TypePtr& second);
+// Redeclaration agreement: same type, tolerating an absent array bound on
+// either side and treating not-yet-evaluated expression bounds as agreeing.
+bool RedeclarationTypesAgree(const Pa7TypePtr& first,
+	const Pa7TypePtr& second);
 
 struct Pa7Namespace;
 struct Pa7Variable;
@@ -159,9 +161,16 @@ struct Pa7Variable
 	bool is_const;
 	bool is_constexpr;
 	bool defined;
+	// Whether the first declaration was itself a definition; a variable
+	// first declared without defining binds to an already-linked entity,
+	// while one whose first declaration defines it may start a new entity.
+	bool initially_defined;
 	std::size_t order;
 	Pa8ExprPtr initializer_expression;
-	Pa8ValuePtr initializer;
+	// Every declared type of this variable, recorded in strict mode so array
+	// bounds spelled as expressions can be checked for redeclaration
+	// agreement once the semantic pass has evaluated them.
+	std::vector<Pa7TypePtr> declared_types;
 
 	Pa7Variable(const std::string& name, const Pa7TypePtr& type,
 		Pa7Namespace* owner = 0);

@@ -118,9 +118,7 @@ private:
 		Declarator& result, DeclaratorMode mode);
 	Parameters ParseParametersAndQualifiers();
 	Declarator ParseParameterDeclaration();
-	Pa8ExprPtr ParseExpression(unsigned minimum_precedence = 1);
-	Pa8ExprPtr ParseUnaryExpression();
-	Pa8ExprPtr ParsePrimaryExpression();
+	Pa8ExprPtr ParseExpression();
 	Pa8ExprPtr MakeExpression(Pa8ExprKind kind);
 	void ParseFunctionBody();
 	Pa7DeclAttributes MakeAttributes(const DeclSpec& spec,
@@ -129,8 +127,6 @@ private:
 		Pa7Namespace* scope) const;
 	void SetTypeExpressionScope(const Pa7TypePtr& type,
 		Pa7Namespace* scope) const;
-	bool IsExpressionStart(std::size_t at) const;
-	int BinaryPrecedence(ETokenType type) const;
 
 	NamePath ParseNamePath();
 	Pa7TypePtr LookupTypedef(const NamePath& path) const;

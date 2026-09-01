@@ -13,24 +13,20 @@ struct Pa8Expr
 {
 	Pa8ExprKind kind;
 	Pa6Token literal;
-	ETokenType op;
 	bool absolute;
 	std::vector<std::string> path;
 	Pa7Namespace* lookup_scope;
-	Pa8ExprPtr left;
-	Pa8ExprPtr right;
-	Pa8ExprPtr third;
-	Pa7TypePtr annotated_type;
-	bool lvalue;
 	std::size_t token_index;
+	// Count of declarations committed in this translation unit when the
+	// expression was parsed; only earlier declarations are visible to it.
+	std::size_t decl_epoch;
 
 	Pa8Expr();
 };
 
 inline Pa8Expr::Pa8Expr()
-	: kind(PA8_EXPR_LITERAL), literal(PA6_EOF_TOKEN, ""), op(KW_AUTO),
-		absolute(false), lookup_scope(0), left(), right(), third(),
-		annotated_type(), lvalue(false), token_index(0)
+	: kind(PA8_EXPR_LITERAL), literal(PA6_EOF_TOKEN, ""), absolute(false),
+		lookup_scope(0), token_index(0), decl_epoch(0)
 {
 }
 
@@ -67,7 +63,6 @@ struct Pa8Temporary
 	std::string symbol;
 	Pa7TypePtr type;
 	Pa8Value value;
-	std::size_t first_use;
 
 	Pa8Temporary();
 };
@@ -77,7 +72,6 @@ struct Pa8StringLiteral
 	std::string symbol;
 	std::vector<unsigned char> bytes;
 	std::size_t alignment;
-	std::size_t first_use;
 
 	Pa8StringLiteral();
 };
@@ -178,11 +172,12 @@ private:
 	Pa8Value EvaluateReferencedValue(const Pa8Value& reference,
 		const Pa7TypePtr& type);
 	Pa8Value EvaluateLiteral(const Pa8Expr& expression);
-	Pa8Value EvaluateUnary(const Pa8Expr& expression);
-	Pa8Value EvaluateBinary(const Pa8Expr& expression);
 	Pa8Value Convert(const Pa8Value& source, const Pa7TypePtr& target,
 		bool require_constant);
 	Pa8Value LoadLvalue(const Pa8Value& source, bool require_constant);
+	bool PointerConvertible(const Pa7TypePtr& source,
+		const Pa7TypePtr& target) const;
+	void CheckDeclaredTypeAgreement();
 	Numeric DecodeNumeric(const Pa8Value& value) const;
 	Pa8Value EncodeNumeric(const Numeric& value, const Pa7TypePtr& target);
 	Pa8Value NullValue(const Pa7TypePtr& type) const;
@@ -207,10 +202,18 @@ private:
 	std::vector<Pa8Temporary> temporaries_;
 	std::vector<Pa8StringLiteral> strings_;
 	std::map<std::string, std::size_t> entity_by_key_;
+	// All linked entities sharing one variable key, in creation order;
+	// duplicate plain definitions produce multiple entities (probe p71).
+	std::map<std::string, std::vector<std::size_t> > linked_variables_;
 	std::map<const Pa7Variable*, std::size_t> variable_entities_;
 	std::map<const Pa7Function*, std::size_t> function_entities_;
 	std::map<const Pa7Variable*, EvalState> variable_states_;
+	std::map<std::string, std::size_t> temporary_by_symbol_;
+	std::map<std::string, std::size_t> string_by_symbol_;
 	std::map<const Pa8Expr*, std::string> string_symbols_;
 	std::size_t next_temporary_id_;
 	std::size_t next_string_id_;
+	// static_assert operands are evaluated with collection off: their string
+	// literals convert to bool but are not emitted to BLOCK3.
+	bool collect_strings_;
 };
