@@ -307,7 +307,7 @@ Pa7TypePtr MergeTypes(const Pa7TypePtr& first, const Pa7TypePtr& second)
 }
 
 Pa7Decl::Pa7Decl()
-	: kind(PA7_DECL_VARIABLE)
+	: kind(PA7_DECL_VARIABLE), origin(PA7_DECL_OWNED)
 {
 }
 
@@ -378,24 +378,29 @@ Pa7Namespace* Pa7Namespace::FindNamespaceDirect(const string& lookup_name)
 Pa7Namespace* Pa7Namespace::AddNamespace(const string& namespace_name,
 	bool is_inline)
 {
-	Pa7Decl* existing = FindDirect(namespace_name, PA7_FIND_NAMESPACE);
-	if (existing && existing->namespace_entity)
+	map<string, Pa7Decl>::iterator existing = declarations.find(namespace_name);
+	if (existing != declarations.end())
 	{
-		Pa7Namespace* result = existing->namespace_entity.get();
+		if (existing->second.kind != PA7_DECL_NAMESPACE ||
+			existing->second.origin != PA7_DECL_OWNED ||
+			!existing->second.namespace_entity)
+			throw runtime_error("namespace name conflicts with declaration");
+		Pa7Namespace* result = existing->second.namespace_entity.get();
 		if (result->inline_namespace != is_inline)
 			throw runtime_error("namespace inline status changed");
 		return result;
 	}
-	if (declarations.find(namespace_name) != declarations.end())
-		throw runtime_error("namespace name conflicts with declaration");
 
 	shared_ptr<Pa7Namespace> result(new Pa7Namespace(namespace_name, this,
 		is_inline, false));
 	Pa7Decl decl;
 	decl.kind = PA7_DECL_NAMESPACE;
+	decl.origin = PA7_DECL_OWNED;
 	decl.namespace_entity = result;
 	declarations[namespace_name] = decl;
 	namespaces.push_back(result);
+	if (is_inline)
+		AddUsingDirective(result.get());
 	return result.get();
 }
 
@@ -405,6 +410,7 @@ Pa7Namespace* Pa7Namespace::AddUnnamedNamespace(bool is_inline)
 	{
 		if (unnamed_child->inline_namespace != is_inline)
 			throw runtime_error("namespace inline status changed");
+		AddUsingDirective(unnamed_child.get());
 		return unnamed_child.get();
 	}
 	unnamed_child.reset(new Pa7Namespace(std::string(), this, is_inline,
@@ -423,12 +429,14 @@ void Pa7Namespace::AddNamespaceAlias(const string& alias_name,
 	if (existing != declarations.end())
 	{
 		if (existing->second.kind != PA7_DECL_NAMESPACE ||
+			existing->second.origin != PA7_DECL_NAMESPACE_ALIAS ||
 			existing->second.namespace_entity.get() != target)
 			throw runtime_error("namespace alias conflicts with declaration");
 		return;
 	}
 	Pa7Decl decl;
 	decl.kind = PA7_DECL_NAMESPACE;
+	decl.origin = PA7_DECL_NAMESPACE_ALIAS;
 	decl.namespace_entity.reset(target, [](Pa7Namespace*) {});
 	declarations[alias_name] = decl;
 }
@@ -443,13 +451,49 @@ void Pa7Namespace::AddUsingDirective(Pa7Namespace* target)
 	using_directives.push_back(target);
 }
 
+void Pa7Namespace::AddUsingDeclaration(const string& declaration_name,
+	const Pa7Decl& source)
+{
+	map<string, Pa7Decl>::iterator existing = declarations.find(
+		declaration_name);
+	if (existing != declarations.end())
+	{
+		const Pa7Decl& prior = existing->second;
+		bool same_entity = prior.kind == source.kind;
+		switch (source.kind)
+		{
+		case PA7_DECL_VARIABLE:
+			same_entity = same_entity && prior.variable == source.variable;
+			break;
+		case PA7_DECL_FUNCTION:
+			same_entity = same_entity && prior.function == source.function;
+			break;
+		case PA7_DECL_TYPEDEF:
+			same_entity = same_entity &&
+				prior.typedef_entity == source.typedef_entity;
+			break;
+		case PA7_DECL_NAMESPACE:
+			same_entity = same_entity &&
+				prior.namespace_entity.get() == source.namespace_entity.get();
+			break;
+		}
+		if (prior.origin == PA7_DECL_USING && same_entity)
+			return;
+		throw runtime_error("using-declaration conflicts with declaration");
+	}
+	Pa7Decl imported = source;
+	imported.origin = PA7_DECL_USING;
+	declarations[declaration_name] = imported;
+}
+
 shared_ptr<Pa7Variable> Pa7Namespace::AddOrMergeVariable(
 	const string& variable_name, const Pa7TypePtr& type)
 {
 	map<string, Pa7Decl>::iterator existing = declarations.find(variable_name);
 	if (existing != declarations.end())
 	{
-		if (existing->second.kind != PA7_DECL_VARIABLE ||
+		if (existing->second.origin != PA7_DECL_OWNED ||
+			existing->second.kind != PA7_DECL_VARIABLE ||
 			!existing->second.variable)
 			throw runtime_error("declaration kind conflict");
 		existing->second.variable->type = MergeTypes(
@@ -471,7 +515,8 @@ shared_ptr<Pa7Function> Pa7Namespace::AddOrMergeFunction(
 	map<string, Pa7Decl>::iterator existing = declarations.find(function_name);
 	if (existing != declarations.end())
 	{
-		if (existing->second.kind != PA7_DECL_FUNCTION ||
+		if (existing->second.origin != PA7_DECL_OWNED ||
+			existing->second.kind != PA7_DECL_FUNCTION ||
 			!existing->second.function)
 			throw runtime_error("declaration kind conflict");
 		return existing->second.function;
@@ -491,7 +536,8 @@ shared_ptr<Pa7Typedef> Pa7Namespace::AddTypedef(const string& typedef_name,
 	map<string, Pa7Decl>::iterator existing = declarations.find(typedef_name);
 	if (existing != declarations.end())
 	{
-		if (existing->second.kind != PA7_DECL_TYPEDEF ||
+		if (existing->second.origin != PA7_DECL_OWNED ||
+			existing->second.kind != PA7_DECL_TYPEDEF ||
 			!existing->second.typedef_entity)
 			throw runtime_error("declaration kind conflict");
 		return existing->second.typedef_entity;

@@ -290,9 +290,13 @@ void Pa7Parser::ParseUsingDeclaration()
 		return;
 	}
 
+	NamePath path;
+	if (ConsumeSimple(OP_COLON2))
+		path.absolute = true;
 	string first;
 	ExpectIdentifier(&first);
-	if (ConsumeSimple(OP_ASS))
+	path.parts.push_back(first);
+	if (!path.absolute && ConsumeSimple(OP_ASS))
 	{
 		DeclSpec spec = ParseDeclSpecifierSeq();
 		Pa7TypePtr type = spec.type;
@@ -308,8 +312,6 @@ void Pa7Parser::ParseUsingDeclaration()
 		return;
 	}
 
-	NamePath path;
-	path.parts.push_back(first);
 	while (ConsumeSimple(OP_COLON2))
 	{
 		string part;
@@ -317,7 +319,7 @@ void Pa7Parser::ParseUsingDeclaration()
 		path.parts.push_back(part);
 	}
 	ExpectEndOfDeclaration();
-	if (path.parts.size() < 2)
+	if (!path.absolute && path.parts.size() < 2)
 		throw runtime_error("unqualified using-declaration");
 
 	vector<string> namespace_parts(path.parts.begin(), path.parts.end() - 1);
@@ -325,14 +327,11 @@ void Pa7Parser::ParseUsingDeclaration()
 		namespace_parts, path.absolute);
 	if (!target)
 		throw runtime_error("using-declaration target namespace not found");
-	const Pa7Decl* source = target->FindDirect(path.parts.back(),
+	Pa7Decl* source = LookupInNamespace(target, path.parts.back(),
 		PA7_FIND_ANY);
 	if (!source)
 		throw runtime_error("using-declaration target not found");
-	map<string, Pa7Decl>::iterator existing =
-		scopes_.back()->declarations.find(path.parts.back());
-	if (existing == scopes_.back()->declarations.end())
-		scopes_.back()->declarations[path.parts.back()] = *source;
+	scopes_.back()->AddUsingDeclaration(path.parts.back(), *source);
 }
 
 void Pa7Parser::ParseSimpleDeclaration()
@@ -364,10 +363,32 @@ void Pa7Parser::ParseSimpleDeclaration()
 		const string& name = declarator.path.parts.back();
 		if (spec.is_typedef)
 			destination->AddTypedef(name, declarator.type);
-		else if (IsFunction(declarator.type))
-			destination->AddOrMergeFunction(name, declarator.type);
 		else
-			destination->AddOrMergeVariable(name, declarator.type);
+		{
+			const bool qualified = declarator.path.absolute ||
+				declarator.path.parts.size() > 1;
+			unsigned filter = IsFunction(declarator.type) ?
+				PA7_FIND_FUNCTION : PA7_FIND_VARIABLE;
+			Pa7Decl* visible = qualified ? LookupInNamespace(destination,
+				name, filter) : 0;
+			if (visible && visible->origin != PA7_DECL_NAMESPACE_ALIAS)
+			{
+				if (visible->kind == PA7_DECL_FUNCTION &&
+					visible->function)
+					visible->function->type = MergeTypes(
+						visible->function->type, declarator.type);
+				else if (visible->kind == PA7_DECL_VARIABLE &&
+					visible->variable)
+					visible->variable->type = MergeTypes(
+						visible->variable->type, declarator.type);
+				else
+					throw runtime_error("declaration kind conflict");
+			}
+			else if (IsFunction(declarator.type))
+				destination->AddOrMergeFunction(name, declarator.type);
+			else
+				destination->AddOrMergeVariable(name, declarator.type);
+		}
 
 		if (ConsumeSimple(OP_ASS))
 		{
@@ -734,7 +755,8 @@ Pa7TypePtr Pa7Parser::LookupTypedef(const NamePath& path) const
 		namespace_parts, path.absolute);
 	if (!scope)
 		return Pa7TypePtr();
-	Pa7Decl* decl = scope->FindDirect(path.parts.back(), PA7_FIND_TYPE);
+	Pa7Decl* decl = LookupInNamespace(scope, path.parts.back(),
+		PA7_FIND_TYPE);
 	return decl && decl->typedef_entity ? decl->typedef_entity->type :
 		Pa7TypePtr();
 }
@@ -745,40 +767,46 @@ Pa7Namespace* Pa7Parser::ResolveNamespace(const NamePath& path) const
 		path.absolute);
 }
 
+Pa7Decl* Pa7Parser::LookupInNamespace(const Pa7Namespace* scope,
+	const string& name, unsigned filter) const
+{
+	if (!scope)
+		return 0;
+	const Pa7Decl* direct = scope->FindDirect(name, filter);
+	if (direct)
+		return const_cast<Pa7Decl*>(direct);
+	set<const Pa7Namespace*> visited;
+	return LookupInUsing(scope, name, filter, visited);
+}
+
 Pa7Decl* Pa7Parser::LookupUnqualified(const string& name,
 	unsigned filter) const
 {
-	for (Pa7Namespace* scope = scopes_.back(); scope;
+	for (const Pa7Namespace* scope = scopes_.back(); scope;
 		scope = scope->parent)
 	{
-		Pa7Decl* direct = const_cast<Pa7Decl*>(
-			static_cast<const Pa7Namespace*>(scope)->FindDirect(name, filter));
-		if (direct)
-			return direct;
-		vector<const Pa7Namespace*> visited;
-		Pa7Decl* imported = LookupInUsing(scope, name, filter, visited);
-		if (imported)
-			return imported;
+		Pa7Decl* found = LookupInNamespace(scope, name, filter);
+		if (found)
+			return found;
 	}
 	return 0;
 }
 
 Pa7Decl* Pa7Parser::LookupInUsing(const Pa7Namespace* scope,
 	const string& name, unsigned filter,
-	vector<const Pa7Namespace*>& visited) const
+	set<const Pa7Namespace*>& visited) const
 {
-	for (size_t i = 0; i < visited.size(); ++i)
-		if (visited[i] == scope)
-			return 0;
-	visited.push_back(scope);
+	if (!scope || !visited.insert(scope).second)
+		return 0;
 	for (size_t i = 0; i < scope->using_directives.size(); ++i)
 	{
-		Pa7Namespace* nominated = scope->using_directives[i];
+		const Pa7Namespace* nominated = scope->using_directives[i];
 		if (!nominated)
 			continue;
+		if (visited.find(nominated) != visited.end())
+			continue;
 		Pa7Decl* direct = const_cast<Pa7Decl*>(
-			static_cast<const Pa7Namespace*>(nominated)->FindDirect(name,
-				filter));
+			nominated->FindDirect(name, filter));
 		if (direct)
 			return direct;
 		Pa7Decl* transitive = LookupInUsing(nominated, name, filter,
@@ -806,9 +834,8 @@ Pa7Namespace* Pa7Parser::ResolveRelativeNamespace(const Pa7Namespace* scope,
 		for (const Pa7Namespace* candidate = scope; candidate;
 			candidate = candidate->parent)
 		{
-			Pa7Decl* decl = const_cast<Pa7Decl*>(
-				static_cast<const Pa7Namespace*>(candidate)->FindDirect(
-					parts[0], PA7_FIND_NAMESPACE));
+			Pa7Decl* decl = LookupInNamespace(candidate, parts[0],
+				PA7_FIND_NAMESPACE);
 			if (decl && decl->namespace_entity)
 			{
 				current = decl->namespace_entity.get();
@@ -821,7 +848,7 @@ Pa7Namespace* Pa7Parser::ResolveRelativeNamespace(const Pa7Namespace* scope,
 		return 0;
 	for (; index < parts.size(); ++index)
 	{
-		Pa7Decl* decl = current->FindDirect(parts[index],
+		Pa7Decl* decl = LookupInNamespace(current, parts[index],
 			PA7_FIND_NAMESPACE);
 		if (!decl || !decl->namespace_entity)
 			return 0;

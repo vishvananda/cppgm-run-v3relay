@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -99,11 +100,13 @@ private:
 	NamePath ParseNamePath();
 	Pa7TypePtr LookupTypedef(const NamePath& path) const;
 	Pa7Namespace* ResolveNamespace(const NamePath& path) const;
+	Pa7Decl* LookupInNamespace(const Pa7Namespace* scope,
+		const std::string& name, unsigned filter) const;
 	Pa7Decl* LookupUnqualified(const std::string& name,
 		unsigned filter) const;
 	Pa7Decl* LookupInUsing(const Pa7Namespace* scope,
 		const std::string& name, unsigned filter,
-		std::vector<const Pa7Namespace*>& visited) const;
+		std::set<const Pa7Namespace*>& visited) const;
 	Pa7Namespace* ResolveRelativeNamespace(const Pa7Namespace* scope,
 		const std::vector<std::string>& parts, bool absolute) const;
 

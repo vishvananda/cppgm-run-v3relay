@@ -156,12 +156,15 @@ failures (through-pa6 is clean at 313). Ownership of the failures:
   machinery. Evidence: focused packet fixtures 23/23; `make test-pa7`
   36/41 (failures 41 → 5); `make test-report-through-pa6` 313/313;
   file audit passes with only the pre-existing warning.
-- CP2 (NEXT) — namespace semantics breadth: unnamed namespaces, inline
+- CP2 (DONE) — namespace semantics breadth: unnamed namespaces, inline
   namespaces + inline-set qualified lookup + reopen check, namespace
   aliases, using-declarations, anchored transitive using-directives.
-  Proof: 41/41 `make test-pa7`; clean `make test-report-through-pa7`.
-- CP3 — audit + hardening: differential probes vs `pa7/nsdecl-ref` on
-  hand inputs (lookup anchoring edges, UB envelope recorded, not
+  Evidence: `make test-pa7` 41/41 (failures 5 → 0);
+  `make test-report-through-pa6` 313/313; `make test-report-through-pa7`
+  354/354; pa7 file audit passes with only the pre-existing warning; the
+  200-namespace directive-chain probe completes in 0.012 s.
+- CP3 (NEXT) — audit + hardening: differential probes vs `pa7/nsdecl-ref`
+  on hand inputs (lookup anchoring edges, UB envelope recorded, not
   chased), perf evidence on scaled probes, keep implementation bodies in
   .cpp (file-audit division warning hygiene), write `pa7/audit.md`,
   close out plan. Proof: through-pa7 clean; audit passes.
@@ -279,7 +282,7 @@ Known uncertainties:
   layout assumptions elsewhere — verified: through-pa6 green is the
   guard).
 
-## Active Checkpoint — CP2: namespace semantics breadth
+## Completed Checkpoint — CP2: namespace semantics breadth
 
 Implement the deferred namespace model semantics while preserving the CP1
 direct-declaration and type/declarator behavior: unnamed namespace reuse and
@@ -305,6 +308,24 @@ anchored using-directives, namespace aliases, and using-declarations.
   220-namespace-name-lookup-shadowing,270-using-declaration-reuse,
   280-inline-namespace-alias-lookup,280-inline-namespace-qualified-lookup,
   280-inline-namespace-reopen-bad,600-deep-using-directive-chain}`.
-- Proof: current CP1 36/41 remains green, the five deferred failures are
-  reduced to zero, then `make test-report-through-pa7` and the pa7 file audit
-  pass.
+- Proof: CP1 36/41 remains green, the five deferred failures are reduced to
+  zero; `make test-pa7` is 41/41, `make test-report-through-pa7` is 354/354,
+  and the pa7 file audit passes.
+
+## Active Checkpoint — CP3: audit + hardening
+
+Audit the completed pa7 implementation against hand-input reference
+observations and scaled performance probes, record the defined behavior and
+known reference/UB boundaries, and close out the plan without changing the
+tested semantic contract.
+
+### Implementation Packet
+
+- `pa7/audit.md`: record differential observations for lookup anchoring and
+  ill-formed-input behavior, plus measured scaled-probe performance.
+- `dev/src/parser/nsdecl_model.cpp` and `dev/src/parser/nsdecl_parser.cpp`:
+  make only evidence-backed hardening edits; keep implementation bodies in
+  `.cpp` files.
+- Proof: `make test-report-through-pa7`,
+  `perl scripts/cppgm_file_audit.pl --stage pa7 --paths dev/src`, and the
+  packet's representative performance probe all pass.

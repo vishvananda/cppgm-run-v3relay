@@ -71,6 +71,13 @@ enum Pa7DeclKind
 	PA7_DECL_NAMESPACE
 };
 
+enum Pa7DeclOrigin
+{
+	PA7_DECL_OWNED,
+	PA7_DECL_NAMESPACE_ALIAS,
+	PA7_DECL_USING
+};
+
 enum Pa7DeclFilter
 {
 	PA7_FIND_ANY = 0,
@@ -83,6 +90,7 @@ enum Pa7DeclFilter
 struct Pa7Decl
 {
 	Pa7DeclKind kind;
+	Pa7DeclOrigin origin;
 	std::shared_ptr<Pa7Variable> variable;
 	std::shared_ptr<Pa7Function> function;
 	std::shared_ptr<Pa7Typedef> typedef_entity;
@@ -145,6 +153,7 @@ struct Pa7Namespace
 	Pa7Namespace* AddUnnamedNamespace(bool inline_namespace = false);
 	void AddNamespaceAlias(const std::string& name, Pa7Namespace* target);
 	void AddUsingDirective(Pa7Namespace* target);
+	void AddUsingDeclaration(const std::string& name, const Pa7Decl& source);
 	std::shared_ptr<Pa7Variable> AddOrMergeVariable(const std::string& name,
 		const Pa7TypePtr& type);
 	std::shared_ptr<Pa7Function> AddOrMergeFunction(const std::string& name,
