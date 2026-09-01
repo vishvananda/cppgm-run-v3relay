@@ -1,11 +1,14 @@
 // (C) 2013 CPPGM Foundation www.cppgm.org.  All rights reserved.
 
 #include <iostream>
+#include <sstream>
 #include <string>
 
 using namespace std;
 
 #include "exceptions.h"
+#include "ctrlexpr_eval.h"
+#include "pptoken_lexer.h"
 
 // mock implementation of IsDefinedIdentifier for PA3
 // return true iff first code point is odd
@@ -45,8 +48,14 @@ int main(int argc, char** argv)
 		if (HasBatchStdinArg(argc, argv))
 			return RunNotImplementedBatchMode();
 
-		// TODO: Implement ctrlexpr as per PA3 assignment description
-		throw NotImplementedException();
+		ostringstream oss;
+		oss << cin.rdbuf();
+		string input = oss.str();
+
+		CtrlExprLineSplitter output(cout, PA3Mock_IsDefinedIdentifier);
+		PPTokenize(input, output);
+
+		return EXIT_SUCCESS;
 	}
 	catch (const NotImplementedException& e)
 	{

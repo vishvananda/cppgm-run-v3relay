@@ -96,67 +96,45 @@ Single root cause today (stub). By owning checkpoint once the pipeline exists:
 
 ## Checkpoint Ledger
 
-- CP1 (ACTIVE) — line pipeline + primary/unary evaluator. Proof: the 6 CP1
-  fixtures above flip to pass (`make test-pa3` 6/20); pa1/pa2 stay clean.
-- CP2 — binary precedence climb + `?:` + full arithmetic/error semantics.
-  Proof: `make test-pa3` 20/20; `make test-report-through-pa3` clean.
+- CP1 (COMPLETE) — line pipeline + primary/unary evaluator. Proof: all 6
+  packet fixture groups match; `make test-pa3` is 9/20 (down from 0/20 at
+  turn start), pa1/pa2 are 81/81, the pa3 source audit checks 20 files, and
+  the 100k-line parenthesis probe completes under 5s.
+- CP2 (ACTIVE) — binary precedence climb + `?:` + full arithmetic/error
+  semantics. Proof target: `make test-pa3` 20/20; `make
+  test-report-through-pa3` clean.
 - CP3 — audit + cleanup: file audit clean, stub remnants pruned, plan marked
   complete.
 
-## Active Checkpoint: CP1 — pipeline + primary/unary
+## Active Checkpoint: CP2 — binary ladder + conditional + arithmetic
 
-Build the whole data path end-to-end with the grammar restricted to
-`controlling-expression := unary-expression` where
-`unary := (+|-|!|~)* primary` and `primary := integral-literal |
-( controlling-expression ) | defined id | defined ( id ) | identifier`.
-Lines using binary/conditional operators fail parse → `error` (no crash, no
-regression); CP2 inserts the binary climb + conditional between the top rule
-and unary at a stable seam.
+Extend the completed line pipeline and unary parser to the full controlling
+expression grammar. Keep the existing token ownership and per-line replay;
+insert precedence-climbing binary levels and the right-associative conditional
+operator between the top rule and unary at the established seam.
 
 ### Implementation Packet
 
-- Files/symbols: create `dev/src/ctrlexpr_eval.h` + `.cpp` with
-  `CtrlExprToken`, `CtrlExprTokenCollector : IPostTokenOutputStream`,
-  `CtrlExprLineSplitter : IPPTokenStream` (ctor takes `std::ostream&` and an
-  is-defined callback), and the evaluator entry
-  (`EvaluateControllingExpression(tokens, is_defined) → EvalResult`).
-  Rewrite the TODO branch of `main` in `dev/ctrlexpr.cpp` following
-  `dev/posttoken.cpp:160-187` (keep batch-stdin guard + catch envelope; keep
-  `PA3Mock_IsDefinedIdentifier`, pass it as the callback). Update
-  `FRONTEND_OBJ_BASENAMES_ctrlexpr` in `dev/frontend_source_sets.mk` to
-  `ctrlexpr_eval pptoken_lexer posttoken_stream posttoken_tables unicode`.
-- Interfaces consumed: `PPTokenize(const std::string&, IPPTokenStream&)`
-  (`dev/src/pptoken_lexer.h`); the 12 `IPPTokenStream` emit events
-  (`dev/src/IPPTokenStream.h`) — buffer all except new_line/eof, blank-line =
-  whitespace-only; `PostTokenStream(IPostTokenOutputStream&)`
-  (`dev/src/posttoken_stream.h`); `ETokenType`/`EFundamentalType`
-  (`dev/src/posttoken_types.h`) — keywords are enum values ≤ `KW_WHILE`,
-  integral types per the signed/unsigned lists in pa3/README.md (signed:
-  bool, wchar_t, char, signed char, short, int, long, long long; unsigned:
-  unsigned char/short/int/long/long long, char16_t, char32_t).
-- Fixture groups: must flip — pa3/tests/{100-primary,110-paren,120-defined}.t,
-  cppgm.tests/course/pa3/{100-unicode-character-literals,
-  120-defined-keyword-operand,120-defined-malformed-operands}.t. The other 14
-  keep failing only on stdout diff (now EXIT_SUCCESS, `error` where CP2 will
-  put values).
-- Required spec facts: identifier/keyword → 0, `true`→1, `false`→0; unary
-  `+ - ~` preserve operand signedness, `!` → signed 0/1; `defined` → signed
-  0/1 via callback (first byte odd), operand may be any identifier incl.
-  keywords/`defined`, whitespace inside parens fine, malformed → error;
-  non-integral or PA2-invalid token anywhere in the line → error; unconsumed
-  trailing tokens → error; blank line → no output; final `eof` line; signed
-  prints as int64_t, unsigned appends `u`; literal bytes widen to 64-bit by
-  sign-extension iff the PA2 type is signed.
-- Commands: focused build `make -C dev ctrlexpr`; manual probe
-  `printf "2\n(0x2)\n-'a'\ndefined foo\ntrue\n3.2\n" | ./dev/ctrlexpr`
-  (expect `2 2 -97 0 1 error eof`); broad `make test-pa3` then
-  `make test-report-through-pa3`; audit
+- Files/symbols: extend `ControllingExpressionParser` and
+  `EvaluateControllingExpression` in `dev/src/ctrlexpr_eval.cpp`; preserve
+  `CtrlExprTokenCollector` and `CtrlExprLineSplitter` ownership. No new
+  frontend interface is needed.
+- Fixtures: pa3/tests/{200-ops,200-ops-alts,250-eval-order,260-cond-ret-type,
+  300-triple}.t and cppgm.tests/course/pa3/{200-adjacent-subtraction,
+  200-chained-multiplicative,200-chained-shifts,200-operator-precedence,
+  200-signed-unsigned-comparison,300-incomplete-expression-bad,
+  300-logical-line-error-isolation,300-unconsumed-expression-tokens-bad,
+  500-integer-overflow}.t.
+- Required facts: precedence and associativity for all binary levels;
+  conditional `?:` with static result-type propagation; UAC for arithmetic,
+  comparisons, and conditional arms; eager flagged evaluation with
+  short-circuit error suppression for `&&`, `||`, and `?:`; wrapping 64-bit
+  arithmetic; and the specified divide/modulo, shift, and signed-minimum
+  errors. Preserve CP1 behavior and final `eof`/line isolation.
+- Focused checks: `make -C dev ctrlexpr`; exercise the 200/250/260 fixture
+  groups directly while editing. Required gates after stabilization:
+  `make test-pa3`, the prior-through-pa3 report, and
   `perl scripts/cppgm_file_audit.pl --stage pa3 --paths dev/src`.
-- Performance probe: the 100k-line paren pipe under Performance Risks (CP1
-  variant: `"((((5))))\n"`), plus eyeball `make test-pa3` wall time.
-- Known uncertainties: (a) unsuffixed decimal > INTMAX_MAX — trust PA2
-  classification (invalid → error), no special-casing; (b) alternative
-  tokens as `defined` operands (`defined(and)`) arrive as Op not Identifier →
-  treated as error; no fixture exercises it, leave until one does; (c) exact
-  stdout on phase-1–3 lex failure doesn't matter — failing tests compare
-  exit status only.
+- Performance probe: `perl -e 'print "((((5))))*3+4\n" x 100000' | timeout 5
+  ./dev/ctrlexpr > /dev/null`; keep parsing linear per line and avoid AST or
+  cross-line buffering.
