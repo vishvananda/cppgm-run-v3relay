@@ -24,7 +24,10 @@ FRONTEND_OBJ_BASENAMES_nsinit := parser/nsdecl_parser parser/nsdecl_model \
 FRONTEND_OBJ_BASENAMES_cy86 := cy86_parse cy86_codegen x86_assembler \
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer \
 	posttoken_stream posttoken_tables unicode
-FRONTEND_OBJ_BASENAMES_cppgm++ :=
+FRONTEND_OBJ_BASENAMES_cppgm++ := parser/ast_parser parser/ast_parser_decl \
+	parser/ast_parser_expr parser/ast_scope parser/ast_model parser/recog_token \
+	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer posttoken_stream \
+	posttoken_tables unicode
 FRONTEND_OBJ_BASENAMES_lowiropt :=
 FRONTEND_OBJ_BASENAMES_lowir2cy86 :=
 FRONTEND_OBJ_BASENAMES_lowir2native :=

@@ -2,14 +2,23 @@
 
 #include "exceptions.h"
 #include "tool_help_text.h"
+#include "preproc_engine.h"
+#include "parser/ast_model.h"
+#include "parser/ast_parser.h"
+#include "parser/recog_token.h"
 
 #include <cstdlib>
+#include <ctime>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace std;
+
+extern "C" long int syscall(long int n, ...) throw ();
 
 namespace {
 
@@ -185,15 +194,22 @@ EmitMode parse_emit_mode(vector<string> & args)
   return mode;
 }
 
-void parse_source_output_invocation(const vector<string> & args,
-                                    bool allow_lowir_options)
+struct SourceOutputInvocation
+{
+  string outfile;
+  vector<string> inputs;
+};
+
+SourceOutputInvocation parse_source_output_invocation(const vector<string> & args,
+                                                      bool allow_lowir_options)
 {
   bool explicit_outfile = false;
-  vector<string> inputs;
+  SourceOutputInvocation invocation;
 
   for(size_t i = 0; i < args.size(); ++i) {
     if(args[i] == "-o") {
       consume_required_option_argument(args, i, "-o", "output file");
+      invocation.outfile = args[i];
       explicit_outfile = true;
       continue;
     }
@@ -212,12 +228,13 @@ void parse_source_output_invocation(const vector<string> & args,
     if(starts_with(args[i], "-")) {
       throw logic_error("unsupported option in emit mode: " + args[i]);
     }
-    inputs.push_back(args[i]);
+    invocation.inputs.push_back(args[i]);
   }
 
-  if(!explicit_outfile || inputs.empty()) {
+  if(!explicit_outfile || invocation.inputs.empty()) {
     throw logic_error("invalid usage");
   }
+  return invocation;
 }
 
 bool consume_preprocess_option(const vector<string> & args, size_t & i)
@@ -379,10 +396,67 @@ int run_unimplemented_mode(const char * feature,
   throw NotImplementedException();
 }
 
+bool pa5_get_file_id(const string & path, PA5FileId & out_fileid)
+{
+  struct
+  {
+    unsigned long int dev;
+    unsigned long int ino;
+    long int unused[16];
+  } data;
+  const int result = static_cast<int>(syscall(4, path.c_str(), &data));
+  out_fileid = make_pair(data.dev, data.ino);
+  return result == 0;
+}
+
+PreprocBuildInfo cppgm_build_info()
+{
+  time_t now = time(0);
+  tm * local_time = localtime(&now);
+  if(local_time == 0) {
+    throw runtime_error("unable to obtain build time");
+  }
+  const char * snapshot = asctime(local_time);
+  if(snapshot == 0) {
+    throw runtime_error("unable to obtain build time");
+  }
+  const string stamp(snapshot);
+  if(stamp.size() < 24) {
+    throw runtime_error("invalid build time");
+  }
+  PreprocBuildInfo build_info;
+  build_info.date = stamp.substr(4, 7) + stamp.substr(20, 4);
+  build_info.time = stamp.substr(11, 8);
+  build_info.author = "Vishvananda";
+  return build_info;
+}
+
 int run_emit_ast_mode(const vector<string> & args)
 {
-  parse_source_output_invocation(args, false);
-  return run_unimplemented_mode("--emit-ast", "PA10");
+  const SourceOutputInvocation invocation =
+      parse_source_output_invocation(args, false);
+  ofstream out(invocation.outfile.c_str());
+  if(!out) {
+    throw runtime_error("unable to open output file");
+  }
+
+  PrintHeader(out, invocation.inputs.size());
+  const PreprocBuildInfo build_info = cppgm_build_info();
+  for(size_t i = 0; i < invocation.inputs.size(); ++i) {
+    ostringstream discarded_preproc_output;
+    PreprocEngine preprocessor(discarded_preproc_output, pa5_get_file_id,
+                               build_info);
+    Pa6TokenCollector collector;
+    preprocessor.RunSingleFile(invocation.inputs[i], collector);
+    AstArena arena;
+    Pa10Parser parser(collector.tokens, arena);
+    const AstId root = parser.ParseTranslationUnit();
+    if(root == 0) {
+      throw runtime_error("parse failed");
+    }
+    PrintUnit(out, i + 1, arena, root);
+  }
+  return EXIT_SUCCESS;
 }
 
 int run_emit_types_mode(const vector<string> & args)

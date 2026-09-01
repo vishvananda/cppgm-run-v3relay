@@ -251,12 +251,15 @@ turns them.
 ## Checkpoint Ledger
 
 - CP1 — driver, AST model/printer, scope table, and the declaration/
-  statement/expression core (F0 + F1). Proves progress by taking pa10 from
-  0/157 to ≥ 40/157 with all 7 negative fixtures passing; through-pa9 stays
-  green (ACTIVE).
+  statement/expression core (F0 + F1) (COMPLETE). Evidence: `make test-pa10`
+  reports 58/157, with all 7 negative fixtures passing and no successful
+  fixture producing a mismatched dump; the turn-start failure count fell from
+  157 to 99. `make test-report-through-pa9` reports 432/432. The pa10 file
+  audit passes (one pre-existing `recog_parser.h` warning), and the 200-level
+  parenthesis and 60-level angle probes each complete in 0.00s.
 - CP2 — namespaces, linkage, using/alias forms, class-specifier with bases,
   members, access labels, bit-fields, special members, ctor-initializers,
-  enums (F2). Target ≥ 70/157.
+  enums (F2). Target ≥ 70/157 (ACTIVE).
 - CP3 — template-declaration, parameter forms, TEMPLATE bindings,
   `typename`/`template` dependent names, explicit instantiation and
   specialization, partial specializations, qualified special-member
@@ -264,139 +267,39 @@ turns them.
 - CP4 — closure: remaining quirks, performance probes, audit warnings,
   `make test-report-through-pa10` green; record results in this file.
 
-## Active Checkpoint — CP1: core parser, model, printer, driver
+## Active Checkpoint — CP2: namespaces, classes, enums, and linkage
 
-Goal: `int main() { return 0; }` and the F0/F1 fixtures dump byte-exact; the
-seven negative fixtures exit 1. Class/enum/namespace/template declaration
-forms may be left unimplemented (parse failure) in CP1, but the *name*
-machinery (nested-name-specifier, speculative template-ids, operator ids,
-Join/concat spelling) must be complete because id-expressions need it.
+Goal: take the current 58/157 baseline to at least 70/157 by adding the
+F2 declaration owners without changing the CP1 dump contract or scope
+rollback behavior.
 
 ### Implementation Packet
 
-Files and symbols to create/modify:
+Files and symbols:
 
-- `dev/src/parser/ast_model.h/.cpp`: `enum AstKind` (one enumerator per dump
-  spelling listed in Stage Design), `const char* AstKindName(AstKind)`,
-  `struct AstNode`, `class AstArena { AstId Make(AstKind, std::string text =
-  ""); AstNode& At(AstId); }`, `void PrintAst(std::ostream&, const AstArena&,
-  AstId root, unsigned depth)`; driver-level helpers `PrintHeader(out, n)`,
-  `PrintUnit(out, k, arena, root)`.
-- `dev/src/parser/ast_scope.h/.cpp`: `enum BindKind {BIND_TYPE, BIND_TEMPLATE,
-  BIND_NAMESPACE, BIND_VALUE}`, `class SyntaxScopes { void Push(); void Pop();
-  size_t Mark() const; bool Rollback(size_t mark); void Bind(const string&,
-  BindKind); const BindKind* Lookup(const string&) const; const BindKind*
-  LookupScopePrefix(const string&) const; }` — bindings in a flat undo log
-  `vector<{scope_depth, name, kind, previous}>` with a per-scope
-  `unordered_map<string, BindKind>`; `Rollback` returns whether anything was
-  undone (caller clears memo).
-- `dev/src/parser/ast_parser.h` + `.cpp`/`_decl.cpp`/`_expr.cpp`: `class
-  Pa10Parser { Pa10Parser(const vector<Pa6Token>&, AstArena&); AstId
-  ParseTranslationUnit(); }` with private rules named after pa10.gram
-  (`parse_declaration`, `parse_simple_declaration`, `parse_function_
-  definition`, `parse_decl_specifier_seq`, `parse_declarator`,
-  `parse_parameter_clause`, `parse_type_id`, `parse_statement`,
-  `parse_expression` … `parse_primary_expression`, `parse_id_expression`,
-  `parse_nested_name_specifier`, `parse_simple_template_id`,
-  `parse_template_argument_list`), helpers `Join(first,last)`,
-  `Concat(first,last)`, `leaf(kind, token)` (`KW_/OP_/TT_IDENTIFIER:` text
-  via `Pa6Token::simple_type` and `TokenTypeToStringMap` from
-  `posttoken_types.h`/`posttoken_tables.cpp`), `restore(...)`,
-  `try_memoized(rule, &Pa10Parser::impl)`, `enter_bracket/leave_bracket/
-  has_angle_boundary/parse_close_angle_bracket` copied from
-  `recog_parser.cpp` lines 194-260.
-- `dev/cppgm++.cpp`: implement `run_emit_ast_mode` (keep the arg validation;
-  add the PA5 file-id syscall shim and build-info construction from
-  `dev/recog.cpp::DoRecog`; open `-o` with `ofstream`; per input: engine →
-  collector → parser → print; return EXIT_SUCCESS).
-- `dev/frontend_source_sets.mk`: set `FRONTEND_OBJ_BASENAMES_cppgm++` as in
-  Stage Design.
+- `dev/src/parser/ast_model.h/.cpp`: extend the existing kind table only when
+  a CP2 fixture requires a class/enum/namespace spelling.
+- `dev/src/parser/ast_scope.h/.cpp`: use `Push`/`Pop` and the undo log for
+  namespace/class bodies; namespace names bind `BIND_NAMESPACE` and class or
+  enum names bind `BIND_TYPE` at the grammar commit point.
+- `dev/src/parser/ast_parser.h`, `ast_parser.cpp`, and
+  `ast_parser_decl.cpp`: implement `parse_namespace_definition`,
+  `parse_namespace_alias_definition`, `parse_linkage_specification`,
+  `parse_using_directive`, `parse_using_declaration`, `parse_class_specifier`,
+  `parse_base_clause`, `parse_member_declaration`,
+  `parse_enum_specifier`, `parse_bit_field_declaration`,
+  `parse_ctor_initializer`, and `parse_mem_initializer`; retain
+  `ast_parser_expr.cpp` behavior.
+- `dev/frontend_source_sets.mk`: keep the PA10 parser/model/scope source set
+  complete; do not add PA6/PA7 sources to the cppgm++ target.
 
-Fixture groups to drive with (in order): spec/100-empty, spec/100-decl,
-spec/100-main, spec/100-params, spec/100-nested-declarator,
-spec/100-array-declarator, spec/100-storage-specifiers, general/100-block-
-items, 100-if-else, 100-while-assign, 100-for-postfix, 100-inc,
-100-operators-pm, 100-conditional-sizeof, spec/100-switch-try,
-100-catch-declaration, 100-rshift-piece-normalization, 100-c-style-cast-
-expression, 100-typedef-style-unary-cast, 100-qualified-id-call,
-100-decl-initializers, 100-typedef-for-init-declaration, 100-function-
-pointer-typedef-parameter, 100-static-assert, 100-lambda-cast,
-200-lambda-declarator, 100-new-delete-traits, 200-parenthesized-new-type-vs-
-placement, 100-structured-type-id, spec/300-type-id-expression-contexts,
-spec/300-declaration-statement-ambiguity, 200-condition-expression-call-
-chain-not-declaration, 100-template-condition, 200-builtin-function-style-
-cast-expression, 200-literal-operator-id, 200-allocation-array-operator-ids,
-200-function-virt-and-noexcept-suffixes, then the 7 negative fixtures.
+Fixture groups: `spec/100-namespace-forms`, `spec/200-bit-field-declaration`,
+`spec/200-class-bases-and-ctor-init`, `general/100-member-declarations`,
+`general/100-special-member-definitions`, `general/100-typedef-struct-union`,
+`general/100-typedef-anonymous-enum`, `general/100-typedef-anonymous-union`,
+`general/100-scoped-enum-underlying-type`, and the F2 linkage/using/member
+fixtures listed in the Failure Map. Preserve all CP1 fixtures and negatives.
 
-Required spec facts (pa10.gram unless noted):
-
-- `translation-unit: declaration* ST_EOF`; `declaration` alternatives in
-  grammar order; `function-definition: decl-specifier-seq declarator
-  compound-statement`; `simple-declaration: decl-specifier-seq
-  init-declarator-list? ;`; `decl-specifier` = simple-type keyword |
-  qualified-type-name | decltype-specifier | cv | typedef extern static
-  inline virtual constexpr thread_local auto (fixtures also use `friend`,
-  `explicit`, `mutable`-free; accept PA6's set).
-- `declarator: ptr-operator* direct-declarator`; `direct-declarator:
-  declarator-id declarator-suffix* | ( declarator ) declarator-suffix*`;
-  suffixes: `parameter-clause function-suffix*` | `[ expression? ]`;
-  function-suffix: cv, ref-qualifier, noexcept-specification,
-  virt-specifier (`override`/`final` arrive as identifiers), trailing-return-
-  type; `ptr-operator: * & &&` plus fixture-required `nested-name-specifier
-  *` (pointer to member, `ptr-operator C::*`).
-- `parameter-declaration: decl-specifier-seq (declarator | abstract-
-  declarator)? default-argument? | ...`; parameter-clause `( ... )` and
-  trailing `, ...` print `parameter-pack ...`.
-- `initializer: = initializer-clause | braced-init-list | ( initializer-
-  clause-list? )`; `= default` / `= delete` print `special-initializer`.
-- `condition: decl-specifier-seq declarator initializer | expression`
-  (initializer mandatory); `for-init-statement: simple-declaration |
-  expression? ;`.
-- Expression precedence ladder from `assignment-expression` down to
-  `pm-expression`; `unary-expression` includes `sizeof`, `sizeof(type-id)`,
-  `alignof`, `noexcept(...)`, `typeid(expr|type-id)`, keyword casts,
-  new/delete; `postfix-suffix: ( argument-list? ) | [ e ] | . id-expression
-  | -> id-expression | ++ | --`; `primary-expression` adds `braced-init-
-  list` and `lambda-expression`; a simple-type keyword followed by `(` or
-  `{` is a functional cast (PA6 `parse_postfix_root`).
-- `id-expression`, `qualified-id: nested-name-specifier template?
-  unqualified-id`, `nested-name-specifier-root: :: | type-name :: |
-  namespace-name :: | decltype-specifier ::`, `simple-template-id:
-  template-name < template-argument-list? close-angle-bracket`, template-
-  argument = type-id | assignment-expression (with `angle_refusal_`),
-  `close-angle-bracket: > | ST_RSHIFT_1 | ST_RSHIFT_2`.
-- Shift operator is the token pair `ST_RSHIFT_1 ST_RSHIFT_2`; print
-  `OP_RSHIFT:>>`.
-- Exit contract (README): any preprocessing, tokenization or parse failure →
-  EXIT_FAILURE; never EXIT_NOT_IMPLEMENTED for `--emit-ast`.
-
-Commands:
-
-- Build: `make -C dev cppgm++`.
-- Focused: `dev/cppgm++ --emit-ast -o /tmp/t.my pa10/tests/spec/100-main.t;
-  echo $?; diff /tmp/t.my pa10/tests/spec/100-main.ref` (repeat per fixture);
-  suite with per-test diffs: `make -C pa10 test`.
-- Broad: `make test-pa10` (must show the pass count rising; log at
-  `.ralph/…/last-test.log`), then `make test-report-through-pa9` to prove no
-  regression (PA6-PA9 tools share `recog_token.cpp` and the preprocessor).
-- Audit: `perl scripts/cppgm_file_audit.pl --stage pa10 --paths dev/src`
-  (keep each new .cpp < 3000 lines, functions < 240 lines).
-
-Performance probe: `time make -C pa10 test` must stay under 3 s total; write
-`/tmp/deep.t` with `int f(){return ((((((((((x))))))))));}` extended to 200
-parens and `A<B<C<…>>> v;` 60 deep and confirm each parses in < 50 ms.
-
-Known uncertainties (decide in code, note the choice in this file):
-
-- Comma expression node name (no fixture; assume `binary-expression
-  OP_COMMA:,`). Elaborated class specifier inside a decl-specifier-seq
-  (`struct S* p;`) node name (no fixture; assume `class-forward-declaration
-  S`).
-- Whether `using M::f` should bind `f` (no fixture depends on it; bind
-  nothing).
-- Unbound identifier at statement start followed by `*` or `&` and another
-  identifier (`x * y;`): the declaration-first policy declares; no fixture
-  contradicts it.
-- Scoped-enum enumerators: bind as VALUE in the enclosing scope as well as
-  the enum scope so `E::A` and bare `A` both classify (fixtures only use
-  `E::A`-style access through the qualified path).
+Exit evidence: `make test-pa10`, `make test-report-through-pa9`, and the pa10
+file audit; the next checkpoint must increase the pa10 pass count without
+removing or weakening any fixture.
