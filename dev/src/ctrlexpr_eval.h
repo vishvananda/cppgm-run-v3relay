@@ -104,7 +104,6 @@ struct CtrlExprLineSplitter : IPPTokenStream
 private:
 	enum RawEventKind
 	{
-		RAW_WHITESPACE,
 		RAW_HEADER_NAME,
 		RAW_IDENTIFIER,
 		RAW_PP_NUMBER,

@@ -135,10 +135,12 @@ private:
 			return condition;
 
 		++position_;
-		const bool condition_valid = !condition.error && !syntax_error_;
+		// The reference discards the condition's evaluation error: the
+		// carried value still selects the arm, and only the selected arm's
+		// error survives.  The result type is the OR of both arm types
+		// regardless of which arm is selected.
 		const bool condition_true = condition.value != 0;
-		EvalResult true_value = ParseConditional(
-			evaluate && condition_valid && condition_true);
+		EvalResult true_value = ParseConditional(evaluate && condition_true);
 
 		if (!IsOperator(OP_COLON))
 		{
@@ -147,16 +149,11 @@ private:
 		}
 		++position_;
 
-		EvalResult false_value = ParseConditional(
-			evaluate && condition_valid && !condition_true);
-		const bool is_unsigned =
-			true_value.is_unsigned || false_value.is_unsigned;
-		EvalResult result(is_unsigned,
-			condition_true ? true_value.value : false_value.value, false);
-		if (evaluate && (condition.error ||
-			(condition_true ? true_value.error : false_value.error)))
-			result.error = true;
-		return result;
+		EvalResult false_value = ParseConditional(evaluate && !condition_true);
+		return EvalResult(true_value.is_unsigned || false_value.is_unsigned,
+			condition_true ? true_value.value : false_value.value,
+			evaluate &&
+				(condition_true ? true_value.error : false_value.error));
 	}
 
 	EvalResult ParseBinary(int minimum_precedence, bool evaluate)
@@ -226,35 +223,30 @@ private:
 			break;
 		case OP_DIV:
 		case OP_MOD:
-			if (right.value == 0)
-			{
-				if (evaluate)
-					error = true;
-			}
-			else if (!is_unsigned &&
+			// A failed operation carries its left operand's value; that
+			// value is observable when a `?:` condition discards the error.
+			if (right.value == 0 || (!is_unsigned &&
 				left.value == (static_cast<std::uint64_t>(1) << 63) &&
-				right.value == static_cast<std::uint64_t>(-1))
+				right.value == static_cast<std::uint64_t>(-1)))
 			{
 				if (evaluate)
 					error = true;
+				value = left.value;
 			}
-			else if (!error)
+			else if (is_unsigned)
 			{
-				if (is_unsigned)
-				{
-					value = op == OP_DIV ? left.value / right.value
-						: left.value % right.value;
-				}
-				else
-				{
-					const std::int64_t left_signed =
-						static_cast<std::int64_t>(left.value);
-					const std::int64_t right_signed =
-						static_cast<std::int64_t>(right.value);
-					value = static_cast<std::uint64_t>(op == OP_DIV
-						? left_signed / right_signed
-						: left_signed % right_signed);
-				}
+				value = op == OP_DIV ? left.value / right.value
+					: left.value % right.value;
+			}
+			else
+			{
+				const std::int64_t left_signed =
+					static_cast<std::int64_t>(left.value);
+				const std::int64_t right_signed =
+					static_cast<std::int64_t>(right.value);
+				value = static_cast<std::uint64_t>(op == OP_DIV
+					? left_signed / right_signed
+					: left_signed % right_signed);
 			}
 			break;
 		case OP_LSHIFT:
@@ -262,12 +254,16 @@ private:
 		{
 			const bool negative_shift = !right.is_unsigned &&
 				static_cast<std::int64_t>(right.value) < 0;
-			const bool invalid_shift = negative_shift || right.value >= 64;
-			if (evaluate && invalid_shift)
-				error = true;
-			else if (!error && !invalid_shift)
+			if (negative_shift || right.value >= 64)
 			{
-				const unsigned int count = static_cast<unsigned int>(right.value);
+				if (evaluate)
+					error = true;
+				value = left.value;
+			}
+			else
+			{
+				const unsigned int count =
+					static_cast<unsigned int>(right.value);
 				if (op == OP_LSHIFT)
 					value = left.value << count;
 				else if (left.is_unsigned)
@@ -347,7 +343,11 @@ private:
 				return EvalResult(operand.is_unsigned,
 					static_cast<std::uint64_t>(0) - operand.value, error);
 			case OP_LNOT:
-				return EvalResult(false, operand.value == 0 ? 1 : 0, error);
+				// The reference evaluator gives `!x` the signedness of its
+				// operand (unlike ISO `!`, which yields signed int), and
+				// later preprocessor stages are gated on that behavior.
+				return EvalResult(operand.is_unsigned,
+					operand.value == 0 ? 1 : 0, error);
 			case OP_COMPL:
 				return EvalResult(operand.is_unsigned, ~operand.value, error);
 			default:
@@ -366,13 +366,6 @@ private:
 		}
 
 		const CtrlExprToken& token = tokens_[position_];
-		if (token.kind == CtrlExprToken::KIND_BAD)
-		{
-			++position_;
-			syntax_error_ = true;
-			return ErrorResult();
-		}
-
 		if (token.kind == CtrlExprToken::KIND_LITERAL)
 		{
 			++position_;
@@ -421,7 +414,7 @@ private:
 
 		if (tokens_[position_].kind == CtrlExprToken::KIND_IDENTIFIER)
 		{
-			const string name = tokens_[position_].text;
+			const string& name = tokens_[position_].text;
 			++position_;
 			return DefinedValue(name);
 		}
@@ -439,7 +432,7 @@ private:
 			return ErrorResult();
 		}
 
-		const string name = tokens_[position_].text;
+		const string& name = tokens_[position_].text;
 		++position_;
 		if (!IsOperator(OP_RPAREN))
 		{
@@ -456,7 +449,7 @@ private:
 		return EvalResult(false, defined ? 1 : 0, false);
 	}
 
-		const vector<CtrlExprToken>& tokens_;
+	const vector<CtrlExprToken>& tokens_;
 	const CtrlExprIsDefined& is_defined_;
 	std::size_t position_;
 	bool syntax_error_;
@@ -528,6 +521,8 @@ void CtrlExprTokenCollector::emit_invalid(const string& source)
 void CtrlExprTokenCollector::emit_simple(const string& source,
 	ETokenType token_type)
 {
+	// Keywords precede operators in ETokenType; every keyword is an
+	// identifier_or_keyword in controlling-expression context.
 	if (token_type <= KW_WHILE)
 		tokens_.push_back(CtrlExprToken::MakeIdentifier(source));
 	else
@@ -626,6 +621,14 @@ EvalResult::EvalResult(bool is_unsigned, std::uint64_t value, bool error)
 EvalResult EvaluateControllingExpression(const vector<CtrlExprToken>& tokens,
 	const CtrlExprIsDefined& is_defined)
 {
+	// The invalid-token check precedes parsing (pa3/README.md Features), so
+	// an unparseable line never recurses; the reference errors here too.
+	for (size_t i = 0; i < tokens.size(); ++i)
+	{
+		if (tokens[i].kind == CtrlExprToken::KIND_BAD)
+			return ErrorResult();
+	}
+
 	ControllingExpressionParser parser(tokens, is_defined);
 	EvalResult result = parser.Parse();
 	if (parser.position() != tokens.size())
@@ -646,21 +649,8 @@ void CtrlExprLineSplitter::append(RawEventKind kind, const string& data)
 
 void CtrlExprLineSplitter::flush_line()
 {
-	bool has_non_whitespace = false;
-	for (size_t i = 0; i < line_.size(); ++i)
-	{
-		if (line_[i].kind != RAW_WHITESPACE)
-		{
-			has_non_whitespace = true;
-			break;
-		}
-	}
-
-	if (!has_non_whitespace)
-	{
-		line_.clear();
+	if (line_.empty())
 		return;
-	}
 
 	vector<CtrlExprToken> tokens;
 	CtrlExprTokenCollector collector(tokens);
@@ -670,9 +660,6 @@ void CtrlExprLineSplitter::flush_line()
 		const RawEvent& event = line_[i];
 		switch (event.kind)
 		{
-		case RAW_WHITESPACE:
-			posttoken_output.emit_whitespace_sequence();
-			break;
 		case RAW_HEADER_NAME:
 			posttoken_output.emit_header_name(event.data);
 			break;
@@ -710,7 +697,8 @@ void CtrlExprLineSplitter::flush_line()
 
 void CtrlExprLineSplitter::emit_whitespace_sequence()
 {
-	append(RAW_WHITESPACE, string());
+	// Whitespace-sequences are discarded (pa3/README.md Features); replaying
+	// them would be a no-op in PostTokenStream anyway.
 }
 
 void CtrlExprLineSplitter::emit_new_line()
