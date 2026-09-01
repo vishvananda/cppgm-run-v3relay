@@ -126,6 +126,12 @@ public:
 	}
 };
 
+bool IsDynamicPredefinedName(const string& name)
+{
+	return name == "__FILE__" || name == "__LINE__" ||
+		name == "__COUNTER__";
+}
+
 const size_t MaxIncludeDepth = 256;
 
 class IncludeDepthGuard
@@ -198,6 +204,7 @@ void PreprocEngine::ProcessSourceFile(const string& srcfile)
 	file_names_.clear();
 	file_name_ids_.clear();
 	pragma_once_files_.clear();
+	undefined_dynamic_.clear();
 	include_depth_ = 0;
 	table_ = MacroTable();
 	InstallPredefineds();
@@ -415,30 +422,48 @@ void PreprocEngine::ProcessInclude(const vector<PPToken>& line,
 	ProcessSourceFile(resolved_path, output);
 }
 
-void PreprocEngine::MarkPragmaOnce(int current_file)
+void PreprocEngine::MarkPragmaOnce(int presumed_file)
 {
-	if (current_file <= 0 ||
-		static_cast<size_t>(current_file) > file_names_.size())
+	// The README defines pragma once on the presumed __FILE__: the current
+	// #line-controlled name looked up as-is, and a failed lookup is an
+	// error (reference-pinned; a #line rename to a missing path fails).
+	if (presumed_file <= 0 ||
+		static_cast<size_t>(presumed_file) > file_names_.size())
+		throw PreprocError("pragma once outside a source file");
+	if (!file_id_lookup_)
 		return;
 
 	PA5FileId file_id = make_pair(0UL, 0UL);
-	if (LookupFileId(file_names_[static_cast<size_t>(current_file) - 1],
-		file_id))
-		pragma_once_files_.insert(file_id);
+	if (!LookupFileId(
+		file_names_[static_cast<size_t>(presumed_file) - 1], file_id))
+		throw PreprocError("unable to identify pragma once file");
+	pragma_once_files_.insert(file_id);
 }
 
 void PreprocEngine::ProcessPragma(const vector<PPToken>& line,
-	int current_file)
+	int presumed_file)
 {
-	if (line.size() == 3 && line[2].kind == PP_TOKEN_IDENTIFIER &&
+	if (line.size() >= 3 && line[2].kind == PP_TOKEN_IDENTIFIER &&
 		line[2].data == "once")
-		MarkPragmaOnce(current_file);
+	{
+		if (line.size() != 3)
+			throw PreprocError("malformed pragma once");
+		MarkPragmaOnce(presumed_file);
+	}
 }
 
-void PreprocEngine::ProcessPragmaText(const string& text, int current_file)
+void PreprocEngine::ProcessPragmaText(const string& text, int presumed_file)
 {
-	if (text == "once")
-		MarkPragmaOnce(current_file);
+	istringstream words(text);
+	string first;
+	words >> first;
+	if (first != "once")
+		return;
+
+	string extra;
+	if (words >> extra)
+		throw PreprocError("malformed pragma once");
+	MarkPragmaOnce(presumed_file);
 }
 
 void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
@@ -454,14 +479,17 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 	int presumed_file = current_file;
 	bool line_mapping_reset = false;
 
-	auto flush_text = [this, &text, &output, current_file]()
+	// All text between two flushes shares one presumed __FILE__ (a #line
+	// rename forces a flush first), so the pragma handler reads the
+	// presumed file in effect for the batch being flushed.
+	auto flush_text = [this, &text, &output, &presumed_file]()
 	{
 		if (!text.empty())
 		{
 			MacroFlushText(text, table_, output,
-				[this, current_file](const string& pragma)
+				[this, &presumed_file](const string& pragma)
 				{
-					ProcessPragmaText(pragma, current_file);
+					ProcessPragmaText(pragma, presumed_file);
 				});
 			text.clear();
 		}
@@ -472,118 +500,132 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 		if (tokens[i].kind != PP_TOKEN_NEW_LINE)
 			continue;
 
-		vector<PPToken> line(tokens.begin() + line_begin,
-			tokens.begin() + i);
-		const size_t physical_start = line.empty() ? tokens[i].src_line :
-			line.front().src_line;
+		const size_t physical_start = i == line_begin ? tokens[i].src_line :
+			tokens[line_begin].src_line;
 		if (!line_mapping_reset && physical_start > next_physical_line)
 			presumed_line += physical_start - next_physical_line;
 		line_mapping_reset = false;
 
-		for (size_t j = 0; j < line.size(); ++j)
+		auto stamp = [&physical_start, &presumed_file, &presumed_line](
+			PPToken& token)
 		{
-			const size_t offset = line[j].src_line >= physical_start
-				? line[j].src_line - physical_start : 0;
-			line[j].presumed_file = presumed_file;
-			line[j].presumed_line = presumed_line + offset;
-		}
-		PPToken newline = tokens[i];
-		newline.presumed_file = presumed_file;
-		newline.presumed_line = presumed_line +
-			(newline.src_line >= physical_start
-				? newline.src_line - physical_start : 0);
+			const size_t offset = token.src_line >= physical_start
+				? token.src_line - physical_start : 0;
+			token.presumed_file = presumed_file;
+			token.presumed_line = presumed_line + offset;
+		};
 
 		bool line_override = false;
 		size_t overridden_line = 0;
 		int overridden_file = presumed_file;
 
-		if (IsDirective(line, "if"))
+		if (i == line_begin || !IsDirectiveHash(tokens[line_begin]))
 		{
-			flush_text();
-			const bool parent_active = active;
-			bool condition = false;
-			if (parent_active)
-				condition = EvaluateCondition(line);
-			groups.push_back(ConditionalGroup(parent_active, condition));
-			active = groups.back().active;
-		}
-		else if (IsDirective(line, "ifdef") ||
-			IsDirective(line, "ifndef"))
-		{
-			flush_text();
-			const bool parent_active = active;
-			bool condition = false;
-			if (parent_active)
+			// A text line (or empty line) appends straight from the token
+			// buffer, newline included; directives get a stamped copy below.
+			if (active)
 			{
+				for (size_t j = line_begin; j <= i; ++j)
+				{
+					text.push_back(tokens[j]);
+					stamp(text.back());
+				}
+			}
+		}
+		else
+		{
+			vector<PPToken> line(tokens.begin() + line_begin,
+				tokens.begin() + i);
+			for (size_t j = 0; j < line.size(); ++j)
+				stamp(line[j]);
+
+			if (IsDirective(line, "if"))
+			{
+				flush_text();
+				const bool parent_active = active;
+				bool condition = false;
+				if (parent_active)
+					condition = EvaluateCondition(line);
+				groups.push_back(ConditionalGroup(parent_active, condition));
+				active = groups.back().active;
+			}
+			else if (IsDirective(line, "ifdef") ||
+				IsDirective(line, "ifndef"))
+			{
+				flush_text();
+				const bool parent_active = active;
+				bool condition = false;
+				if (parent_active)
+				{
+					if (line.size() != 3 ||
+						line[2].kind != PP_TOKEN_IDENTIFIER)
+						throw PreprocError("malformed conditional directive");
+					condition = table_.IsDefined(line[2].data);
+					if (IsDirective(line, "ifndef"))
+						condition = !condition;
+				}
+				groups.push_back(ConditionalGroup(parent_active, condition));
+				active = groups.back().active;
+			}
+			else if (IsDirective(line, "elif"))
+			{
+				flush_text();
+				if (groups.empty() || groups.back().in_else)
+					throw PreprocError("misplaced elif");
+				ConditionalGroup& group = groups.back();
+				if (!group.parent_active || group.taken)
+				{
+					group.active = false;
+					active = false;
+				}
+				else
+				{
+					const bool condition = EvaluateCondition(line);
+					group.active = condition;
+					group.taken = condition;
+					active = condition;
+				}
+			}
+			else if (IsDirective(line, "else"))
+			{
+				flush_text();
+				if (groups.empty() || groups.back().in_else)
+					throw PreprocError("misplaced else");
+				ConditionalGroup& group = groups.back();
+				const bool branch_active = group.parent_active && !group.taken;
+				if (branch_active && line.size() != 2)
+					throw PreprocError("malformed else");
+				group.in_else = true;
+				group.active = branch_active;
+				group.taken = true;
+				active = branch_active;
+			}
+			else if (IsDirective(line, "endif"))
+			{
+				flush_text();
+				if (groups.empty())
+					throw PreprocError("misplaced endif");
+				if (groups.back().parent_active && line.size() != 2)
+					throw PreprocError("malformed endif");
+				groups.pop_back();
+				active = groups.empty() ? true : groups.back().active;
+			}
+			else if (active && IsDirective(line, "define"))
+			{
+				flush_text();
+				table_.Define(line);
+			}
+			else if (active && IsDirective(line, "undef"))
+			{
+				flush_text();
 				if (line.size() != 3 ||
-					line[2].kind != PP_TOKEN_IDENTIFIER)
-					throw PreprocError("malformed conditional directive");
-				condition = table_.IsDefined(line[2].data);
-				if (IsDirective(line, "ifndef"))
-					condition = !condition;
+					line[2].kind != PP_TOKEN_IDENTIFIER ||
+					line[2].data == "__VA_ARGS__")
+					throw PreprocError("malformed undef directive");
+				if (IsDynamicPredefinedName(line[2].data))
+					undefined_dynamic_.insert(line[2].data);
+				table_.Undef(line[2].data);
 			}
-			groups.push_back(ConditionalGroup(parent_active, condition));
-			active = groups.back().active;
-		}
-		else if (IsDirective(line, "elif"))
-		{
-			flush_text();
-			if (groups.empty() || groups.back().in_else)
-				throw PreprocError("misplaced elif");
-			ConditionalGroup& group = groups.back();
-			if (!group.parent_active || group.taken)
-			{
-				group.active = false;
-				active = false;
-			}
-			else
-			{
-				if (!IsDirective(line, "elif"))
-					throw PreprocError("malformed elif");
-				const bool condition = EvaluateCondition(line);
-				group.active = condition;
-				group.taken = condition;
-				active = condition;
-			}
-		}
-		else if (IsDirective(line, "else"))
-		{
-			flush_text();
-			if (groups.empty() || groups.back().in_else)
-				throw PreprocError("misplaced else");
-			ConditionalGroup& group = groups.back();
-			const bool branch_active = group.parent_active && !group.taken;
-			if (branch_active && line.size() != 2)
-				throw PreprocError("malformed else");
-			group.in_else = true;
-			group.active = branch_active;
-			group.taken = true;
-			active = branch_active;
-		}
-		else if (IsDirective(line, "endif"))
-		{
-			flush_text();
-			if (groups.empty())
-				throw PreprocError("misplaced endif");
-			if (groups.back().active && line.size() != 2)
-				throw PreprocError("malformed endif");
-			groups.pop_back();
-			active = groups.empty() ? true : groups.back().active;
-		}
-		else if (active && IsDirective(line, "define"))
-		{
-			flush_text();
-			table_.Define(line);
-		}
-		else if (active && IsDirective(line, "undef"))
-		{
-			flush_text();
-			if (line.size() != 3 ||
-				line[2].kind != PP_TOKEN_IDENTIFIER ||
-				line[2].data == "__VA_ARGS__")
-				throw PreprocError("malformed undef directive");
-			table_.Undef(line[2].data);
-		}
 			else if (active && IsDirective(line, "line"))
 			{
 				flush_text();
@@ -600,11 +642,9 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 			else if (active && IsDirective(line, "pragma"))
 			{
 				flush_text();
-				ProcessPragma(line, current_file);
+				ProcessPragma(line, presumed_file);
 			}
-			else if (!line.empty() && IsDirectiveHash(line[0]))
-		{
-			if (active)
+			else if (active)
 			{
 				flush_text();
 				if (line.size() >= 2 &&
@@ -614,11 +654,6 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 				if (line.size() != 1)
 					throw PreprocError("invalid preprocessing directive");
 			}
-		}
-		else if (active)
-		{
-			text.insert(text.end(), line.begin(), line.end());
-			text.push_back(newline);
 		}
 
 		const size_t physical_end = tokens[i].src_line;
@@ -637,10 +672,6 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 		line_begin = i + 1;
 	}
 
-	if (line_begin < tokens.size() && active)
-	{
-		text.insert(text.end(), tokens.begin() + line_begin, tokens.end());
-	}
 	flush_text();
 	if (!groups.empty())
 		throw PreprocError("unterminated conditional group");
@@ -648,8 +679,11 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 
 bool PreprocEngine::IsDynamicPredefined(const string& name) const
 {
-	return name == "__FILE__" || name == "__LINE__" ||
-		name == "__COUNTER__";
+	// #undef disables a dynamic predefined (reference-pinned; the include
+	// and line machinery keep their own typed state, so only macro
+	// replacement is affected).
+	return IsDynamicPredefinedName(name) &&
+		undefined_dynamic_.find(name) == undefined_dynamic_.end();
 }
 
 bool PreprocEngine::ResolveDynamicPredefined(const PPToken& source,

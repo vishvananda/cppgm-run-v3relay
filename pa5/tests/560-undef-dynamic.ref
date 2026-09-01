@@ -1,0 +1,6 @@
+preproc 1
+sof tests/560-undef-dynamic.t
+identifier __LINE__
+identifier __COUNTER__
+literal "tests/560-undef-dynamic.t" array of 26 char 74657374732F3536302D756E6465662D64796E616D69632E7400
+eof

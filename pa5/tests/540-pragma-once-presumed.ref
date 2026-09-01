@@ -1,0 +1,5 @@
+preproc 1
+sof tests/540-pragma-once-presumed.t
+identifier A
+identifier A
+eof

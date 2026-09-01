@@ -46,9 +46,9 @@ private:
 		PostTokenStream& output, int current_file);
 	void ProcessInclude(const std::vector<PPToken>& line,
 		int presumed_file, PostTokenStream& output);
-	void ProcessPragma(const std::vector<PPToken>& line, int current_file);
-	void ProcessPragmaText(const std::string& text, int current_file);
-	void MarkPragmaOnce(int current_file);
+	void ProcessPragma(const std::vector<PPToken>& line, int presumed_file);
+	void ProcessPragmaText(const std::string& text, int presumed_file);
+	void MarkPragmaOnce(int presumed_file);
 	bool ResolveIncludePath(const std::string& include_name,
 		int presumed_file, std::string& resolved_path,
 		PA5FileId& resolved_id, bool& have_resolved_id) const;
@@ -70,6 +70,7 @@ private:
 	std::vector<std::string> file_names_;
 	std::map<std::string, int> file_name_ids_;
 	std::set<PA5FileId> pragma_once_files_;
+	std::set<std::string> undefined_dynamic_;
 	MacroTable table_;
 	std::size_t counter_;
 	std::size_t include_depth_;

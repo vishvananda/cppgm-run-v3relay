@@ -147,6 +147,4 @@ struct PostTokenStream;
 
 void MacroProcessFile(const string& input, IPostTokenOutputStream& output);
 void MacroFlushText(const std::vector<PPToken>& text, const MacroTable& table,
-	PostTokenStream& output);
-void MacroFlushText(const std::vector<PPToken>& text, const MacroTable& table,
 	PostTokenStream& output, const MacroPragmaHandler& pragma_handler);
