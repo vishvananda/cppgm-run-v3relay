@@ -1,8 +1,8 @@
 # PA4 Plan — macro (phases 1–6 + phase-7 tokenization with #define/#undef)
 
-State at planning: 0/72 pa4 fixtures pass (tool is the EXIT_NOT_IMPLEMENTED
-stub); through-pa3 green; file audit green. Oracle: `.ref` files; failing
-fixtures compare exit status only.
+State at CP1 completion: 51/72 pa4 fixtures pass; through-pa3 remains green;
+the pa4 file audit remains green. Oracle: `.ref` files; failing fixtures
+compare exit status only.
 
 ## Stage Design
 
@@ -172,91 +172,60 @@ All 72 failures = one stub; ownership after CP1 split:
 
 ## Checkpoint Ledger
 
-- CP1 (ACTIVE) — directive layer, macro table with full define-time
+- CP1 (COMPLETE) — directive layer, macro table with full define-time
   validation, expansion core with paint model, arg collection + lazy
   pre-expansion + ordinary substitution (no #/##/__VA_ARGS__ substitution
   yet), single-PostTokenStream replay, tool main. Proof: `make test-pa4`
-  failures drop 72 → ≈30 (every fixture whose semantics avoid #/##/varargs,
-  incl. all define-error and recursion fixtures above);
-  `make test-report-through-pa3` stays green; file audit green.
-- CP2 — stringize, paste + re-lex, placemarkers, variadics + GNU comma rule,
-  ws-flag propagation polish. Proof: 72/72 `make test-pa4` and clean
-  `make test-report-through-pa4`; through-pa3 unchanged.
+  reports 51/72, with the 21 remaining failures confined to the deferred
+  #/##/varargs substitution groups; `make test-report-through-pa3` reports
+  104/104; `make test-report-through-pa4` reports 155/176; file audit passes.
+- CP2 (ACTIVE) — stringize, paste + re-lex, placemarkers, variadics + GNU
+  comma rule, and ws-flag propagation polish. Proof pending: 72/72
+  `make test-pa4` and clean `make test-report-through-pa4`.
 - CP3 — architecture audit + cleanup: perf probe recorded, optional
   differential run against `pa4/macro-ref` on generated inputs (observation
   only), consolidate findings in `pa4/audit.md`. Proof: clean
   `make test-report-through-pa4`, audit script green, git clean.
 
-## Active Checkpoint: CP1
+## Active Checkpoint: CP2
 
-Build the whole pipeline minus the #/##/varargs operators. Include ALL
-define-time validation (badhash/badvargs errors are parse-time and cheap) so
-error fixtures pass even though operator substitution waits for CP2. Where an
-operator would fire in substitution (a `#p`/`##` actually reached), CP1 may
-throw MacroError — those fixtures stay red until CP2 and prove nothing.
+Complete the deferred replacement operators and variadic substitution while
+preserving CP1's directive/table ownership and blue-paint rescan.
 
 ### Implementation Packet
 
-Files/symbols (new files go in `dev/src/`, listed in
-`dev/frontend_source_sets.mk`):
+Files/symbols:
 
-- NEW `dev/src/macro_replace.h` / `macro_replace.cpp`:
-  - `enum EPPTokenKind` (header-name, identifier, pp-number, char-lit,
-    ud-char-lit, string-lit, ud-string-lit, op-or-punc, non-ws-char,
-    new-line, placemarker);
-  - `struct PPToken { EPPTokenKind kind; std::string data;
-    bool preceded_by_ws; PaintSet paint; bool noninvokable; }` with
-    `PaintSet` = sorted `std::vector<std::string>` + `PaintContains`,
-    `PaintUnion`, `PaintIntersect` helpers;
-  - `struct PPTokenCollector : IPPTokenStream` → `std::vector<PPToken>`
-    (whitespace event → flag on next token; new-line kept as token; note
-    `using std::string;` before including `IPPTokenStream.h`, as
-    `ctrlexpr_eval.h:12` does);
-  - `struct Macro { bool function_like; bool variadic;
-    std::vector<std::string> params; std::vector<PPToken> replacement; }`;
-  - `class MacroTable` — `Define` (parse from directive-line tokens,
-    validate per plan, redefinition compare incl. ws flags), `Undef`,
-    `Lookup`;
-  - `class MacroExpander` — stack rescan over a text-sequence with an output
-    callback; invocation detection, arg collection, lazy arg pre-expansion,
-    substitution, paint rules 1–4 and 6 above;
-  - driver `void MacroProcessFile(const std::string& input,
-    IPostTokenOutputStream& output)` — collect, carve directives, expand
-    text-sequences, replay every output token into one internal
-    `PostTokenStream` via a kind→emit_* switch (mirror
-    `CtrlExprLineSplitter::flush_line` in `dev/src/ctrlexpr_eval.cpp`),
-    final `emit_eof`;
-  - `class MacroError : public std::runtime_error`.
-- NEW `dev/src/posttoken_debug.h` — hoist `DebugPostTokenOutputStream`
-  verbatim from `dev/posttoken.cpp:57-137` (plus HexDump/ValueToHexChar);
-  EDIT `dev/posttoken.cpp` to include it (pure move — through-pa2 gates it).
-- EDIT `dev/macro.cpp` — replace stub body, mirroring `dev/posttoken.cpp`
-  main: keep `--batch-stdin` guard and catch envelope (`MacroError`/any
-  `std::exception` → EXIT_FAILURE), read all stdin, call `MacroProcessFile`.
-- EDIT `dev/frontend_source_sets.mk:12` →
-  `FRONTEND_OBJ_BASENAMES_macro := macro_replace pptoken_lexer
-  posttoken_stream posttoken_tables unicode`.
+- EDIT `dev/src/macro_replace.h` / `macro_replace.cpp`:
+  - extend `MacroExpander` substitution context to select raw arguments for
+    `#` and `##`, while retaining lazy pre-expansion for ordinary parameters;
+  - stringize raw spellings using `preceded_by_ws`, escape literal spellings,
+    and preserve raw-string/trigraph spellings;
+  - paste operand spellings, re-lex through `PPTokenize`, require one data
+    token, carry operand paint/flags, and rescan the pasted token;
+  - represent and resolve placemarkers, including empty-argument joins;
+  - collect fixed and variadic arguments, substitute `__VA_ARGS__`, and apply
+    the GNU comma-paste rule.
+- Preserve the existing `MacroTable` define-time validation, deque rescan,
+  helper-head paint boundary, and one `PostTokenStream` replay.
 
-Fixture groups for CP1 verification (see Failure Map): directive/table
-errors + recursion + pass-through text; spot-check by hand:
-`pa4/tests/600-recurse.t`, `910-recurse2.t`, `700-redef2.t`,
-`cppgm.tests/course/pa4/400-fun-macro-define.t`,
-`200-function-macro-invocation-boundaries.t`, `100-undef-simple.t`.
+Fixture groups for CP2 verification: `pa4/tests/250-join.t`,
+`500-tricky-join.t`, `700-redef-q.t`, `700-strlit-q.t`,
+`800-placemarker-q.t`, `850-varargs-q.t`,
+`pa4/tests/920-deferred-helper-argument-prescan.t`, and the course operator
+groups listed in the Failure Map.
 
-Required spec facts: spec.md 16.3 [cpp.replace] paras 1–4 (redefinition
-identity, param lists, arg-count matching), 16.3.1 (argument substitution +
-pre-expansion), 16.3.4 (rescanning; course paint deviation per this plan and
-pa4/README.md traces), 16.3.5 examples (700-redef-q, 700-strlit-q,
-800-placemarker, 850-varargs mirror them). pa4/README.md "Features" +
-"Design Notes" are authoritative where they diverge from ISO.
+Required spec facts: spec.md 16.3.1–16.3.5 for raw/expanded argument choice,
+stringization, concatenation, rescanning, and variadic arguments;
+pa4/README.md "Features" + "Design Notes" remain authoritative where they
+diverge from ISO.
 
 Commands:
 - focused: `make test-pa4` (builds tool, runs all 72)
-- prior gate: `make test-report-through-pa3` (must stay green — posttoken.cpp
-  is touched by the header hoist)
+- prior gate: `make test-report-through-pa3`
 - broad: `make test-report-through-pa4`
 - audit: `perl scripts/cppgm_file_audit.pl --stage pa4 --paths dev/src`
-- single fixture: `dev/macro < pa4/tests/600-recurse.t | diff - pa4/tests/600-recurse.ref`
+- single fixtures: `dev/macro < pa4/tests/500-tricky-join.t | diff - pa4/tests/500-tricky-join.ref`
 
 Performance probe (after CP1, again at CP3):
 

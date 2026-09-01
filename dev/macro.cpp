@@ -1,11 +1,14 @@
 // (C) 2013 CPPGM Foundation www.cppgm.org.  All rights reserved.
 
 #include <iostream>
+#include <sstream>
 #include <string>
 
 using namespace std;
 
 #include "exceptions.h"
+#include "macro_replace.h"
+#include "posttoken_debug.h"
 
 bool HasBatchStdinArg(int argc, char** argv)
 {
@@ -35,15 +38,20 @@ int main(int argc, char** argv)
 		if (HasBatchStdinArg(argc, argv))
 			return RunNotImplementedBatchMode();
 
-		// TODO: Implement macro as per PA4 assignment description
-		throw NotImplementedException();
+		ostringstream oss;
+		oss << cin.rdbuf();
+
+		DebugPostTokenOutputStream output;
+		MacroProcessFile(oss.str(), output);
+
+		return EXIT_SUCCESS;
 	}
-	catch (const NotImplementedException& e)
+	catch (const MacroError& e)
 	{
 		cerr << "ERROR: " << e.what() << endl;
-		return CPPGM_EXIT_NOT_IMPLEMENTED;
+		return EXIT_FAILURE;
 	}
-	catch (exception& e)
+	catch (const exception& e)
 	{
 		cerr << "ERROR: " << e.what() << endl;
 		return EXIT_FAILURE;
