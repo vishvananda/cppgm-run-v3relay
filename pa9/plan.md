@@ -149,17 +149,18 @@ NotImplementedException; nothing exists yet). By unblocking component:
 
 ## Checkpoint Ledger
 
-- CP1 — integer core end-to-end (ACTIVE). Full parse/sema for the entire
+- CP1 — integer core end-to-end (COMPLETED). Full parse/sema for the entire
   opcode table + layout + ELF + stub/epilogue + assembler + translation
   for data/literal, move8..64, jump/jumpif/call/ret, not/and/or/xor,
-  shifts, iadd/isub, all integer comparisons, syscall0..6. Floats and
-  mul/div/mod parse+validate but translate → internal "later-CP" error.
-  Progress proof: failing tests drop 18 → 6 (the 12 CP1 tests above pass;
-  make test-pa9 shows only 220/300/400/500/501/600 failing).
+  shifts, iadd/isub, all integer comparisons, syscall0..6. The remaining
+  unsupported arithmetic/conversion paths return a compiler error.
+  Progress proof: `make test-pa9` reports 14/18 tests passing, with failures
+  reduced 18 → 4 (400, 500, 501, 600); `test-report-through-pa8` reports
+  414/414 and the pa9 file audit passes.
 - CP2 — multiply/divide/modulus: one-operand MUL/IMUL/DIV/IDIV with
   widening (xor rdx / cqo family; 8-bit uses ax with al/ah split).
-  Progress proof: 6 → 3 failing (220-hexdump, 300-binary-calculator,
-  400-integer-calculator pass).
+  Progress proof: 4 → 3 failing when 400-integer-calculator is complete;
+  retain the 14 CP1 passes and all malformed grammar witnesses.
 - CP3 — x87 float80: conversions, arithmetic, comparisons (FCOMIP flag
   idiom: order operands so flt→setb, fle→setbe, fgt/fge by swap; feq/fne
   → sete/setne), move80 (10-byte copy), red-zone bounce buffers.
@@ -167,59 +168,20 @@ NotImplementedException; nothing exists yet). By unblocking component:
 - CP4 — stage close: `make test-report-through-pa9` clean, file audit
   clean, perf probe recorded, architecture notes appended here.
 
-## Active Checkpoint: CP1 — integer core end-to-end
+## Active Checkpoint: CP2 — multiply/divide/modulus
 
 Implementation Packet:
 
-- Files/symbols to create/modify: `dev/src/cy86_parse.h/.cpp`
-  (Cy86TokenCollector, Cy86Literal{type,bytes,num_elements},
-  Cy86Opcode table + descriptor parser, Cy86Parser, Cy86Statement,
-  Cy86Operand, Cy86Error), `dev/src/x86_assembler.h/.cpp`
-  (X86Instruction, Encode → vector<unsigned char>),
-  `dev/src/cy86_codegen.h/.cpp` (Cy86ToX86Translator, Cy86Layout,
-  BuildProgramImage returning full file bytes), rewrite `dev/cy86.cpp`
-  driver (mirror dev/nsinit.cpp envelope; keep batch guard, ElfHeader/
-  ProgramSegmentHeader structs, PA9SetFileExecutable), update
-  `FRONTEND_OBJ_BASENAMES_cy86` in `dev/frontend_source_sets.mk` (list
-  above). Reuse untouched: preproc_engine.h (RunSingleFile),
-  posttoken_stream.h (IPostTokenOutputStream), posttoken_types.h
-  (EFundamentalType, ETokenType OP_SEMICOLON/OP_COLON/OP_MINUS/OP_PLUS/
-  OP_LPAREN/OP_RPAREN/OP_LSQUARE/OP_RSQUARE), x86_register_model.h,
-  exceptions.h.
-- Fixture groups: pa9/tests/100-*,110-*,200-*,210-* and pa9/course/pa9/*
-  (7 files) must pass; 220/300/400/500/501/600 remain failing with impl
-  exit 86/1 — acceptable only for these six.
-- Required spec facts: all in "Stage Design"/"Semantic rules" above
-  (image layout + stub/epilogue bytes, alignment table, width-conversion
-  and signedness rules, register mapping/discipline, error taxonomy,
-  entry-point rule, two-pass layout invariant). Opcode operand
-  descriptors: transcribe pa9/cy86-opcode.desc verbatim into the static
-  table; grammar: pa9/pa9.gram (regular; statements end at OP_SEMICOLON;
-  labels recursive via `label: statement`).
-- Focused commands: build `make -C dev cy86`; single case
-  `cd pa9 && ../dev/cy86 -o /tmp/t.prog tests/100-ret42.t.1 && /tmp/t.prog;
-  echo $?` (expect 42); suite `make test-pa9` (root). Broad command:
-  `make test-report-through-pa8` must stay clean (nothing in the shared
-  pipeline may change behaviorally); `make test-report-through-pa9` is the
-  stage exit gate (CP4).
-- Performance probe: `time ./210-reverser.my.program < 210-reverser.stdin`
-  style manual run is enough at CP1; from CP2 on, run 300-binary-calculator
-  and at CP3 500-to-float80 via `time` and require < 5 s wall (half the
-  10 s CPPGM_PROGRAM_TEST_TIMEOUT_SEC budget).
-- File audit: `perl scripts/cppgm_file_audit.pl --stage pa9 --paths
-  dev/src` — limits: source ≤ 3000 lines, function ≤ 240 lines, nesting
-  ≤ 8; split per-opcode-family translate helpers rather than one giant
-  switch. (One pre-existing warning on recog_parser.h is expected.)
-- Known uncertainties: (1) ref inserts a 16-byte `jmp`+pad before
-  instructions that follow ≥4-aligned literal data (seen in the
-  500-string Mach-O at body offset 0x30) — hello-world's 15-byte stdout
-  proves no padding after align-1 data, and no graded fixture depends on
-  the quirk; do not replicate, revisit only if a label-arithmetic
-  mismatch appears. (2) String-array immediates at integer widths and
-  float literals at mismatched float widths: apply the mechanical byte
-  truncate/extend rule; fixtures appear never to exercise these. (3)
-  Whether unused-but-clashing or undefined-but-unreferenced labels error:
-  follow the spec text (clash always ill-formed; only referenced labels
-  need definitions) unless a fixture disagrees. (4) x87 default control
-  word (round-nearest, 64-bit precision) is assumed for conversions —
-  "exactly representable" UB clause covers rounding differences.
+- Files/symbols: `dev/src/x86_assembler.cpp` one-operand
+  `MUL/IMUL/DIV/IDIV` encoding and `dev/src/cy86_codegen.cpp`
+  `TranslateMultiply`, `TranslateDivide`, and high-half setup; preserve
+  the fixed rax/rdx discipline and handle the 8-bit AX/AL/AH case.
+- Regression fixtures: keep all 14 current passes green; target
+  `pa9/tests/400-integer-calculator.t.1` while retaining the three malformed
+  course grammar witnesses.
+- Required scope: preserve the fixed-width integer operand lowering and
+  all 14 existing passes while closing multiply/divide/modulus semantics.
+- Focused command: `make -C dev cy86`; representative run is
+  `time ./300-binary-calculator.my.program < 300-binary-calculator.stdin`,
+  with wall time below 5 s. Required gates remain `make test-pa9`,
+  `make test-report-through-pa8`, and the pa9 file audit.
