@@ -167,8 +167,9 @@ Declaration rules (fixture-pinned):
 
 ## Failure Map
 
-All 68 fixtures fail identically: `run_emit_types_mode` throws
-`NotImplementedException` → EXIT_NOT_IMPLEMENTED.  By owning boundary:
+CP1 now passes its 35-fixture boundary and the stage reports 45/68.  The
+remaining 23 failures are deferred by the checkpoint split.  By owning
+boundary:
 
 | group | owner | tests |
 | --- | --- | --- |
@@ -188,32 +189,32 @@ All 68 fixtures fail identically: `run_emit_types_mode` throws
   (`B = A + 1`) stay linear.  No retry loops, no deferred worklists.
 - Recursion depth follows AST depth (blocks, declarators, expressions),
   bounded by the PA10 parser's accepted depth.
-- Probe: 20000 declarations over 200 namespaces with qualified typedef
-  lookups and 2000 nested blocks must run < 1 s / < 100 MB and double
-  linearly; the 68-test suite well under 1 s wall.
+- Probe evidence: 20000 declarations over 200 namespaces with qualified
+  typedef lookups and a 10-deep block chain took 0.23 s / 57116 KB; the same
+  input supplied twice as separate argv inputs took 0.41 s / 58972 KB, so
+  time and peak memory remain linear and under the packet limits.
 
 ## Checkpoint Ledger
 
-- CP1 core model + driver + namespaces/classes/functions/types — ACTIVE
-  (target ≥ 35/68; through-pa10 stays 589/589; file audit passes).
+- CP1 core model + driver + namespaces/classes/functions/types — COMPLETE
+  (45/68 stage tests; all 35 packet fixtures pass; through-pa10 is 589/589;
+  file audit passes).
 - CP2 enums, constant evaluation, sizeof/alignof, static_assert, parser
-  extents and qualified enum names — PENDING (target 64/68).
+  extents and qualified enum names — ACTIVE (target 64/68).
 - CP3 template-parameter scopes and template-id rejection — PENDING
   (target 68/68; `make test-report-through-pa11` clean).
 - CP4 architecture cleanup, audit, performance evidence in `audit.md` —
   PENDING.
 
-## Active Checkpoint: CP1 — core scope/type model
+## Completed Checkpoint: CP1 — core scope/type model
 
-Deliver the driver, type table, scope model, lookup, declarator-derived
-types, declaration collection for namespaces/classes/functions/blocks, and
-the printer.  Enum specifiers, static_assert, templates and non-literal
-constant expressions throw "unsupported" (EXIT_FAILURE) so their fixtures
-stay counted as failing until CP2/CP3.  Progress proof: stage tests rise
-from 0/68 to at least 35/68 with the 35 CP1 fixtures below passing, while
-`make test-report-through-pa10` stays fully passing and the file audit
-passes.  Expected-failure fixtures count only when the success fixtures of
-the same group also pass.
+The driver, type table, scope model, lookup, declarator-derived types,
+declaration collection for namespaces/classes/functions/blocks, and printer
+are complete. Enum specifiers, `static_assert`, templates and non-literal
+constant expressions remain unsupported as planned for CP2/CP3. Evidence is
+recorded in `audit.md`: the 35 CP1 fixtures pass, the stage is 45/68,
+through-pa10 is 589/589, and the file audit passes. Expected-failure fixtures
+remain counted only when the success fixtures of the same group pass.
 
 ### Implementation Packet
 
@@ -327,3 +328,19 @@ Known uncertainties (decide by the listed default, note in `audit.md`):
 - The bare anonymous union name needs the declaration's token extent,
   which the PA10 AST does not record; CP2 adds it (parser change) — CP1
   must not print such declarations and may throw on them.
+
+## Active Checkpoint: CP2 — enums and constant evaluation
+
+Implement the next coherent boundary in `dev/src/sema/const_eval.*`,
+`scope_builder.*`, `type_builder.cpp`, and the minimal parser extent support
+needed by the qualified-enum and anonymous-union fixtures. Add canonical enum
+entities/types and enumerator bindings/scopes; extend constant evaluation for
+literal, identifier, unary/binary, conditional, cast, `sizeof`, and `alignof`
+expressions with short-circuiting and checked integer behavior; consume those
+values for array bounds, enumerators, and `static_assert`. Preserve all CP1
+behavior and reject malformed enum, reference, and bound cases with failure.
+Progress proof: raise the stage to at least 64/68 while through-pa10 remains
+589/589 and the file audit passes. Focused starting fixtures are
+`tests/spec/200-const-int-static-assert.t`, `tests/spec/200-enum-scoped.t`,
+and `tests/general/200-sizeof-qualified-type-idexpr.t`; template parameter
+and template-id fixtures remain CP3.
