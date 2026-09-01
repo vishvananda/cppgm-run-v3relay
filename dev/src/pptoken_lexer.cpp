@@ -225,48 +225,15 @@ public:
 
 	int peek(size_t lookahead = 0)
 	{
-		size_t saved = mark();
-		bool saved_last_was_ucn = last_was_ucn;
-		try
-		{
-			int result = EndOfFile;
-			for (size_t i = 0; i <= lookahead; ++i)
-				result = next();
-			rewind(saved);
-			last_was_ucn = saved_last_was_ucn;
-			return result;
-		}
-		catch (...)
-		{
-			rewind(saved);
-			last_was_ucn = saved_last_was_ucn;
-			throw;
-		}
+		bool from_ucn;
+		return Lookahead(lookahead, from_ucn);
 	}
 
 	bool peek_is_ucn(size_t lookahead = 0)
 	{
-		size_t saved = mark();
-		bool saved_last_was_ucn = last_was_ucn;
-		try
-		{
-			bool result = false;
-			for (size_t i = 0; i <= lookahead; ++i)
-			{
-				next();
-				if (i == lookahead)
-					result = last_was_ucn;
-			}
-			rewind(saved);
-			last_was_ucn = saved_last_was_ucn;
-			return result;
-		}
-		catch (...)
-		{
-			rewind(saved);
-			last_was_ucn = saved_last_was_ucn;
-			throw;
-		}
+		bool from_ucn;
+		Lookahead(lookahead, from_ucn);
+		return from_ucn;
 	}
 
 	size_t mark() const
@@ -280,6 +247,28 @@ public:
 	}
 
 private:
+
+	int Lookahead(size_t lookahead, bool& from_ucn)
+	{
+		size_t saved = mark();
+		bool saved_last_was_ucn = last_was_ucn;
+		try
+		{
+			int result = EndOfFile;
+			for (size_t i = 0; i <= lookahead; ++i)
+				result = next();
+			from_ucn = last_was_ucn;
+			rewind(saved);
+			last_was_ucn = saved_last_was_ucn;
+			return result;
+		}
+		catch (...)
+		{
+			rewind(saved);
+			last_was_ucn = saved_last_was_ucn;
+			throw;
+		}
+	}
 
 	int NextPhysical()
 	{
@@ -583,12 +572,15 @@ void ScanEscapeSequence(SourceDecoder& decoder, string& token)
 	throw runtime_error("Invalid escape sequence");
 }
 
+// An empty character literal ('') does not match the character-literal
+// grammar, but the reference implementation (and GCC's preprocessor) emit it
+// as a character-literal token and defer rejection to literal evaluation;
+// cppgm.tests/course/pa2/300-invalid-character-string-boundary depends on it.
 string ScanDelimitedLiteral(SourceDecoder& decoder, char delimiter,
-	const char* prefix, bool character_literal)
+	const char* prefix)
 {
 	string token = TakeAscii(decoder, prefix);
 	AppendCodePoint(token, decoder.next()); // opening quote
-	bool has_content = false;
 
 	while (true)
 	{
@@ -600,8 +592,6 @@ string ScanDelimitedLiteral(SourceDecoder& decoder, char delimiter,
 		if (!from_ucn && codepoint == delimiter)
 		{
 			AppendCodePoint(token, decoder.next());
-			if (character_literal && !has_content)
-				throw runtime_error("Empty character literal");
 			return token;
 		}
 
@@ -609,7 +599,6 @@ string ScanDelimitedLiteral(SourceDecoder& decoder, char delimiter,
 			ScanEscapeSequence(decoder, token);
 		else
 			AppendCodePoint(token, decoder.next());
-		has_content = true;
 	}
 }
 
@@ -708,27 +697,17 @@ bool TryScanHeaderName(SourceDecoder& decoder, int opening,
 
 enum DirectiveContext
 {
+	StartOfLine,
 	NoDirective,
 	AfterDirectiveHash,
 	ExpectingHeaderName
 };
 
-void AdvanceDirectiveContext(bool at_start_of_line, const string& token,
-	DirectiveContext& context)
+void AdvanceDirectiveContext(const string& token, DirectiveContext& context)
 {
 	if (context == AfterDirectiveHash)
-	{
 		context = token == "include" ? ExpectingHeaderName : NoDirective;
-		return;
-	}
-
-	if (context == ExpectingHeaderName)
-	{
-		context = NoDirective;
-		return;
-	}
-
-	if (at_start_of_line && (token == "#" || token == "%:"))
+	else if (context == StartOfLine && (token == "#" || token == "%:"))
 		context = AfterDirectiveHash;
 	else
 		context = NoDirective;
@@ -877,27 +856,27 @@ bool ConsumeWhitespaceSequence(SourceDecoder& decoder)
 			consumed = true;
 			continue;
 		}
-		if (codepoint != '/' || decoder.peek(1) != '/')
+		if (codepoint == '/' && decoder.peek(1) == '*')
 		{
-			if (codepoint == '/' && decoder.peek(1) == '*')
-			{
-				ConsumeBlockComment(decoder);
-				consumed = true;
-				continue;
-			}
-			return consumed;
+			ConsumeBlockComment(decoder);
+			consumed = true;
+			continue;
 		}
-
-		decoder.next();
-		decoder.next();
-		consumed = true;
-		while (decoder.peek() != EndOfFile && decoder.peek() != '\n')
+		if (codepoint == '/' && decoder.peek(1) == '/')
+		{
 			decoder.next();
+			decoder.next();
+			while (decoder.peek() != EndOfFile && decoder.peek() != '\n')
+				decoder.next();
+			consumed = true;
+			continue;
+		}
+		return consumed;
 	}
 }
 
 void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
-	bool at_start_of_line, DirectiveContext& context)
+	DirectiveContext& context)
 {
 	if (context == ExpectingHeaderName)
 	{
@@ -924,7 +903,7 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 			output.emit_string_literal(token);
 		else
 			output.emit_user_defined_string_literal(token);
-		AdvanceDirectiveContext(at_start_of_line, token, context);
+		AdvanceDirectiveContext(token, context);
 		return;
 	}
 
@@ -936,14 +915,14 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 
 	if (character_prefix != nullptr)
 	{
-		string token = ScanDelimitedLiteral(decoder, '\'', character_prefix, true);
+		string token = ScanDelimitedLiteral(decoder, '\'', character_prefix);
 		string suffix = ScanUserDefinedSuffix(decoder);
 		token += suffix;
 		if (suffix.empty())
 			output.emit_character_literal(token);
 		else
 			output.emit_user_defined_character_literal(token);
-		AdvanceDirectiveContext(at_start_of_line, token, context);
+		AdvanceDirectiveContext(token, context);
 		return;
 	}
 
@@ -956,14 +935,14 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 
 	if (string_prefix != nullptr)
 	{
-		string token = ScanDelimitedLiteral(decoder, '"', string_prefix, false);
+		string token = ScanDelimitedLiteral(decoder, '"', string_prefix);
 		string suffix = ScanUserDefinedSuffix(decoder);
 		token += suffix;
 		if (suffix.empty())
 			output.emit_string_literal(token);
 		else
 			output.emit_user_defined_string_literal(token);
-		AdvanceDirectiveContext(at_start_of_line, token, context);
+		AdvanceDirectiveContext(token, context);
 		return;
 	}
 
@@ -976,7 +955,7 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 			output.emit_preprocessing_op_or_punc(token);
 		else
 			output.emit_identifier(token);
-		AdvanceDirectiveContext(at_start_of_line, token, context);
+		AdvanceDirectiveContext(token, context);
 		return;
 	}
 
@@ -985,7 +964,7 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 	{
 		string token = ScanPPNumber(decoder);
 		output.emit_pp_number(token);
-		AdvanceDirectiveContext(at_start_of_line, token, context);
+		AdvanceDirectiveContext(token, context);
 		return;
 	}
 
@@ -993,13 +972,13 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 	if (!operator_token.empty())
 	{
 		output.emit_preprocessing_op_or_punc(operator_token);
-		AdvanceDirectiveContext(at_start_of_line, operator_token, context);
+		AdvanceDirectiveContext(operator_token, context);
 		return;
 	}
 
 	string token = encode_utf8(decoder.next());
 	output.emit_non_whitespace_char(token);
-	AdvanceDirectiveContext(at_start_of_line, token, context);
+	AdvanceDirectiveContext(token, context);
 }
 
 } // namespace
@@ -1009,8 +988,7 @@ void PPTokenize(const string& input, IPPTokenStream& output)
 	SourceDecoder decoder(input);
 	bool saw_logical_character = false;
 	bool ended_with_new_line = false;
-	bool at_start_of_line = true;
-	DirectiveContext context = NoDirective;
+	DirectiveContext context = StartOfLine;
 
 	while (decoder.peek() != EndOfFile)
 	{
@@ -1027,16 +1005,14 @@ void PPTokenize(const string& input, IPPTokenStream& output)
 			decoder.next();
 			saw_logical_character = true;
 			ended_with_new_line = true;
-			at_start_of_line = true;
-			context = NoDirective;
+			context = StartOfLine;
 			output.emit_new_line();
 			continue;
 		}
 
-		EmitCoreToken(decoder, output, at_start_of_line, context);
+		EmitCoreToken(decoder, output, context);
 		saw_logical_character = true;
 		ended_with_new_line = false;
-		at_start_of_line = false;
 	}
 
 	if (saw_logical_character && !ended_with_new_line)

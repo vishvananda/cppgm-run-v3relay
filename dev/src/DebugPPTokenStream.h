@@ -8,12 +8,12 @@ struct DebugPPTokenStream : IPPTokenStream
 {
 	void emit_whitespace_sequence()
 	{
-		cout << "whitespace-sequence 0 " << endl;
+		cout << "whitespace-sequence 0 \n";
 	}
 
 	void emit_new_line()
 	{
-		cout << "new-line 0 " << endl;
+		cout << "new-line 0 \n";
 	}
 
 	void emit_header_name(const string& data)
@@ -68,10 +68,12 @@ struct DebugPPTokenStream : IPPTokenStream
 
 private:
 
+	// "\n" instead of endl: one flush per token is a write syscall per token,
+	// which dominates tool wall time on large inputs.
 	void write_token(const string& type, const string& data)
 	{
 		cout << type << " " << data.size() << " ";
 		cout.write(data.data(), data.size());
-		cout << endl;
+		cout << "\n";
 	}
 };
