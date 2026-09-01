@@ -152,9 +152,12 @@ after CP1, 47/70 pass. By owning layer:
   `make test-pa5` is 47/70 with the remaining 23 in CP2/CP3 scope;
   through-pa4 is 184/184; file audit is 25/25; the repeated-argument probe is
   0.10s / 26640 KB.
-- CP2 — conditional group stack, defined pre-resolution, PA3 evaluation
-  wiring, #line, dynamic __FILE__/__LINE__/__COUNTER__ hook + head stamping.
-  Proof: the ~17 conditional/line fixtures pass; CP1 set holds.
+- CP2 (COMPLETE) — conditional group stack, defined pre-resolution, PA3
+  evaluation wiring, #line, dynamic __FILE__/__LINE__/__COUNTER__ hook +
+  head stamping. Proof: 63/70 `make test-pa5` with only the seven CP3
+  include/pragma fixtures failing; through-pa4 is 184/184; file audit is
+  25/25; the repeated-argument probe is 0.11s / 27980 KB (within the ≤2s
+  budget).
 - CP3 — #include frames + path search, pragma once + #pragma, _Pragma
   filter, `%:%:` paste, multi-srcfile loop. Proof: remaining ~10 fixtures;
   70/70 `make test-pa5`; clean `make test-report-through-pa5`.
@@ -164,30 +167,24 @@ after CP1, 47/70 pass. By owning layer:
   findings consolidated in `pa5/audit.md`. Proof: 70/70 + through-pa5 clean +
   audit + probes in budget.
 
-## Active Checkpoint — CP2
+## Active Checkpoint — CP3
 
-Deliverable: conditional groups and line control work through the existing
-CP1 engine, with dynamic `__FILE__`, `__LINE__`, and `__COUNTER__` expansion
-using the token's presumed source position. Include and pragma handling remain
-the CP3 boundary.
+Deliverable: include frames and path search, pragma-once identity, `_Pragma`
+filtering, `%:%:` handling, and independent command-line source-file state,
+while preserving the completed CP2 location and conditional semantics.
 
 ### Implementation Packet
 
-1. `dev/src/preproc_engine.{h,cpp}`: add the conditional group stack
-   `{parent_active, taken, in_else, active}`; implement `#if`/`#ifdef`/
-   `#ifndef`/`#elif`/`#else`/`#endif`, active/inactive non-directive rules,
-   and unterminated-group errors.
-2. `dev/src/ctrlexpr_eval.{h,cpp}`: pre-resolve `defined` operands (including
-   identifier-like alternative tokens), evaluate active expressions through
-   PA3, and map expression errors to `PreprocError`.
-3. `dev/src/macro_replace.{h,cpp}`: add the dynamic predefined expansion hook
-   and preserve source/head stamping through object, function, argument,
-   stringize, and paste replacements.
-4. `#line`: maintain physical-to-presumed line/file state and apply a
-   directive's values to the physical line after its terminating NEW_LINE.
-   `__COUNTER__` resets with each command-line source file.
+1. `dev/src/preproc_engine.{h,cpp}`: add include frames, quoted/header path
+   search, recursive token processing, pragma-once file identity, and
+   command-line source-file isolation around `ProcessSourceFile` and
+   `ProcessTokens`.
+2. `dev/src/macro_replace.{h,cpp}`: preserve the CP2 expansion/location
+   contract while handling `%:%:` and filtering `_Pragma` tokens at the
+   macro-rescan boundary.
+3. Prove the current failures flip: `200-include`, `400-header-guarded`,
+   `500-alt`, `500-pragma-ignore`, `501-pragma-op-ignore`,
+   `600-pragma-op`, and `800-pragma-once`, plus the CP2 and CP1 sets.
 
-Proof: CP2 conditional/line fixtures (`150-no-error`, `170-nondir*`,
-`200-if`, `400-predefined-macros`, `500-predefined-macros`, line fixtures, and
-the corresponding `cppgm.tests/course/pa5` cases) pass while the CP1 set and
-the 0.10s repeated-argument probe remain intact.
+Proof target: 70/70 `make test-pa5`, clean through-pa5, file audit, and the
+CP2 repeated-argument probe within its existing budget.

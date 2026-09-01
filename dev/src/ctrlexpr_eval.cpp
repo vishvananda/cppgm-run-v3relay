@@ -8,6 +8,7 @@
 using namespace std;
 
 #include "ctrlexpr_eval.h"
+#include "macro_replace.h"
 
 namespace
 {
@@ -634,6 +635,120 @@ EvalResult EvaluateControllingExpression(const vector<CtrlExprToken>& tokens,
 	if (parser.position() != tokens.size())
 		result.error = true;
 	return result;
+}
+
+bool IsIdentifierLikeDefinedOperand(const PPToken& token)
+{
+	if (token.kind == PP_TOKEN_IDENTIFIER)
+		return true;
+	if (token.kind != PP_TOKEN_PREPROCESSING_OP_OR_PUNC)
+		return false;
+	return token.data == "new" || token.data == "delete" ||
+		token.data == "and" || token.data == "and_eq" ||
+		token.data == "bitand" || token.data == "bitor" ||
+		token.data == "compl" || token.data == "not" ||
+		token.data == "not_eq" || token.data == "or" ||
+		token.data == "or_eq" || token.data == "xor" ||
+		token.data == "xor_eq";
+}
+
+bool ResolveDefinedOperands(vector<PPToken>& tokens,
+	const CtrlExprIsDefined& is_defined)
+{
+	vector<PPToken> resolved;
+	resolved.reserve(tokens.size());
+
+	for (size_t i = 0; i < tokens.size(); ++i)
+	{
+		if (tokens[i].kind != PP_TOKEN_IDENTIFIER ||
+			tokens[i].data != "defined")
+		{
+			resolved.push_back(tokens[i]);
+			continue;
+		}
+
+		size_t operand = i + 1;
+		size_t end = operand;
+		if (operand < tokens.size() &&
+			IsIdentifierLikeDefinedOperand(tokens[operand]))
+		{
+			end = operand + 1;
+		}
+		else if (operand + 2 < tokens.size() &&
+			tokens[operand].data == "(" &&
+			 IsIdentifierLikeDefinedOperand(tokens[operand + 1]) &&
+			tokens[operand + 2].data == ")")
+		{
+			operand += 1;
+			end = operand + 2;
+		}
+		else
+		{
+			return false;
+		}
+
+		const string& name = tokens[operand].data;
+		PPToken replacement = tokens[i];
+		replacement.kind = PP_TOKEN_PP_NUMBER;
+		replacement.data = is_defined && is_defined(name) ? "1" : "0";
+		replacement.noninvokable = false;
+		resolved.push_back(replacement);
+		i = end - 1;
+	}
+
+	tokens.swap(resolved);
+	return true;
+}
+
+EvalResult EvaluateControllingExpression(const vector<PPToken>& tokens,
+	const CtrlExprIsDefined& is_defined)
+{
+	vector<CtrlExprToken> converted;
+	CtrlExprTokenCollector collector(converted);
+	PostTokenStream posttoken_output(collector);
+
+	for (size_t i = 0; i < tokens.size(); ++i)
+	{
+		const PPToken& token = tokens[i];
+		switch (token.kind)
+		{
+		case PP_TOKEN_HEADER_NAME:
+			posttoken_output.emit_header_name(token.data);
+			break;
+		case PP_TOKEN_IDENTIFIER:
+			posttoken_output.emit_identifier(token.data);
+			break;
+		case PP_TOKEN_PP_NUMBER:
+			posttoken_output.emit_pp_number(token.data);
+			break;
+		case PP_TOKEN_CHARACTER_LITERAL:
+			posttoken_output.emit_character_literal(token.data);
+			break;
+		case PP_TOKEN_USER_DEFINED_CHARACTER_LITERAL:
+			posttoken_output.emit_user_defined_character_literal(token.data);
+			break;
+		case PP_TOKEN_STRING_LITERAL:
+			posttoken_output.emit_string_literal(token.data);
+			break;
+		case PP_TOKEN_USER_DEFINED_STRING_LITERAL:
+			posttoken_output.emit_user_defined_string_literal(token.data);
+			break;
+		case PP_TOKEN_PREPROCESSING_OP_OR_PUNC:
+			posttoken_output.emit_preprocessing_op_or_punc(token.data);
+			break;
+		case PP_TOKEN_NON_WHITESPACE_CHAR:
+			posttoken_output.emit_non_whitespace_char(token.data);
+			break;
+		case PP_TOKEN_NEW_LINE:
+			posttoken_output.emit_new_line();
+			break;
+		case PP_TOKEN_PLACEMARKER:
+			collector.emit_invalid(string());
+			break;
+		}
+	}
+	posttoken_output.emit_eof();
+	return EvaluateControllingExpression(converted, is_defined);
 }
 
 CtrlExprLineSplitter::CtrlExprLineSplitter(ostream& output,

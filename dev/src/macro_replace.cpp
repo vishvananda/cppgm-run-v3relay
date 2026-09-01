@@ -356,6 +356,10 @@ PPToken ObjectReplacementToken(const PPToken& source, const PPToken& head,
 	const string& macro_name, bool first)
 {
 	PPToken result = source;
+	result.src_file = head.src_file;
+	result.src_line = head.src_line;
+	result.presumed_file = head.presumed_file;
+	result.presumed_line = head.presumed_line;
 	result.paint = PaintUnion(source.paint, head.paint);
 	AddPaint(result.paint, macro_name);
 	if (first)
@@ -369,6 +373,10 @@ PPToken FunctionReplacementToken(const PPToken& source,
 	bool first)
 {
 	PPToken result = source;
+	result.src_file = head.src_file;
+	result.src_line = head.src_line;
+	result.presumed_file = head.presumed_file;
+	result.presumed_line = head.presumed_line;
 	result.paint = PaintIntersect(head.paint, closing.paint);
 	AddPaint(result.paint, macro_name);
 	if (first)
@@ -526,6 +534,11 @@ PPToken PasteTokens(const PPToken& left, const PPToken& right)
 
 	PPToken result = data[0];
 	result.preceded_by_ws = left.preceded_by_ws;
+	const PPToken& stamp = left.kind == PP_TOKEN_PLACEMARKER ? right : left;
+	result.src_file = stamp.src_file;
+	result.src_line = stamp.src_line;
+	result.presumed_file = stamp.presumed_file;
+	result.presumed_line = stamp.presumed_line;
 	result.paint = PaintUnion(left.paint, right.paint);
 	MarkPainted(result);
 	return result;
@@ -958,14 +971,14 @@ PaintSet PaintAdd(const PaintSet& paint, const string& name)
 
 PPToken::PPToken()
 	: kind(PP_TOKEN_NON_WHITESPACE_CHAR), preceded_by_ws(false),
-		src_file(0), src_line(0),
+		src_file(0), src_line(0), presumed_file(0), presumed_line(0),
 		noninvokable(false)
 {
 }
 
 PPToken::PPToken(EPPTokenKind kind, const string& data, bool preceded_by_ws)
 	: kind(kind), data(data), preceded_by_ws(preceded_by_ws),
-		src_file(0), src_line(0),
+		src_file(0), src_line(0), presumed_file(0), presumed_line(0),
 		noninvokable(false)
 {
 }
@@ -985,6 +998,8 @@ void PPTokenCollector::append(EPPTokenKind kind, const string& data)
 	PPToken token(kind, data, whitespace_pending);
 	token.src_file = src_file_;
 	token.src_line = current_line_;
+	token.presumed_file = src_file_;
+	token.presumed_line = current_line_;
 	tokens.push_back(token);
 	whitespace_pending = false;
 }
@@ -1145,6 +1160,24 @@ const Macro* MacroTable::Lookup(const string& name) const
 	return it == macros_.end() ? 0 : &it->second;
 }
 
+void MacroTable::SetDynamicResolver(const MacroDynamicResolver& resolver,
+	const MacroDefinedPredicate& is_defined)
+{
+	dynamic_resolver_ = resolver;
+	is_defined_ = is_defined;
+}
+
+bool MacroTable::ResolveDynamic(const PPToken& source,
+	PPToken& replacement) const
+{
+	return dynamic_resolver_ && dynamic_resolver_(source, replacement);
+}
+
+bool MacroTable::IsDefined(const string& name) const
+{
+	return Lookup(name) != 0 || (is_defined_ && is_defined_(name));
+}
+
 MacroExpander::MacroExpander(const MacroTable& table)
 	: table_(table)
 {
@@ -1173,6 +1206,16 @@ void MacroExpander::Expand(const vector<PPToken>& input,
 			throw MacroError("__VA_ARGS__ outside variadic macro");
 
 		const Macro* macro = table_.Lookup(head.data);
+		if (macro == 0)
+		{
+			PPToken dynamic;
+			if (table_.ResolveDynamic(head, dynamic))
+			{
+				vector<PPToken> replacement(1, dynamic);
+				Prepend(pending, replacement);
+				continue;
+			}
+		}
 		if (macro == 0 || head.noninvokable ||
 			PaintContains(head.paint, head.data))
 		{

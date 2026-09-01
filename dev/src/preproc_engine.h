@@ -41,8 +41,15 @@ private:
 	void ProcessSourceFile(const std::string& srcfile);
 	void ProcessTokens(const std::vector<PPToken>& tokens,
 		PostTokenStream& output);
+	bool EvaluateCondition(const std::vector<PPToken>& line);
+	bool ParseLineDirective(const std::vector<PPToken>& line,
+		int current_file, std::size_t& line_number,
+		int& file_number);
 	int RegisterFileName(const std::string& name);
 	void InstallPredefineds();
+	bool ResolveDynamicPredefined(const PPToken& source,
+		PPToken& replacement);
+	bool IsDynamicPredefined(const std::string& name) const;
 
 	std::ostream& output_;
 	FileIdLookup file_id_lookup_;
@@ -50,6 +57,8 @@ private:
 	std::vector<std::string> file_names_;
 	std::map<std::string, int> file_name_ids_;
 	MacroTable table_;
+	int active_source_file_;
+	std::size_t counter_;
 };
 
 void PreprocRun(const std::vector<std::string>& srcfiles, std::ostream& out,

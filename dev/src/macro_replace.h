@@ -42,6 +42,8 @@ struct PPToken
 	bool preceded_by_ws;
 	int src_file;
 	size_t src_line;
+	int presumed_file;
+	size_t presumed_line;
 	PaintSet paint;
 	bool noninvokable;
 
@@ -88,6 +90,10 @@ struct Macro
 	Macro();
 };
 
+typedef std::function<bool(const PPToken&, PPToken&)>
+	MacroDynamicResolver;
+typedef std::function<bool(const string&)> MacroDefinedPredicate;
+
 class MacroError : public std::runtime_error
 {
 public:
@@ -111,8 +117,15 @@ public:
 	void Undef(const string& name);
 	const Macro* Lookup(const string& name) const;
 
+	void SetDynamicResolver(const MacroDynamicResolver& resolver,
+		const MacroDefinedPredicate& is_defined);
+	bool ResolveDynamic(const PPToken& source, PPToken& replacement) const;
+	bool IsDefined(const string& name) const;
+
 private:
 	std::map<string, Macro> macros_;
+	MacroDynamicResolver dynamic_resolver_;
+	MacroDefinedPredicate is_defined_;
 };
 
 class MacroExpander

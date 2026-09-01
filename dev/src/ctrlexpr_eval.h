@@ -14,6 +14,8 @@ using std::string;
 #include "IPPTokenStream.h"
 #include "posttoken_stream.h"
 
+struct PPToken;
+
 struct CtrlExprToken
 {
 	enum Kind
@@ -82,6 +84,15 @@ struct EvalResult
 EvalResult EvaluateControllingExpression(
 	const std::vector<CtrlExprToken>& tokens,
 	const CtrlExprIsDefined& is_defined);
+
+// Resolve the defined operator before macro expansion. Its operand is an
+// identifier even when that spelling is also an alternative-token keyword.
+// A false return means the token sequence contains malformed defined syntax.
+bool ResolveDefinedOperands(std::vector<PPToken>& tokens,
+	const CtrlExprIsDefined& is_defined);
+
+EvalResult EvaluateControllingExpression(
+	const std::vector<PPToken>& tokens, const CtrlExprIsDefined& is_defined);
 
 struct CtrlExprLineSplitter : IPPTokenStream
 {
