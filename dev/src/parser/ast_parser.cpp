@@ -348,9 +348,44 @@ bool Pa10Parser::can_start_declaration() const
 		is_storage_or_function_specifier(current.simple_type) ||
 		current.IsSimple(KW_DECLTYPE) || current.IsSimple(KW_TYPENAME) ||
 		current.IsSimple(KW_STATIC_ASSERT) || current.IsSimple(KW_USING) ||
+		current.IsSimple(KW_TEMPLATE) ||
 		current.IsSimple(KW_CLASS) || current.IsSimple(KW_STRUCT) ||
 		current.IsSimple(KW_UNION) || current.IsSimple(KW_ENUM) ||
 		current.IsSimple(KW_NAMESPACE);
+}
+
+bool Pa10Parser::consume_attribute_specifiers()
+{
+	bool consumed = false;
+	while ((is_kind(PA6_IDENTIFIER_TOKEN) &&
+			(token(pos_).spelling == "__attribute__" ||
+			 token(pos_).spelling == "__declspec")) ||
+		is_simple(KW_ALIGNAS))
+	{
+		consumed = true;
+		++pos_;
+		if (!consume_simple(OP_LPAREN))
+			return false;
+		unsigned depth = 1;
+		while (depth != 0)
+		{
+			if (at_end())
+				return false;
+			if (is_simple(OP_LPAREN))
+			{
+				++depth;
+				++pos_;
+			}
+			else if (is_simple(OP_RPAREN))
+			{
+				--depth;
+				++pos_;
+			}
+			else
+				++pos_;
+		}
+	}
+	return consumed;
 }
 
 bool Pa10Parser::node_has_kind(AstId node, AstKind kind) const
@@ -411,6 +446,34 @@ void Pa10Parser::bind_parameters(AstId declarator)
 		bind_parameters(value.children[i]);
 }
 
+void Pa10Parser::bind_template_declaration(AstId declaration)
+{
+	if (declaration == 0)
+		return;
+	const AstNode& value = arena_.At(declaration);
+	string name;
+	if (value.kind == AST_CLASS_SPECIFIER ||
+		value.kind == AST_CLASS_FORWARD_DECLARATION)
+		name = value.text;
+	else
+	{
+		vector<string> names;
+		collect_identifier_names(declaration, names);
+		if (!names.empty())
+			name = names[0];
+	}
+	if (name.empty())
+		return;
+	const size_t scope = name.rfind("::");
+	if (scope != string::npos)
+		name = name.substr(scope + 2);
+	const size_t template_args = name.find('<');
+	if (template_args != string::npos)
+		name = name.substr(0, template_args);
+	if (!name.empty())
+		scopes_.Bind(name, BIND_TEMPLATE);
+}
+
 AstId Pa10Parser::parse_translation_unit()
 {
 	const Mark saved = mark();
@@ -433,6 +496,19 @@ AstId Pa10Parser::parse_declaration()
 	const Mark saved = mark();
 	if (is_simple(OP_SEMICOLON))
 		return parse_empty_declaration();
+	if (is_simple(KW_TEMPLATE) ||
+		(is_simple(KW_EXTERN) && is_simple(KW_TEMPLATE, pos_ + 1)))
+	{
+		const AstId explicit_instantiation =
+			parse_explicit_instantiation_declaration();
+		if (explicit_instantiation != 0)
+			return explicit_instantiation;
+		restore(saved);
+		const AstId templated = parse_template_declaration();
+		if (templated != 0)
+			return templated;
+		restore(saved);
+	}
 	if (is_simple(KW_STATIC_ASSERT))
 		return parse_static_assert_declaration();
 	if (is_simple(KW_NAMESPACE))

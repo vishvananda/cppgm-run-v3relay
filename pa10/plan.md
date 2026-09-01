@@ -267,45 +267,50 @@ turns them.
   timed suite invocation completes in 0.35s before the first known CP3
   fixture stops that non-keep-going harness.
 - CP3 — template-declaration, parameter forms, TEMPLATE bindings,
-  `typename`/`template` dependent names, explicit instantiation and
-  specialization, partial specializations, qualified special-member
-  definitions (F3). Target ≥ 150/157 (ACTIVE).
-- CP4 — closure: remaining quirks, performance probes, audit warnings,
-  `make test-report-through-pa10` green; record results in this file.
+	`typename`/`template` dependent names, explicit instantiation and
+	specialization, partial specializations, qualified special-member
+	definitions (F3) (CHECKPOINT COMPLETE; PA10 remains open). Evidence: the
+	focused CP3 sweep passes 37/37; `make test-pa10` reports 143/157, reducing
+	the current-stage failures from 63 to 14 without removing coverage.
+	`make test-report-through-pa9` reports 432/432, and the pa10 file audit
+	passes with one pre-existing `recog_parser.h` warning. The 14 residual
+	failures are carried to CP4.
+- CP4 — residual PA10 closure, performance probes, audit warnings,
+	`make test-report-through-pa10` green; record results in this file.
 
-## Active Checkpoint — CP3: templates and dependent declarations
+## Active Checkpoint — CP4: residual PA10 closure
 
-Goal: extend the 94/157 CP2 baseline through the template/dependent-name
-fixtures without changing the completed F0–F2 dump contracts or scope
-rollback behavior.
+Goal: close the remaining 14 PA10 failures and reach a green full-stage
+report without changing the completed F0–F3 dump contracts or scope rollback
+behavior.
 
 ### Implementation Packet
 
 Files and symbols:
 
-- `dev/src/parser/ast_model.h/.cpp`: extend the existing kind table only when
-  a CP3 fixture requires a template/dependent-declaration spelling.
-- `dev/src/parser/ast_scope.h/.cpp`: preserve transactional `Push`/`Pop`,
-  undo-log rollback, and the completed TYPE/NAMESPACE ownership while adding
-  TEMPLATE and template-clause bindings.
-- `dev/src/parser/ast_parser.h`, `ast_parser.cpp`, and
-  `ast_parser_decl.cpp`: implement the template declaration, parameter,
-  explicit instantiation/specialization, dependent-name, and qualified
-  special-member productions named by the Failure Map; retain the completed
-  namespace/class/enum/member productions.
-- `dev/src/parser/ast_parser_expr.cpp`: only extend dependent/template-id
-  expression ownership where a CP3 fixture requires it.
+- `dev/src/parser/ast_parser.cpp`, `ast_parser_decl.cpp`, and
+	`ast_parser_expr.cpp`: trace each residual failure to its declaration,
+	expression, initializer, or attribute ownership path and make the smallest
+	shared semantic correction.
+- `dev/src/parser/ast_model.h/.cpp` and `ast_scope.h/.cpp`: extend only when
+	a residual fixture requires a canonical AST kind or binding; preserve the
+	transactional scope and completed F0–F3 ownership.
 - `dev/frontend_source_sets.mk`: keep the PA10 parser/model/scope source set
-  complete; do not add PA6/PA7 sources to the cppgm++ target.
+	complete; do not add PA6/PA7 sources to the cppgm++ target.
 
-Fixture groups: `spec/100-template-class`, `spec/100-template-parameters`,
-`spec/200-explicit-instantiation-declaration`,
-`spec/200-explicit-specialization-syntax`,
-`spec/200-non-type-template-parameters`,
-`spec/200-qualified-special-member-definition`, and the F3 template,
-dependent-name, attribute, and imported-using fixtures listed in the Failure
-Map. Preserve all F0–F2 fixtures and negatives.
+Residual fixtures: `100-function-traits`,
+`200-decltype-base-and-mem-initializer`, `200-friend-type-declaration`,
+`200-function-throw-typed-specification`, `200-lambda-capture-forms`,
+`200-member-template-if-less-template-call`,
+`200-placement-new-identifier-led-initializer`, `200-placement-new-pack-init`,
+`200-qualified-call-member-body`, `200-sizeof-elaborated-class-type-id`,
+`200-sizeof-zero-arg-functional-cast`,
+`200-trailing-parameter-carries-dependency-attribute`,
+`200-trailing-parameter-vendor-attribute`, and
+`200-typeid-postfix-member-suffix`.
 
-Exit evidence: the pa10 stage pass count must increase without removing or
+Preserve all earlier PA tests and fixture coverage.
+
+Exit evidence: the pa10 stage must reach 157/157 without removing or
 weakening any fixture; run `make test-pa10`, `make test-report-through-pa9`,
 and the pa10 file audit after source is stable.

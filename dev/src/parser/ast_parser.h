@@ -44,6 +44,8 @@ private:
 	// Translation units, declarations and statements.
 	AstId parse_translation_unit();
 	AstId parse_declaration();
+	AstId parse_template_declaration();
+	AstId parse_explicit_instantiation_declaration();
 	AstId parse_function_definition();
 	AstId parse_special_member_definition();
 	AstId parse_simple_declaration();
@@ -101,9 +103,15 @@ private:
 	AstId parse_function_suffixes(AstId declarator);
 	AstId parse_qualified_name(bool declarator_name);
 	AstId parse_nested_name_specifier();
-	AstId parse_simple_template_id();
+	AstId parse_simple_template_id(bool qualified = false);
 	AstId parse_template_argument_list();
 	AstId parse_template_argument();
+	AstId parse_template_parameter_clause();
+	AstId parse_template_parameter_list();
+	AstId parse_template_parameter();
+	AstId parse_type_template_parameter();
+	AstId parse_template_template_parameter();
+	AstId parse_non_type_template_parameter();
 	AstId parse_operator_function_id();
 	AstId parse_literal_operator_id();
 
@@ -167,10 +175,12 @@ private:
 	bool is_assignment_operator(ETokenType type) const;
 	bool can_start_expression() const;
 	bool can_start_declaration() const;
+	bool consume_attribute_specifiers();
 	bool node_has_kind(AstId node, AstKind kind) const;
 	void collect_identifier_names(AstId node, std::vector<std::string>& names) const;
 	void bind_declarator(AstId declarator, BindKind kind);
 	void bind_parameters(AstId declarator);
+	void bind_template_declaration(AstId declaration);
 
 	const std::vector<Pa6Token>& tokens_;
 	AstArena& arena_;

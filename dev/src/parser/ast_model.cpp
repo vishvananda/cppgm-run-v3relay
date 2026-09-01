@@ -126,6 +126,7 @@ const char* Names[] =
 	"template-parameter-clause",
 	"template-parameter-list",
 	"type-parameter",
+	"parameter-key",
 	"template-template-parameter",
 	"non-type-template-parameter",
 	"default-template-argument",

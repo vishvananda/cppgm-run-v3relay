@@ -10,6 +10,14 @@ bool IsRelational(ETokenType type)
 	return type == OP_LT || type == OP_GT || type == OP_LE || type == OP_GE;
 }
 
+bool CanContinueTemplateIdExpression(const Pa6Token& token,
+	bool nested_template_context)
+{
+	if (token.kind == PA6_IDENTIFIER_TOKEN || token.kind == PA6_LITERAL_TOKEN)
+		return false;
+	return !nested_template_context || !token.IsSimple(OP_LBRACE);
+}
+
 } // namespace
 
 AstId Pa10Parser::parse_expression()
@@ -332,10 +340,20 @@ AstId Pa10Parser::parse_cast_expression()
 		const Pa6Token& first = token(pos_ + 1);
 		const BindKind* binding = first.kind == PA6_IDENTIFIER_TOKEN ?
 			scopes_.Lookup(first.spelling) : 0;
+		bool unknown_cast_candidate = false;
+		if (first.kind == PA6_IDENTIFIER_TOKEN &&
+			is_simple(OP_RPAREN, pos_ + 2))
+		{
+			const Mark lookahead = mark();
+			pos_ += 3;
+			unknown_cast_candidate = can_start_expression();
+			restore(lookahead);
+		}
 		const bool candidate = (first.kind == PA6_SIMPLE_TOKEN &&
 			(is_builtin_type(first.simple_type) || is_cv_qualifier(first.simple_type)))
 			|| (first.kind == PA6_IDENTIFIER_TOKEN && binding != 0 &&
-				(*binding == BIND_TYPE || *binding == BIND_TEMPLATE));
+				(*binding == BIND_TYPE || *binding == BIND_TEMPLATE)) ||
+			unknown_cast_candidate;
 		if (candidate && enter_bracket(OP_LPAREN))
 		{
 			AstId type = parse_type_id();
@@ -422,14 +440,18 @@ AstId Pa10Parser::parse_postfix_expression()
 		if (is_simple(OP_DOT) || is_simple(OP_ARROW))
 		{
 			const string op = token_label(token(pos_++));
-			AstId member = parse_id_expression();
+			const bool dependent_template = consume_simple(KW_TEMPLATE);
+			AstId member = is_simple(KW_OPERATOR) ?
+				parse_operator_function_id() : parse_id_expression();
 			if (member == 0)
 			{
 				restore(saved);
 				return 0;
 			}
 			const AstNode& name = arena_.At(member);
-			const AstId identifier = make(AST_IDENTIFIER, name.text);
+			const AstId identifier = make(AST_IDENTIFIER,
+				dependent_template ? string("template ") + name.text :
+				name.text);
 			const AstId result = make(AST_MEMBER_EXPRESSION, op);
 			add(result, expression);
 			add(result, identifier);
@@ -492,7 +514,8 @@ AstId Pa10Parser::parse_primary_expression()
 	if (token(pos_).kind == PA6_SIMPLE_TOKEN &&
 		is_keyword_literal(token(pos_).simple_type))
 		return make(AST_KEYWORD_LITERAL, token_label(token(pos_++)));
-	if (is_kind(PA6_IDENTIFIER_TOKEN) || is_simple(OP_COLON2))
+	if (is_kind(PA6_IDENTIFIER_TOKEN) || is_simple(OP_COLON2) ||
+		is_simple(KW_DECLTYPE))
 		return parse_id_expression();
 	return 0;
 }
@@ -501,6 +524,26 @@ AstId Pa10Parser::parse_id_expression()
 {
 	const Mark saved = mark();
 	const size_t start = pos_;
+	if (is_simple(KW_DECLTYPE))
+	{
+		if (parse_decltype_specifier(false) == 0 ||
+			!consume_simple(OP_COLON2) || !is_kind(PA6_IDENTIFIER_TOKEN))
+		{
+			restore(saved);
+			return 0;
+		}
+		++pos_;
+		while (consume_simple(OP_COLON2))
+		{
+			if (!is_kind(PA6_IDENTIFIER_TOKEN))
+			{
+				restore(saved);
+				return 0;
+			}
+			++pos_;
+		}
+		return make(AST_ID_EXPRESSION, Join(start, pos_));
+	}
 	if (consume_simple(OP_COLON2) && !is_kind(PA6_IDENTIFIER_TOKEN))
 	{
 		restore(saved);
@@ -515,8 +558,10 @@ AstId Pa10Parser::parse_id_expression()
 	if (is_simple(OP_LT))
 	{
 		const Mark template_mark = mark();
+		const bool nested_template_context = has_angle_boundary();
 		--pos_;
-		if (parse_simple_template_id() == 0)
+		if (parse_simple_template_id() == 0 ||
+			!CanContinueTemplateIdExpression(token(pos_), nested_template_context))
 			restore(template_mark);
 	}
 	while (consume_simple(OP_COLON2))
@@ -530,8 +575,10 @@ AstId Pa10Parser::parse_id_expression()
 		if (is_simple(OP_LT))
 		{
 			const Mark template_mark = mark();
+			const bool nested_template_context = has_angle_boundary();
 			--pos_;
-			if (parse_simple_template_id() == 0)
+			if (parse_simple_template_id() == 0 ||
+				!CanContinueTemplateIdExpression(token(pos_), nested_template_context))
 				restore(template_mark);
 		}
 	}
