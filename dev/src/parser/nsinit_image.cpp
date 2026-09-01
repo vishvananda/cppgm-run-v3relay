@@ -35,6 +35,24 @@ void StoreLittleEndian(vector<unsigned char>& image, size_t offset,
 		image[offset + i] = static_cast<unsigned char>(value >> (i * 8));
 }
 
+void ApplyRelocations(vector<unsigned char>& image, size_t source_offset,
+	const Pa8Value& value, const map<string, size_t>& addresses)
+{
+	for (size_t i = 0; i < value.relocs.size(); ++i)
+	{
+		const Pa8Relocation& relocation = value.relocs[i];
+		map<string, size_t>::const_iterator target = addresses.find(
+			relocation.symbol);
+		if (target == addresses.end())
+			throw runtime_error("unresolved relocation");
+		const int64_t address = static_cast<int64_t>(target->second);
+		const int64_t relocated = address +
+			static_cast<int64_t>(relocation.addend);
+		StoreLittleEndian(image, source_offset + relocation.offset,
+			static_cast<uint64_t>(relocated));
+	}
+}
+
 } // namespace
 
 Pa8ImageBuilder::Pa8ImageBuilder(
@@ -78,9 +96,23 @@ vector<unsigned char> Pa8ImageBuilder::Build()
 		addresses[entity.key] = offset;
 	}
 
+	for (size_t i = 0; i < sema.Temporaries().size(); ++i)
+	{
+		const Pa8Temporary& temporary = sema.Temporaries()[i];
+		AlignImage(image, sema.TypeAlignment(temporary.type));
+		const size_t offset = image.size();
+		const size_t size = sema.TypeSize(temporary.type);
+		if (temporary.value.bytes.size() != size)
+			throw runtime_error("temporary size does not match object type");
+		image.insert(image.end(), temporary.value.bytes.begin(),
+			temporary.value.bytes.end());
+		addresses[temporary.symbol] = offset;
+	}
+
 	for (size_t i = 0; i < sema.Strings().size(); ++i)
 	{
 		const Pa8StringLiteral& literal = sema.Strings()[i];
+		AlignImage(image, literal.alignment);
 		addresses[literal.symbol] = image.size();
 		image.insert(image.end(), literal.bytes.begin(), literal.bytes.end());
 	}
@@ -93,19 +125,16 @@ vector<unsigned char> Pa8ImageBuilder::Build()
 		map<string, size_t>::const_iterator source = addresses.find(entity.key);
 		if (source == addresses.end())
 			throw runtime_error("object address was not assigned");
-		for (size_t j = 0; j < entity.value.relocs.size(); ++j)
-		{
-			const Pa8Relocation& relocation = entity.value.relocs[j];
-			map<string, size_t>::const_iterator target = addresses.find(
-				relocation.symbol);
-			if (target == addresses.end())
-				throw runtime_error("unresolved relocation");
-			const int64_t address = static_cast<int64_t>(target->second);
-			const int64_t relocated = address +
-				static_cast<int64_t>(relocation.addend);
-			StoreLittleEndian(image, source->second + relocation.offset,
-				static_cast<uint64_t>(relocated));
-		}
+		ApplyRelocations(image, source->second, entity.value, addresses);
+	}
+	for (size_t i = 0; i < sema.Temporaries().size(); ++i)
+	{
+		const Pa8Temporary& temporary = sema.Temporaries()[i];
+		map<string, size_t>::const_iterator source = addresses.find(
+			temporary.symbol);
+		if (source == addresses.end())
+			throw runtime_error("temporary address was not assigned");
+		ApplyRelocations(image, source->second, temporary.value, addresses);
 	}
 	return image;
 }

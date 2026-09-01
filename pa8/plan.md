@@ -1,8 +1,8 @@
 # PA8 Plan — nsinit (initialization, linking, mock program image)
 
-State: CP1 complete — 57/60 pa8 fixtures pass; through-pa7 is green (354/354)
-and the pa8 file audit passes. The three remaining pa8 failures are the
-deferred valid array-string and reference paths. Harness: `text_t1` mode — all
+State: CP2 complete — 60/60 pa8 fixtures pass; through-pa7 is green (354/354)
+and the pa8 file audit passes with the pre-existing `recog_parser.h` warning.
+Harness: `text_t1` mode — all
 `NNN-name.t.*` files are passed to
 `nsinit -o <out>` in sorted order; exit status always graded; outfile compared
 byte-wise only when the ref exits EXIT_SUCCESS; 10 s/test timeout.
@@ -133,10 +133,12 @@ By owning boundary once the envelope exists:
 	 remain intentionally deferred). Evidence: `make test-pa8` is 57/60,
 	 `make test-report-through-pa7` is 354/354, and the pa8 source audit passes
 	 (one pre-existing warning in `recog_parser.h`).
-- CP2 — references + lifetime-extended temporaries (BLOCK2), arrays +
-  char-array init + string literals (BLOCK3), function-to-pointer and
-  remaining conversion diagnostics. Progress proof: reference/array/string
-  groups clear (~15 more), no regressions.
+- CP2 (COMPLETE) — references + lifetime-extended temporaries (BLOCK2),
+  unknown-bound character-array initialization + string literals (BLOCK3),
+  chained reference lvalues, and aligned relocations. Evidence: all three
+  focused images match their checked-in refs; `make test-pa8` is 60/60,
+  `make test-report-through-pa7` is 354/354, and the pa8 source audit passes
+  with one pre-existing warning in `recog_parser.h`.
 - CP3 — mandatory-diagnostic hardening (namespace conflicts, alias misuse,
   qualified-decl scope, thread_local agreement, ODR) + perf probes + audit.
   Progress proof: 60/60 `make test-pa8`, clean
@@ -264,12 +266,13 @@ Known uncertainties (probe with nsinit-ref, then pin in code + audit.md):
   combination validation already; verify it rejects in pa8 mode rather than
   silently defaulting (course 300-invalid-fundamental-specifiers-bad).
 
-## Active Checkpoint — CP2: references, arrays, and remaining image data
+## Completed Checkpoint — CP2: references, arrays, and remaining image data
 
-Extend the existing semantic and image ownership path for lifetime-extended
-reference temporaries (BLOCK2), array/string initialization (BLOCK3), and the
-remaining valid function-pointer/reference conversions. Preserve the 57/60
-baseline and close the three currently failing valid fixtures.
+Extended the semantic and image ownership path for lifetime-extended reference
+temporaries (BLOCK2), array/string initialization (BLOCK3), and chained
+reference lvalue-to-rvalue conversion. Unknown-bound arrays now complete from
+the string element width, and BLOCK2/BLOCK3 objects are aligned and relocated
+in their specified order.
 
 ### Implementation Packet
 
@@ -284,6 +287,32 @@ Files/symbols to touch:
 
 Focused fixtures: `pa8/tests/310-array-str-lit.t.1`,
 `pa8/tests/450-reference.t.1`, `pa8/tests/700-reference-to-reference.t.1`,
-then the remaining course reference/conversion fixtures. Exit evidence is
-`make test-pa8` at 60/60 with `make test-report-through-pa7` still 354/354 and
-the pa8 source audit passing.
+all matching their checked-in reference images. Exit evidence is
+`make test-pa8` at 60/60, `make test-report-through-pa7` at 354/354, and the
+pa8 source audit passing.
+
+## Active Checkpoint — CP3: mandatory diagnostics and final audit
+
+Harden the existing parser/model/sema ownership path for the remaining
+diagnostic-required namespace conflicts, alias and using misuse, non-enclosing
+qualified declarations, thread-local/redeclaration agreement, and ODR cases.
+Preserve the 60/60 pa8 baseline while validating the deep-namespace path and
+completing the final audit.
+
+### Implementation Packet
+
+Files/symbols to touch:
+- `dev/src/parser/nsdecl_model.h/.cpp`: declaration agreement and ODR
+  ownership in `AddOrMergeVariable`/`AddOrMergeFunction`, including storage,
+  linkage, and thread-local attributes.
+- `dev/src/parser/nsdecl_parser.h/.cpp`: namespace/alias/using conflict
+  diagnostics and qualified-declarator scope checks in the strict parser.
+- `dev/src/parser/nsinit_sema.h/.cpp`: linked-entity agreement and diagnostic
+  propagation without weakening the completed BLOCK1–3 image path.
+
+Focused fixtures: the `410-namespace-conflict*`, namespace-alias misuse,
+`300-nonenclosing-qualified-decl`, `600-qualified-redeclaration`, and
+thread-local agreement cases named in the failure map, followed by the deep
+namespace performance probe. Exit evidence is 60/60 `make test-pa8`,
+`make test-report-through-pa8`, the pa8 source audit, and the recorded probe
+result.

@@ -111,6 +111,17 @@ Pa8Value::Pa8Value()
 {
 }
 
+Pa8Temporary::Pa8Temporary()
+	: symbol(), type(), value(), first_use(numeric_limits<size_t>::max())
+{
+}
+
+Pa8StringLiteral::Pa8StringLiteral()
+	: symbol(), bytes(), alignment(1),
+		first_use(numeric_limits<size_t>::max())
+{
+}
+
 Pa8ProgramEntity::Pa8ProgramEntity()
 	: is_function(false), key(), variable(0), function(0), type(), variables(),
 		functions(), first_unit(numeric_limits<size_t>::max()),
@@ -121,15 +132,20 @@ Pa8ProgramEntity::Pa8ProgramEntity()
 
 Pa8ProgramSema::Pa8ProgramSema(
 	const vector<shared_ptr<Pa7Namespace> >& globals)
-	: globals_(globals), entities_(), strings_(), entity_by_key_(),
+	: globals_(globals), entities_(), temporaries_(), strings_(), entity_by_key_(),
 		variable_entities_(), function_entities_(), variable_states_(),
-		string_symbols_(), next_string_id_(0)
+		string_symbols_(), next_temporary_id_(0), next_string_id_(0)
 {
 }
 
 const vector<Pa8ProgramEntity>& Pa8ProgramSema::Entities() const
 {
 	return entities_;
+}
+
+const vector<Pa8Temporary>& Pa8ProgramSema::Temporaries() const
+{
+	return temporaries_;
 }
 
 const vector<Pa8StringLiteral>& Pa8ProgramSema::Strings() const
@@ -587,14 +603,23 @@ Pa8Value Pa8ProgramSema::EvaluateLiteral(const Pa8Expr& expression)
 	{
 		if (token.spelling.find('"') == string::npos)
 			throw runtime_error("unsupported literal expression");
-		result.type = MakeArray(true, 0,
-			ApplyCV(PA7_CV_CONST, MakeFundamental(FT_CHAR)));
+		const size_t quote = token.spelling.find('"');
+		const string prefix = token.spelling.substr(0, quote);
+		const EFundamentalType element_type = prefix == "u" ? FT_CHAR16_T :
+			(prefix == "U" ? FT_CHAR32_T :
+			(prefix == "L" ? FT_WCHAR_T : FT_CHAR));
 		result.bytes = DecodeString(token.spelling);
-		result.type->bound = result.bytes.size();
+		const size_t element_width = FundamentalSize(element_type);
+		if (!element_width || result.bytes.size() % element_width != 0)
+			throw runtime_error("invalid string literal element width");
+		result.type = MakeArray(true, result.bytes.size() / element_width,
+			ApplyCV(PA7_CV_CONST, MakeFundamental(element_type)));
 		result.is_constant = true;
 		result.is_lvalue = true;
 		result.is_string_literal = true;
 		result.string_symbol = RegisterStringLiteral(expression);
+		result.address_relocs.push_back(Pa8Relocation(0,
+			result.string_symbol, 0));
 		return result;
 	}
 	result.type = MakeFundamental(token.lit_type);
@@ -628,6 +653,7 @@ Pa8Value Pa8ProgramSema::LoadLvalue(const Pa8Value& source,
 		throw runtime_error("lvalue-to-rvalue conversion is not constant");
 	Pa8Value result = source;
 	result.is_lvalue = false;
+	result.address_relocs.clear();
 	return result;
 }
 
@@ -671,17 +697,61 @@ Pa8Value Pa8ProgramSema::EvaluateVariable(Pa7Variable* variable)
 	return value;
 }
 
+Pa8Value Pa8ProgramSema::EvaluateReferencedValue(const Pa8Value& reference,
+	const Pa7TypePtr& type)
+{
+	if (reference.relocs.size() != 1)
+		return Pa8Value();
+	const Pa8Relocation& relocation = reference.relocs[0];
+	map<string, size_t>::const_iterator entity_index =
+		entity_by_key_.find(relocation.symbol);
+	if (entity_index != entity_by_key_.end())
+	{
+		Pa8ProgramEntity& entity = entities_[entity_index->second];
+		if (entity.is_function || !entity.defined || !entity.variable)
+			return Pa8Value();
+		Pa8Value result = EvaluateVariable(entity.variable);
+		// A reference preserves the address of a non-const object, but
+		// reading that object is not a constant expression merely because
+		// its zero-initialized image is known here.
+		if (!entity.variable->is_const && !entity.variable->is_constexpr &&
+			!IsConstType(entity.type))
+			result.is_constant = false;
+		result.type = type;
+		return result;
+	}
+	for (size_t i = 0; i < temporaries_.size(); ++i)
+		if (temporaries_[i].symbol == relocation.symbol)
+		{
+			Pa8Value result = temporaries_[i].value;
+			result.type = type;
+			return result;
+		}
+	for (size_t i = 0; i < strings_.size(); ++i)
+		if (strings_[i].symbol == relocation.symbol)
+		{
+			Pa8Value result;
+			result.type = type;
+			result.bytes = strings_[i].bytes;
+			result.is_constant = true;
+			result.is_string_literal = true;
+			result.string_symbol = strings_[i].symbol;
+			return result;
+		}
+	return Pa8Value();
+}
+
 Pa8Value Pa8ProgramSema::EvaluateUnary(const Pa8Expr& expression)
 {
 	Pa8Value child = EvaluateExpression(expression.left, false);
 	if (expression.op == OP_AMP)
 	{
-		if (!child.is_lvalue && !child.type)
+		if (!child.is_lvalue || child.address_relocs.empty())
 			throw runtime_error("address-of requires an lvalue");
 		Pa8Value result;
 		result.type = MakePointer(child.type);
 		result.bytes.assign(8, 0);
-		result.relocs = child.relocs;
+		result.relocs = child.address_relocs;
 		result.is_constant = true;
 		return result;
 	}
@@ -693,7 +763,7 @@ Pa8Value Pa8ProgramSema::EvaluateUnary(const Pa8Expr& expression)
 			throw runtime_error("dereference of non-pointer expression");
 		Pa8Value result;
 		result.type = pointed;
-		result.relocs = child.relocs;
+		result.address_relocs = child.relocs;
 		result.is_lvalue = true;
 		result.is_constant = false;
 		return result;
@@ -841,17 +911,42 @@ Pa8Value Pa8ProgramSema::EvaluateExpression(const Pa8ExprPtr& expression,
 				throw runtime_error("identifier is not a program variable");
 			Pa8ProgramEntity& entity = entities_[index->second];
 			Pa7TypePtr variable_type = entity.type ? entity.type : variable->type;
-			if (IsConstType(variable_type) && entity.defined)
+			Pa7TypePtr stripped_variable_type = StripCV(variable_type);
+			if (stripped_variable_type &&
+				(stripped_variable_type->kind == PA7_TYPE_LVALUE_REFERENCE ||
+				 stripped_variable_type->kind == PA7_TYPE_RVALUE_REFERENCE))
 			{
-				result = EvaluateVariable(variable);
-				result.type = variable_type;
+				Pa8Value reference = EvaluateVariable(variable);
+				Pa7TypePtr referred_type = Pointee(variable_type);
+				if (!referred_type || reference.relocs.empty())
+					throw runtime_error("reference has no bound object");
+				result.type = referred_type;
+				result.is_lvalue = true;
+				result.address_relocs = reference.relocs;
+				Pa8Value referred = EvaluateReferencedValue(reference,
+					referred_type);
+				if (referred.type)
+				{
+					result.bytes = referred.bytes;
+					result.relocs = referred.relocs;
+					result.is_constant = referred.is_constant;
+				}
 			}
 			else
 			{
 				result.type = variable_type;
 				result.is_lvalue = true;
-				result.relocs.push_back(Pa8Relocation(0,
+				result.address_relocs.push_back(Pa8Relocation(0,
 					SymbolFor(variable), 0));
+				if (entity.defined &&
+					(IsConstType(variable_type) || variable->is_const ||
+					 variable->is_constexpr))
+				{
+					Pa8Value value = EvaluateVariable(variable);
+					result.bytes = value.bytes;
+					result.relocs = value.relocs;
+					result.is_constant = value.is_constant;
+				}
 			}
 		}
 		else if (resolved.declaration->kind == PA7_DECL_FUNCTION &&
@@ -861,7 +956,7 @@ Pa8Value Pa8ProgramSema::EvaluateExpression(const Pa8ExprPtr& expression,
 			result.type = function->type;
 			result.is_lvalue = true;
 			result.is_constant = true;
-			result.relocs.push_back(Pa8Relocation(0,
+			result.address_relocs.push_back(Pa8Relocation(0,
 				SymbolFor(function), 0));
 		}
 		else
@@ -1033,22 +1128,40 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 	if (stripped_target->kind == PA7_TYPE_LVALUE_REFERENCE ||
 		stripped_target->kind == PA7_TYPE_RVALUE_REFERENCE)
 	{
+		Pa7TypePtr target_referred = Pointee(target);
+		if (!target_referred || !source.type)
+			throw runtime_error("invalid reference target");
 		if (stripped_target->kind == PA7_TYPE_RVALUE_REFERENCE &&
 			source.is_lvalue)
 			throw runtime_error("rvalue reference cannot bind an lvalue");
-		Pa7TypePtr target_referred = Pointee(target);
-		if (target_referred && !IsConstType(target_referred) &&
-			IsConstType(source.type))
-			throw runtime_error("reference initialization drops const");
-		if (!source.is_lvalue)
-			throw runtime_error("temporary reference requires block2 support");
+		if (source.is_lvalue)
+		{
+			if (!CompatibleTypes(StripCV(source.type),
+				StripCV(target_referred)))
+				throw runtime_error("reference initializer type mismatch");
+			if (!IsConstType(target_referred) &&
+				IsConstType(source.type))
+				throw runtime_error("reference initialization drops const");
+			if (source.address_relocs.empty())
+				throw runtime_error("reference initializer has no address");
+			Pa8Value result;
+			result.type = target;
+			result.bytes.assign(8, 0);
+			result.relocs = source.address_relocs;
+			result.is_constant = true;
+			return result;
+		}
+		if (stripped_target->kind == PA7_TYPE_LVALUE_REFERENCE &&
+			!IsConstType(target_referred))
+			throw runtime_error("non-const lvalue reference needs an lvalue");
+		Pa8Value temporary_value = Convert(source, target_referred, true);
+		const string temporary = RegisterTemporary(target_referred,
+			temporary_value);
 		Pa8Value result;
 		result.type = target;
 		result.bytes.assign(8, 0);
-		result.relocs = source.relocs;
-		result.is_constant = source.is_constant;
-		if (require_constant && !result.is_constant)
-			throw runtime_error("reference initializer is not constant");
+		result.relocs.push_back(Pa8Relocation(0, temporary, 0));
+		result.is_constant = true;
 		return result;
 	}
 	if (stripped_target->kind == PA7_TYPE_POINTER)
@@ -1073,7 +1186,7 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 			Pa8Value result;
 			result.type = target;
 			result.bytes.assign(8, 0);
-			result.relocs = value.relocs;
+			result.relocs = value.address_relocs;
 			result.is_constant = true;
 			return result;
 		}
@@ -1082,7 +1195,7 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 			Pa8Value result;
 			result.type = target;
 			result.bytes.assign(8, 0);
-			result.relocs = value.relocs;
+			result.relocs = value.address_relocs;
 			result.is_constant = true;
 			return result;
 		}
@@ -1109,6 +1222,24 @@ Pa8Value Pa8ProgramSema::Convert(const Pa8Value& source,
 	{
 		if (!source.is_string_literal)
 			throw runtime_error("array initializer is not supported");
+		if (stripped_target->children.size() != 1 ||
+			StripCV(source.type) == Pa7TypePtr() ||
+			StripCV(source.type)->kind != PA7_TYPE_ARRAY ||
+			StripCV(source.type)->children.size() != 1)
+			throw runtime_error("invalid string literal array type");
+		const size_t source_element_size = TypeSize(
+			StripCV(source.type)->children[0]);
+		const size_t target_element_size = TypeSize(
+			stripped_target->children[0]);
+		if (!source_element_size || source_element_size != target_element_size ||
+			source.bytes.size() % target_element_size != 0)
+			throw runtime_error("string literal element type does not agree");
+		if (!stripped_target->has_bound)
+		{
+			stripped_target->has_bound = true;
+			stripped_target->bound = source.bytes.size() /
+				target_element_size;
+		}
 		Pa8Value result;
 		result.type = target;
 		const size_t size = TypeSize(target);
@@ -1171,6 +1302,23 @@ void Pa8ProgramSema::ResolveArrayBounds(const Pa7TypePtr& type)
 	for (size_t i = 0; i < type->children.size(); ++i)
 		ResolveArrayBounds(type->children[i]);
 	ResolveArrayBounds(type->return_type);
+}
+
+string Pa8ProgramSema::RegisterTemporary(const Pa7TypePtr& type,
+	const Pa8Value& source)
+{
+	ostringstream symbol;
+	symbol << "@temporary" << next_temporary_id_++;
+	Pa8Temporary temporary;
+	temporary.symbol = symbol.str();
+	temporary.type = type;
+	temporary.value = source;
+	temporary.value.type = type;
+	temporary.value.is_lvalue = false;
+	temporary.value.address_relocs.clear();
+	temporary.first_use = next_temporary_id_ - 1;
+	temporaries_.push_back(temporary);
+	return temporary.symbol;
 }
 
 vector<unsigned char> Pa8ProgramSema::DecodeString(const string& spelling) const
@@ -1251,6 +1399,10 @@ string Pa8ProgramSema::RegisterStringLiteral(const Pa8Expr& expression)
 	Pa8StringLiteral literal;
 	literal.symbol = symbol.str();
 	literal.bytes = DecodeString(expression.literal.spelling);
+	const size_t quote = expression.literal.spelling.find('"');
+	const string prefix = expression.literal.spelling.substr(0, quote);
+	literal.alignment = prefix == "u" ? 2 :
+		(prefix == "U" || prefix == "L" ? 4 : 1);
 	literal.first_use = expression.token_index;
 	strings_.push_back(literal);
 	string_symbols_[&expression] = literal.symbol;
@@ -1260,12 +1412,14 @@ string Pa8ProgramSema::RegisterStringLiteral(const Pa8Expr& expression)
 void Pa8ProgramSema::Analyze()
 {
 	entities_.clear();
+	temporaries_.clear();
 	strings_.clear();
 	entity_by_key_.clear();
 	variable_entities_.clear();
 	function_entities_.clear();
 	variable_states_.clear();
 	string_symbols_.clear();
+	next_temporary_id_ = 0;
 	next_string_id_ = 0;
 	for (size_t i = 0; i < globals_.size(); ++i)
 		CollectNamespace(globals_[i].get(), i);

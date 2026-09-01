@@ -49,6 +49,10 @@ struct Pa8Value
 {
 	std::vector<unsigned char> bytes;
 	std::vector<Pa8Relocation> relocs;
+	// An lvalue carries its address separately from the relocations in its
+	// loaded value.  This matters for a constant lvalue: it can participate in
+	// both lvalue-to-rvalue evaluation and address/reference binding.
+	std::vector<Pa8Relocation> address_relocs;
 	Pa7TypePtr type;
 	bool is_constant;
 	bool is_lvalue;
@@ -58,11 +62,24 @@ struct Pa8Value
 	Pa8Value();
 };
 
+struct Pa8Temporary
+{
+	std::string symbol;
+	Pa7TypePtr type;
+	Pa8Value value;
+	std::size_t first_use;
+
+	Pa8Temporary();
+};
+
 struct Pa8StringLiteral
 {
 	std::string symbol;
 	std::vector<unsigned char> bytes;
+	std::size_t alignment;
 	std::size_t first_use;
+
+	Pa8StringLiteral();
 };
 
 struct Pa8ProgramEntity
@@ -95,6 +112,7 @@ public:
 
 	void Analyze();
 	const std::vector<Pa8ProgramEntity>& Entities() const;
+	const std::vector<Pa8Temporary>& Temporaries() const;
 	const std::vector<Pa8StringLiteral>& Strings() const;
 
 	std::string SymbolFor(const Pa7Variable* variable) const;
@@ -157,6 +175,8 @@ private:
 	Pa8Value EvaluateExpression(const Pa8ExprPtr& expression,
 		bool require_constant = false);
 	Pa8Value EvaluateVariable(Pa7Variable* variable);
+	Pa8Value EvaluateReferencedValue(const Pa8Value& reference,
+		const Pa7TypePtr& type);
 	Pa8Value EvaluateLiteral(const Pa8Expr& expression);
 	Pa8Value EvaluateUnary(const Pa8Expr& expression);
 	Pa8Value EvaluateBinary(const Pa8Expr& expression);
@@ -175,6 +195,8 @@ private:
 	std::size_t FundamentalAlignment(EFundamentalType type) const;
 	unsigned long long ArrayBound(const Pa7TypePtr& type);
 	void ResolveArrayBounds(const Pa7TypePtr& type);
+	std::string RegisterTemporary(const Pa7TypePtr& type,
+		const Pa8Value& source);
 	std::string RegisterStringLiteral(const Pa8Expr& expression);
 	std::vector<unsigned char> DecodeString(const std::string& spelling) const;
 	bool IsZero(const Pa8Value& value) const;
@@ -182,11 +204,13 @@ private:
 
 	const std::vector<std::shared_ptr<Pa7Namespace> >& globals_;
 	std::vector<Pa8ProgramEntity> entities_;
+	std::vector<Pa8Temporary> temporaries_;
 	std::vector<Pa8StringLiteral> strings_;
 	std::map<std::string, std::size_t> entity_by_key_;
 	std::map<const Pa7Variable*, std::size_t> variable_entities_;
 	std::map<const Pa7Function*, std::size_t> function_entities_;
 	std::map<const Pa7Variable*, EvalState> variable_states_;
 	std::map<const Pa8Expr*, std::string> string_symbols_;
+	std::size_t next_temporary_id_;
 	std::size_t next_string_id_;
 };
