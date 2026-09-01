@@ -126,73 +126,32 @@ Scale is tiny (largest fixture 4.1 KB) but keep the boundary honest:
 
 | id  | scope                                                      | proof of progress                          | status |
 |-----|------------------------------------------------------------|--------------------------------------------|--------|
-| CP1 | decoder pipeline + core tokenizer + build wiring            | group-1 fixtures (~24) pass in `make test-pa1`; no test regresses to a new failure kind | ACTIVE |
-| CP2 | char/string/ud/raw literals + escape validation             | group-2 fixtures pass; ~48/53 green        | todo   |
+| CP1 | decoder pipeline + core tokenizer + build wiring            | 24 packet core fixtures pass; `make test-pa1` is 25/53 (28 failures vs 53 at start); prior-through and file audit pass | DONE |
+| CP2 | char/string/ud/raw literals + escape validation             | group-2 fixtures pass; ~48/53 green        | ACTIVE |
 | CP3 | header-name context + integration endgame                   | 53/53; `make test-report-through-pa1` clean; file audit still green | todo   |
 
 Each checkpoint is one commit at a stable ownership boundary. Adding new tests
 is out of scope; progress = existing failure reduction only.
 
-## Active Checkpoint: CP1 — decoder + core tokenizer
+## Active Checkpoint: CP2 — literals + escapes
 
-Build the `SourceDecoder` (UTF-8 → trigraph → splice → UCN, BOM strip,
-raw-mode flag, mark/rewind), UTF-8 encoder, E1/E2 tables, and the tokenizer
-loop for: whitespace-sequence (incl. `//` and `/* */`, error on unterminated
-block comment), new-line, identifier (checking the identifier-like-operator
-set → preprocessing-op-or-punc), pp-number, full op/punc DFA (incl. digraphs,
-`...`, `<::` exception, `.`/`..` retraction), non-whitespace-character, eof.
-On `'` or `"` (incl. after encoding prefixes `u8 u U L` / `R`) throw
-`NotImplementedException` so literal tests keep failing exactly as today
-(exit 86) — CP2 replaces that arm. Wire the build and the thin `main`.
+Replace the intentional `NotImplementedException` quote arm with plain and
+raw character/string literal tokenization, encoding prefixes, UCN and escape
+validation, user-defined suffixes, and the decoder’s raw-mode boundary. Keep
+the CP1 decoder and core-token behavior unchanged; header-name context remains
+CP3.
 
 ### Implementation Packet
 
 - Files/symbols:
-  - NEW `dev/src/pptoken_lexer.h`: `void PPTokenize(const std::string&,
-    IPPTokenStream&);` with `struct IPPTokenStream;` forward declaration.
-  - NEW `dev/src/pptoken_lexer.cpp`: `SourceDecoder` (members: `const
-    std::string& buf`, `size_t pos`, `bool raw`; methods `next`, `peek(k)`,
-    `mark`, `rewind`), `encode_utf8`, `AnnexE1_Allowed_RangesSorted` /
-    `AnnexE2_DisallowedInitially_RangesSorted` (copied from stub
-    `dev/pptoken.cpp:60-116`), `Digraph_IdentifierLike_Operators`,
-    `PPTokenize` loop. Audit caps: ≤240 lines/function, ≤8 nesting — split the
-    op DFA by leading character into helpers if needed.
-  - EDIT `dev/pptoken.cpp`: keep `HasBatchStdinArg`/batch fallback and the
-    try/catch shape; body becomes read-stdin + `DebugPPTokenStream out;
-    PPTokenize(input, out);`. Delete moved tables and the stub `PPTokenizer`.
-  - EDIT `dev/frontend_source_sets.mk` line 9:
-    `FRONTEND_OBJ_BASENAMES_pptoken := pptoken_lexer`.
-- Fixture groups: target = Failure Map group 1 (24 fixtures listed above);
-  must-not-change = groups 2–3 keep failing with exit-86 mismatch, nothing new.
-- Required spec facts (all in pa1/README.md, restated here): trigraphs
-  `??= ??/ ??' ??( ??) ??! ??< ??> ??-` → `# \ ^ [ ] | { } ~`; UCN forms
-  `\u`+4 hex / `\U`+8 hex, valid values ≤ 0x10FFFF (invalid → error);
-  pp-number = `digit | . digit` then `digit | identifier-nondigit | e/E sign |
-  .`; identifier = nondigit/E1 start (not E2), continue nondigit/digit/E1;
-  op list incl. `<: :> <% %> %: %:%: ... ->* >>= <<=` and the 13
-  identifier-like ops; whitespace cps: space, \t (0x09), \v (0x0B), \f (0x0C)
-  (LF is its own token; CR see uncertainties).
-- Focused commands:
-  - `make -C dev pptoken`
-  - `./dev/pptoken < pa1/tests/100-a.t | diff - pa1/tests/100-a.ref`
-  - per-fixture loop over group 1, e.g.
-    `for t in 100-comments 250-dot2-ppnum 400-angle-colon-madness ...; do
-    ./dev/pptoken < pa1/tests/$t.t | diff - pa1/tests/$t.ref || echo FAIL $t;
-    done` (cppgm fixtures live in `cppgm.tests/course/pa1/`).
-- Broad commands: `make test-pa1` (per-test report; expect ~24 newly passing),
-  then `make test-report-through-pa1` (stage exit criterion), then
+  - EDIT `dev/src/pptoken_lexer.cpp`: extend `EmitCoreToken` and add bounded
+    literal scanners; use `SourceDecoder::raw` for raw bodies and preserve the
+    one-pass decoder ownership. Validate simple, numeric, hex, octal, and UCN
+    escapes before emitting the complete token.
+  - Keep `dev/src/pptoken_lexer.h`’s public `PPTokenize` boundary and the CP1
+    build wiring unchanged unless a literal-only helper needs a declaration.
+- Fixture groups: target = Failure Map group 2; preserve all 24 CP1 core
+  successes and the intentional header-name gap in group 3.
+- Focused commands: `make -C dev pptoken`, then the group-2 fixture loop.
+  Broad proof remains `make test-pa1`, `make test-report-through-pa1`, and
   `perl scripts/cppgm_file_audit.pl --stage pa1 --paths dev/src`.
-- Performance probe:
-  `time ./dev/pptoken < pa1/tests/900-real-world.t > /dev/null` — must be
-  effectively instant (<10 ms; harness kills a test at 10 s).
-- Known uncertainties (resolve by observing `pa1/pptoken-ref` on probe inputs
-  — observation is allowed; fixtures remain the only gate):
-  1. `"\\u0040"`: does a UCN after an escaped backslash still stream-decode?
-     (`"\\u{"` is proven verbatim, but `u{` is not a valid UCN there.)
-  2. UCN surrogate values `\uD800–\uDFFF`: error or accepted?
-  3. CR (0x0D): whitespace member or non-whitespace-character? (Fixtures are
-     LF-only; pick ref behavior.)
-  4. UTF-8 strictness beyond 0xFF: overlong encodings, encoded surrogates,
-     truncated tails — error like 300-utf8-ff, or accept? Probe ref.
-  5. Non-leading U+FEFF: identifier char (E1 says yes) vs stripped — only the
-     file-leading BOM is fixture-proven stripped.
