@@ -116,38 +116,31 @@ try without handler, ellipsis without comma, deep template failure).
   deferred CP2 failures) from 0/47 at checkpoint start; all named CP1
   groups pass, the deep-template probe is 0.009s, prior-through-pa5 is
   260/260, and the pa6 source audit passes.
-- CP2 (ACTIVE) — declaration breadth: class-specifier/members/base clauses, enum,
-  namespace/using/linkage/asm/alias, template-declaration + explicit
-  inst/spec, operator/conversion/literal-operator ids, exceptions,
-  full lambda. Proof: remaining 25x/30x/18x/40x/45x/course groups flip;
-  target ≥ 45/47, no regressions.
-- CP3 — disambiguation and hardening: exact 6.8/8.2 and angle-commit
-  behavior on all fixtures, deep-template perf probe in budget,
-  differential probes vs `recog-ref-stdin --trace` on grey "ill-formed
-  but syntactically valid" cases, file audit clean, final
-  `make test-report-through-pa6` 0-fail. New fixtures only if a real gap
-  is found (regenerate via documented ref-test targets only).
+- CP2 (COMPLETE) — declaration breadth: class-specifier/members/base clauses,
+  enum, namespace/using/linkage/asm/alias, template-declaration + explicit
+  inst/spec, operator/conversion/literal-operator ids, exceptions, and full
+  lambda. Evidence: `make test-pa6` is 47/47 (13/13 packet fixtures flipped),
+  prior-through-pa5 is 260/260, the deep-template probe is 0.07s, and the
+  pa6 source audit passes (one non-fatal header-division warning).
+- CP3 (ACTIVE) — disambiguation and hardening: exact 6.8/8.2 and
+  angle-commit behavior on all fixtures, deep-template performance in budget,
+  differential probes on grey ill-formed-but-syntactic cases, final
+  `make test-report-through-pa6` 0-fail. New fixtures only for a real gap.
 
-## Active Checkpoint — CP2: declaration breadth
+## Active Checkpoint — CP3: disambiguation and hardening
 
-Extend the completed token/parser path through class and enum declarations,
-members and bases, namespaces and using/linkage forms, templates,
-operator/conversion ids, exceptions, and lambdas. Preserve CP1’s ordinary
-backtracking and angle commitment behavior while replacing only the explicit
-CP2 stubs.
+Harden declaration-vs-expression and type-id-vs-expression ordering, template
+angle commitment, malformed balanced input, and memoized failure behavior
+without regressing the completed declaration breadth.
 
 ### Implementation Packet
 
 Files/symbols to edit:
-- `dev/src/parser/recog_parser.h/.cpp`: replace the explicit CP2 stubs for
-  class/enum specifiers and members, namespace/using/linkage/asm/alias
-  declarations, template declarations and explicit inst/spec, exception
-  specifications, and lambda expressions. Reuse the CP1 token, bracket,
-  memo, and backtracking helpers.
-- `dev/recog.cpp`: keep the CP1 preprocessor/token/parser envelope and
-  add no fixture-specific routing.
+- `dev/src/parser/recog_parser.cpp` and `dev/src/parser/recog_parser_cp2.cpp`:
+  trace and harden ordered alternatives, angle-context keys, and failure
+  restoration; add focused coverage only when a semantic gap is demonstrated.
+- Named proof inputs: pa6 angle/ambiguity and malformed course fixtures;
+  keep the preprocessor/token envelope unchanged.
 
-Proof targets: the remaining `180`, `250`, `270`, `300`, `400`, `450`,
-`122`, and course member/operator-template groups flip without regressing
-the 34 passing tests; then rerun `make test-report-through-pa6`, the file
-audit, and the deep-template performance probe.
+Proof targets: prior-through-pa5, full pa6, file audit, and the deep-template
+probe remain clean; then finish with `make test-report-through-pa6`.

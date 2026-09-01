@@ -112,6 +112,7 @@ private:
 	bool parse_type_specifier_seq();
 	bool parse_trailing_type_specifier_seq();
 	bool parse_simple_type_specifier();
+	bool parse_elaborated_type_specifier();
 	bool parse_decltype_specifier();
 
 	bool parse_attribute_specifier();
@@ -164,10 +165,12 @@ private:
 	bool parse_template_argument_dots();
 	bool parse_template_argument();
 	bool parse_template_argument_impl();
+	bool parse_template_argument_suffix();
+	bool parse_template_parameter_list();
+	bool parse_template_parameter();
+	bool parse_type_parameter();
 	bool parse_typename_specifier();
 
-	// CP2 nonterminals are explicit stubs so their alternatives fail through
-	// ordinary declaration backtracking until their checkpoint is reached.
 	bool parse_class_specifier();
 	bool parse_enum_specifier();
 	bool parse_namespace_definition();
@@ -181,6 +184,16 @@ private:
 	bool parse_asm_definition();
 	bool parse_exception_specification();
 	bool parse_lambda_expression();
+	bool parse_base_clause();
+	bool parse_base_specifier_list();
+	bool parse_base_specifier();
+	bool parse_member_declaration();
+	bool parse_ctor_initializer();
+	bool parse_mem_initializer_list();
+	bool parse_mem_initializer();
+	bool parse_try_block();
+	bool parse_handler();
+	bool parse_exception_declaration();
 
 	const Pa6Token& token(std::size_t at) const;
 	bool at_end() const;

@@ -375,6 +375,15 @@ bool Pa6Parser::parse_function_body()
 {
 	const size_t start = pos_;
 	const size_t context = brackets_.size();
+	if (parse_ctor_initializer())
+	{
+		if (parse_try_block() || parse_compound_statement())
+			return true;
+		restore(start, context);
+	}
+	if (parse_try_block())
+		return true;
+	restore(start, context);
 	if (parse_compound_statement())
 		return true;
 	restore(start, context);
@@ -599,12 +608,13 @@ bool Pa6Parser::parse_unqualified_id()
 	const size_t context = brackets_.size();
 	if (is_simple(KW_OPERATOR))
 	{
-		if (is_kind(PA6_LITERAL_TOKEN, pos_ + 1) &&
-			(token(pos_ + 1).flags & PA6_EMPTY_STRING_FLAG) != 0 &&
-			parse_literal_operator_id())
+		if (parse_template_id())
 			return true;
+		if (hard_failure_)
+			return false;
 		restore(start, context);
-		if (parse_operator_function_id() || parse_conversion_function_id())
+		if (parse_literal_operator_id() || parse_operator_function_id() ||
+			parse_conversion_function_id())
 			return true;
 		restore(start, context);
 		return false;
@@ -784,7 +794,22 @@ bool Pa6Parser::parse_literal_operator_id()
 
 bool Pa6Parser::parse_template_id()
 {
-	return parse_simple_template_id();
+	const size_t start = pos_;
+	const size_t context = brackets_.size();
+	if (parse_simple_template_id())
+		return true;
+	if (hard_failure_)
+		return false;
+	restore(start, context);
+	if (parse_operator_function_id() || parse_literal_operator_id())
+	{
+		if (is_simple(OP_LT) && parse_template_argument_suffix())
+			return true;
+		if (is_simple(OP_LT))
+			hard_failure_ = true;
+	}
+	restore(start, context);
+	return false;
 }
 
 bool Pa6Parser::parse_typename_specifier()
@@ -885,10 +910,10 @@ bool Pa6Parser::parse_type_specifier()
 {
 	const size_t start = pos_;
 	const size_t context = brackets_.size();
-	if (parse_trailing_type_specifier())
+	if (parse_class_specifier() || parse_enum_specifier())
 		return true;
 	restore(start, context);
-	if (parse_class_specifier() || parse_enum_specifier())
+	if (parse_trailing_type_specifier())
 		return true;
 	restore(start, context);
 	return false;
@@ -935,6 +960,9 @@ bool Pa6Parser::parse_simple_type_specifier()
 	if (parse_decltype_specifier())
 		return true;
 	restore(start, context);
+	if (parse_elaborated_type_specifier())
+		return true;
+	restore(start, context);
 	if (parse_nested_name_specifier())
 	{
 		if (consume_simple(KW_TEMPLATE) && parse_simple_template_id())
@@ -945,6 +973,31 @@ bool Pa6Parser::parse_simple_type_specifier()
 	restore(start, context);
 	if (parse_type_name())
 		return true;
+	restore(start, context);
+	return false;
+}
+
+bool Pa6Parser::parse_elaborated_type_specifier()
+{
+	const size_t start = pos_;
+	const size_t context = brackets_.size();
+	const bool class_key = consume_simple(KW_CLASS) ||
+		consume_simple(KW_STRUCT) || consume_simple(KW_UNION);
+	if (class_key || consume_simple(KW_ENUM))
+	{
+		while (parse_attribute_specifier())
+		{
+		}
+		const size_t qualified = pos_;
+		if (parse_nested_name_specifier())
+		{
+			if (parse_simple_template_id() || consume_identifier())
+				return true;
+		}
+		restore(qualified, brackets_.size());
+		if (parse_simple_template_id() || consume_identifier())
+			return true;
+	}
 	restore(start, context);
 	return false;
 }
@@ -1614,7 +1667,8 @@ bool Pa6Parser::parse_statement()
 	restore(start, context);
 	if (parse_labeled_statement() || parse_expression_statement() ||
 		parse_compound_statement() || parse_selection_statement() ||
-		parse_iteration_statement() || parse_jump_statement())
+		parse_iteration_statement() || parse_jump_statement() ||
+		parse_try_block())
 		return true;
 	restore(start, context);
 	return false;
@@ -2518,123 +2572,4 @@ bool Pa6Parser::parse_template_argument_list()
 			return false;
 	}
 	return true;
-}
-
-bool Pa6Parser::parse_template_argument_dots()
-{
-	if (!parse_template_argument())
-		return false;
-	consume_simple(OP_DOTS);
-	return true;
-}
-
-bool Pa6Parser::parse_template_argument()
-{
-	return try_memoized(MEMO_TEMPLATE_ARGUMENT,
-		&Pa6Parser::parse_template_argument_impl);
-}
-
-bool Pa6Parser::parse_template_argument_impl()
-{
-	const size_t start = pos_;
-	const size_t context = brackets_.size();
-	const bool old_angle_refusal = angle_refusal_;
-	angle_refusal_ = true;
-	if (parse_constant_expression())
-	{
-		angle_refusal_ = old_angle_refusal;
-		return true;
-	}
-	if (hard_failure_)
-	{
-		angle_refusal_ = old_angle_refusal;
-		return false;
-	}
-	restore(start, context);
-	angle_refusal_ = true;
-	if (parse_type_id())
-	{
-		angle_refusal_ = old_angle_refusal;
-		return true;
-	}
-	if (hard_failure_)
-	{
-		angle_refusal_ = old_angle_refusal;
-		return false;
-	}
-	restore(start, context);
-	angle_refusal_ = true;
-	if (parse_id_expression())
-	{
-		angle_refusal_ = old_angle_refusal;
-		return true;
-	}
-	angle_refusal_ = old_angle_refusal;
-	restore(start, context);
-	return false;
-}
-
-bool Pa6Parser::parse_class_specifier()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_enum_specifier()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_namespace_definition()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_template_declaration()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_explicit_instantiation()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_explicit_specialization()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_linkage_specification()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_alias_declaration()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_using_declaration()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_using_directive()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_asm_definition()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_exception_specification()
-{
-	return false;
-}
-
-bool Pa6Parser::parse_lambda_expression()
-{
-	return false;
 }
