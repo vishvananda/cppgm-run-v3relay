@@ -47,26 +47,31 @@ inline std::string HexDump(const void* pdata, std::size_t nbytes)
 // DebugPostTokenOutputStream: helper class to produce PA2 output format.
 struct DebugPostTokenOutputStream : IPostTokenOutputStream
 {
+	explicit DebugPostTokenOutputStream(std::ostream& out = std::cout)
+		: out_(out)
+	{
+	}
+
 	void emit_invalid(const std::string& source) override
 	{
-		std::cout << "invalid " << source << "\n";
+		out_ << "invalid " << source << "\n";
 	}
 
 	void emit_simple(const std::string& source, ETokenType token_type) override
 	{
-		std::cout << "simple " << source << " "
+		out_ << "simple " << source << " "
 			<< TokenTypeToStringMap.at(token_type) << "\n";
 	}
 
 	void emit_identifier(const std::string& source) override
 	{
-		std::cout << "identifier " << source << "\n";
+		out_ << "identifier " << source << "\n";
 	}
 
 	void emit_literal(const std::string& source, EFundamentalType type,
 		const void* data, std::size_t nbytes) override
 	{
-		std::cout << "literal " << source << " "
+		out_ << "literal " << source << " "
 			<< FundamentalTypeToStringMap.at(type) << " "
 			<< HexDump(data, nbytes) << "\n";
 	}
@@ -75,7 +80,7 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 		std::size_t num_elements, EFundamentalType type, const void* data,
 		std::size_t nbytes) override
 	{
-		std::cout << "literal " << source << " array of " << num_elements
+		out_ << "literal " << source << " array of " << num_elements
 			<< " " << FundamentalTypeToStringMap.at(type) << " "
 			<< HexDump(data, nbytes) << "\n";
 	}
@@ -84,7 +89,7 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 		const std::string& ud_suffix, EFundamentalType type, const void* data,
 		std::size_t nbytes) override
 	{
-		std::cout << "user-defined-literal " << source << " " << ud_suffix
+		out_ << "user-defined-literal " << source << " " << ud_suffix
 			<< " character " << FundamentalTypeToStringMap.at(type) << " "
 			<< HexDump(data, nbytes) << "\n";
 	}
@@ -93,7 +98,7 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 		const std::string& ud_suffix, std::size_t num_elements,
 		EFundamentalType type, const void* data, std::size_t nbytes) override
 	{
-		std::cout << "user-defined-literal " << source << " " << ud_suffix
+		out_ << "user-defined-literal " << source << " " << ud_suffix
 			<< " string array of " << num_elements << " "
 			<< FundamentalTypeToStringMap.at(type) << " "
 			<< HexDump(data, nbytes) << "\n";
@@ -102,19 +107,22 @@ struct DebugPostTokenOutputStream : IPostTokenOutputStream
 	void emit_user_defined_literal_integer(const std::string& source,
 		const std::string& ud_suffix, const std::string& prefix) override
 	{
-		std::cout << "user-defined-literal " << source << " " << ud_suffix
+		out_ << "user-defined-literal " << source << " " << ud_suffix
 			<< " integer " << prefix << "\n";
 	}
 
 	void emit_user_defined_literal_floating(const std::string& source,
 		const std::string& ud_suffix, const std::string& prefix) override
 	{
-		std::cout << "user-defined-literal " << source << " " << ud_suffix
+		out_ << "user-defined-literal " << source << " " << ud_suffix
 			<< " floating " << prefix << "\n";
 	}
 
 	void emit_eof() override
 	{
-		std::cout << "eof\n";
+		out_ << "eof\n";
 	}
+
+private:
+	std::ostream& out_;
 };

@@ -12,12 +12,131 @@ using namespace std;
 #include "posttoken_stream.h"
 #include "pptoken_lexer.h"
 
+struct PaintTreeNode
+{
+	string name;
+	PaintSet left;
+	PaintSet right;
+	size_t height;
+	size_t size;
+
+	PaintTreeNode(const string& name, const PaintSet& left,
+		const PaintSet& right)
+		: name(name), left(left), right(right),
+			height(1 + max(left ? left->height : 0,
+				right ? right->height : 0)),
+			size(1 + (left ? left->size : 0) +
+				(right ? right->size : 0))
+	{
+	}
+};
+
 namespace
 {
+
+PaintSet MakePaintNode(const string& name, const PaintSet& left,
+	const PaintSet& right)
+{
+	return PaintSet(new PaintTreeNode(name, left, right));
+}
+
+int PaintHeight(const PaintSet& node)
+{
+	return node ? static_cast<int>(node->height) : 0;
+}
+
+size_t PaintSize(const PaintSet& node)
+{
+	return node ? node->size : 0;
+}
+
+PaintSet RotateRight(const PaintSet& node)
+{
+	const PaintSet pivot = node->left;
+	const PaintSet moved = pivot->right;
+	return MakePaintNode(pivot->name,
+		pivot->left, MakePaintNode(node->name, moved, node->right));
+}
+
+PaintSet RotateLeft(const PaintSet& node)
+{
+	const PaintSet pivot = node->right;
+	const PaintSet moved = pivot->left;
+	return MakePaintNode(pivot->name,
+		MakePaintNode(node->name, node->left, moved), pivot->right);
+}
+
+PaintSet BalancePaintNode(const PaintSet& node)
+{
+	const int balance = PaintHeight(node->left) - PaintHeight(node->right);
+	if (balance > 1)
+	{
+		PaintSet root = node;
+		if (PaintHeight(root->left->left) <
+			PaintHeight(root->left->right))
+		{
+			root = MakePaintNode(root->name, RotateLeft(root->left),
+				root->right);
+		}
+		return RotateRight(root);
+	}
+	if (balance < -1)
+	{
+		PaintSet root = node;
+		if (PaintHeight(root->right->right) <
+			PaintHeight(root->right->left))
+		{
+			root = MakePaintNode(root->name, root->left,
+				RotateRight(root->right));
+		}
+		return RotateLeft(root);
+	}
+	return node;
+}
+
+PaintSet InsertPaint(const PaintSet& node, const string& name)
+{
+	if (!node)
+		return MakePaintNode(name, PaintSet(), PaintSet());
+	if (name == node->name)
+		return node;
+	if (name < node->name)
+	{
+		return BalancePaintNode(MakePaintNode(node->name,
+			InsertPaint(node->left, name), node->right));
+	}
+	return BalancePaintNode(MakePaintNode(node->name, node->left,
+		InsertPaint(node->right, name)));
+}
+
+void InsertPaintTree(const PaintSet& source, PaintSet& result)
+{
+	if (!source)
+		return;
+	InsertPaintTree(source->left, result);
+	result = InsertPaint(result, source->name);
+	InsertPaintTree(source->right, result);
+}
+
+void IntersectPaintTree(const PaintSet& source, const PaintSet& other,
+	PaintSet& result)
+{
+	if (!source)
+		return;
+	IntersectPaintTree(source->left, other, result);
+	if (PaintContains(other, source->name))
+		result = InsertPaint(result, source->name);
+	IntersectPaintTree(source->right, other, result);
+}
 
 bool IsData(const PPToken& token, const char* data)
 {
 	return token.data == data;
+}
+
+bool IsDirectiveHash(const PPToken& token)
+{
+	return IsData(token, "#") || IsData(token, "%:");
 }
 
 bool IsIdentifier(const PPToken& token)
@@ -27,9 +146,7 @@ bool IsIdentifier(const PPToken& token)
 
 void AddPaint(PaintSet& paint, const string& name)
 {
-	PaintSet::iterator position = lower_bound(paint.begin(), paint.end(), name);
-	if (position == paint.end() || *position != name)
-		paint.insert(position, name);
+	paint = PaintAdd(paint, name);
 }
 
 void MarkPainted(PPToken& token)
@@ -743,9 +860,20 @@ void FlushText(const vector<PPToken>& text, const MacroTable& table,
 	});
 }
 
+} // namespace
+
+void MacroFlushText(const vector<PPToken>& text, const MacroTable& table,
+	PostTokenStream& output)
+{
+	FlushText(text, table, output);
+}
+
+namespace
+{
+
 bool IsDirective(const vector<PPToken>& line, const char* name)
 {
-	return line.size() >= 2 && IsData(line[0], "#") &&
+	return line.size() >= 2 && IsDirectiveHash(line[0]) &&
 		line[1].kind == PP_TOKEN_IDENTIFIER && line[1].data == name;
 }
 
@@ -761,45 +889,103 @@ void ProcessUndef(const vector<PPToken>& line, MacroTable& table)
 
 PaintSet PaintUnion(const PaintSet& left, const PaintSet& right)
 {
-	PaintSet result;
-	set_union(left.begin(), left.end(), right.begin(), right.end(),
-		back_inserter(result));
+	if (!left)
+		return right;
+	if (!right)
+		return left;
+	if (PaintSize(left) < PaintSize(right))
+	{
+		PaintSet result = right;
+		InsertPaintTree(left, result);
+		return result;
+	}
+	PaintSet result = left;
+	InsertPaintTree(right, result);
 	return result;
 }
 
 PaintSet PaintIntersect(const PaintSet& left, const PaintSet& right)
 {
+	if (!left || !right)
+		return PaintSet();
+	if (left == right)
+		return left;
+	const PaintSet& source = PaintSize(left) < PaintSize(right) ? left : right;
+	const PaintSet& other = PaintSize(left) < PaintSize(right) ? right : left;
 	PaintSet result;
-	set_intersection(left.begin(), left.end(), right.begin(), right.end(),
-		back_inserter(result));
+	IntersectPaintTree(source, other, result);
 	return result;
 }
 
 bool PaintContains(const PaintSet& paint, const string& name)
 {
-	return binary_search(paint.begin(), paint.end(), name);
+	PaintSet node = paint;
+	while (node)
+	{
+		if (name == node->name)
+			return true;
+		node = name < node->name ? node->left : node->right;
+	}
+	return false;
+}
+
+PaintSet PaintAdd(const PaintSet& paint, const string& name)
+{
+	struct PaintAddKey
+	{
+		PaintSet parent;
+		string name;
+
+		bool operator<(const PaintAddKey& other) const
+		{
+			if (parent.get() != other.parent.get())
+				return std::less<const PaintTreeNode*>()(parent.get(),
+					other.parent.get());
+			return name < other.name;
+		}
+	};
+
+	static map<PaintAddKey, PaintSet> cache;
+	const PaintAddKey key = { paint, name };
+	map<PaintAddKey, PaintSet>::const_iterator found = cache.find(key);
+	if (found != cache.end())
+		return found->second;
+
+	PaintSet result = InsertPaint(paint, name);
+	cache.insert(make_pair(key, result));
+	return result;
 }
 
 PPToken::PPToken()
 	: kind(PP_TOKEN_NON_WHITESPACE_CHAR), preceded_by_ws(false),
+		src_file(0), src_line(0),
 		noninvokable(false)
 {
 }
 
 PPToken::PPToken(EPPTokenKind kind, const string& data, bool preceded_by_ws)
 	: kind(kind), data(data), preceded_by_ws(preceded_by_ws),
+		src_file(0), src_line(0),
 		noninvokable(false)
 {
 }
 
-PPTokenCollector::PPTokenCollector()
-	: whitespace_pending(false)
+PPTokenCollector::PPTokenCollector(int src_file)
+	: whitespace_pending(false), src_file_(src_file), current_line_(0)
 {
+}
+
+void PPTokenCollector::on_token_line(size_t physical_line)
+{
+	current_line_ = physical_line;
 }
 
 void PPTokenCollector::append(EPPTokenKind kind, const string& data)
 {
-	tokens.push_back(PPToken(kind, data, whitespace_pending));
+	PPToken token(kind, data, whitespace_pending);
+	token.src_file = src_file_;
+	token.src_line = current_line_;
+	tokens.push_back(token);
 	whitespace_pending = false;
 }
 
@@ -869,7 +1055,7 @@ Macro::Macro()
 
 void MacroTable::Define(const vector<PPToken>& directive_line)
 {
-	if (directive_line.size() < 3 || !IsData(directive_line[0], "#") ||
+	if (directive_line.size() < 3 || !IsDirectiveHash(directive_line[0]) ||
 		directive_line[1].kind != PP_TOKEN_IDENTIFIER ||
 		directive_line[1].data != "define")
 		throw MacroError("malformed define directive");
@@ -1044,7 +1230,7 @@ void MacroProcessFile(const string& input, IPostTokenOutputStream& output)
 			text.clear();
 			ProcessUndef(line, table);
 		}
-		else if (!line.empty() && IsData(line[0], "#"))
+		else if (!line.empty() && IsDirectiveHash(line[0]))
 		{
 			// A line-initial # always starts a directive. The null
 			// directive is a no-op; any other unrecognized directive is

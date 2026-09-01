@@ -107,7 +107,8 @@ ctrlexpr_eval pptoken_lexer posttoken_stream posttoken_tables unicode`).
 
 ## Failure Map
 
-All 70 fixtures fail with EXIT_NOT_IMPLEMENTED (stub throw). By owning layer:
+At CP1 start all 70 fixtures failed with EXIT_NOT_IMPLEMENTED (stub throw);
+after CP1, 47/70 pass. By owning layer:
 
 - Envelope + PA4 replay (~43): 100-empty, 100-nodefs, 120-invalid, 150-max,
   150-null-directive, 170-nondir2/3, 200-fnlike, 200-onedef, 250-badvargs1–4,
@@ -143,12 +144,14 @@ All 70 fixtures fail with EXIT_NOT_IMPLEMENTED (stub throw). By owning layer:
 
 ## Checkpoint Ledger
 
-- CP1 (ACTIVE) — engine skeleton at the carve/flush boundary: position sink,
+- CP1 (COMPLETE) — engine skeleton at the carve/flush boundary: position sink,
   token stamps, logical-line carve, PA4 define/undef/text delegation, static
   predefineds, null directive + non-directive error, `%:` directive start,
   outfile envelope, invalid→error, adapter rewrite. Progress proof: the ~43
   envelope+replay fixtures flip from EXIT_NOT_IMPLEMENTED to pass;
-  through-pa4 stays 184/184; file audit clean.
+  `make test-pa5` is 47/70 with the remaining 23 in CP2/CP3 scope;
+  through-pa4 is 184/184; file audit is 25/25; the repeated-argument probe is
+  0.10s / 26640 KB.
 - CP2 — conditional group stack, defined pre-resolution, PA3 evaluation
   wiring, #line, dynamic __FILE__/__LINE__/__COUNTER__ hook + head stamping.
   Proof: the ~17 conditional/line fixtures pass; CP1 set holds.
@@ -161,81 +164,30 @@ All 70 fixtures fail with EXIT_NOT_IMPLEMENTED (stub throw). By owning layer:
   findings consolidated in `pa5/audit.md`. Proof: 70/70 + through-pa5 clean +
   audit + probes in budget.
 
-## Active Checkpoint — CP1
+## Active Checkpoint — CP2
 
-Deliverable: `preproc` produces correct outfiles for directive-free and
-define/undef-only inputs, with the PA4 expansion engine replayed through one
-`PostTokenStream` per srcfile and errors mapped to EXIT_FAILURE. Conditionals,
-#line, includes, and pragmas remain unimplemented; any `#` directive other
-than define/undef/null and `#error` may error (that is the correct CP1
-behavior for every fixture in the CP1 proof set).
+Deliverable: conditional groups and line control work through the existing
+CP1 engine, with dynamic `__FILE__`, `__LINE__`, and `__COUNTER__` expansion
+using the token's presumed source position. Include and pragma handling remain
+the CP3 boundary.
 
-Tasks:
-1. `dev/src/pptoken_lexer.{h,cpp}`: add `IPPTokenPositionSink` (pure virtual
-   `on_token_line(size_t physical_line)`) and a three-arg `PPTokenize`
-   overload; `SourceDecoder` counts raw `\n` bytes; latch line when a token's
-   first character is committed; report before each emit. Two-arg overload
-   delegates with nullptr.
-2. `dev/src/macro_replace.{h,cpp}`: add `int src_file; size_t src_line;` to
-   `PPToken` (default 0); `PPTokenCollector` optionally implements the sink
-   and stamps tokens (NEW_LINE tokens carry the line they terminate).
-3. New `dev/src/preproc_engine.{h,cpp}`: `PreprocError`; engine class holding
-   MacroTable, file-name table, per-srcfile state; carve loop generalizing
-   `MacroProcessFile` (macro_replace.cpp:1018) — do not copy it: directive
-   set here is define/undef/null/#error/unknown-error, text flush reuses
-   `FlushText`-equivalent expansion into the shared stream. Install static
-   predefineds via `MacroTable::Define(name, macro)`. Entry:
-   `PreprocRun(const vector<string>& srcfiles, ostream& out, FileIdLookup)`.
-4. `dev/src/posttoken_debug.h`: constructor takes `std::ostream& out =
-   std::cout`; members write to `out_`. Engine-side subclass overrides
-   `emit_invalid` to throw `PreprocError`.
-5. `dev/preproc.cpp`: drop the NotImplemented throw; parse `-o out srcs…`,
-   one `asctime` snapshot, call `PreprocRun`, catch → EXIT_FAILURE. Keep
-   `PA5GetFileId` (pass as callback) and the batch-stdin stub.
-6. `dev/frontend_source_sets.mk`: set the preproc list (see Stage Design).
+### Implementation Packet
 
-Fixture groups (proof): the ~43 CP1 fixtures in the Failure Map envelope
-group; run through-pa4 to prove no regression in pptoken/posttoken/ctrlexpr/
-macro from the shared-file edits.
+1. `dev/src/preproc_engine.{h,cpp}`: add the conditional group stack
+   `{parent_active, taken, in_else, active}`; implement `#if`/`#ifdef`/
+   `#ifndef`/`#elif`/`#else`/`#endif`, active/inactive non-directive rules,
+   and unterminated-group errors.
+2. `dev/src/ctrlexpr_eval.{h,cpp}`: pre-resolve `defined` operands (including
+   identifier-like alternative tokens), evaluate active expressions through
+   PA3, and map expression errors to `PreprocError`.
+3. `dev/src/macro_replace.{h,cpp}`: add the dynamic predefined expansion hook
+   and preserve source/head stamping through object, function, argument,
+   stringize, and paste replacements.
+4. `#line`: maintain physical-to-presumed line/file state and apply a
+   directive's values to the physical line after its terminating NEW_LINE.
+   `__COUNTER__` resets with each command-line source file.
 
-Required spec/handout facts (self-contained):
-- Output: first line `preproc <N>`; per srcfile `sof <argv-spelling>`, PA2
-  posttoken lines, `eof` (pa5/README.md "Output Format"; PA2 format is
-  what `DebugPostTokenOutputStream` already prints).
-- PA5 errors → EXIT_FAILURE: any `invalid` posttoken, `#undef` with extra
-  tokens (300-undef-extra), malformed `#define` (PA4 rules), `#` followed by
-  a non-directive-list token (170-nondir2), `#error` (CP1: always active).
-- Null directive: `#` alone on a logical line (after comment stripping) is a
-  no-op (150-null-directive).
-- Logical lines: NEW_LINE tokens delimit; a `#` (or `%:`) as first line token
-  starts a directive; text accumulates NEW_LINEs so fn-like invocations span
-  lines (PA4 behavior retained; a directive inside active argument collection
-  errors, per pa4/audit.md item 5).
-- Phase 6 string concatenation must cross text-sequence and (later) include
-  boundaries: exactly one `PostTokenStream` per srcfile (700-strlit-a shows
-  multi-token concatenated spellings in one literal line).
-- Srcfiles are independent: reset table/predefineds/output section per file.
-
-Commands:
-- Build: `make -C dev preproc`
-- Focused: `cd pa5 && ../dev/preproc -o /tmp/o tests/200-onedef.t; echo $?;
-  diff /tmp/o tests/200-onedef.ref` (same pattern for any fixture; expected
-  exit in `<fixture>.ref.exit_status`)
-- Stage: `make test-pa5` (from repo root; also rebuilds)
-- Broad: `make test-report-through-pa4` (must stay 184/184), then
-  `make test-report-through-pa5`
-- Audit: `perl scripts/cppgm_file_audit.pl --stage pa5 --paths dev/src`
-- Adhoc differential: `cd pa5 && echo '<src>' | ./preproc-stdin` vs
-  `./preproc-ref-stdin` (observation only; fixtures are the oracle)
-- Perf probe: `cd pa5 && time ../dev/preproc -o /dev/null
-  course/pa5/600-repeated-argument-expansion.t` — budget ≤2s.
-
-Known uncertainties (resolve by observing preproc-ref, never by editing
-fixtures): exact error text never matters (exit status only); whether
-`#define`/`#undef` of predefined macros is permitted (no fixture; suggest
-allowing table ops and letting the dynamic hook shadow only
-__FILE__/__LINE__/__COUNTER__); unterminated `#if` in the MAIN srcfile
-(include case is pinned as error; suggest error for both); `#ifdef` operand
-being an identifier-like alternative token (mirror the `defined` rule);
-whether emit_whitespace_sequence ordering from the lexer needs a
-position report (it does not carry a token — skip it).
+Proof: CP2 conditional/line fixtures (`150-no-error`, `170-nondir*`,
+`200-if`, `400-predefined-macros`, `500-predefined-macros`, line fixtures, and
+the corresponding `cppgm.tests/course/pa5` cases) pass while the CP1 set and
+the 0.10s repeated-argument probe remain intact.

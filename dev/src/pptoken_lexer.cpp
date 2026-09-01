@@ -50,11 +50,13 @@ class SourceDecoder
 public:
 	const string& buf;
 	size_t pos;
+	size_t physical_line;
 	bool raw;
 	bool last_was_ucn;
 
 	SourceDecoder(const string& buf)
-		: buf(buf), pos(0), raw(false), last_was_ucn(false)
+		: buf(buf), pos(0), physical_line(1), raw(false),
+			last_was_ucn(false)
 	{
 		if (buf.size() >= 3 &&
 			static_cast<unsigned char>(buf[0]) == 0xEF &&
@@ -123,9 +125,22 @@ public:
 		return pos;
 	}
 
-	void rewind(size_t saved)
+	void rewind(size_t saved, size_t saved_line)
 	{
 		pos = saved;
+		physical_line = saved_line;
+	}
+
+	size_t line_for_next_token()
+	{
+		size_t saved = mark();
+		size_t saved_line = physical_line;
+		bool saved_last_was_ucn = last_was_ucn;
+		int codepoint = next();
+		size_t result = codepoint == '\n' ? saved_line : physical_line;
+		rewind(saved, saved_line);
+		last_was_ucn = saved_last_was_ucn;
+		return result;
 	}
 
 private:
@@ -133,6 +148,7 @@ private:
 	int Lookahead(size_t lookahead, bool& from_ucn)
 	{
 		size_t saved = mark();
+		size_t saved_line = physical_line;
 		bool saved_last_was_ucn = last_was_ucn;
 		try
 		{
@@ -140,13 +156,13 @@ private:
 			for (size_t i = 0; i <= lookahead; ++i)
 				result = next();
 			from_ucn = last_was_ucn;
-			rewind(saved);
+			rewind(saved, saved_line);
 			last_was_ucn = saved_last_was_ucn;
 			return result;
 		}
 		catch (...)
 		{
-			rewind(saved);
+			rewind(saved, saved_line);
 			last_was_ucn = saved_last_was_ucn;
 			throw;
 		}
@@ -157,6 +173,8 @@ private:
 		size_t end;
 		int result = DecodeUtf8At(buf, pos, end);
 		pos = end;
+		if (result == '\n')
+			++physical_line;
 		return result;
 	}
 
@@ -187,11 +205,13 @@ private:
 		if (first == '\n')
 		{
 			pos = after_first;
+			++physical_line;
 			return true;
 		}
 		if (first == '\r' && PeekPhysical(1, &after_first) == '\n')
 		{
 			pos = after_first;
+			++physical_line;
 			return true;
 		}
 		return false;
@@ -557,6 +577,7 @@ bool TryScanHeaderName(SourceDecoder& decoder, int opening,
 	string& token)
 {
 	size_t saved = decoder.mark();
+	size_t saved_line = decoder.physical_line;
 	int closing = opening == '<' ? '>' : '"';
 	token.clear();
 	AppendCodePoint(token, decoder.next());
@@ -566,7 +587,7 @@ bool TryScanHeaderName(SourceDecoder& decoder, int opening,
 		int codepoint = decoder.next();
 		if (codepoint == EndOfFile || codepoint == '\n' || codepoint == '\r')
 		{
-			decoder.rewind(saved);
+			decoder.rewind(saved, saved_line);
 			token.clear();
 			return false;
 		}
@@ -758,8 +779,15 @@ bool ConsumeWhitespaceSequence(SourceDecoder& decoder)
 }
 
 void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
-	DirectiveContext& context)
+	DirectiveContext& context, IPPTokenPositionSink* position_sink)
 {
+	const size_t token_line = decoder.line_for_next_token();
+	auto report_token_line = [position_sink, token_line]()
+	{
+		if (position_sink != nullptr)
+			position_sink->on_token_line(token_line);
+	};
+
 	if (context == ExpectingHeaderName)
 	{
 		int opening = decoder.peek();
@@ -768,6 +796,7 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 			string token;
 			if (TryScanHeaderName(decoder, opening, token))
 			{
+				report_token_line();
 				output.emit_header_name(token);
 				context = NoDirective;
 				return;
@@ -782,9 +811,15 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 		string suffix = ScanUserDefinedSuffix(decoder);
 		token += suffix;
 		if (suffix.empty())
+		{
+			report_token_line();
 			output.emit_string_literal(token);
+		}
 		else
+		{
+			report_token_line();
 			output.emit_user_defined_string_literal(token);
+		}
 		AdvanceDirectiveContext(token, context);
 		return;
 	}
@@ -801,9 +836,15 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 		string suffix = ScanUserDefinedSuffix(decoder);
 		token += suffix;
 		if (suffix.empty())
+		{
+			report_token_line();
 			output.emit_character_literal(token);
+		}
 		else
+		{
+			report_token_line();
 			output.emit_user_defined_character_literal(token);
+		}
 		AdvanceDirectiveContext(token, context);
 		return;
 	}
@@ -821,9 +862,15 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 		string suffix = ScanUserDefinedSuffix(decoder);
 		token += suffix;
 		if (suffix.empty())
+		{
+			report_token_line();
 			output.emit_string_literal(token);
+		}
 		else
+		{
+			report_token_line();
 			output.emit_user_defined_string_literal(token);
+		}
 		AdvanceDirectiveContext(token, context);
 		return;
 	}
@@ -834,9 +881,15 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 	{
 		string token = ScanIdentifier(decoder);
 		if (Digraph_IdentifierLike_Operators.count(token) != 0)
+		{
+			report_token_line();
 			output.emit_preprocessing_op_or_punc(token);
+		}
 		else
+		{
+			report_token_line();
 			output.emit_identifier(token);
+		}
 		AdvanceDirectiveContext(token, context);
 		return;
 	}
@@ -845,6 +898,7 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 		(codepoint == '.' && IsAsciiDigit(decoder.peek(1))))
 	{
 		string token = ScanPPNumber(decoder);
+		report_token_line();
 		output.emit_pp_number(token);
 		AdvanceDirectiveContext(token, context);
 		return;
@@ -853,19 +907,22 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
 	string operator_token = ScanOperator(decoder);
 	if (!operator_token.empty())
 	{
+		report_token_line();
 		output.emit_preprocessing_op_or_punc(operator_token);
 		AdvanceDirectiveContext(operator_token, context);
 		return;
 	}
 
 	string token = EncodeUtf8(decoder.next());
+	report_token_line();
 	output.emit_non_whitespace_char(token);
 	AdvanceDirectiveContext(token, context);
 }
 
 } // namespace
 
-void PPTokenize(const string& input, IPPTokenStream& output)
+void PPTokenize(const string& input, IPPTokenStream& output,
+	IPPTokenPositionSink* position_sink)
 {
 	SourceDecoder decoder(input);
 	bool saw_logical_character = false;
@@ -884,15 +941,18 @@ void PPTokenize(const string& input, IPPTokenStream& output)
 
 		if (decoder.peek() == '\n')
 		{
+			size_t token_line = decoder.physical_line;
 			decoder.next();
 			saw_logical_character = true;
 			ended_with_new_line = true;
 			context = StartOfLine;
+			if (position_sink != nullptr)
+				position_sink->on_token_line(token_line);
 			output.emit_new_line();
 			continue;
 		}
 
-		EmitCoreToken(decoder, output, context);
+		EmitCoreToken(decoder, output, context, position_sink);
 		saw_logical_character = true;
 		ended_with_new_line = false;
 	}
@@ -900,4 +960,9 @@ void PPTokenize(const string& input, IPPTokenStream& output)
 	if (saw_logical_character && !ended_with_new_line)
 		output.emit_new_line();
 	output.emit_eof();
+}
+
+void PPTokenize(const string& input, IPPTokenStream& output)
+{
+	PPTokenize(input, output, nullptr);
 }

@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@
 using std::string;
 
 #include "IPPTokenStream.h"
+#include "pptoken_lexer.h"
 
 enum EPPTokenKind
 {
@@ -25,17 +27,21 @@ enum EPPTokenKind
 	PP_TOKEN_PLACEMARKER
 };
 
-typedef std::vector<string> PaintSet;
+struct PaintTreeNode;
+typedef std::shared_ptr<const PaintTreeNode> PaintSet;
 
 bool PaintContains(const PaintSet& paint, const string& name);
 PaintSet PaintUnion(const PaintSet& left, const PaintSet& right);
 PaintSet PaintIntersect(const PaintSet& left, const PaintSet& right);
+PaintSet PaintAdd(const PaintSet& paint, const string& name);
 
 struct PPToken
 {
 	EPPTokenKind kind;
 	string data;
 	bool preceded_by_ws;
+	int src_file;
+	size_t src_line;
 	PaintSet paint;
 	bool noninvokable;
 
@@ -43,12 +49,14 @@ struct PPToken
 	PPToken(EPPTokenKind kind, const string& data, bool preceded_by_ws);
 };
 
-struct PPTokenCollector : IPPTokenStream
+struct PPTokenCollector : IPPTokenStream, IPPTokenPositionSink
 {
 	std::vector<PPToken> tokens;
 	bool whitespace_pending;
 
-	PPTokenCollector();
+	explicit PPTokenCollector(int src_file = 0);
+
+	void on_token_line(size_t physical_line) override;
 
 	void emit_whitespace_sequence() override;
 	void emit_new_line() override;
@@ -65,6 +73,9 @@ struct PPTokenCollector : IPPTokenStream
 
 private:
 	void append(EPPTokenKind kind, const string& data);
+
+	int src_file_;
+	size_t current_line_;
 };
 
 struct Macro
@@ -118,5 +129,8 @@ private:
 };
 
 struct IPostTokenOutputStream;
+struct PostTokenStream;
 
 void MacroProcessFile(const string& input, IPostTokenOutputStream& output);
+void MacroFlushText(const std::vector<PPToken>& text, const MacroTable& table,
+	PostTokenStream& output);

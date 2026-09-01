@@ -6,15 +6,15 @@
 #include <vector>
 #include <stdexcept>
 #include <fstream>
+#include <ctime>
 
 using namespace std;
 
 #include "exceptions.h"
+#include "preproc_engine.h"
 
 // For pragma once implementation:
 // system-wide unique file id type `PA5FileId`
-typedef pair<unsigned long int, unsigned long int> PA5FileId;
-
 // bootstrap system call interface, used by PA5GetFileId
 extern "C" long int syscall(long int n, ...) throw ();
 
@@ -74,6 +74,22 @@ int main(int argc, char** argv)
 {
 	try
 	{
+		time_t now = time(nullptr);
+		tm* local_time = localtime(&now);
+		if (local_time == nullptr)
+			throw runtime_error("unable to obtain build time");
+		const char* asctime_snapshot = asctime(local_time);
+		if (asctime_snapshot == nullptr)
+			throw runtime_error("unable to obtain build time");
+		const string build_stamp(asctime_snapshot);
+		if (build_stamp.size() < 24)
+			throw runtime_error("invalid build time");
+		PreprocBuildInfo build_info;
+		build_info.date = build_stamp.substr(4, 7) +
+			build_stamp.substr(20, 4);
+		build_info.time = build_stamp.substr(11, 8);
+		build_info.author = "Vishvananda";
+
 		if (HasBatchStdinArg(argc, argv))
 			return RunNotImplementedBatchMode();
 
@@ -86,37 +102,18 @@ int main(int argc, char** argv)
 			throw logic_error("invalid usage");
 
 		string outfile = args[1];
-		size_t nsrcfiles = args.size() - 2;
-
-		throw NotImplementedException();
 
 		ofstream out(outfile);
+		if (!out)
+			throw runtime_error("unable to open output file");
 
-		out << "preproc " << nsrcfiles << endl;
-
-		for (size_t i = 0; i < nsrcfiles; i++)
-		{
-			string srcfile = args[i+2];
-
-			out << "sof " << srcfile << endl;
-
-			ifstream in(srcfile);
-
-			// TODO: implement `preproc` as per PA5 description
-			out << "not yet implemented" << endl;
-	
-			out << "eof" << endl;
-
-		}
-	}
-	catch (const NotImplementedException& e)
-	{
-		cerr << "ERROR: " << e.what() << endl;
-		return CPPGM_EXIT_NOT_IMPLEMENTED;
+		vector<string> srcfiles(args.begin() + 2, args.end());
+		PreprocRun(srcfiles, out, PA5GetFileId, build_info);
 	}
 	catch (exception& e)
 	{
 		cerr << "ERROR: " << e.what() << endl;
 		return EXIT_FAILURE;
 	}
+	return EXIT_SUCCESS;
 }
