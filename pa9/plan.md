@@ -168,27 +168,29 @@ NotImplementedException; nothing exists yet). By unblocking component:
   and the pa9 file audit passes. The specified 300 calculator probe, with
   output redirected to `/dev/null`, is 0.479 s (<5 s); all prior integer and
   malformed grammar witnesses stay green.
-- CP3 — x87 float80: conversions, arithmetic, comparisons (FCOMIP flag
-  idiom: order operands so flt→setb, fle→setbe, fgt/fge by swap; feq/fne
-  → sete/setne), move80 (10-byte copy), red-zone bounce buffers.
-  Progress proof: 3 → 0 failing; `make test-pa9` clean.
+- CP3 — x87 float80 (COMPLETED): x87 register/memory encodings, conversions,
+  arithmetic, comparisons (FCOMIP flag idiom: order operands so flt→setb,
+  fle→setbe, fgt/fge by swap; feq/fne → sete/setne), move80 (10-byte copy),
+  and bounded red-zone bounce buffers. Unsigned 16/32/64-bit conversion
+  paths use zero extension or signed-range-preserving split/offset idioms.
+  Progress proof: `make test-pa9` reports 18/18, reducing the three
+  turn-start failures to 0; `make test-report-through-pa8` reports 414/414,
+  the pa9 file audit passes with its existing one warning, and the specified
+  300 calculator probe is 0.333 s wall time (<5 s). The direct move80 probe
+  round-tripped `0x0000011F71FB04CB`; all earlier integer and malformed
+  grammar witnesses remain green.
 - CP4 — stage close: `make test-report-through-pa9` clean, file audit
   clean, perf probe recorded, architecture notes appended here.
 
-## Active Checkpoint: CP3 — x87 float80
+## Active Checkpoint: CP4 — stage close
 
 Implementation Packet:
 
-- Files/symbols: `dev/src/x86_assembler.cpp` x87 register/instruction
-  encoding and `dev/src/cy86_codegen.cpp` float conversion, arithmetic,
-  comparison, `move80`, and red-zone bounce-buffer lowering.
-- Regression fixtures: keep all 15 current passes green and close
-  `pa9/tests/500-to-float80.t.1`, `pa9/tests/501-from-float80.t.1`, and
-  `pa9/tests/600-float-calculator.t.1` while retaining the three malformed
-  course grammar witnesses.
-- Required scope: preserve integer lowering, data alignment, and the fixed
-  register discipline while implementing the x87 float80 checkpoint.
-- Focused command: `make -C dev cy86`; representative run is
-  `time ./300-binary-calculator.my.program < 300-binary-calculator.stdin`,
-  with wall time below 5 s. Required gates remain `make test-pa9`,
-  `make test-report-through-pa8`, and the pa9 file audit.
+- Files/symbols: `pa9/plan.md` checkpoint evidence and the root test/audit
+  targets; no compiler implementation changes are expected for this close.
+- Required gates: `make test-report-through-pa9` and
+  `perl scripts/cppgm_file_audit.pl --stage pa9 --paths dev/src`.
+- Closeout evidence: retain the 18/18 pa9 result, 414/414 through-pa8 result,
+  and the sub-5-second calculator probe recorded above; preserve the fixed
+  register discipline and the existing audit warning unless its owner is
+  explicitly addressed.

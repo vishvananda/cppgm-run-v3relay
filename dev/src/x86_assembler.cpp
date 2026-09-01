@@ -428,6 +428,132 @@ void EncodeUnaryMultiply(vector<unsigned char>& out, X86Mnemonic mnemonic,
 		ModRM(out, group, operands[0]);
 }
 
+unsigned X87Index(const X86Operand& operand)
+{
+	if (operand.kind != X86_X87_REGISTER_OPERAND || operand.x87_index > 7)
+		throw runtime_error("invalid x87 stack register");
+	return operand.x87_index;
+}
+
+void EncodeX87Memory(vector<unsigned char>& out, X86Mnemonic mnemonic,
+	unsigned width, const X86Operand& operand)
+{
+	if (operand.kind != X86_MEMORY_OPERAND)
+		throw runtime_error("x87 memory instruction requires a memory operand");
+	unsigned opcode = 0;
+	unsigned group = 0;
+	switch (mnemonic)
+	{
+	case X86_FLD:
+		if (width == 32) { opcode = 0xd9; group = 0; }
+		else if (width == 64) { opcode = 0xdd; group = 0; }
+		else if (width == 80) { opcode = 0xdb; group = 5; }
+		else throw runtime_error("unsupported x87 FLD width");
+		break;
+	case X86_FSTP:
+		if (width == 32) { opcode = 0xd9; group = 3; }
+		else if (width == 64) { opcode = 0xdd; group = 3; }
+		else if (width == 80) { opcode = 0xdb; group = 7; }
+		else throw runtime_error("unsupported x87 FSTP width");
+		break;
+	case X86_FILD:
+		if (width == 16) { opcode = 0xdf; group = 0; }
+		else if (width == 32) { opcode = 0xdb; group = 0; }
+		else if (width == 64) { opcode = 0xdf; group = 5; }
+		else throw runtime_error("unsupported x87 FILD width");
+		break;
+	case X86_FISTP:
+		if (width == 16) { opcode = 0xdf; group = 3; }
+		else if (width == 32) { opcode = 0xdb; group = 3; }
+		else if (width == 64) { opcode = 0xdf; group = 7; }
+		else throw runtime_error("unsupported x87 FISTP width");
+		break;
+	case X86_FADD:
+		if (width == 32) { opcode = 0xd8; group = 0; }
+		else if (width == 64) { opcode = 0xdc; group = 0; }
+		else throw runtime_error("unsupported x87 FADD width");
+		break;
+	case X86_FSUB:
+		if (width == 32) { opcode = 0xd8; group = 4; }
+		else if (width == 64) { opcode = 0xdc; group = 4; }
+		else throw runtime_error("unsupported x87 FSUB width");
+		break;
+	case X86_FMUL:
+		if (width == 32) { opcode = 0xd8; group = 1; }
+		else if (width == 64) { opcode = 0xdc; group = 1; }
+		else throw runtime_error("unsupported x87 FMUL width");
+		break;
+	case X86_FDIV:
+		if (width == 32) { opcode = 0xd8; group = 6; }
+		else if (width == 64) { opcode = 0xdc; group = 6; }
+		else throw runtime_error("unsupported x87 FDIV width");
+		break;
+	default:
+		throw runtime_error("not an x87 memory instruction");
+	}
+	REX(out, 0, 0, Code(operand.base));
+	Byte(out, opcode);
+	ModRM(out, group, operand);
+}
+
+void EncodeX87Stack(vector<unsigned char>& out, X86Mnemonic mnemonic,
+	const X86Operand& operand)
+{
+	const unsigned index = X87Index(operand);
+	Byte(out, mnemonic == X86_FCOMIP ? 0xdf :
+		(mnemonic == X86_FSTP ? 0xdd :
+			(mnemonic == X86_FLD ? 0xd9 : 0xde)));
+	unsigned opcode;
+	switch (mnemonic)
+	{
+	case X86_FLD: opcode = 0xc0; break;
+	case X86_FSTP: opcode = 0xd8; break;
+	case X86_FADDP: opcode = 0xc0; break;
+	case X86_FSUBP: opcode = 0xe8; break;
+	case X86_FMULP: opcode = 0xc8; break;
+	case X86_FDIVP: opcode = 0xf8; break;
+	case X86_FCOMIP: opcode = 0xf0; break;
+	default: throw runtime_error("not an x87 stack instruction");
+	}
+	Byte(out, opcode + index);
+}
+
+void EncodeX87(vector<unsigned char>& out, X86Mnemonic mnemonic,
+	unsigned width, const vector<X86Operand>& operands)
+{
+	if (mnemonic == X86_FCHS)
+	{
+		if (!operands.empty())
+			throw runtime_error("FCHS takes no operands");
+		Byte(out, 0xd9);
+		Byte(out, 0xe0);
+		return;
+	}
+	if (mnemonic == X86_FADDP || mnemonic == X86_FSUBP ||
+		mnemonic == X86_FMULP || mnemonic == X86_FDIVP ||
+		mnemonic == X86_FCOMIP ||
+		((mnemonic == X86_FLD || mnemonic == X86_FSTP) &&
+			operands.size() == 1 &&
+			operands[0].kind == X86_X87_REGISTER_OPERAND))
+	{
+		if (operands.size() != 1)
+			throw runtime_error("x87 stack instruction requires one operand");
+		EncodeX87Stack(out, mnemonic, operands[0]);
+		return;
+	}
+	if (operands.size() != 1)
+		throw runtime_error("x87 memory instruction requires one operand");
+	if (mnemonic == X86_FLD || mnemonic == X86_FSTP ||
+		mnemonic == X86_FILD || mnemonic == X86_FISTP ||
+		mnemonic == X86_FADD || mnemonic == X86_FSUB ||
+		mnemonic == X86_FMUL || mnemonic == X86_FDIV)
+	{
+		EncodeX87Memory(out, mnemonic, width, operands[0]);
+		return;
+	}
+	throw runtime_error("unexpected x87 instruction");
+}
+
 void EncodeNoOperand(vector<unsigned char>& out, X86Mnemonic mnemonic)
 {
 	switch (mnemonic)
@@ -462,6 +588,17 @@ X86Operand X86HighByte(X64Register reg)
 	operand.kind = X86_HIGH_BYTE_REGISTER_OPERAND;
 	operand.reg = reg;
 	operand.width = 8;
+	return operand;
+}
+
+X86Operand X87Reg(unsigned index)
+{
+	if (index > 7)
+		throw runtime_error("invalid x87 stack register");
+	X86Operand operand;
+	operand.kind = X86_X87_REGISTER_OPERAND;
+	operand.x87_index = index;
+	operand.width = 80;
 	return operand;
 }
 
@@ -572,6 +709,22 @@ vector<unsigned char> X86Instruction::Encode() const
 		if (!operands.empty())
 			throw runtime_error("x86 instruction takes no operands");
 		EncodeNoOperand(result, mnemonic);
+		break;
+	case X86_FLD:
+	case X86_FSTP:
+	case X86_FILD:
+	case X86_FISTP:
+	case X86_FADD:
+	case X86_FSUB:
+	case X86_FMUL:
+	case X86_FDIV:
+	case X86_FADDP:
+	case X86_FSUBP:
+	case X86_FMULP:
+	case X86_FDIVP:
+	case X86_FCOMIP:
+	case X86_FCHS:
+		EncodeX87(result, mnemonic, width, operands);
 		break;
 	case X86_SETCC:
 		if (operands.size() != 1 ||

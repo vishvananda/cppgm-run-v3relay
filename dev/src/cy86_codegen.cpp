@@ -18,6 +18,13 @@ const size_t kImageHeaderSize = kElfHeaderSize + kProgramHeaderSize;
 
 typedef vector<unsigned char> ByteVector;
 
+// Each translated instruction may reuse these 16-byte slots.  They live in
+// the System V red zone, so no stack-pointer adjustment is needed and the
+// fixed CY86 register convention remains intact.
+const int64_t kBouncePrimary = -16;
+const int64_t kBounceSecondary = -32;
+const int64_t kBounceTertiary = -48;
+
 void Append(ByteVector& output, const ByteVector& bytes)
 {
 	output.insert(output.end(), bytes.begin(), bytes.end());
@@ -155,6 +162,77 @@ void EmitMoveImmediate(ByteVector& output, X64Register reg, uint64_t value)
 	Emit(output, X86_MOV, 64, Two(X86Reg(reg, 64), X86Imm(value, 64)));
 }
 
+uint64_t LiteralChunk(const Cy86Literal& literal, size_t offset,
+	size_t count)
+{
+	uint64_t value = 0;
+	for (size_t i = 0; i < count; ++i)
+	{
+		const size_t index = offset + i;
+		if (index < literal.bytes.size())
+			value |= uint64_t(literal.bytes[index]) << (i * 8);
+	}
+	return value;
+}
+
+void WriteLiteralToBounce(ByteVector& output, const Cy86Literal& literal,
+	size_t byte_count, int64_t offset)
+{
+	size_t position = 0;
+	while (byte_count - position >= 8)
+	{
+		EmitMoveImmediate(output, XR_RAX,
+			LiteralChunk(literal, position, 8));
+		Emit(output, X86_MOV, 64,
+			Two(X86Mem(XR_RSP, offset + static_cast<int64_t>(position), 64),
+				X86Reg(XR_RAX, 64)));
+		position += 8;
+	}
+	if (byte_count - position >= 4)
+	{
+		Emit(output, X86_MOV, 32,
+			Two(X86Reg(XR_RAX, 32),
+				X86Imm(LiteralChunk(literal, position, 4), 32)));
+		Emit(output, X86_MOV, 32,
+			Two(X86Mem(XR_RSP, offset + static_cast<int64_t>(position), 32),
+				X86Reg(XR_RAX, 32)));
+		position += 4;
+	}
+	if (byte_count - position >= 2)
+	{
+		Emit(output, X86_MOV, 16,
+			Two(X86Reg(XR_RAX, 16),
+				X86Imm(LiteralChunk(literal, position, 2), 16)));
+		Emit(output, X86_MOV, 16,
+			Two(X86Mem(XR_RSP, offset + static_cast<int64_t>(position), 16),
+				X86Reg(XR_RAX, 16)));
+		position += 2;
+	}
+	if (byte_count != position)
+	{
+		Emit(output, X86_MOV, 8,
+			Two(X86Reg(XR_RAX, 8),
+				X86Imm(LiteralChunk(literal, position, 1), 8)));
+		Emit(output, X86_MOV, 8,
+			Two(X86Mem(XR_RSP, offset + static_cast<int64_t>(position), 8),
+				X86Reg(XR_RAX, 8)));
+	}
+}
+
+void StoreRawRegister(ByteVector& output, X64Register source,
+	unsigned width, int64_t offset)
+{
+	Emit(output, X86_MOV, width,
+		Two(X86Mem(XR_RSP, offset, width), X86Reg(source, width)));
+}
+
+void LoadRawBounce(ByteVector& output, X64Register target, unsigned width,
+	int64_t offset)
+{
+	Emit(output, X86_MOV, width,
+		Two(X86Reg(target, width), X86Mem(XR_RSP, offset, width)));
+}
+
 uint64_t MemoryBase(const Cy86Memory& memory,
 	const map<string, uint64_t>& labels)
 {
@@ -229,11 +307,82 @@ void StoreOperand(ByteVector& output, const Cy86Operand& operand,
 	throw Cy86Error("write operand is not writable");
 }
 
+unsigned FloatLiteralWidth(const Cy86Literal& literal, unsigned fallback)
+{
+	switch (literal.type)
+	{
+	case FT_FLOAT: return 32;
+	case FT_DOUBLE: return 64;
+	case FT_LONG_DOUBLE: return 80;
+	default: return fallback;
+	}
+}
+
+void LoadFloatOperand(ByteVector& output, const Cy86Operand& operand,
+	unsigned width, const map<string, uint64_t>& labels, int64_t bounce)
+{
+	if (operand.kind == CY86_MEMORY_OPERAND)
+	{
+		EmitAddress(output, operand.memory, labels, XR_RSI);
+		Emit(output, X86_FLD, width,
+			One(X86Mem(XR_RSI, 0, width)));
+		return;
+	}
+	if (operand.kind != CY86_IMMEDIATE_OPERAND)
+		throw Cy86Error("floating register operand cannot be lowered");
+	const unsigned literal_width = FloatLiteralWidth(operand.immediate.literal,
+		width);
+	const size_t byte_count = literal_width == 80 ? 10 : literal_width / 8;
+	WriteLiteralToBounce(output, operand.immediate.literal, byte_count, bounce);
+	Emit(output, X86_FLD, literal_width,
+		One(X86Mem(XR_RSP, bounce, literal_width)));
+}
+
+void StoreFloatOperand(ByteVector& output, const Cy86Operand& operand,
+	unsigned width, const map<string, uint64_t>& labels)
+{
+	if (operand.kind != CY86_MEMORY_OPERAND)
+		throw Cy86Error("floating result must be stored in memory");
+	EmitAddress(output, operand.memory, labels, XR_RDI);
+	Emit(output, X86_FSTP, width,
+		One(X86Mem(XR_RDI, 0, width)));
+}
+
 void TranslateMove(ByteVector& output, const Cy86Statement& statement,
 	unsigned width, const map<string, uint64_t>& labels)
 {
 	LoadOperand(output, statement.operands[1], width, XR_RAX, labels);
 	StoreOperand(output, statement.operands[0], width, XR_RAX, labels);
+}
+
+void TranslateMove80(ByteVector& output, const Cy86Statement& statement,
+	const map<string, uint64_t>& labels)
+{
+	const Cy86Operand& source = statement.operands[1];
+	if (source.kind == CY86_IMMEDIATE_OPERAND)
+		WriteLiteralToBounce(output, source.immediate.literal, 10,
+			kBouncePrimary);
+	else if (source.kind == CY86_MEMORY_OPERAND)
+	{
+		EmitAddress(output, source.memory, labels, XR_RSI);
+		Emit(output, X86_MOV, 64,
+			Two(X86Reg(XR_RAX, 64), X86Mem(XR_RSI, 0, 64)));
+		StoreRawRegister(output, XR_RAX, 64, kBouncePrimary);
+		Emit(output, X86_MOV, 16,
+			Two(X86Reg(XR_RAX, 16), X86Mem(XR_RSI, 8, 16)));
+		StoreRawRegister(output, XR_RAX, 16, kBouncePrimary + 8);
+	}
+	else
+		throw Cy86Error("move80 source is not readable");
+	if (statement.operands[0].kind != CY86_MEMORY_OPERAND)
+		throw Cy86Error("move80 destination is not writable memory");
+	EmitAddress(output, statement.operands[0].memory, labels, XR_RDI);
+	LoadRawBounce(output, XR_RAX, 64, kBouncePrimary);
+	Emit(output, X86_MOV, 64,
+		Two(X86Mem(XR_RDI, 0, 64), X86Reg(XR_RAX, 64)));
+	LoadRawBounce(output, XR_RAX, 16, kBouncePrimary + 8);
+	Emit(output, X86_MOV, 16,
+		Two(X86Mem(XR_RDI, 8, 16), X86Reg(XR_RAX, 16)));
 }
 
 X86Mnemonic BinaryMnemonic(const string& opcode)
@@ -452,6 +601,230 @@ void TranslateDivide(ByteVector& output, const Cy86Statement& statement,
 			remainder ? XR_RDX : XR_RAX, labels);
 }
 
+unsigned ConversionWidth(const string& opcode)
+{
+	if (StartsWith(opcode, "s8") || StartsWith(opcode, "u8") ||
+		StartsWith(opcode, "f80convs8") ||
+		StartsWith(opcode, "f80convu8"))
+		return 8;
+	if (StartsWith(opcode, "s16") || StartsWith(opcode, "u16") ||
+		StartsWith(opcode, "f80convs16") ||
+		StartsWith(opcode, "f80convu16"))
+		return 16;
+	if (StartsWith(opcode, "f32convf80"))
+		return 32;
+	if (StartsWith(opcode, "f64convf80"))
+		return 64;
+	if (StartsWith(opcode, "f80convf32"))
+		return 32;
+	if (StartsWith(opcode, "f80convf64"))
+		return 64;
+	if (StartsWith(opcode, "s32") || StartsWith(opcode, "u32"))
+		return 32;
+	if (StartsWith(opcode, "s64") || StartsWith(opcode, "u64"))
+		return 64;
+	if (StartsWith(opcode, "f80convs32") ||
+		StartsWith(opcode, "f80convu32"))
+		return 32;
+	if (StartsWith(opcode, "f80convs64") ||
+		StartsWith(opcode, "f80convu64"))
+		return 64;
+	throw Cy86Error("unknown CY86 conversion width: " + opcode);
+}
+
+void TranslateIntegerToFloat80(ByteVector& output,
+	const Cy86Statement& statement, unsigned width, bool signed_op,
+	const map<string, uint64_t>& labels)
+{
+	const Cy86Operand& source = statement.operands[1];
+	if (width == 8)
+	{
+		if (!signed_op)
+			Emit(output, X86_XOR, 32,
+				Two(X86Reg(XR_RAX, 32), X86Reg(XR_RAX, 32)));
+		LoadOperand(output, source, 8, XR_RAX, labels);
+		if (signed_op)
+			Emit(output, X86_CBW, 0, vector<X86Operand>());
+		StoreRawRegister(output, XR_RAX, 16, kBouncePrimary);
+		Emit(output, X86_FILD, 16,
+			One(X86Mem(XR_RSP, kBouncePrimary, 16)));
+	}
+	else if (width == 16)
+	{
+		if (signed_op)
+		{
+			LoadOperand(output, source, 16, XR_RAX, labels);
+			StoreRawRegister(output, XR_RAX, 16, kBouncePrimary);
+			Emit(output, X86_FILD, 16,
+				One(X86Mem(XR_RSP, kBouncePrimary, 16)));
+		}
+		else
+		{
+			Emit(output, X86_XOR, 32,
+				Two(X86Reg(XR_RAX, 32), X86Reg(XR_RAX, 32)));
+			LoadOperand(output, source, 16, XR_RAX, labels);
+			StoreRawRegister(output, XR_RAX, 32, kBouncePrimary);
+			Emit(output, X86_FILD, 32,
+				One(X86Mem(XR_RSP, kBouncePrimary, 32)));
+		}
+	}
+	else if (width == 32)
+	{
+		LoadOperand(output, source, 32, XR_RAX, labels);
+		if (signed_op)
+		{
+			StoreRawRegister(output, XR_RAX, 32, kBouncePrimary);
+			Emit(output, X86_FILD, 32,
+				One(X86Mem(XR_RSP, kBouncePrimary, 32)));
+		}
+		else
+		{
+			// A zero-extending 32-bit load makes the value fit in a
+			// signed 64-bit FILD operand.
+			StoreRawRegister(output, XR_RAX, 64, kBouncePrimary);
+			Emit(output, X86_FILD, 64,
+				One(X86Mem(XR_RSP, kBouncePrimary, 64)));
+		}
+	}
+	else if (signed_op)
+	{
+		LoadOperand(output, source, 64, XR_RAX, labels);
+		StoreRawRegister(output, XR_RAX, 64, kBouncePrimary);
+		Emit(output, X86_FILD, 64,
+			One(X86Mem(XR_RSP, kBouncePrimary, 64)));
+	}
+	else
+	{
+		// Convert n as 2 * (n >> 1) + (n & 1).  Both FILD operands
+		// are signed, while the intermediate values stay in range.
+		LoadOperand(output, source, 64, XR_RAX, labels);
+		Emit(output, X86_MOV, 64,
+			Two(X86Reg(XR_RBX, 64), X86Reg(XR_RAX, 64)));
+		Emit(output, X86_AND, 64,
+			Two(X86Reg(XR_RAX, 64), X86Imm(1, 64)));
+		StoreRawRegister(output, XR_RAX, 16, kBouncePrimary + 8);
+		EmitMoveImmediate(output, XR_RCX, 1);
+		Emit(output, X86_SHR, 64,
+			Two(X86Reg(XR_RBX, 64), X86Reg(XR_RCX, 8)));
+		StoreRawRegister(output, XR_RBX, 64, kBouncePrimary);
+		Emit(output, X86_FILD, 64,
+			One(X86Mem(XR_RSP, kBouncePrimary, 64)));
+		Emit(output, X86_FLD, 80, One(X87Reg(0)));
+		Emit(output, X86_FADDP, 0, One(X87Reg(1)));
+		Emit(output, X86_FILD, 16,
+			One(X86Mem(XR_RSP, kBouncePrimary + 8, 16)));
+		Emit(output, X86_FADDP, 0, One(X87Reg(1)));
+	}
+	StoreFloatOperand(output, statement.operands[0], 80, labels);
+}
+
+void TranslateFloatToFloat80(ByteVector& output,
+	const Cy86Statement& statement, unsigned width,
+	const map<string, uint64_t>& labels)
+{
+	LoadFloatOperand(output, statement.operands[1], width, labels,
+		kBouncePrimary);
+	StoreFloatOperand(output, statement.operands[0], 80, labels);
+}
+
+void TranslateFloatFrom80(ByteVector& output,
+	const Cy86Statement& statement, unsigned width, bool unsigned_op,
+	bool floating_op,
+	const map<string, uint64_t>& labels)
+{
+	LoadFloatOperand(output, statement.operands[1], 80, labels,
+		kBouncePrimary);
+	if (floating_op)
+	{
+		StoreFloatOperand(output, statement.operands[0], width, labels);
+		return;
+	}
+	if (!unsigned_op && (width == 32 || width == 64))
+	{
+		Emit(output, X86_FISTP, width,
+			One(X86Mem(XR_RSP, kBounceSecondary, width)));
+		LoadRawBounce(output, XR_RAX, width, kBounceSecondary);
+		StoreOperand(output, statement.operands[0], width, XR_RAX, labels);
+		return;
+	}
+	if (unsigned_op && width == 64)
+	{
+		// Subtract 2^63, convert the signed result, then toggle the
+		// high bit.  This is valid for every exactly representable
+		// uint64 value and avoids an out-of-range signed FISTP.
+		EmitMoveImmediate(output, XR_RAX, uint64_t(0x8000000000000000ULL));
+		StoreRawRegister(output, XR_RAX, 64, kBounceSecondary);
+		Emit(output, X86_FILD, 64,
+			One(X86Mem(XR_RSP, kBounceSecondary, 64)));
+		Emit(output, X86_FCHS, 0, vector<X86Operand>());
+		Emit(output, X86_FSUBP, 0, One(X87Reg(1)));
+		Emit(output, X86_FISTP, 64,
+			One(X86Mem(XR_RSP, kBounceTertiary, 64)));
+		LoadRawBounce(output, XR_RAX, 64, kBounceTertiary);
+		EmitMoveImmediate(output, XR_RBX, uint64_t(0x8000000000000000ULL));
+		Emit(output, X86_XOR, 64,
+			Two(X86Reg(XR_RAX, 64), X86Reg(XR_RBX, 64)));
+		StoreOperand(output, statement.operands[0], 64, XR_RAX, labels);
+		return;
+	}
+	const unsigned storage_width = width == 8 ? 16 :
+		(unsigned_op ? (width == 16 ? 32 : 64) : width);
+	Emit(output, X86_FISTP, storage_width,
+		One(X86Mem(XR_RSP, kBounceSecondary, storage_width)));
+	LoadRawBounce(output, XR_RAX, storage_width, kBounceSecondary);
+	StoreOperand(output, statement.operands[0], width, XR_RAX, labels);
+}
+
+X86Mnemonic FloatBinaryMnemonic(const string& opcode)
+{
+	if (StartsWith(opcode, "fadd")) return X86_FADDP;
+	if (StartsWith(opcode, "fsub")) return X86_FSUBP;
+	if (StartsWith(opcode, "fmul")) return X86_FMULP;
+	if (StartsWith(opcode, "fdiv")) return X86_FDIVP;
+	throw Cy86Error("not a floating binary opcode: " + opcode);
+}
+
+void TranslateFloatBinary(ByteVector& output,
+	const Cy86Statement& statement, unsigned width,
+	const map<string, uint64_t>& labels)
+{
+	LoadFloatOperand(output, statement.operands[1], width, labels,
+		kBouncePrimary);
+	LoadFloatOperand(output, statement.operands[2], width, labels,
+		kBounceSecondary);
+	Emit(output, FloatBinaryMnemonic(statement.opcode), 0,
+		One(X87Reg(1)));
+	StoreFloatOperand(output, statement.operands[0], width, labels);
+}
+
+X86Condition FloatCompareCondition(const string& opcode)
+{
+	if (StartsWith(opcode, "feq")) return XC_E;
+	if (StartsWith(opcode, "fne")) return XC_NE;
+	if (StartsWith(opcode, "flt")) return XC_B;
+	if (StartsWith(opcode, "fgt")) return XC_A;
+	if (StartsWith(opcode, "fle")) return XC_BE;
+	if (StartsWith(opcode, "fge")) return XC_AE;
+	throw Cy86Error("not a floating comparison opcode: " + opcode);
+}
+
+void TranslateFloatCompare(ByteVector& output,
+	const Cy86Statement& statement, unsigned width,
+	const map<string, uint64_t>& labels)
+{
+	// FCOMIP compares ST(0) against ST(i); load the right operand
+	// first so the resulting flags have the CY86 left/right order.
+	LoadFloatOperand(output, statement.operands[2], width, labels,
+		kBouncePrimary);
+	LoadFloatOperand(output, statement.operands[1], width, labels,
+		kBounceSecondary);
+	Emit(output, X86_FCOMIP, 0, One(X87Reg(1)));
+	Emit(output, X86_FSTP, 0, One(X87Reg(0)));
+	Emit(output, X86_SETCC, 8, FloatCompareCondition(statement.opcode),
+		One(X86Reg(XR_RAX, 8)));
+	StoreOperand(output, statement.operands[0], 8, XR_RAX, labels);
+}
+
 ByteVector MaterializeData(const Cy86Statement& statement)
 {
 	const size_t width = statement.data_width;
@@ -562,8 +935,33 @@ vector<unsigned char> Cy86ToX86Translator::Translate(const Cy86Statement& statem
 		throw Cy86Error("data statement has no instruction encoding");
 	ByteVector output;
 	const string& opcode = statement.opcode;
-	if (StartsWith(opcode, "move"))
+	if (opcode == "move80")
+		TranslateMove80(output, statement, labels);
+	else if (StartsWith(opcode, "move"))
 		TranslateMove(output, statement, OpcodeWidth(opcode), labels);
+	else if (StartsWith(opcode, "f80conv"))
+		TranslateFloatFrom80(output, statement, ConversionWidth(opcode),
+			StartsWith(opcode, "f80convu"), StartsWith(opcode, "f80convf"),
+			labels);
+	else if (opcode.find("convf80") != string::npos &&
+		StartsWith(opcode, "f32"))
+		TranslateFloatToFloat80(output, statement, ConversionWidth(opcode),
+			labels);
+	else if (opcode.find("convf80") != string::npos &&
+		StartsWith(opcode, "f64"))
+		TranslateFloatToFloat80(output, statement, ConversionWidth(opcode),
+			labels);
+	else if (opcode.find("convf80") != string::npos &&
+		(StartsWith(opcode, "s") || StartsWith(opcode, "u")))
+		TranslateIntegerToFloat80(output, statement, ConversionWidth(opcode),
+			StartsWith(opcode, "s"), labels);
+	else if (StartsWith(opcode, "fadd") || StartsWith(opcode, "fsub") ||
+		StartsWith(opcode, "fmul") || StartsWith(opcode, "fdiv"))
+		TranslateFloatBinary(output, statement, OpcodeWidth(opcode), labels);
+	else if (StartsWith(opcode, "feq") || StartsWith(opcode, "fne") ||
+		StartsWith(opcode, "flt") || StartsWith(opcode, "fgt") ||
+		StartsWith(opcode, "fle") || StartsWith(opcode, "fge"))
+		TranslateFloatCompare(output, statement, OpcodeWidth(opcode), labels);
 	else if (StartsWith(opcode, "iadd") || StartsWith(opcode, "isub") ||
 		StartsWith(opcode, "and") || StartsWith(opcode, "or") ||
 		StartsWith(opcode, "xor"))
