@@ -11,7 +11,9 @@ FRONTEND_OBJ_BASENAMES_posttoken := pptoken_lexer posttoken_stream posttoken_tab
 FRONTEND_OBJ_BASENAMES_ctrlexpr := ctrlexpr_eval pptoken_lexer posttoken_stream posttoken_tables unicode
 FRONTEND_OBJ_BASENAMES_macro := macro_replace pptoken_lexer posttoken_stream posttoken_tables unicode
 FRONTEND_OBJ_BASENAMES_preproc := preproc_engine macro_replace ctrlexpr_eval pptoken_lexer posttoken_stream posttoken_tables unicode
-FRONTEND_OBJ_BASENAMES_recog :=
+FRONTEND_OBJ_BASENAMES_recog := parser/recog_parser parser/recog_token \
+	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer \
+	posttoken_stream posttoken_tables unicode
 FRONTEND_OBJ_BASENAMES_nsdecl :=
 FRONTEND_OBJ_BASENAMES_nsinit :=
 FRONTEND_OBJ_BASENAMES_cy86 :=

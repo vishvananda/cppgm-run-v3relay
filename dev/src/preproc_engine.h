@@ -21,6 +21,8 @@ struct PreprocBuildInfo
 	std::string author;
 };
 
+struct IPostTokenOutputStream;
+
 class PreprocError : public std::runtime_error
 {
 public:
@@ -37,8 +39,11 @@ public:
 		const PreprocBuildInfo& build_info);
 
 	void Run(const std::vector<std::string>& srcfiles);
+	void RunSingleFile(const std::string& srcfile,
+		IPostTokenOutputStream& sink);
 
 private:
+	void ResetSourceFileState();
 	void ProcessSourceFile(const std::string& srcfile);
 	void ProcessSourceFile(const std::string& srcfile,
 		PostTokenStream& output);

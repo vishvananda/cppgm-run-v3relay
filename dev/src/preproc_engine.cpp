@@ -197,7 +197,7 @@ void PreprocEngine::InstallPredefineds()
 		"\"" + build_info_.time + "\"");
 }
 
-void PreprocEngine::ProcessSourceFile(const string& srcfile)
+void PreprocEngine::ResetSourceFileState()
 {
 	// Command-line source files are independent preprocessing translation
 	// units. Includes below this call intentionally share this state.
@@ -218,7 +218,20 @@ void PreprocEngine::ProcessSourceFile(const string& srcfile)
 		{
 			return IsDynamicPredefined(name);
 		});
+}
 
+void PreprocEngine::RunSingleFile(const string& srcfile,
+	IPostTokenOutputStream& sink)
+{
+	ResetSourceFileState();
+	PostTokenStream posttoken_output(sink);
+	ProcessSourceFile(srcfile, posttoken_output);
+	posttoken_output.emit_eof();
+}
+
+void PreprocEngine::ProcessSourceFile(const string& srcfile)
+{
+	ResetSourceFileState();
 	PreprocPostTokenOutputStream output(output_);
 	PostTokenStream posttoken_output(output);
 	ProcessSourceFile(srcfile, posttoken_output);
