@@ -94,7 +94,9 @@ struct Pa7Decl
 	std::shared_ptr<Pa7Variable> variable;
 	std::shared_ptr<Pa7Function> function;
 	std::shared_ptr<Pa7Typedef> typedef_entity;
-	std::shared_ptr<Pa7Namespace> namespace_entity;
+	// Namespaces are owned by the parent's member vectors; declaration map
+	// entries (including aliases and using imports) only reference them.
+	Pa7Namespace* namespace_entity;
 
 	Pa7Decl();
 	bool Matches(unsigned filter) const;
@@ -130,7 +132,6 @@ struct Pa7Namespace
 	Pa7Namespace* parent;
 	bool inline_namespace;
 	bool unnamed;
-	Pa7Namespace* alias_target;
 
 	std::map<std::string, Pa7Decl> declarations;
 	std::vector<std::shared_ptr<Pa7Variable> > variables;
@@ -147,7 +148,9 @@ struct Pa7Namespace
 		unsigned filter = PA7_FIND_ANY);
 	const Pa7Decl* FindDirect(const std::string& name,
 		unsigned filter = PA7_FIND_ANY) const;
-	Pa7Namespace* FindNamespaceDirect(const std::string& name) const;
+	// 3.4.3.2p2 first stage: this namespace and its transitive inline set.
+	const Pa7Decl* FindDirectOrInline(const std::string& name,
+		unsigned filter = PA7_FIND_ANY) const;
 	Pa7Namespace* AddNamespace(const std::string& name,
 		bool inline_namespace = false);
 	Pa7Namespace* AddUnnamedNamespace(bool inline_namespace = false);

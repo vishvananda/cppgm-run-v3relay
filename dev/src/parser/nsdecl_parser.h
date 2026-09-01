@@ -56,6 +56,21 @@ private:
 		Parameters() : varargs(false) {}
 	};
 
+	// One declarator ptr-operator or suffix; a declarator is folded by
+	// applying its wrapper chain inside-out over the decl-specifier type.
+	struct TypeWrapper
+	{
+		Pa7TypeKind kind;
+		unsigned cv;
+		bool has_bound;
+		unsigned long long bound;
+		Parameters parameters;
+
+		TypeWrapper()
+			: kind(PA7_TYPE_POINTER), cv(PA7_CV_NONE), has_bound(false),
+				bound(0) {}
+	};
+
 	struct FundamentalSpec
 	{
 		bool have_char;
@@ -88,14 +103,10 @@ private:
 	Declarator ParseDeclarator(const Pa7TypePtr& base, DeclaratorMode mode);
 	Declarator ParsePtrDeclarator(const Pa7TypePtr& base,
 		DeclaratorMode mode);
+	void ParseDeclaratorChain(std::vector<TypeWrapper>& chain,
+		Declarator& result, DeclaratorMode mode);
 	Parameters ParseParametersAndQualifiers();
 	Declarator ParseParameterDeclaration();
-
-	Pa7TypePtr InsertFunctionSuffix(const Pa7TypePtr& type,
-		const Parameters& parameters);
-	Pa7TypePtr InsertArraySuffix(const Pa7TypePtr& type, bool has_bound,
-		unsigned long long bound);
-	Pa7TypePtr ParseArraySuffix(const Pa7TypePtr& type, bool grouped);
 
 	NamePath ParseNamePath();
 	Pa7TypePtr LookupTypedef(const NamePath& path) const;
@@ -112,6 +123,7 @@ private:
 
 	bool IsParameterStart(std::size_t at) const;
 	bool IsDeclSpecifierStart(std::size_t at) const;
+	bool QualifiedTypeNameStartsAt(std::size_t at) const;
 	bool IsDeclaratorStart(std::size_t at) const;
 	bool TryRedundantParentheses(const Pa7TypePtr& base,
 		DeclaratorMode mode, Declarator& result);

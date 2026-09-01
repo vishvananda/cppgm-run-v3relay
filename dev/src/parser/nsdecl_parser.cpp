@@ -9,22 +9,8 @@ namespace
 
 bool IsStorageSpecifier(ETokenType type)
 {
-	switch (type)
-	{
-	case KW_EXTERN:
-	case KW_STATIC:
-	case KW_THREAD_LOCAL:
-	case KW_REGISTER:
-	case KW_MUTABLE:
-	case KW_INLINE:
-	case KW_VIRTUAL:
-	case KW_EXPLICIT:
-	case KW_FRIEND:
-	case KW_CONSTEXPR:
-		return true;
-	default:
-		return false;
-	}
+	return type == KW_STATIC || type == KW_THREAD_LOCAL ||
+		type == KW_EXTERN;
 }
 
 bool IsCVSpecifier(ETokenType type)
@@ -49,19 +35,10 @@ bool IsFundamentalSpecifier(ETokenType type)
 	case KW_FLOAT:
 	case KW_DOUBLE:
 	case KW_VOID:
-	case KW_AUTO:
 		return true;
 	default:
 		return false;
 	}
-}
-
-bool IsDeclarationBoundary(const Pa6Token& token)
-{
-	return token.IsSimple(OP_SEMICOLON) || token.IsSimple(OP_COMMA) ||
-		token.IsSimple(OP_RPAREN) || token.IsSimple(OP_RSQUARE) ||
-		token.IsSimple(OP_DOTS) || token.IsSimple(OP_ASS) ||
-		token.kind == PA6_EOF_TOKEN;
 }
 
 } // namespace
@@ -259,7 +236,6 @@ void Pa7Parser::ParseNamespaceDefinition()
 	}
 	ExpectSimple(OP_RBRACE);
 	scopes_.pop_back();
-	ConsumeSimple(OP_SEMICOLON);
 }
 
 void Pa7Parser::ParseNamespaceAliasDefinition()
@@ -369,9 +345,12 @@ void Pa7Parser::ParseSimpleDeclaration()
 				declarator.path.parts.size() > 1;
 			unsigned filter = IsFunction(declarator.type) ?
 				PA7_FIND_FUNCTION : PA7_FIND_VARIABLE;
-			Pa7Decl* visible = qualified ? LookupInNamespace(destination,
-				name, filter) : 0;
-			if (visible && visible->origin != PA7_DECL_NAMESPACE_ALIAS)
+			// A qualified declarator-id matches members of the named
+			// namespace and its inline set only; using-directives do not
+			// contribute members (nsdecl-ref declares a fresh entity).
+			Pa7Decl* visible = qualified ? const_cast<Pa7Decl*>(
+				destination->FindDirectOrInline(name, filter)) : 0;
+			if (visible)
 			{
 				if (visible->kind == PA7_DECL_FUNCTION &&
 					visible->function)
@@ -390,11 +369,6 @@ void Pa7Parser::ParseSimpleDeclaration()
 				destination->AddOrMergeVariable(name, declarator.type);
 		}
 
-		if (ConsumeSimple(OP_ASS))
-		{
-			while (!IsDeclarationBoundary(Token(pos_)))
-				++pos_;
-		}
 		if (!ConsumeSimple(OP_COMMA))
 			break;
 	}
@@ -465,7 +439,6 @@ Pa7Parser::DeclSpec Pa7Parser::ParseDeclSpecifierSeq()
 		case KW_FLOAT: fundamental.have_float = true; break;
 		case KW_DOUBLE: fundamental.have_double = true; break;
 		case KW_VOID: fundamental.have_void = true; break;
-		case KW_AUTO: fundamental.have_int = true; break;
 		default: break;
 		}
 	}
@@ -504,38 +477,72 @@ Pa7Parser::Declarator Pa7Parser::ParseDeclarator(const Pa7TypePtr& base,
 Pa7Parser::Declarator Pa7Parser::ParsePtrDeclarator(const Pa7TypePtr& base,
 	DeclaratorMode mode)
 {
+	Declarator result;
+	vector<TypeWrapper> chain;
+	ParseDeclaratorChain(chain, result, mode);
+
 	Pa7TypePtr working = base;
-	bool have_ptr_operator = false;
+	for (size_t i = 0; i < chain.size(); ++i)
+	{
+		const TypeWrapper& wrap = chain[i];
+		switch (wrap.kind)
+		{
+		case PA7_TYPE_POINTER:
+			working = ApplyCV(wrap.cv, MakePointer(working));
+			break;
+		case PA7_TYPE_LVALUE_REFERENCE:
+			working = MakeReference(false, working);
+			break;
+		case PA7_TYPE_RVALUE_REFERENCE:
+			working = MakeReference(true, working);
+			break;
+		case PA7_TYPE_ARRAY:
+			working = MakeArray(wrap.has_bound, wrap.bound, working);
+			break;
+		default:
+			working = MakeFunction(wrap.parameters.types,
+				wrap.parameters.varargs, working);
+			break;
+		}
+	}
+	result.type = working;
+	if (mode == DECL_NAMED && !result.has_name)
+		throw runtime_error("named declarator is abstract");
+	return result;
+}
+
+void Pa7Parser::ParseDeclaratorChain(vector<TypeWrapper>& chain,
+	Declarator& result, DeclaratorMode mode)
+{
+	vector<TypeWrapper> ops;
 	while (IsSimple(OP_STAR) || IsSimple(OP_AMP) || IsSimple(OP_LAND))
 	{
-		have_ptr_operator = true;
+		TypeWrapper op;
 		if (ConsumeSimple(OP_STAR))
 		{
-			unsigned cv = PA7_CV_NONE;
+			op.kind = PA7_TYPE_POINTER;
 			while (IsSimple(KW_CONST) || IsSimple(KW_VOLATILE))
 			{
 				if (ConsumeSimple(KW_CONST))
-					cv |= PA7_CV_CONST;
+					op.cv |= PA7_CV_CONST;
 				else
 				{
 					ExpectSimple(KW_VOLATILE);
-					cv |= PA7_CV_VOLATILE;
+					op.cv |= PA7_CV_VOLATILE;
 				}
 			}
-			working = MakePointer(working);
-			working = ApplyCV(cv, working);
 		}
 		else if (ConsumeSimple(OP_AMP))
-			working = MakeReference(false, working);
+			op.kind = PA7_TYPE_LVALUE_REFERENCE;
 		else
 		{
 			ExpectSimple(OP_LAND);
-			working = MakeReference(true, working);
+			op.kind = PA7_TYPE_RVALUE_REFERENCE;
 		}
+		ops.push_back(op);
 	}
 
-	Declarator result;
-	bool grouped = false;
+	vector<TypeWrapper> child;
 	if (IsKind(PA6_IDENTIFIER_TOKEN) || IsSimple(OP_COLON2))
 	{
 		result.path = ParseNamePath();
@@ -544,11 +551,8 @@ Pa7Parser::Declarator Pa7Parser::ParsePtrDeclarator(const Pa7TypePtr& base,
 	else if (IsSimple(OP_LPAREN) && !IsParameterStart(pos_ + 1))
 	{
 		ExpectSimple(OP_LPAREN);
-		Declarator nested = ParsePtrDeclarator(working, mode);
+		ParseDeclaratorChain(child, result, mode);
 		ExpectSimple(OP_RPAREN);
-		result = nested;
-		working = nested.type;
-		grouped = true;
 	}
 	else if (IsSimple(OP_LPAREN) || IsSimple(OP_LSQUARE))
 	{
@@ -556,49 +560,47 @@ Pa7Parser::Declarator Pa7Parser::ParsePtrDeclarator(const Pa7TypePtr& base,
 		// whose contents can start a parameter-declaration-clause is the
 		// function suffix form required by 8.2p7.
 	}
-	else if (have_ptr_operator)
+	else if (!ops.empty())
 	{
 		// `(*)` and `(&)` use the pointer operator as the abstract root.
 	}
 	else
 		throw runtime_error("missing declarator root");
 
-	bool have_suffix = false;
+	vector<TypeWrapper> suffixes;
 	while (IsSimple(OP_LPAREN) || IsSimple(OP_LSQUARE))
 	{
+		TypeWrapper suffix;
 		if (IsSimple(OP_LPAREN))
 		{
-			Parameters parameters = ParseParametersAndQualifiers();
-			if (grouped || have_suffix)
-				working = InsertFunctionSuffix(working, parameters);
-			else
-				working = MakeFunction(parameters.types, parameters.varargs,
-					working);
+			suffix.kind = PA7_TYPE_FUNCTION;
+			suffix.parameters = ParseParametersAndQualifiers();
 		}
 		else
 		{
 			Pa6Token literal(PA6_EOF_TOKEN, "");
 			ExpectSimple(OP_LSQUARE);
-			bool has_bound = !IsSimple(OP_RSQUARE);
-			unsigned long long bound = 0;
-			if (has_bound)
+			suffix.kind = PA7_TYPE_ARRAY;
+			suffix.has_bound = !IsSimple(OP_RSQUARE);
+			if (suffix.has_bound)
 			{
-				if (!ConsumeLiteral(&literal) || !literal.lit_scalar)
-					throw runtime_error("array bound is not a scalar literal");
-				bound = literal.lit_value;
+				if (!ConsumeLiteral(&literal) || !literal.lit_scalar ||
+					literal.lit_type > FT_BOOL || literal.lit_value == 0)
+					throw runtime_error(
+						"array bound is not a positive integral literal");
+				suffix.bound = literal.lit_value;
 			}
 			ExpectSimple(OP_RSQUARE);
-			if (grouped || have_suffix)
-				working = InsertArraySuffix(working, has_bound, bound);
-			else
-				working = MakeArray(has_bound, bound, working);
 		}
-		have_suffix = true;
+		suffixes.push_back(suffix);
 	}
-	result.type = working;
-	if (mode == DECL_NAMED && !result.has_name)
-		throw runtime_error("named declarator is abstract");
-	return result;
+
+	// 8.3: within one level, suffixes bind tighter than ptr-operators and
+	// a grouped sub-declarator binds tightest, so the applied-first-to-last
+	// wrapper order is ops, then suffixes reversed, then the child chain.
+	chain.insert(chain.end(), ops.begin(), ops.end());
+	chain.insert(chain.end(), suffixes.rbegin(), suffixes.rend());
+	chain.insert(chain.end(), child.begin(), child.end());
 }
 
 Pa7Parser::Parameters Pa7Parser::ParseParametersAndQualifiers()
@@ -657,73 +659,6 @@ Pa7Parser::Declarator Pa7Parser::ParseParameterDeclaration()
 	return ParseDeclarator(spec.type, DECL_EITHER);
 }
 
-Pa7TypePtr Pa7Parser::InsertFunctionSuffix(const Pa7TypePtr& type,
-	const Parameters& parameters)
-{
-	if (!type)
-		return MakeFunction(parameters.types, parameters.varargs, type);
-	switch (type->kind)
-	{
-	case PA7_TYPE_CV:
-		if (type->children.size() == 1)
-			return ApplyCV(type->cv, InsertFunctionSuffix(type->children[0],
-				parameters));
-		break;
-	case PA7_TYPE_POINTER:
-		if (type->children.size() == 1)
-			return MakePointer(InsertFunctionSuffix(type->children[0],
-				parameters));
-		break;
-	case PA7_TYPE_ARRAY:
-		if (type->children.size() == 1)
-			return MakeArray(type->has_bound, type->bound,
-				InsertFunctionSuffix(type->children[0], parameters));
-		break;
-	case PA7_TYPE_FUNCTION:
-		return MakeFunction(type->children, type->varargs,
-			InsertFunctionSuffix(type->return_type, parameters));
-	case PA7_TYPE_LVALUE_REFERENCE:
-	case PA7_TYPE_RVALUE_REFERENCE:
-		break;
-	case PA7_TYPE_FUNDAMENTAL:
-		break;
-	}
-	return MakeFunction(parameters.types, parameters.varargs, type);
-}
-
-Pa7TypePtr Pa7Parser::InsertArraySuffix(const Pa7TypePtr& type,
-	bool has_bound, unsigned long long bound)
-{
-	if (!type)
-		return MakeArray(has_bound, bound, type);
-	switch (type->kind)
-	{
-	case PA7_TYPE_CV:
-		if (type->children.size() == 1)
-			return ApplyCV(type->cv, InsertArraySuffix(type->children[0],
-				has_bound, bound));
-		break;
-	case PA7_TYPE_POINTER:
-		if (type->children.size() == 1)
-			return MakePointer(InsertArraySuffix(type->children[0],
-				has_bound, bound));
-		break;
-	case PA7_TYPE_ARRAY:
-		if (type->children.size() == 1)
-			return MakeArray(type->has_bound, type->bound,
-				InsertArraySuffix(type->children[0], has_bound, bound));
-		break;
-	case PA7_TYPE_FUNCTION:
-		return MakeFunction(type->children, type->varargs,
-			InsertArraySuffix(type->return_type, has_bound, bound));
-	case PA7_TYPE_LVALUE_REFERENCE:
-	case PA7_TYPE_RVALUE_REFERENCE:
-	case PA7_TYPE_FUNDAMENTAL:
-		break;
-	}
-	return MakeArray(has_bound, bound, type);
-}
-
 Pa7Parser::NamePath Pa7Parser::ParseNamePath()
 {
 	NamePath result;
@@ -772,7 +707,7 @@ Pa7Decl* Pa7Parser::LookupInNamespace(const Pa7Namespace* scope,
 {
 	if (!scope)
 		return 0;
-	const Pa7Decl* direct = scope->FindDirect(name, filter);
+	const Pa7Decl* direct = scope->FindDirectOrInline(name, filter);
 	if (direct)
 		return const_cast<Pa7Decl*>(direct);
 	set<const Pa7Namespace*> visited;
@@ -806,7 +741,7 @@ Pa7Decl* Pa7Parser::LookupInUsing(const Pa7Namespace* scope,
 		if (visited.find(nominated) != visited.end())
 			continue;
 		Pa7Decl* direct = const_cast<Pa7Decl*>(
-			nominated->FindDirect(name, filter));
+			nominated->FindDirectOrInline(name, filter));
 		if (direct)
 			return direct;
 		Pa7Decl* transitive = LookupInUsing(nominated, name, filter,
@@ -838,7 +773,7 @@ Pa7Namespace* Pa7Parser::ResolveRelativeNamespace(const Pa7Namespace* scope,
 				PA7_FIND_NAMESPACE);
 			if (decl && decl->namespace_entity)
 			{
-				current = decl->namespace_entity.get();
+				current = decl->namespace_entity;
 				index = 1;
 				break;
 			}
@@ -852,7 +787,7 @@ Pa7Namespace* Pa7Parser::ResolveRelativeNamespace(const Pa7Namespace* scope,
 			PA7_FIND_NAMESPACE);
 		if (!decl || !decl->namespace_entity)
 			return 0;
-		current = decl->namespace_entity.get();
+		current = decl->namespace_entity;
 	}
 	return current;
 }
@@ -861,30 +796,38 @@ bool Pa7Parser::IsParameterStart(size_t at) const
 {
 	const Pa6Token& token = Token(at);
 	if (token.kind == PA6_EOF_TOKEN || token.IsSimple(OP_RPAREN) ||
-		token.IsSimple(OP_DOTS) || token.IsSimple(OP_COLON2))
+		token.IsSimple(OP_DOTS))
 		return true;
-	if (token.kind == PA6_IDENTIFIER_TOKEN)
-	{
-		NamePath path;
-		path.parts.push_back(token.spelling);
-		return LookupTypedef(path) != 0;
-	}
+	if (token.IsSimple(OP_COLON2) || token.kind == PA6_IDENTIFIER_TOKEN)
+		return QualifiedTypeNameStartsAt(at);
 	return IsDeclSpecifierStart(at);
 }
 
 bool Pa7Parser::IsDeclSpecifierStart(size_t at) const
 {
-	const Pa6Token& token = Token(at);
-	if (token.kind == PA6_IDENTIFIER_TOKEN)
+	const ETokenType type = Token(at).simple_type;
+	return IsCVSpecifier(type) || type == KW_TYPEDEF ||
+		IsStorageSpecifier(type) || IsFundamentalSpecifier(type);
+}
+
+bool Pa7Parser::QualifiedTypeNameStartsAt(size_t at) const
+{
+	NamePath path;
+	if (Token(at).IsSimple(OP_COLON2))
 	{
-		NamePath path;
-		path.parts.push_back(token.spelling);
-		return LookupTypedef(path) != 0;
+		path.absolute = true;
+		++at;
 	}
-	return IsCVSpecifier(token.simple_type) ||
-		token.simple_type == KW_TYPEDEF ||
-		IsStorageSpecifier(token.simple_type) ||
-		IsFundamentalSpecifier(token.simple_type);
+	if (Token(at).kind != PA6_IDENTIFIER_TOKEN)
+		return false;
+	path.parts.push_back(Token(at).spelling);
+	while (Token(at + 1).IsSimple(OP_COLON2) &&
+		Token(at + 2).kind == PA6_IDENTIFIER_TOKEN)
+	{
+		path.parts.push_back(Token(at + 2).spelling);
+		at += 2;
+	}
+	return LookupTypedef(path) != 0;
 }
 
 bool Pa7Parser::IsDeclaratorStart(size_t at) const

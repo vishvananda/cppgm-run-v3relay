@@ -307,7 +307,7 @@ Pa7TypePtr MergeTypes(const Pa7TypePtr& first, const Pa7TypePtr& second)
 }
 
 Pa7Decl::Pa7Decl()
-	: kind(PA7_DECL_VARIABLE), origin(PA7_DECL_OWNED)
+	: kind(PA7_DECL_VARIABLE), origin(PA7_DECL_OWNED), namespace_entity(0)
 {
 }
 
@@ -347,7 +347,7 @@ Pa7Typedef::Pa7Typedef(const string& typedef_name, const Pa7TypePtr& value)
 Pa7Namespace::Pa7Namespace(const string& namespace_name,
 	Pa7Namespace* namespace_parent, bool is_inline, bool is_unnamed)
 	: name(namespace_name), parent(namespace_parent),
-		inline_namespace(is_inline), unnamed(is_unnamed), alias_target(0)
+		inline_namespace(is_inline), unnamed(is_unnamed)
 {
 }
 
@@ -368,11 +368,22 @@ const Pa7Decl* Pa7Namespace::FindDirect(const string& lookup_name,
 	return &it->second;
 }
 
-Pa7Namespace* Pa7Namespace::FindNamespaceDirect(const string& lookup_name)
-	const
+const Pa7Decl* Pa7Namespace::FindDirectOrInline(const string& lookup_name,
+	unsigned filter) const
 {
-	const Pa7Decl* decl = FindDirect(lookup_name, PA7_FIND_NAMESPACE);
-	return decl && decl->namespace_entity ? decl->namespace_entity.get() : 0;
+	const Pa7Decl* direct = FindDirect(lookup_name, filter);
+	if (direct)
+		return direct;
+	for (size_t i = 0; i < namespaces.size(); ++i)
+	{
+		if (!namespaces[i]->inline_namespace)
+			continue;
+		const Pa7Decl* found = namespaces[i]->FindDirectOrInline(lookup_name,
+			filter);
+		if (found)
+			return found;
+	}
+	return 0;
 }
 
 Pa7Namespace* Pa7Namespace::AddNamespace(const string& namespace_name,
@@ -385,9 +396,12 @@ Pa7Namespace* Pa7Namespace::AddNamespace(const string& namespace_name,
 			existing->second.origin != PA7_DECL_OWNED ||
 			!existing->second.namespace_entity)
 			throw runtime_error("namespace name conflicts with declaration");
-		Pa7Namespace* result = existing->second.namespace_entity.get();
-		if (result->inline_namespace != is_inline)
-			throw runtime_error("namespace inline status changed");
+		Pa7Namespace* result = existing->second.namespace_entity;
+		// 7.3.1p8: only marking a previously non-inline namespace inline is
+		// ill-formed; reopening an inline namespace without the keyword is
+		// allowed and it stays inline (nsdecl-ref agrees).
+		if (is_inline && !result->inline_namespace)
+			throw runtime_error("non-inline namespace reopened as inline");
 		return result;
 	}
 
@@ -396,7 +410,7 @@ Pa7Namespace* Pa7Namespace::AddNamespace(const string& namespace_name,
 	Pa7Decl decl;
 	decl.kind = PA7_DECL_NAMESPACE;
 	decl.origin = PA7_DECL_OWNED;
-	decl.namespace_entity = result;
+	decl.namespace_entity = result.get();
 	declarations[namespace_name] = decl;
 	namespaces.push_back(result);
 	if (is_inline)
@@ -408,8 +422,8 @@ Pa7Namespace* Pa7Namespace::AddUnnamedNamespace(bool is_inline)
 {
 	if (unnamed_child)
 	{
-		if (unnamed_child->inline_namespace != is_inline)
-			throw runtime_error("namespace inline status changed");
+		if (is_inline && !unnamed_child->inline_namespace)
+			throw runtime_error("non-inline namespace reopened as inline");
 		AddUsingDirective(unnamed_child.get());
 		return unnamed_child.get();
 	}
@@ -430,14 +444,14 @@ void Pa7Namespace::AddNamespaceAlias(const string& alias_name,
 	{
 		if (existing->second.kind != PA7_DECL_NAMESPACE ||
 			existing->second.origin != PA7_DECL_NAMESPACE_ALIAS ||
-			existing->second.namespace_entity.get() != target)
+			existing->second.namespace_entity != target)
 			throw runtime_error("namespace alias conflicts with declaration");
 		return;
 	}
 	Pa7Decl decl;
 	decl.kind = PA7_DECL_NAMESPACE;
 	decl.origin = PA7_DECL_NAMESPACE_ALIAS;
-	decl.namespace_entity.reset(target, [](Pa7Namespace*) {});
+	decl.namespace_entity = target;
 	declarations[alias_name] = decl;
 }
 
@@ -474,7 +488,7 @@ void Pa7Namespace::AddUsingDeclaration(const string& declaration_name,
 			break;
 		case PA7_DECL_NAMESPACE:
 			same_entity = same_entity &&
-				prior.namespace_entity.get() == source.namespace_entity.get();
+				prior.namespace_entity == source.namespace_entity;
 			break;
 		}
 		if (prior.origin == PA7_DECL_USING && same_entity)
