@@ -126,59 +126,46 @@ Data flow inside `PostTokenStream`:
 | id  | scope | proof of progress | status |
 |-----|-------|-------------------|--------|
 | CP1 | skeleton: dev/src classifier + tool adapter + build wiring; routing (A) + full pp-number path (B, C) | `make test-pa2`: 15/26 (11 failures, down from 26); `make test-report-through-pa1`: 53/53; file audit: 16 files passed; linearity probe: 2.45s/4.88s for 200k/400k lines | complete |
-| CP2 | shared `unicode.h/.cpp` extraction + character literals (D) | pa2 failures ≤10; through-pa1 53/53 proves lexer refactor safe; audit pass | ACTIVE |
+| CP2 | shared `unicode.h/.cpp` extraction + character literals (D) | `make -C pa2 check` passes for `200-character-literal` and `200-unicode-character-literals`; `make test-pa2`: 17/26 (9 failures, down from 11); `make test-report-through-pa1`: 53/53; file audit: 18 files passed; reference probes confirm empty `''x` invalid, malformed cooked-UCN input fails in phase 3, and the `u` BMP-maximum probe is valid | complete |
 | CP3 | string sequences: deferred encoding, concat, operator"" split (E, F) | 26/26 pa2; clean `make test-report-through-pa2`; audit pass | pending |
 | CP4 | architecture cleanup + divergence audit vs ref outside corpus | all green stays green; audit notes recorded | pending |
 
-## Active Checkpoint: CP2 — shared unicode + character literal ownership
+## Active Checkpoint: CP3 — string sequences and concatenation ownership
 
-Extract the PA1 Unicode primitives into one shared implementation and complete
-character-literal classification/value production. Preserve CP1's 15/26
-passing fixtures and make the D fixtures pass; string sequencing remains for
-CP3.
+Implement deferred string literal decoding/encoding, adjacent string
+concatenation, user-defined string output, and the `operator""` split. Preserve
+CP2's character-literal behavior and keep malformed sequences invalid.
 
 ### Implementation Packet
 
 Files/symbols to create or touch:
-- `dev/src/unicode.h` and `dev/src/unicode.cpp` — own the UTF-8
-  code-point decoder/encoder and validity helpers currently embedded in
-  `pptoken_lexer.cpp`; keep the PA1 behavior and linear scan unchanged.
-- `dev/src/pptoken_lexer.cpp` — replace the moved helper definitions with
-  the shared Unicode interface; retain the lexer’s token spelling and error
-  behavior.
-- `dev/src/posttoken_stream.cpp` — implement character-literal escape/UCN
-  decoding, code-point validity checks, prefix-to-fundamental-type selection,
-  and user-defined-character output; keep string callbacks deferred to CP3.
-- `dev/frontend_source_sets.mk` — add `unicode` to the pptoken and
-  posttoken source sets.
-- Fixtures in scope: D (`200-character-literal`,
-  `200-unicode-character-literals`) plus all A/B/C fixtures as regression
-  coverage.
+- `dev/src/posttoken_stream.cpp` — own cooked-string element decoding,
+  code-unit encoding, sequence buffering, concatenation, and string UDL
+  output; retain CP2 character ownership.
+- `dev/src/posttoken_stream.h` — extend private state only if the sequence
+  callbacks require it; keep the public output protocol unchanged.
+- Fixtures in scope: `pa2/tests/250-string-literal`,
+  `pa2/tests/250-ud-strchar`, `pa2/tests/450-string-literal-concat`,
+  `pa2/tests/700-hard-string-concat`,
+  `pa2/tests/750-reserved-literal-operator-suffix`, plus the supplemental
+  pa2 string fixtures.
 
 Required facts:
-- Character values are valid only in [0,0xD800) or [0xE000,0x110000).
-  Ordinary literals use `char` for values ≤127 and `int` otherwise;
-  `u`, `U`, and `L` use `char16_t`, `char32_t`, and `wchar_t`.
-- Numeric and simple/octal/hex escapes contribute one code point; ordinary
-  and prefixed code-unit range checks must be enforced, and multi-code-point
-  or empty literals are invalid.
-- A user-defined character suffix is split only after a valid character value;
-  preserve source and suffix in the output protocol.
+- Decode escapes to code points, encode each element according to the string
+  prefix, append the required null element, and reject out-of-range values.
+- Adjacent strings concatenate only when their prefixes and UDL state permit;
+  preserve the space-separated source in every output path.
+- A string UDL suffix is split only after the complete sequence is validated;
+  `operator""` handling must not consume an unrelated following token.
 - Run `make -C dev posttoken`, `make test-pa2`,
   `make test-report-through-pa1`, and
   `perl scripts/cppgm_file_audit.pl --stage pa2 --paths dev/src` after the
   source is stable.
 
-Known uncertainties (resolve by probing `posttoken-ref`, record answers in
-this file when they change behavior):
-- Multi-element sequences after `operator` (e.g. `operator ""sv "abc"`) —
-  does the split apply only to singleton sequences? (CP3)
-- Cooked literals containing a verbatim `\u` left by PA1's
-  invalid-UCN pass-through (e.g. `"\u{"`) — expected invalid at posttoken;
-  confirm. (CP2/CP3)
-- `''x` (empty ud-char-literal from PA1 pass-through) — expected invalid;
-  confirm. (CP2)
-- `u'\xFFFF'`-style non-surrogate BMP maxima are valid (string case proven;
-  char case inferred). Spot-check when implementing CP2.
+Known uncertainties (resolve by probing `posttoken-ref`, recording answers
+here when they change behavior):
+- Multi-element sequences after `operator` (for example,
+  `operator ""sv "abc"`) and whether the split applies only to singleton
+  sequences.
 - Whether an invalid token between `operator` and a string sequence resets
-  the KW_OPERATOR flag. (CP3)
+  the KW_OPERATOR flag.

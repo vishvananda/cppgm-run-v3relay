@@ -8,6 +8,7 @@ using namespace std;
 
 #include "IPPTokenStream.h"
 #include "posttoken_stream.h"
+#include "unicode.h"
 
 namespace
 {
@@ -57,7 +58,7 @@ bool IsIdentifierContinuationByte(unsigned char c)
 
 bool IsUDSuffix(const string& suffix)
 {
-	if (suffix.empty() || suffix[0] != '_')
+	if (suffix.size() < 2 || suffix[0] != '_')
 		return false;
 
 	for (size_t i = 1; i < suffix.size(); ++i)
@@ -526,6 +527,265 @@ void EmitFloating(IPostTokenOutputStream& output, const string& source,
 	}
 }
 
+struct CharacterLiteralClassification
+{
+	string prefix;
+	size_t after_quote;
+	int codepoint;
+	EFundamentalType type;
+};
+
+bool DecodeSimpleEscape(char escaped, int& codepoint)
+{
+	switch (escaped)
+	{
+	case '\'': codepoint = '\''; return true;
+	case '"': codepoint = '"'; return true;
+	case '?': codepoint = '?'; return true;
+	case '\\': codepoint = '\\'; return true;
+	case 'a': codepoint = '\a'; return true;
+	case 'b': codepoint = '\b'; return true;
+	case 'f': codepoint = '\f'; return true;
+	case 'n': codepoint = '\n'; return true;
+	case 'r': codepoint = '\r'; return true;
+	case 't': codepoint = '\t'; return true;
+	case 'v': codepoint = '\v'; return true;
+	default: return false;
+	}
+}
+
+bool ParseCharacterEscape(const string& source, size_t& cursor,
+	int& codepoint)
+{
+	if (cursor >= source.size() || source[cursor] != '\\' ||
+		cursor + 1 >= source.size())
+		return false;
+
+	char escaped = source[cursor + 1];
+	if (DecodeSimpleEscape(escaped, codepoint))
+	{
+		cursor += 2;
+		return true;
+	}
+
+	if (escaped == 'x')
+	{
+		size_t first_digit = cursor + 2;
+		size_t end = first_digit;
+		unsigned long long value = 0;
+		bool too_large = false;
+		while (end < source.size() && IsHexDigit(source[end]))
+		{
+			int digit = HexDigitValue(source[end]);
+			if (!too_large)
+			{
+				if (value > (0x10FFFFULL -
+					static_cast<unsigned long long>(digit)) / 16)
+				{
+					too_large = true;
+					value = 0x110000ULL;
+				}
+				else
+					value = value * 16 + static_cast<unsigned long long>(digit);
+			}
+			++end;
+		}
+		if (end == first_digit)
+			return false;
+		cursor = end;
+		codepoint = static_cast<int>(value);
+		return true;
+	}
+
+	if (escaped >= '0' && escaped <= '7')
+	{
+		size_t end = cursor + 1;
+		int value = 0;
+		for (int digits = 0; digits < 3 && end < source.size() &&
+			source[end] >= '0' && source[end] <= '7'; ++digits, ++end)
+			value = value * 8 + source[end] - '0';
+		cursor = end;
+		codepoint = value;
+		return true;
+	}
+
+	return false;
+}
+
+bool ParseCharacterLiteral(const string& source,
+	CharacterLiteralClassification& result)
+{
+	size_t quote;
+	if (source.compare(0, 2, "u'") == 0)
+	{
+		result.prefix = "u";
+		quote = 1;
+	}
+	else if (source.compare(0, 2, "U'") == 0)
+	{
+		result.prefix = "U";
+		quote = 1;
+	}
+	else if (source.compare(0, 2, "L'") == 0)
+	{
+		result.prefix = "L";
+		quote = 1;
+	}
+	else if (!source.empty() && source[0] == '\'')
+	{
+		result.prefix.clear();
+		quote = 0;
+	}
+	else
+		return false;
+
+	if (quote + 1 >= source.size())
+		return false;
+
+	size_t cursor = quote + 1;
+	int codepoint;
+	if (source[cursor] == '\\')
+	{
+		if (!ParseCharacterEscape(source, cursor, codepoint))
+			return false;
+	}
+	else
+	{
+		size_t end;
+		codepoint = DecodeUtf8At(source, cursor, end);
+		if (codepoint < 0)
+			return false;
+		cursor = end;
+	}
+
+	if (cursor >= source.size() || source[cursor] != '\'')
+		return false;
+
+	result.after_quote = cursor + 1;
+	result.codepoint = codepoint;
+	return true;
+}
+
+bool SelectCharacterType(const string& prefix, int codepoint,
+	EFundamentalType& type)
+{
+	if (!IsUnicodeScalarValue(codepoint))
+		return false;
+
+	if (prefix == "u")
+	{
+		if (static_cast<unsigned long long>(codepoint) >
+			static_cast<unsigned long long>(numeric_limits<char16_t>::max()))
+			return false;
+		type = FT_CHAR16_T;
+	}
+	else if (prefix == "U")
+	{
+		if (static_cast<unsigned long long>(codepoint) >
+			static_cast<unsigned long long>(numeric_limits<char32_t>::max()))
+			return false;
+		type = FT_CHAR32_T;
+	}
+	else if (prefix == "L")
+	{
+		if (static_cast<unsigned long long>(codepoint) >
+			static_cast<unsigned long long>(numeric_limits<wchar_t>::max()))
+			return false;
+		type = FT_WCHAR_T;
+	}
+	else if (codepoint <= 127)
+		type = FT_CHAR;
+	else
+		type = FT_INT;
+	return true;
+}
+
+bool AnalyzeCharacterLiteral(const string& source,
+	CharacterLiteralClassification& result)
+{
+	return ParseCharacterLiteral(source, result) &&
+		SelectCharacterType(result.prefix, result.codepoint, result.type);
+}
+
+template<typename T>
+void EmitCharacterValue(IPostTokenOutputStream& output, const string& source,
+	EFundamentalType type, int codepoint)
+{
+	T value = static_cast<T>(codepoint);
+	output.emit_literal(source, type, &value, sizeof(value));
+}
+
+void EmitCharacterLiteralValue(IPostTokenOutputStream& output,
+	const string& source, const CharacterLiteralClassification& classification)
+{
+	switch (classification.type)
+	{
+	case FT_CHAR:
+		EmitCharacterValue<char>(output, source, FT_CHAR,
+			classification.codepoint);
+		return;
+	case FT_INT:
+		EmitCharacterValue<int>(output, source, FT_INT,
+			classification.codepoint);
+		return;
+	case FT_CHAR16_T:
+		EmitCharacterValue<char16_t>(output, source, FT_CHAR16_T,
+			classification.codepoint);
+		return;
+	case FT_CHAR32_T:
+		EmitCharacterValue<char32_t>(output, source, FT_CHAR32_T,
+			classification.codepoint);
+		return;
+	case FT_WCHAR_T:
+		EmitCharacterValue<wchar_t>(output, source, FT_WCHAR_T,
+			classification.codepoint);
+		return;
+	default:
+		return;
+	}
+}
+
+template<typename T>
+void EmitUserDefinedCharacterValue(IPostTokenOutputStream& output,
+	const string& source, const string& suffix, EFundamentalType type,
+	int codepoint)
+{
+	T value = static_cast<T>(codepoint);
+	output.emit_user_defined_literal_character(source, suffix, type, &value,
+		sizeof(value));
+}
+
+void EmitUserDefinedCharacterLiteralValue(IPostTokenOutputStream& output,
+	const string& source, const string& suffix,
+	const CharacterLiteralClassification& classification)
+{
+	switch (classification.type)
+	{
+	case FT_CHAR:
+		EmitUserDefinedCharacterValue<char>(output, source, suffix, FT_CHAR,
+			classification.codepoint);
+		return;
+	case FT_INT:
+		EmitUserDefinedCharacterValue<int>(output, source, suffix, FT_INT,
+			classification.codepoint);
+		return;
+	case FT_CHAR16_T:
+		EmitUserDefinedCharacterValue<char16_t>(output, source, suffix,
+			FT_CHAR16_T, classification.codepoint);
+		return;
+	case FT_CHAR32_T:
+		EmitUserDefinedCharacterValue<char32_t>(output, source, suffix,
+			FT_CHAR32_T, classification.codepoint);
+		return;
+	case FT_WCHAR_T:
+		EmitUserDefinedCharacterValue<wchar_t>(output, source, suffix,
+			FT_WCHAR_T, classification.codepoint);
+		return;
+	default:
+		return;
+	}
+}
+
 } // namespace
 
 PostTokenStream::PostTokenStream(IPostTokenOutputStream& output)
@@ -583,12 +843,33 @@ void PostTokenStream::emit_pp_number(const string& data)
 
 void PostTokenStream::emit_character_literal(const string& data)
 {
-	output_.emit_invalid(data);
+	CharacterLiteralClassification classification;
+	if (!AnalyzeCharacterLiteral(data, classification) ||
+		classification.after_quote != data.size())
+	{
+		output_.emit_invalid(data);
+		return;
+	}
+	EmitCharacterLiteralValue(output_, data, classification);
 }
 
 void PostTokenStream::emit_user_defined_character_literal(const string& data)
 {
-	output_.emit_invalid(data);
+	CharacterLiteralClassification classification;
+	if (!AnalyzeCharacterLiteral(data, classification))
+	{
+		output_.emit_invalid(data);
+		return;
+	}
+
+	const string suffix = data.substr(classification.after_quote);
+	if (!IsUDSuffix(suffix))
+	{
+		output_.emit_invalid(data);
+		return;
+	}
+	EmitUserDefinedCharacterLiteralValue(output_, data, suffix,
+		classification);
 }
 
 void PostTokenStream::emit_string_literal(const string& data)
