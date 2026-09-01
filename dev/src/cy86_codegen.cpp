@@ -66,44 +66,69 @@ uint64_t WidthMask(unsigned width)
 	return (uint64_t(1) << width) - 1;
 }
 
-uint64_t ReadLiteral(const Cy86Literal& literal)
+bool IsFloatingType(EFundamentalType type)
+{
+	return type == FT_FLOAT || type == FT_DOUBLE || type == FT_LONG_DOUBLE;
+}
+
+// Arithmetic negation over the PA2 encoding in the literal's own width:
+// floats flip the sign bit, integrals take the two's complement.  A long
+// double is a 16-byte object whose 80-bit payload puts the sign in byte 9.
+void NegateLiteralBytes(ByteVector& bytes, EFundamentalType type)
+{
+	if (bytes.empty())
+		return;
+	if (IsFloatingType(type))
+	{
+		const size_t sign_index = type == FT_LONG_DOUBLE && bytes.size() > 9 ?
+			9 : bytes.size() - 1;
+		bytes[sign_index] ^= 0x80;
+		return;
+	}
+	for (size_t i = 0; i < bytes.size(); ++i)
+		bytes[i] = static_cast<unsigned char>(~bytes[i]);
+	for (size_t i = 0; i < bytes.size(); ++i)
+	{
+		++bytes[i];
+		if (bytes[i] != 0)
+			break;
+	}
+}
+
+// The immediate width conversion is byte-mechanical for every literal kind:
+// too long keeps the low `byte_count` bytes; too short sign-extends signed
+// integral scalars and zero-extends everything else (floats, arrays,
+// unsigned).  Negation applies in the literal's own width first.
+ByteVector ConvertLiteralBytes(const Cy86Literal& literal, bool negated,
+	size_t byte_count)
+{
+	ByteVector bytes = literal.bytes;
+	if (negated)
+		NegateLiteralBytes(bytes, literal.type);
+	unsigned char fill = 0;
+	if (bytes.size() < byte_count && !bytes.empty() &&
+		!Cy86IsLiteralArray(literal) && Cy86IsSignedIntegral(literal.type) &&
+		(bytes.back() & 0x80) != 0)
+		fill = 0xff;
+	bytes.resize(byte_count, fill);
+	return bytes;
+}
+
+uint64_t PackBytes(const ByteVector& bytes)
 {
 	uint64_t value = 0;
-	const size_t count = min<size_t>(literal.bytes.size(), sizeof(value));
+	const size_t count = min<size_t>(bytes.size(), sizeof(value));
 	for (size_t i = 0; i < count; ++i)
-		value |= uint64_t(literal.bytes[i]) << (i * 8);
+		value |= uint64_t(bytes[i]) << (i * 8);
 	return value;
 }
 
 uint64_t ConvertLiteral(const Cy86Literal& literal, unsigned width,
 	bool negated)
 {
-	const bool packed_character_array = literal.is_array &&
-		literal.type == FT_CHAR && literal.num_elements == literal.bytes.size();
-	if (!Cy86IsIntegral(literal.type) ||
-		(!packed_character_array &&
-			(literal.is_array || literal.num_elements > 1)) ||
-		(packed_character_array && literal.bytes.size() > sizeof(uint64_t)) ||
-		width == 0 || width > 64)
-		throw Cy86Error("literal cannot be used as an integer immediate");
-	const size_t source_bytes = literal.bytes.size();
-	const unsigned source_width = static_cast<unsigned>(min<size_t>(
-		source_bytes, sizeof(uint64_t)) * 8);
-	uint64_t value = ReadLiteral(literal);
-	if (source_width != 0 && source_width < 64)
-		value &= WidthMask(source_width);
-	if (negated)
-	{
-		if (source_width == 0)
-			value = 0;
-		else
-			value = (uint64_t(0) - value) & WidthMask(source_width);
-	}
-	if (width > source_width && source_width != 0 &&
-		Cy86IsSignedIntegral(literal.type) &&
-		(value & (uint64_t(1) << (source_width - 1))))
-		value |= ~WidthMask(source_width);
-	return value & WidthMask(width);
+	if (width == 0 || width > 64)
+		throw Cy86Error("invalid integer immediate width");
+	return PackBytes(ConvertLiteralBytes(literal, negated, width / 8));
 }
 
 uint64_t ResolveLabel(const map<string, uint64_t>& labels,
@@ -127,6 +152,22 @@ uint64_t ImmediateValue(const Cy86Immediate& immediate, unsigned width,
 		value = immediate.addend_negative ? value - addend : value + addend;
 	}
 	return value & WidthMask(width);
+}
+
+// Immediate bytes at an arbitrary operand byte count (data operands and
+// x87 loads, where the count may be 10).  Label values are 64-bit and
+// zero-extend beyond 8 bytes.
+ByteVector ImmediateBytes(const Cy86Immediate& immediate, size_t byte_count,
+	const map<string, uint64_t>& labels)
+{
+	if (!immediate.label)
+		return ConvertLiteralBytes(immediate.literal, immediate.negated,
+			byte_count);
+	uint64_t value = ImmediateValue(immediate, 64, labels);
+	ByteVector bytes(byte_count, 0);
+	for (size_t i = 0; i < byte_count && i < sizeof(value); ++i)
+		bytes[i] = static_cast<unsigned char>(value >> (i * 8));
+	return bytes;
 }
 
 unsigned OpcodeWidth(const string& opcode)
@@ -162,60 +203,38 @@ void EmitMoveImmediate(ByteVector& output, X64Register reg, uint64_t value)
 	Emit(output, X86_MOV, 64, Two(X86Reg(reg, 64), X86Imm(value, 64)));
 }
 
-uint64_t LiteralChunk(const Cy86Literal& literal, size_t offset,
-	size_t count)
+uint64_t BytesChunk(const ByteVector& bytes, size_t offset, size_t count)
 {
 	uint64_t value = 0;
 	for (size_t i = 0; i < count; ++i)
-	{
-		const size_t index = offset + i;
-		if (index < literal.bytes.size())
-			value |= uint64_t(literal.bytes[index]) << (i * 8);
-	}
+		value |= uint64_t(bytes[offset + i]) << (i * 8);
 	return value;
 }
 
-void WriteLiteralToBounce(ByteVector& output, const Cy86Literal& literal,
-	size_t byte_count, int64_t offset)
+void WriteBytesToBounce(ByteVector& output, const ByteVector& bytes,
+	int64_t offset)
 {
 	size_t position = 0;
-	while (byte_count - position >= 8)
+	while (bytes.size() - position >= 8)
 	{
-		EmitMoveImmediate(output, XR_RAX,
-			LiteralChunk(literal, position, 8));
+		EmitMoveImmediate(output, XR_RAX, BytesChunk(bytes, position, 8));
 		Emit(output, X86_MOV, 64,
 			Two(X86Mem(XR_RSP, offset + static_cast<int64_t>(position), 64),
 				X86Reg(XR_RAX, 64)));
 		position += 8;
 	}
-	if (byte_count - position >= 4)
+	for (unsigned chunk = 4; chunk >= 1; chunk /= 2)
 	{
-		Emit(output, X86_MOV, 32,
-			Two(X86Reg(XR_RAX, 32),
-				X86Imm(LiteralChunk(literal, position, 4), 32)));
-		Emit(output, X86_MOV, 32,
-			Two(X86Mem(XR_RSP, offset + static_cast<int64_t>(position), 32),
-				X86Reg(XR_RAX, 32)));
-		position += 4;
-	}
-	if (byte_count - position >= 2)
-	{
-		Emit(output, X86_MOV, 16,
-			Two(X86Reg(XR_RAX, 16),
-				X86Imm(LiteralChunk(literal, position, 2), 16)));
-		Emit(output, X86_MOV, 16,
-			Two(X86Mem(XR_RSP, offset + static_cast<int64_t>(position), 16),
-				X86Reg(XR_RAX, 16)));
-		position += 2;
-	}
-	if (byte_count != position)
-	{
-		Emit(output, X86_MOV, 8,
-			Two(X86Reg(XR_RAX, 8),
-				X86Imm(LiteralChunk(literal, position, 1), 8)));
-		Emit(output, X86_MOV, 8,
-			Two(X86Mem(XR_RSP, offset + static_cast<int64_t>(position), 8),
-				X86Reg(XR_RAX, 8)));
+		if (bytes.size() - position < chunk)
+			continue;
+		const unsigned width = chunk * 8;
+		Emit(output, X86_MOV, width,
+			Two(X86Reg(XR_RAX, width),
+				X86Imm(BytesChunk(bytes, position, chunk), width)));
+		Emit(output, X86_MOV, width,
+			Two(X86Mem(XR_RSP, offset + static_cast<int64_t>(position), width),
+				X86Reg(XR_RAX, width)));
+		position += chunk;
 	}
 }
 
@@ -274,10 +293,16 @@ void LoadOperand(ByteVector& output, const Cy86Operand& operand,
 			Two(X86Reg(target, width), X86Reg(operand.reg.reg, width)));
 		return;
 	case CY86_IMMEDIATE_OPERAND:
-		Emit(output, X86_MOV, width,
-			Two(X86Reg(target, width),
-				X86Imm(ImmediateValue(operand.immediate, width, labels), width)));
+	{
+		const uint64_t value = ImmediateValue(operand.immediate, width, labels);
+		// Label values differ between the sizing pass and the final pass,
+		// so label-dependent 64-bit immediates must use the fixed 10-byte
+		// encoding to keep statement sizes label-independent.
+		const X86Operand immediate = width == 64 && operand.immediate.label ?
+			X86ImmFullWidth(value, 64) : X86Imm(value, width);
+		Emit(output, X86_MOV, width, Two(X86Reg(target, width), immediate));
 		return;
+	}
 	case CY86_MEMORY_OPERAND:
 		EmitAddress(output, operand.memory, labels, XR_RSI);
 		Emit(output, X86_MOV, width,
@@ -307,40 +332,44 @@ void StoreOperand(ByteVector& output, const Cy86Operand& operand,
 	throw Cy86Error("write operand is not writable");
 }
 
-unsigned FloatLiteralWidth(const Cy86Literal& literal, unsigned fallback)
-{
-	switch (literal.type)
-	{
-	case FT_FLOAT: return 32;
-	case FT_DOUBLE: return 64;
-	case FT_LONG_DOUBLE: return 80;
-	default: return fallback;
-	}
-}
-
+// Floating operands are byte patterns: immediates convert byte-mechanically
+// to the operand width, and register operands bounce their bits through the
+// red zone.  Both then load with an operand-width FLD.
 void LoadFloatOperand(ByteVector& output, const Cy86Operand& operand,
 	unsigned width, const map<string, uint64_t>& labels, int64_t bounce)
 {
-	if (operand.kind == CY86_MEMORY_OPERAND)
+	switch (operand.kind)
 	{
+	case CY86_MEMORY_OPERAND:
 		EmitAddress(output, operand.memory, labels, XR_RSI);
-		Emit(output, X86_FLD, width,
-			One(X86Mem(XR_RSI, 0, width)));
+		Emit(output, X86_FLD, width, One(X86Mem(XR_RSI, 0, width)));
+		return;
+	case CY86_REGISTER_OPERAND:
+		StoreRawRegister(output, operand.reg.reg, width, bounce);
+		Emit(output, X86_FLD, width, One(X86Mem(XR_RSP, bounce, width)));
+		return;
+	case CY86_IMMEDIATE_OPERAND:
+	{
+		const size_t byte_count = width == 80 ? 10 : width / 8;
+		WriteBytesToBounce(output,
+			ImmediateBytes(operand.immediate, byte_count, labels), bounce);
+		Emit(output, X86_FLD, width, One(X86Mem(XR_RSP, bounce, width)));
 		return;
 	}
-	if (operand.kind != CY86_IMMEDIATE_OPERAND)
-		throw Cy86Error("floating register operand cannot be lowered");
-	const unsigned literal_width = FloatLiteralWidth(operand.immediate.literal,
-		width);
-	const size_t byte_count = literal_width == 80 ? 10 : literal_width / 8;
-	WriteLiteralToBounce(output, operand.immediate.literal, byte_count, bounce);
-	Emit(output, X86_FLD, literal_width,
-		One(X86Mem(XR_RSP, bounce, literal_width)));
+	}
+	throw Cy86Error("invalid CY86 operand kind");
 }
 
 void StoreFloatOperand(ByteVector& output, const Cy86Operand& operand,
 	unsigned width, const map<string, uint64_t>& labels)
 {
+	if (operand.kind == CY86_REGISTER_OPERAND)
+	{
+		Emit(output, X86_FSTP, width,
+			One(X86Mem(XR_RSP, kBounceTertiary, width)));
+		LoadRawBounce(output, operand.reg.reg, width, kBounceTertiary);
+		return;
+	}
 	if (operand.kind != CY86_MEMORY_OPERAND)
 		throw Cy86Error("floating result must be stored in memory");
 	EmitAddress(output, operand.memory, labels, XR_RDI);
@@ -359,10 +388,10 @@ void TranslateMove80(ByteVector& output, const Cy86Statement& statement,
 	const map<string, uint64_t>& labels)
 {
 	const Cy86Operand& source = statement.operands[1];
+	// The reference rejects width-80 immediates outside floating operands.
 	if (source.kind == CY86_IMMEDIATE_OPERAND)
-		WriteLiteralToBounce(output, source.immediate.literal, 10,
-			kBouncePrimary);
-	else if (source.kind == CY86_MEMORY_OPERAND)
+		throw Cy86Error("move80 source cannot be an immediate");
+	if (source.kind == CY86_MEMORY_OPERAND)
 	{
 		EmitAddress(output, source.memory, labels, XR_RSI);
 		Emit(output, X86_MOV, 64,
@@ -508,21 +537,28 @@ unsigned ParseSyscallNumber(const string& opcode)
 	return count;
 }
 
+// Red-zone slots below the bounce area for the syscall number and up to six
+// parameters (-64 .. -120, within the 128-byte red zone).
+const int64_t kSyscallStage = -64;
+
 void TranslateSyscall(ByteVector& output, const Cy86Statement& statement,
 	const map<string, uint64_t>& labels)
 {
 	const unsigned count = ParseSyscallNumber(statement.opcode);
 	if (count > 6 || statement.operands.size() != count + 2)
 		throw Cy86Error("invalid syscall operand count");
-	LoadOperand(output, statement.operands[1], 64, XR_RBX, labels);
-	for (int i = static_cast<int>(count) - 1; i >= 0; --i)
+	// Memory operand loads clobber rsi/rbx scratch, so stage every value
+	// in the red zone first and fill the parameter registers afterwards.
+	for (unsigned i = 0; i <= count; ++i)
 	{
-		LoadOperand(output, statement.operands[2 + i], 64, XR_RAX, labels);
-		Emit(output, X86_MOV, 64,
-			Two(X86Reg(kSyscallArguments[i], 64), X86Reg(XR_RAX, 64)));
+		LoadOperand(output, statement.operands[1 + i], 64, XR_RAX, labels);
+		StoreRawRegister(output, XR_RAX, 64,
+			kSyscallStage - 8 * static_cast<int64_t>(i));
 	}
-	Emit(output, X86_MOV, 64,
-		Two(X86Reg(XR_RAX, 64), X86Reg(XR_RBX, 64)));
+	for (unsigned i = 0; i < count; ++i)
+		LoadRawBounce(output, kSyscallArguments[i], 64,
+			kSyscallStage - 8 * static_cast<int64_t>(i + 1));
+	LoadRawBounce(output, XR_RAX, 64, kSyscallStage);
 	Emit(output, X86_SYSCALL, 0, vector<X86Operand>());
 	StoreOperand(output, statement.operands[0], 64, XR_RAX, labels);
 }
@@ -797,69 +833,60 @@ void TranslateFloatBinary(ByteVector& output,
 	StoreFloatOperand(output, statement.operands[0], width, labels);
 }
 
-X86Condition FloatCompareCondition(const string& opcode)
-{
-	if (StartsWith(opcode, "feq")) return XC_E;
-	if (StartsWith(opcode, "fne")) return XC_NE;
-	if (StartsWith(opcode, "flt")) return XC_B;
-	if (StartsWith(opcode, "fgt")) return XC_A;
-	if (StartsWith(opcode, "fle")) return XC_BE;
-	if (StartsWith(opcode, "fge")) return XC_AE;
-	throw Cy86Error("not a floating comparison opcode: " + opcode);
-}
-
 void TranslateFloatCompare(ByteVector& output,
 	const Cy86Statement& statement, unsigned width,
 	const map<string, uint64_t>& labels)
 {
-	// FCOMIP compares ST(0) against ST(i); load the right operand
-	// first so the resulting flags have the CY86 left/right order.
-	LoadFloatOperand(output, statement.operands[2], width, labels,
+	// FCOMIP compares ST(0) against ST(i) and treats NaN as unordered
+	// (CF=ZF=PF=1).  Ordering comparisons use the above-conditions, which
+	// are false on unordered: fgt/fge test op1 vs op2 directly, flt/fle
+	// swap the load order and test op2 vs op1.  Equality needs the parity
+	// flag: feq = ZF && !PF, fne = !ZF || PF.
+	const bool swapped = StartsWith(statement.opcode, "flt") ||
+		StartsWith(statement.opcode, "fle");
+	const size_t first = swapped ? 1 : 2;
+	const size_t second = swapped ? 2 : 1;
+	LoadFloatOperand(output, statement.operands[first], width, labels,
 		kBouncePrimary);
-	LoadFloatOperand(output, statement.operands[1], width, labels,
+	LoadFloatOperand(output, statement.operands[second], width, labels,
 		kBounceSecondary);
 	Emit(output, X86_FCOMIP, 0, One(X87Reg(1)));
 	Emit(output, X86_FSTP, 0, One(X87Reg(0)));
-	Emit(output, X86_SETCC, 8, FloatCompareCondition(statement.opcode),
-		One(X86Reg(XR_RAX, 8)));
+	if (StartsWith(statement.opcode, "feq") ||
+		StartsWith(statement.opcode, "fne"))
+	{
+		const bool negated = StartsWith(statement.opcode, "fne");
+		Emit(output, X86_SETCC, 8, negated ? XC_NE : XC_E,
+			One(X86Reg(XR_RAX, 8)));
+		Emit(output, X86_SETCC, 8, negated ? XC_P : XC_NP,
+			One(X86Reg(XR_RCX, 8)));
+		Emit(output, negated ? X86_OR : X86_AND, 8,
+			Two(X86Reg(XR_RAX, 8), X86Reg(XR_RCX, 8)));
+	}
+	else
+	{
+		const bool strict = StartsWith(statement.opcode, "flt") ||
+			StartsWith(statement.opcode, "fgt");
+		Emit(output, X86_SETCC, 8, strict ? XC_A : XC_AE,
+			One(X86Reg(XR_RAX, 8)));
+	}
 	StoreOperand(output, statement.operands[0], 8, XR_RAX, labels);
 }
 
-ByteVector MaterializeData(const Cy86Statement& statement)
+ByteVector MaterializeData(const Cy86Statement& statement,
+	const map<string, uint64_t>& labels)
 {
-	const size_t width = statement.data_width;
-	if (width == 0)
+	if (statement.data_width == 0)
 	{
+		// Literal statement: PA2 bytes at their own width; the parser has
+		// verified any negation applies to an arithmetic scalar.
 		ByteVector result = statement.literal.bytes;
-		if (!statement.negated)
-			return result;
-		if (!Cy86IsArithmetic(statement.literal.type) ||
-			statement.literal.is_array)
-			throw Cy86Error("cannot negate CY86 data literal");
-		for (size_t i = 0; i < result.size(); ++i)
-			result[i] = static_cast<unsigned char>(~result[i]);
-		for (size_t i = 0; i < result.size(); ++i)
-		{
-			++result[i];
-			if (result[i] != 0)
-				break;
-		}
+		if (statement.negated)
+			NegateLiteralBytes(result, statement.literal.type);
 		return result;
 	}
-	if (width <= 8)
-	{
-		const uint64_t value = ConvertLiteral(statement.literal,
-			static_cast<unsigned>(width * 8), statement.negated);
-		ByteVector result(width);
-		for (size_t i = 0; i < width; ++i)
-			result[i] = static_cast<unsigned char>(value >> (i * 8));
-		return result;
-	}
-	ByteVector result(width, 0);
-	const size_t count = min(width, statement.literal.bytes.size());
-	copy(statement.literal.bytes.begin(), statement.literal.bytes.begin() + count,
-		result.begin());
-	return result;
+	return ImmediateBytes(statement.operands[0].immediate,
+		statement.data_width, labels);
 }
 
 size_t DataAlignment(const Cy86Statement& statement)
@@ -991,7 +1018,7 @@ vector<unsigned char> Cy86ToX86Translator::Translate(const Cy86Statement& statem
 	else if (opcode == "ret")
 		Emit(output, X86_RET, 0, vector<X86Operand>());
 	else
-		throw Cy86Error("opcode is outside the integer checkpoint: " + opcode);
+		throw Cy86Error("unhandled CY86 opcode: " + opcode);
 	return output;
 }
 
@@ -1042,16 +1069,12 @@ Cy86Layout BuildCy86Layout(const vector<Cy86Statement>& statements)
 		for (size_t j = 0; j < statements[i].labels.size(); ++j)
 			layout.labels[statements[i].labels[j]] = kImageBase + current;
 		if (statements[i].is_data)
-		{
-			layout.statement_sizes[i] = MaterializeData(statements[i]).size();
-			current += layout.statement_sizes[i];
-		}
+			layout.statement_sizes[i] =
+				MaterializeData(statements[i], placeholders).size();
 		else
-		{
 			layout.statement_sizes[i] =
 				translator.Translate(statements[i], placeholders).size();
-			current += layout.statement_sizes[i];
-		}
+		current += layout.statement_sizes[i];
 	}
 	layout.epilogue_offset = current;
 	layout.entry = kImageBase + current;
@@ -1081,7 +1104,7 @@ vector<unsigned char> BuildProgramImage(const vector<Cy86Statement>& statements)
 		}
 		ByteVector bytes;
 		if (statements[i].is_data)
-			bytes = MaterializeData(statements[i]);
+			bytes = MaterializeData(statements[i], layout.labels);
 		else
 			bytes = translator.Translate(statements[i], layout.labels);
 		if (bytes.size() != layout.statement_sizes[i])

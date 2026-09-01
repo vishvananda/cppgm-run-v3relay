@@ -240,4 +240,5 @@ private:
 bool Cy86IsSignedIntegral(EFundamentalType type);
 bool Cy86IsIntegral(EFundamentalType type);
 bool Cy86IsArithmetic(EFundamentalType type);
+bool Cy86IsLiteralArray(const Cy86Literal& literal);
 std::size_t Cy86FundamentalSize(EFundamentalType type);

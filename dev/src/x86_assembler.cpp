@@ -186,23 +186,10 @@ void EncodeMov(vector<unsigned char>& out, unsigned width,
 		Bytes(out, src.immediate, width / 8);
 		return;
 	}
-	if (src.kind == X86_IMMEDIATE_OPERAND &&
-		(dst.kind == X86_REGISTER_OPERAND || dst.kind == X86_MEMORY_OPERAND))
+	if (src.kind == X86_IMMEDIATE_OPERAND && dst.kind == X86_MEMORY_OPERAND)
 	{
-		if (dst.kind == X86_REGISTER_OPERAND && width == 64)
-		{
-			Prefix(out, width);
-			const unsigned reg = Code(dst.reg);
-			REX(out, width, 0, reg);
-			Byte(out, 0xb8 + (reg & 7));
-			Bytes(out, src.immediate, 8);
-			return;
-		}
 		Prefix(out, width);
-		const unsigned rm_code = dst.kind == X86_REGISTER_OPERAND ?
-			Code(dst.reg) : Code(dst.base);
-		const bool force = width == 8 && IsByteRegister(rm_code);
-		REX(out, width, 0, rm_code, force);
+		REX(out, width, 0, Code(dst.base));
 		Byte(out, width == 8 ? 0xc6 : 0xc7);
 		ModRM(out, 0, dst);
 		Bytes(out, src.immediate, width / 8 == 8 ? 4 : width / 8);

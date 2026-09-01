@@ -246,22 +246,10 @@ vector<Cy86Opcode> ParseOpcodeTable()
 	return result;
 }
 
-bool IsLiteralArray(const Cy86Literal& literal)
-{
-	return literal.is_array || literal.num_elements > 1;
-}
-
 void RejectIfNotArithmetic(const Cy86Literal& literal)
 {
-	if (!Cy86IsArithmetic(literal.type) || IsLiteralArray(literal))
+	if (!Cy86IsArithmetic(literal.type) || Cy86IsLiteralArray(literal))
 		throw Cy86Error("literal is not arithmetic");
-}
-
-bool IsAddressOperand(const Cy86Operand& operand)
-{
-	return operand.kind == CY86_IMMEDIATE_OPERAND ||
-		operand.kind == CY86_REGISTER_OPERAND ||
-		operand.kind == CY86_MEMORY_OPERAND;
 }
 
 } // namespace
@@ -349,11 +337,16 @@ const vector<Cy86Opcode>& Cy86OpcodeTable()
 
 const Cy86Opcode* Cy86FindOpcode(const string& name)
 {
-	const vector<Cy86Opcode>& table = Cy86OpcodeTable();
-	for (size_t i = 0; i < table.size(); ++i)
-		if (table[i].name == name)
-			return &table[i];
-	return 0;
+	static const map<string, const Cy86Opcode*> index = []
+	{
+		map<string, const Cy86Opcode*> result;
+		const vector<Cy86Opcode>& table = Cy86OpcodeTable();
+		for (size_t i = 0; i < table.size(); ++i)
+			result[table[i].name] = &table[i];
+		return result;
+	}();
+	const map<string, const Cy86Opcode*>::const_iterator it = index.find(name);
+	return it == index.end() ? 0 : it->second;
 }
 
 bool Cy86ParseRegister(const string& spelling, Cy86Register& result)
@@ -439,6 +432,11 @@ bool Cy86IsArithmetic(EFundamentalType type)
 {
 	return Cy86IsIntegral(type) || type == FT_FLOAT || type == FT_DOUBLE ||
 		type == FT_LONG_DOUBLE;
+}
+
+bool Cy86IsLiteralArray(const Cy86Literal& literal)
+{
+	return literal.is_array || literal.num_elements > 1;
 }
 
 size_t Cy86FundamentalSize(EFundamentalType type)
@@ -588,8 +586,6 @@ Cy86Statement Cy86Parser::ParseDataLiteral(const vector<string>& labels,
 Cy86Statement Cy86Parser::ParseInstruction(const vector<string>& labels,
 	const string& opcode_name)
 {
-	if (Cy86FindOpcode(opcode_name) == 0)
-		throw Cy86Error("unknown CY86 opcode: " + opcode_name);
 	Cy86Statement result;
 	result.labels = labels;
 	result.opcode = opcode_name;
@@ -745,11 +741,7 @@ void Cy86Parser::ValidateStatement(Cy86Statement& statement)
 	{
 		if (opcode->operands.size() != 1 || statement.operands.size() != 1 ||
 			statement.operands[0].kind != CY86_IMMEDIATE_OPERAND)
-			throw Cy86Error("data opcode requires one literal");
-		const Cy86Immediate& immediate = statement.operands[0].immediate;
-		if (immediate.label || immediate.has_addend ||
-			IsLiteralArray(immediate.literal))
-			throw Cy86Error("data opcode requires a scalar literal");
+			throw Cy86Error("data opcode requires one immediate");
 		string suffix = statement.opcode.substr(4);
 		unsigned bits = 0;
 		for (size_t i = 0; i < suffix.size(); ++i)
@@ -760,9 +752,7 @@ void Cy86Parser::ValidateStatement(Cy86Statement& statement)
 		}
 		statement.is_data = true;
 		statement.data_width = bits / 8;
-		statement.literal = immediate.literal;
-		statement.negated = immediate.negated;
-		statement.operands.clear();
+		RememberLabelReference(statement.operands[0]);
 		return;
 	}
 	if (statement.operands.size() != opcode->operands.size())
@@ -774,6 +764,10 @@ void Cy86Parser::ValidateStatement(Cy86Statement& statement)
 	}
 }
 
+// Operand types beyond these checks are unconstrained: the reference
+// converts every immediate byte-mechanically at the operand width (floats,
+// arrays, and labels included) in every category, and floating operands may
+// be registers (bit-pattern semantics via a bounce slot).
 void Cy86Parser::ValidateOperand(const Cy86Operand& operand,
 	const Cy86OperandSpec& spec) const
 {
@@ -781,35 +775,13 @@ void Cy86Parser::ValidateOperand(const Cy86Operand& operand,
 		throw Cy86Error("write operand cannot be immediate");
 	if (spec.access == 'I' && operand.kind != CY86_IMMEDIATE_OPERAND)
 		throw Cy86Error("operand must be an immediate literal");
-	if (operand.kind == CY86_REGISTER_OPERAND)
-	{
-		if (spec.width == 80 || operand.reg.width != spec.width)
-			throw Cy86Error("CY86 register width mismatch");
-		if (spec.category == 'f')
-			throw Cy86Error("floating register operands are invalid");
-		return;
-	}
-	if (operand.kind == CY86_MEMORY_OPERAND)
-	{
-		if (operand.memory.base_is_register &&
-			operand.memory.base_register.width != 64)
-			throw Cy86Error("memory address register must be 64-bit");
-		if (spec.category == 'b' && spec.width != 8)
-			throw Cy86Error("invalid boolean operand width");
-		return;
-	}
-	const Cy86Immediate& immediate = operand.immediate;
-	if (immediate.negated)
-		RejectIfNotArithmetic(immediate.literal);
-	if (spec.category == 'f' &&
-		immediate.literal.type != FT_FLOAT && immediate.literal.type != FT_DOUBLE &&
-		immediate.literal.type != FT_LONG_DOUBLE)
-		throw Cy86Error("floating operand requires floating literal");
-	if ((spec.category == 's' || spec.category == 'u') &&
-		!immediate.label && !Cy86IsIntegral(immediate.literal.type))
-		throw Cy86Error("integer operand requires integral literal");
-	if (spec.category == 'a' && !IsAddressOperand(operand))
-		throw Cy86Error("invalid address operand");
+	if (operand.kind == CY86_REGISTER_OPERAND &&
+		(spec.width == 80 || operand.reg.width != spec.width))
+		throw Cy86Error("CY86 register width mismatch");
+	if (operand.kind == CY86_MEMORY_OPERAND &&
+		operand.memory.base_is_register &&
+		operand.memory.base_register.width != 64)
+		throw Cy86Error("memory address register must be 64-bit");
 }
 
 void Cy86Parser::RememberLabelReference(const Cy86Operand& operand)

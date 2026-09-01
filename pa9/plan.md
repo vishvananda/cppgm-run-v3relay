@@ -1,196 +1,86 @@
-# PA9 Plan — cy86 (CY86 mock IL → x86-64 ELF executable)
+# PA9 Plan — cy86 (CY86 mock IL → x86-64 ELF executable) [COMPLETE]
 
-Contract: `cy86 -o <out> <src1..srcN>` runs the PA5 preprocessor+tokenizer per
-TU, concatenates the token sequences in argv order, parses the regular CY86
-grammar (pa9/pa9.gram), semantically checks operands against
-pa9/cy86-opcode.desc, translates each CY86 instruction to a fixed x86-64
-sequence, assembles machine code, and writes a single-PT_LOAD ELF executable
-(chmod 0755). Grading: impl exit status must match ref (`0` well-formed, `1`
-ill-formed); when 0, the generated program is executed with the test's
-`.stdin` and its stdout + exit status are compared to text fixtures. 18
-fixtures: 11 pa9/tests + 7 pa9/course/pa9. Timeouts: build 30 s
-(CPPGM_BUILD_TEST_TIMEOUT_SEC), program run 10 s
-(CPPGM_PROGRAM_TEST_TIMEOUT_SEC). No fixture or ref regeneration is needed
-(all `.ref.*` fixtures are checked in); course `.ref.program` binaries are
-Mach-O (fixtures came from macOS) — only stdout/exit text fixtures gate.
+Final state: 432/432 fixtures pass through `make test-report-through-pa9`
+(414 through-pa8 + 11 pa9 local + 7 pa9 course); pa9 file audit passes.
+The architecture review, findings, the 45-probe differential matrix,
+performance evidence, and the divergence envelope are consolidated in
+`pa9/audit.md`.
 
-## Stage Design
+`cy86 -o <out> <src1..srcN>` runs the PA5 preprocessor+tokenizer per TU,
+concatenates the token sequences in argv order, parses the regular CY86
+grammar (pa9/pa9.gram), checks operands against pa9/cy86-opcode.desc,
+translates each CY86 instruction to a fixed x86-64 sequence, and writes a
+single-PT_LOAD ELF executable (chmod 0755). Grading: impl exit status
+must match ref (0 well-formed, 1 ill-formed); when 0, the generated
+program runs with the test's `.stdin` and its stdout + exit status are
+compared to text fixtures. Timeouts: build 30 s, program run 10 s.
 
-Owning boundaries (new code; PA5 pipeline reused as-is):
+## Stage Design (as built)
 
-- `dev/src/cy86_parse.h/.cpp` — token acquisition + parse + sema.
-  `Cy86TokenCollector : IPostTokenOutputStream` (posttoken_stream.h)
-  preserving raw PA2 bytes: literals keep `EFundamentalType`, byte vector,
-  num_elements (Pa6Token is unusable here: it folds literal data to a u64,
-  losing 10-byte long doubles and arrays). emit_invalid, any UDL emit, and
-  any KW_* simple token → ill-formed. `Cy86Opcode` table transcribed
-  statically from pa9/cy86-opcode.desc (171 entries; descriptor chars
-  w/r/a/b/i/s/u/f/I + width 8..80). `Cy86Parser` → `vector<Cy86Statement>`
-  (labels attached; operand model: Register{reg,width} | Immediate{literal
-  bytes/type, negate, label, label±lit} | Memory{base reg | label | lit,
-  ±offset}); label table (spelling clash with opcode/register/label →
-  ill-formed; undefined label reference → ill-formed). Operand checks:
-  count, `w` not immediate, `I` immediate only, register width == operand
-  width exactly (no 80-bit registers ⇒ w80 is memory-only), memory address
-  register must be 64-bit.
-- `dev/src/x86_assembler.h/.cpp` — reusable x86-64 object model + encoder
-  (kept small, extended in later PAs): `X86Instruction` (mnemonic form, ops)
-  → encoded bytes via generic {legacy prefix 66, REX, opcode, modrm, sib,
-  disp, imm}. Mnemonic forms needed: MOV (r/m↔r 8/16/32/64, r64←imm64,
-  r/m←imm32), ADD SUB AND OR XOR CMP (r/m,r), NOT NEG (r/m), SHL SHR SAR
-  (r/m,cl), MUL IMUL DIV IDIV (one-operand), CBW/CWDE/CDQE CWD/CDQ/CQO,
-  SETcc (X86Condition in x86_register_model.h), TEST (r/m8,r8), JMP/CALL
-  (r64), Jcc rel8, RET, PUSH r64, SYSCALL, UD2, and x87: FLD/FSTP
-  (m32/m64/m80), FILD/FISTP (m16/m32/m64), FADDP FSUBP FMULP FDIVP,
-  FCOMIP/FUCOMIP, FSTP st(0). Register enums already exist in
-  `dev/src/x86_register_model.h` (X64Register, X86Condition).
-- `dev/src/cy86_codegen.h/.cpp` — `Cy86ToX86Translator` (per-opcode fixed
-  sequences, register discipline below) + layout + ELF writer.
-  Deterministic two-pass layout: label-dependent immediates always emit
-  `mov r64, imm64` (10 bytes) so statement sizes are label-independent;
-  pass 1 walks statements computing alignment padding + addresses + label
-  values, pass 2 emits with final values (assert sizes match). O(n), no
-  relaxation loop.
-- `dev/cy86.cpp` — driver rewrite mirroring dev/nsinit.cpp envelope: keep
-  HasBatchStdinArg guard, arg loop (keep `--target` tolerance), per-TU
-  fresh PreprocEngine (`RunSingleFile(src, collector)` with PA5GetFileId +
-  build stamp exactly as nsinit's AnalyzeTranslationUnit), token concat
-  across TUs dropping per-TU EOF, compile, binary write (trunc), chmod via
-  existing PA9SetFileExecutable (syscall 90). Reuse the stub's ElfHeader /
-  ProgramSegmentHeader structs. NotImplementedException throw removed; any
-  error → EXIT_FAILURE.
+Owning boundaries (PA5 pipeline reused as-is; three new source pairs):
+
+- `dev/src/cy86_parse.h/.cpp` — token acquisition + parse + structural
+  sema. `Cy86TokenCollector : IPostTokenOutputStream` preserves raw PA2
+  literal bytes (long double = 16-byte object, sign in byte 9); any
+  invalid token, UDL, or keyword is ill-formed. Opcode table (170
+  entries) transcribed from cy86-opcode.desc, map-indexed. `Cy86Parser`
+  → `vector<Cy86Statement>` (labels attached; operands: register |
+  immediate {literal ± negation | label ± addend} | memory {register |
+  label | literal base, ± offset}); label table rejects reserved
+  spellings, duplicates, and undefined references. Validation enforces
+  only the structural rules the reference has: operand count, `w` not
+  immediate, `I` immediate-only, exact register width (no 80-bit
+  registers), 64-bit address registers, negation of arithmetic scalars
+  only. Types are otherwise unconstrained — immediates convert
+  byte-mechanically in every category (ref-pinned; see audit.md).
+- `dev/src/x86_assembler.h/.cpp` — reusable x86-64 object model +
+  encoder, extended in later PAs: generic {66 prefix, REX, opcode,
+  modrm, sib, disp, imm} emission for MOV, ADD/SUB/AND/OR/XOR/CMP
+  (register and immediate forms), NOT/NEG, SHL/SHR/SAR by cl,
+  MUL/IMUL/DIV/IDIV, sign-extension family, SETcc, TEST, JMP/CALL r64,
+  Jcc rel8, RET, PUSH/POP, SYSCALL, UD2, and the x87 set (FLD/FSTP
+  m32/m64/m80 and st(i), FILD/FISTP m16/m32/m64, F{ADD,SUB,MUL,DIV}P,
+  FCOMIP, FCHS). `X86ImmFullWidth` pins the 10-byte mov form where
+  encoding size must not depend on the value.
+- `dev/src/cy86_codegen.h/.cpp` — one byte-level literal authority
+  (`ConvertLiteralBytes`: negation in own width — two's complement
+  integral / sign-flip float — then truncate-keep-low or sign/zero
+  extend by literal type) feeding u64 immediates, x87 operand bytes,
+  and data statements. Deterministic two-pass layout: label-dependent
+  64-bit immediates always emit `mov r64, imm64` so statement sizes are
+  label-independent; pass 1 sizes with placeholder labels, pass 2 emits
+  with final values under a size-equality assertion. O(n), no
+  relaxation. Translator register discipline: values in rax/rbx/rcx
+  (shift count cl), rdx for widening/mul/div, addresses in rsi/rdi,
+  r12–r15/rsp/rbp never scratch; red zone holds bounce slots
+  ([rsp-16/-32/-48]) and syscall staging ([rsp-64..-120]) so operand
+  loads can never clobber staged values. Float operands are byte
+  patterns loaded/stored at operand width (immediates converted,
+  registers bounced); comparisons use FCOMIP with above-conditions and
+  parity handling for IEEE NaN semantics. Image: ehdr + one RWX phdr at
+  0x400000, stub (zero r12–r15, mov rbp,rsp, jmp entry) at 0x400078,
+  statements with alignment padding (arrays: element size; scalars:
+  fundamental size, long double 16; dataN: N/8), exit-0 epilogue.
+  Entry = label `start`, else first statement, else epilogue.
+- `dev/cy86.cpp` — driver envelope mirroring nsinit: batch-stdin guard,
+  arg loop, per-TU fresh PreprocEngine, token concat dropping per-TU
+  EOF, compile, binary write, chmod via syscall 90; any error →
+  EXIT_FAILURE.
 - `dev/frontend_source_sets.mk` — `FRONTEND_OBJ_BASENAMES_cy86 :=
   cy86_parse cy86_codegen x86_assembler preproc_engine macro_replace
-  ctrlexpr_eval pptoken_lexer posttoken_stream posttoken_tables unicode`.
-
-Program image (pinned by ref disassembly + fixtures):
-
-- ELF: ehdr(64) + one phdr(56, PT_LOAD RWX, vaddr 0x400000, offset 0),
-  body at vaddr 0x400078; filesz = memsz = 120 + body. ELF entry = 0x400078.
-- Body = stub, statements, epilogue. Stub (27 B): xor r12..r15 (zeroed
-  registers — ref does this), `mov rbp,rsp`, `mov rax, <entry>; jmp rax`
-  where <entry> = label `start` if defined, else first statement, else
-  epilogue. Epilogue (fall-through off program end): `mov rax,60; mov
-  rdi,0; syscall; ud2` — the empty program (course 100-empty-program) must
-  build AND exit 0.
-- Alignment on virtual addresses (≡ file offsets here): scalars align =
-  PA2 size except long double = 16 (payload is 10 bytes —
-  posttoken_stream.cpp emits FT_LONG_DOUBLE as 10; course
-  500-long-double-label-alignment asserts addr%16==0); arrays align =
-  element size (course 500-string-literal-element-alignment: char[] align
-  1, char32_t[] align 4); dataN aligns to N/8. Zero padding.
-
-Semantic rules the tests pin:
-
-- Signed integral (sign-extends): FT_SIGNED_CHAR/SHORT/INT/LONG/LONG_LONG,
-  FT_CHAR, FT_WCHAR_T (course 400-negated-wchar-sign-extension: ref
-  program exit 255 ⇒ `(-L'A')` = sign-extended 0xFFFFFFFFFFFFFFBF).
-  Unsigned: unsigned family, FT_CHAR16_T, FT_CHAR32_T, FT_BOOL. Floats:
-  FT_FLOAT/DOUBLE/LONG_DOUBLE. Arrays: non-arithmetic (negation
-  ill-formed), widen by zero-extension.
-- Immediate width conversion (byte-mechanical, little-endian): too long →
-  drop highest-order bytes (keep low `width/8`); too short → sign-extend
-  iff signed integral else zero-extend. Negation only for arithmetic
-  types, applied in the literal's own width before widening. Bare label =
-  u64; `(label±intlit)`: lit must be integral, extended to 64, then
-  added/subtracted; result u64.
-- Grammar strictness (course 300-*: all impl exit 1): `-lit` and
-  `label±lit` immediates require parens outside statement-literal position;
-  memory `[lit]` has no minus form (`[-1]` ill-formed).
-- Register mapping: sp→rsp, bp→rbp, x→r12, y→r13, z→r14, t→r15. 32-bit
-  writes zero upper 32 (use 32-bit mov forms — matches x86); 8/16-bit
-  writes preserve upper bits.
-
-Translator register discipline (per CY86 instruction, fixed sequence):
-operand values load into rax/rbx/rcx (op3 shift count in cl), rdx reserved
-for widening/mul/div high half; memory addresses computed into rsi/rdi
-(recomputed for writeback; never live across the central op); r12–r15/
-rsp/rbp are never scratch. syscallN: load params op3..opN into
-rdi,rsi,rdx,r10,r8,r9 (values first, one at a time), syscall number into
-rax last, then `syscall` (clobbers rcx/r11 — both scratch), store rax to
-op1. call: load target into rbx, then `call rbx` as final instruction
-(pushed x86 return address == next CY86 statement address); ret: `ret`;
-jumpif: cond byte → al, target → rbx, `test al,al; je +2; jmp rbx`. x87
-ops: fld/fild operands (via memory or red zone [rsp-8]/[rsp-16] for
-register/immediate sources), f-op, fstp/fistp to destination (red zone
-bounce for register destinations). u64convf80: fild + add 2^64 correction
-when top bit set; f80convu64: subtract 2^63 bias, fistp, re-add.
-
-## Failure Map
-
-All 18 tests currently fail with impl exit 86 (driver stub throws
-NotImplementedException; nothing exists yet). By unblocking component:
-
-- Integer core end-to-end (CP1): 100-noop, 100-ret42, 110-hello-world,
-  200-duplicator, 210-reverser (move/jump/jumpif/call/ret/syscall/
-  iadd/isub/ieq/data/literal statements); course 100-empty-program
-  (epilogue), 3× course 300-*-bad (parse strictness),
-  400-negated-wchar-sign-extension (negation + urshift64), 2× course 500-*
-  alignment (layout). 12 tests.
-- mul/div/mod (CP2): 220-hexdump (umod64, urshift8), 300-binary-calculator
-  (umul64), 400-integer-calculator (umul64/udiv64/umod64/not). 3 tests.
-  (Only unsigned variants appear in fixtures; signed still implemented.)
-- x87 float80 (CP3): 500-to-float80 (all [su]NconvF80 + f32/f64convf80),
-  501-from-float80 (all f80conv*), 600-float-calculator (f{add,sub,mul,
-  div}{32,64,80} + all float comparisons). 3 tests.
-
-## Performance Risks
-
-- Program-run 10 s timeout with large IO: 300-binary-calculator (16 MB
-  stdin, 8.5 MB stdout), 500-to-float80 (12 MB in / 24 MB out, 1M cases).
-  Test programs buffer IO themselves (iobegin reads stdin up front), so
-  syscall count is low; the risk is per-instruction expansion. The naive
-  load/op/store scheme (~10–20 x86 instructions per CY86 instruction) is
-  what the ref uses and it passes; keep expansions fixed and small, avoid
-  anything super-constant. No relaxation/iteration in layout (fixed imm64
-  encodings ⇒ single sizing pass).
-- Compile side trivial (inputs ≤ 323 lines); reuse of PreprocEngine per TU
-  matches nsinit and is not hot.
+  ctrlexpr_eval pptoken_lexer posttoken_stream posttoken_tables
+  unicode`.
 
 ## Checkpoint Ledger
 
-- CP1 — integer core end-to-end (COMPLETED). Full parse/sema for the entire
-  opcode table + layout + ELF + stub/epilogue + assembler + translation
-  for data/literal, move8..64, jump/jumpif/call/ret, not/and/or/xor,
-  shifts, iadd/isub, all integer comparisons, syscall0..6. The remaining
-  unsupported arithmetic/conversion paths return a compiler error.
-  Progress proof: `make test-pa9` reports 14/18 tests passing, with failures
-  reduced 18 → 4 (400, 500, 501, 600); `test-report-through-pa8` reports
-  414/414 and the pa9 file audit passes.
-- CP2 — multiply/divide/modulus (COMPLETED): one-operand MUL/IMUL/DIV/IDIV
-  with widening (xor rdx / cqo family; 8-bit uses ax with al/ah split),
-  fixed-width character-array immediates, and compact literal immediates
-  for the hot integer paths.
-  Progress proof: `make test-pa9` reports 15/18, reducing the turn-start
-  4 failures to 3 (`500-to-float80`, `501-from-float80`, `600-float`);
-  the 400-integer-calculator output is byte-for-byte identical to its
-  checked-in reference, `make test-report-through-pa8` reports 414/414,
-  and the pa9 file audit passes. The specified 300 calculator probe, with
-  output redirected to `/dev/null`, is 0.479 s (<5 s); all prior integer and
-  malformed grammar witnesses stay green.
-- CP3 — x87 float80 (COMPLETED): x87 register/memory encodings, conversions,
-  arithmetic, comparisons (FCOMIP flag idiom: order operands so flt→setb,
-  fle→setbe, fgt/fge by swap; feq/fne → sete/setne), move80 (10-byte copy),
-  and bounded red-zone bounce buffers. Unsigned 16/32/64-bit conversion
-  paths use zero extension or signed-range-preserving split/offset idioms.
-  Progress proof: `make test-pa9` reports 18/18, reducing the three
-  turn-start failures to 0; `make test-report-through-pa8` reports 414/414,
-  the pa9 file audit passes with its existing one warning, and the specified
-  300 calculator probe is 0.333 s wall time (<5 s). The direct move80 probe
-  round-tripped `0x0000011F71FB04CB`; all earlier integer and malformed
-  grammar witnesses remain green.
-- CP4 — stage close: `make test-report-through-pa9` clean, file audit
-  clean, perf probe recorded, architecture notes appended here.
-
-## Active Checkpoint: CP4 — stage close
-
-Implementation Packet:
-
-- Files/symbols: `pa9/plan.md` checkpoint evidence and the root test/audit
-  targets; no compiler implementation changes are expected for this close.
-- Required gates: `make test-report-through-pa9` and
-  `perl scripts/cppgm_file_audit.pl --stage pa9 --paths dev/src`.
-- Closeout evidence: retain the 18/18 pa9 result, 414/414 through-pa8 result,
-  and the sub-5-second calculator probe recorded above; preserve the fixed
-  register discipline and the existing audit warning unless its owner is
-  explicitly addressed.
+- CP1 — integer core end-to-end (COMPLETED): 14/18 pa9 from 0/18;
+  through-pa8 414/414.
+- CP2 — multiply/divide/modulus (COMPLETED): 15/18; 400-integer-
+  calculator byte-identical to its reference fixture.
+- CP3 — x87 float80 (COMPLETED): 18/18; calculator probe 0.333 s.
+- CP4 — final architecture audit (COMPLETED): label-immediate size
+  stability, syscall staging, byte-mechanical immediate model, float
+  negation, float operand shapes, NaN comparisons, structure cleanups;
+  432/432, 45 differential probes match cy86-ref, linear compile
+  scaling, heavy programs ≤ 2.01 s of the 10 s cap. Details in
+  `pa9/audit.md`.

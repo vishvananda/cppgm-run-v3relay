@@ -16,44 +16,6 @@ using namespace std;
 #include "exceptions.h"
 #include "preproc_engine.h"
 
-struct ElfHeader
-{
-	unsigned char ident[16] =
-	{
-		0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0
-	};
-	short int type = 2;
-	short int machine = 0x3E;
-	int version = 1;
-	long int entry;
-	long int phoff = 64;
-	long int shoff = 0;
-	int processor_flags = 0;
-	short int ehsize = 64;
-	short int phentsize = 56;
-	short int phnum = 1;
-	short int shentsize = 0;
-	short int shnum = 0;
-	short int shstrndx = 0;
-};
-
-struct ProgramSegmentHeader
-{
-	int type = 1;
-
-	static constexpr int executable = 1 << 0;
-	static constexpr int writable = 1 << 1;
-	static constexpr int readable = 1 << 2;
-
-	int flags = executable | writable | readable;
-	long int offset = 0;
-	long int vaddr = 0x400000;
-	long int paddr = 0;
-	long int filesz;
-	long int memsz;
-	long int align = 0;
-};
-
 extern "C" long int syscall(long int n, ...) throw ();
 
 bool PA5GetFileId(const string& path, PA5FileId& out_fileid)
