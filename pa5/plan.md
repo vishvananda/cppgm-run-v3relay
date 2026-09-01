@@ -2,8 +2,8 @@
 
 Target: 70/70 pa5 fixtures (63 `pa5/tests` + 7 `pa5/course/pa5`) via root
 `make test-pa5`, then clean `make test-report-through-pa5` (184 prior + 70).
-Current: 0/70 — `dev/preproc.cpp` is the untouched starter stub; every fixture
-fails with EXIT_NOT_IMPLEMENTED. Through-pa4 is green (184/184).
+Current: 70/70 via `make test-pa5`; through-pa4 is green (184/184), and the
+pa5 file audit is 25/25.
 
 ## Stage Design
 
@@ -158,33 +158,33 @@ after CP1, 47/70 pass. By owning layer:
   include/pragma fixtures failing; through-pa4 is 184/184; file audit is
   25/25; the repeated-argument probe is 0.11s / 27980 KB (within the ≤2s
   budget).
-- CP3 — #include frames + path search, pragma once + #pragma, _Pragma
-  filter, `%:%:` paste, multi-srcfile loop. Proof: remaining ~10 fixtures;
-  70/70 `make test-pa5`; clean `make test-report-through-pa5`.
+- CP3 (COMPLETE) — #include frames + path search, bounded recursive token
+  processing, pragma once + #pragma, `_Pragma` filter, `%:%:` paste, and
+  independent multi-srcfile state. Proof: 70/70 `make test-pa5` (the seven
+  packet failures flipped); 184/184 `make test-report-through-pa4`; file
+  audit 25/25; repeated-argument probe 0.348s (within the ≤2s budget).
 - CP4 — architecture audit + cleanup, perf probes, differential spot-checks
   against preproc-ref, optional boundary fixtures under
   `cppgm.tests/course/pa5` (ref regeneration per TESTING_AND_REFERENCES.md),
   findings consolidated in `pa5/audit.md`. Proof: 70/70 + through-pa5 clean +
   audit + probes in budget.
 
-## Active Checkpoint — CP3
+## Active Checkpoint — CP4
 
-Deliverable: include frames and path search, pragma-once identity, `_Pragma`
-filtering, `%:%:` handling, and independent command-line source-file state,
-while preserving the completed CP2 location and conditional semantics.
+Deliverable: audit and harden the completed pa5 implementation, prove clean
+through-pa5 behavior, and record representative performance and differential
+findings without changing fixture coverage.
 
 ### Implementation Packet
 
-1. `dev/src/preproc_engine.{h,cpp}`: add include frames, quoted/header path
-   search, recursive token processing, pragma-once file identity, and
-   command-line source-file isolation around `ProcessSourceFile` and
-   `ProcessTokens`.
-2. `dev/src/macro_replace.{h,cpp}`: preserve the CP2 expansion/location
-   contract while handling `%:%:` and filtering `_Pragma` tokens at the
-   macro-rescan boundary.
-3. Prove the current failures flip: `200-include`, `400-header-guarded`,
-   `500-alt`, `500-pragma-ignore`, `501-pragma-op-ignore`,
-   `600-pragma-op`, and `800-pragma-once`, plus the CP2 and CP1 sets.
+1. `dev/src/preproc_engine.{h,cpp}` and `dev/src/macro_replace.{h,cpp}`:
+   perform the architecture audit for ownership, error paths, recursion
+   bounds, macro-rescan behavior, and source-file isolation; fix only real
+   spec or robustness findings.
+2. `pa5/audit.md`: consolidate the audit, differential spot-checks against
+   `preproc-ref`, and the two plan probes, with no fixture or reference edits
+   unless a concrete standard-aligned gap is found.
+3. Prove 70/70 `make test-pa5`, clean `make test-report-through-pa5`, the pa5
+   file audit, and both performance probes remain within their budgets.
 
-Proof target: 70/70 `make test-pa5`, clean through-pa5, file audit, and the
-CP2 repeated-argument probe within its existing budget.
+Proof target: 70/70 plus clean through-pa5, audit findings, and bounded probes.

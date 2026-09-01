@@ -79,6 +79,17 @@ bool UnquoteStringLiteral(const string& literal, string& value)
 	return true;
 }
 
+bool UnquoteHeaderName(const string& header, string& value)
+{
+	if (header.size() < 2 ||
+		(header[0] != '"' && header[0] != '<') ||
+		header[header.size() - 1] !=
+			(header[0] == '"' ? '"' : '>'))
+		return false;
+	value = header.substr(1, header.size() - 2);
+	return true;
+}
+
 struct ConditionalGroup
 {
 	bool parent_active;
@@ -115,12 +126,32 @@ public:
 	}
 };
 
+const size_t MaxIncludeDepth = 256;
+
+class IncludeDepthGuard
+{
+public:
+	explicit IncludeDepthGuard(size_t& depth)
+		: depth_(depth)
+	{
+		++depth_;
+	}
+
+	~IncludeDepthGuard()
+	{
+		--depth_;
+	}
+
+private:
+	size_t& depth_;
+};
+
 } // namespace
 
 PreprocEngine::PreprocEngine(ostream& output, FileIdLookup file_id_lookup,
 	const PreprocBuildInfo& build_info)
 	: output_(output), file_id_lookup_(file_id_lookup),
-		build_info_(build_info), active_source_file_(0), counter_(0)
+		build_info_(build_info), counter_(0), include_depth_(0)
 {
 }
 
@@ -162,20 +193,14 @@ void PreprocEngine::InstallPredefineds()
 
 void PreprocEngine::ProcessSourceFile(const string& srcfile)
 {
-	ifstream input(srcfile.c_str(), ios::in | ios::binary);
-	if (!input)
-		throw PreprocError("unable to open source file: " + srcfile);
-
-	const string contents((istreambuf_iterator<char>(input)),
-		istreambuf_iterator<char>());
-	const int src_file = RegisterFileName(srcfile);
-
-	// Each command-line source has an independent macro environment, while
-	// the output stream remains local so string-literal sequences are flushed
-	// exactly once at this source file's end.
+	// Command-line source files are independent preprocessing translation
+	// units. Includes below this call intentionally share this state.
+	file_names_.clear();
+	file_name_ids_.clear();
+	pragma_once_files_.clear();
+	include_depth_ = 0;
 	table_ = MacroTable();
 	InstallPredefineds();
-	active_source_file_ = src_file;
 	counter_ = 0;
 	table_.SetDynamicResolver(
 		[this](const PPToken& source, PPToken& replacement)
@@ -187,13 +212,30 @@ void PreprocEngine::ProcessSourceFile(const string& srcfile)
 			return IsDynamicPredefined(name);
 		});
 
-	PPTokenCollector collector(src_file);
-	PPTokenize(contents, collector, &collector);
-
 	PreprocPostTokenOutputStream output(output_);
 	PostTokenStream posttoken_output(output);
-	ProcessTokens(collector.tokens, posttoken_output);
+	ProcessSourceFile(srcfile, posttoken_output);
 	posttoken_output.emit_eof();
+}
+
+void PreprocEngine::ProcessSourceFile(const string& srcfile,
+	PostTokenStream& output)
+{
+	if (include_depth_ >= MaxIncludeDepth)
+		throw PreprocError("include nesting too deep");
+	IncludeDepthGuard depth_guard(include_depth_);
+
+	ifstream input(srcfile.c_str(), ios::in | ios::binary);
+	if (!input)
+		throw PreprocError("unable to open source file: " + srcfile);
+
+	const string contents((istreambuf_iterator<char>(input)),
+		istreambuf_iterator<char>());
+	const int src_file = RegisterFileName(srcfile);
+
+	PPTokenCollector collector(src_file);
+	PPTokenize(contents, collector, &collector);
+	ProcessTokens(collector.tokens, output, src_file);
 }
 
 bool PreprocEngine::EvaluateCondition(const vector<PPToken>& line)
@@ -280,8 +322,127 @@ bool PreprocEngine::ParseLineDirective(const vector<PPToken>& line,
 	return true;
 }
 
+bool PreprocEngine::PathCanBeOpened(const string& path) const
+{
+	ifstream input(path.c_str(), ios::in | ios::binary);
+	return static_cast<bool>(input);
+}
+
+bool PreprocEngine::LookupFileId(const string& path,
+	PA5FileId& file_id) const
+{
+	return file_id_lookup_ && file_id_lookup_(path, file_id);
+}
+
+bool PreprocEngine::ResolveIncludePath(const string& include_name,
+	int presumed_file, string& resolved_path, PA5FileId& resolved_id,
+	bool& have_resolved_id) const
+{
+	vector<string> candidates;
+	if (presumed_file > 0 &&
+		static_cast<size_t>(presumed_file) <= file_names_.size())
+	{
+		const string& presumed_name =
+			file_names_[static_cast<size_t>(presumed_file) - 1];
+		const size_t slash = presumed_name.rfind('/');
+		if (slash != string::npos)
+			candidates.push_back(presumed_name.substr(0, slash + 1) +
+				include_name);
+	}
+	candidates.push_back(include_name);
+
+	for (size_t i = 0; i < candidates.size(); ++i)
+	{
+		if (i != 0 && candidates[i] == candidates[i - 1])
+			continue;
+		if (!PathCanBeOpened(candidates[i]))
+			continue;
+
+		PA5FileId file_id = make_pair(0UL, 0UL);
+		const bool have_file_id = LookupFileId(candidates[i], file_id);
+		if (file_id_lookup_ && !have_file_id)
+			continue;
+
+		resolved_path = candidates[i];
+		resolved_id = file_id;
+		have_resolved_id = have_file_id;
+		return true;
+	}
+	return false;
+}
+
+void PreprocEngine::ProcessInclude(const vector<PPToken>& line,
+	int presumed_file, PostTokenStream& output)
+{
+	string include_name;
+	if (line.size() == 3 && line[2].kind == PP_TOKEN_HEADER_NAME)
+	{
+		if (!UnquoteHeaderName(line[2].data, include_name))
+			throw PreprocError("malformed include directive");
+	}
+	else
+	{
+		vector<PPToken> values(line.begin() + 2, line.end());
+		vector<PPToken> expanded;
+		MacroExpander expander(table_);
+		try
+		{
+			expander.Expand(values, [&expanded](const PPToken& token)
+			{
+				expanded.push_back(token);
+			});
+		}
+		catch (const MacroError& error)
+		{
+			throw PreprocError(error.what());
+		}
+		if (expanded.size() != 1 ||
+			expanded[0].kind != PP_TOKEN_STRING_LITERAL ||
+			!UnquoteStringLiteral(expanded[0].data, include_name))
+			throw PreprocError("malformed include directive");
+	}
+
+	string resolved_path;
+	PA5FileId resolved_id = make_pair(0UL, 0UL);
+	bool have_resolved_id = false;
+	if (!ResolveIncludePath(include_name, presumed_file, resolved_path,
+		resolved_id, have_resolved_id))
+		throw PreprocError("unable to resolve include: " + include_name);
+	if (have_resolved_id &&
+		pragma_once_files_.find(resolved_id) != pragma_once_files_.end())
+		return;
+
+	ProcessSourceFile(resolved_path, output);
+}
+
+void PreprocEngine::MarkPragmaOnce(int current_file)
+{
+	if (current_file <= 0 ||
+		static_cast<size_t>(current_file) > file_names_.size())
+		return;
+
+	PA5FileId file_id = make_pair(0UL, 0UL);
+	if (LookupFileId(file_names_[static_cast<size_t>(current_file) - 1],
+		file_id))
+		pragma_once_files_.insert(file_id);
+}
+
+void PreprocEngine::ProcessPragma(const vector<PPToken>& line,
+	int current_file)
+{
+	if (line.size() == 3 && line[2].kind == PP_TOKEN_IDENTIFIER &&
+		line[2].data == "once")
+		MarkPragmaOnce(current_file);
+}
+
+void PreprocEngine::ProcessPragmaText(const string& text, int current_file)
+{
+	if (text == "once")
+		MarkPragmaOnce(current_file);
+}
+
 void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
-	PostTokenStream& output)
+	PostTokenStream& output, int current_file)
 {
 	vector<PPToken> text;
 	text.reserve(tokens.size());
@@ -290,14 +451,18 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 	size_t line_begin = 0;
 	size_t next_physical_line = 1;
 	size_t presumed_line = 1;
-	int presumed_file = active_source_file_;
+	int presumed_file = current_file;
 	bool line_mapping_reset = false;
 
-	auto flush_text = [this, &text, &output]()
+	auto flush_text = [this, &text, &output, current_file]()
 	{
 		if (!text.empty())
 		{
-			MacroFlushText(text, table_, output);
+			MacroFlushText(text, table_, output,
+				[this, current_file](const string& pragma)
+				{
+					ProcessPragmaText(pragma, current_file);
+				});
 			text.clear();
 		}
 	};
@@ -419,15 +584,25 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 				throw PreprocError("malformed undef directive");
 			table_.Undef(line[2].data);
 		}
-		else if (active && IsDirective(line, "line"))
-		{
-			flush_text();
-			if (!ParseLineDirective(line, presumed_file, overridden_line,
-				overridden_file))
-				throw PreprocError("malformed line directive");
-			line_override = true;
-		}
-		else if (!line.empty() && IsDirectiveHash(line[0]))
+			else if (active && IsDirective(line, "line"))
+			{
+				flush_text();
+				if (!ParseLineDirective(line, presumed_file, overridden_line,
+					overridden_file))
+					throw PreprocError("malformed line directive");
+				line_override = true;
+			}
+			else if (active && IsDirective(line, "include"))
+			{
+				flush_text();
+				ProcessInclude(line, presumed_file, output);
+			}
+			else if (active && IsDirective(line, "pragma"))
+			{
+				flush_text();
+				ProcessPragma(line, current_file);
+			}
+			else if (!line.empty() && IsDirectiveHash(line[0]))
 		{
 			if (active)
 			{

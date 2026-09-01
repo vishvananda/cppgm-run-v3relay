@@ -134,6 +134,11 @@ bool IsData(const PPToken& token, const char* data)
 	return token.data == data;
 }
 
+bool IsPasteOperator(const PPToken& token)
+{
+	return IsData(token, "##") || IsData(token, "%:%:");
+}
+
 bool IsDirectiveHash(const PPToken& token)
 {
 	return IsData(token, "#") || IsData(token, "%:");
@@ -176,7 +181,12 @@ bool MacroEquivalent(const Macro& left, const Macro& right)
 	{
 		const PPToken& a = left.replacement[i];
 		const PPToken& b = right.replacement[i];
-		if (a.kind != b.kind || a.data != b.data)
+		if (IsPasteOperator(a) || IsPasteOperator(b))
+		{
+			if (!IsPasteOperator(a) || !IsPasteOperator(b))
+				return false;
+		}
+		else if (a.kind != b.kind || a.data != b.data)
 			return false;
 		// The first replacement token's whitespace comes from the
 		// invocation site when the macro expands. All later flags are
@@ -203,8 +213,8 @@ void ValidateMacro(const string& name, const Macro& macro)
 	}
 
 	if (!macro.replacement.empty() &&
-		(macro.replacement.front().data == "##" ||
-		 macro.replacement.back().data == "##"))
+		(IsPasteOperator(macro.replacement.front()) ||
+		 IsPasteOperator(macro.replacement.back())))
 		throw MacroError("token paste at replacement-list boundary");
 
 	for (size_t i = 0; i < macro.replacement.size(); ++i)
@@ -602,7 +612,7 @@ vector<PPToken> BuildObjectReplacement(const Macro& macro,
 	for (size_t i = 0; i < macro.replacement.size(); ++i)
 	{
 		const PPToken& source = macro.replacement[i];
-		if (IsData(source, "##"))
+		if (IsPasteOperator(source))
 		{
 			replacement.push_back(ReplacementElement());
 			continue;
@@ -637,7 +647,7 @@ public:
 			const PPToken& source = macro_.replacement[i];
 
 			if (IsData(source, ",") && i + 2 < macro_.replacement.size() &&
-				IsData(macro_.replacement[i + 1], "##") &&
+				IsPasteOperator(macro_.replacement[i + 1]) &&
 				IsVariadicParameter(macro_.replacement[i + 2]))
 			{
 				if (HasReplacementData(variadic_raw_))
@@ -651,7 +661,7 @@ public:
 				continue;
 			}
 
-			if (IsData(source, "##"))
+			if (IsPasteOperator(source))
 			{
 				replacement.push_back(ReplacementElement());
 				continue;
@@ -693,9 +703,9 @@ public:
 		if (FindParameter(source, varargs, index))
 		{
 			const bool adjacent_to_paste =
-				(i != 0 && IsData(macro_.replacement[i - 1], "##")) ||
+				(i != 0 && IsPasteOperator(macro_.replacement[i - 1])) ||
 				(i + 1 < macro_.replacement.size() &&
-					IsData(macro_.replacement[i + 1], "##"));
+					IsPasteOperator(macro_.replacement[i + 1]));
 			const bool raw = adjacent_to_paste;
 			const bool helper_head = i + 1 < macro_.replacement.size() &&
 				IsData(macro_.replacement[i + 1], "(");
@@ -873,12 +883,88 @@ void FlushText(const vector<PPToken>& text, const MacroTable& table,
 	});
 }
 
+bool DestringizePragma(const PPToken& token, string& text)
+{
+	if (token.kind != PP_TOKEN_STRING_LITERAL)
+		return false;
+
+	const size_t opening = token.data.find('"');
+	if (opening == string::npos || token.data.empty() ||
+		token.data[token.data.size() - 1] != '"' ||
+		opening + 1 > token.data.size() - 1)
+		return false;
+
+	text.clear();
+	for (size_t i = opening + 1; i + 1 < token.data.size(); ++i)
+	{
+		if (token.data[i] == '\\' && i + 2 < token.data.size())
+		{
+			const char escaped = token.data[++i];
+			if (escaped == '\\' || escaped == '"')
+				text.push_back(escaped);
+			else
+			{
+				text.push_back('\\');
+				text.push_back(escaped);
+			}
+		}
+		else
+			text.push_back(token.data[i]);
+	}
+	return true;
+}
+
+void FlushTextWithPragmas(const vector<PPToken>& text,
+	const MacroTable& table, PostTokenStream& output,
+	const MacroPragmaHandler& pragma_handler)
+{
+	if (text.empty())
+		return;
+
+	vector<PPToken> expanded;
+	MacroExpander expander(table);
+	expander.Expand(text, [&expanded](const PPToken& token)
+	{
+		expanded.push_back(token);
+	});
+
+	for (size_t i = 0; i < expanded.size();)
+	{
+		const PPToken& token = expanded[i];
+		if (token.kind != PP_TOKEN_IDENTIFIER || token.data != "_Pragma")
+		{
+			ReplayToken(output, token);
+			++i;
+			continue;
+		}
+
+		if (i + 3 >= expanded.size() ||
+			!IsData(expanded[i + 1], "(") ||
+			expanded[i + 2].kind != PP_TOKEN_STRING_LITERAL ||
+			!IsData(expanded[i + 3], ")"))
+			throw MacroError("malformed _Pragma operator");
+
+		string pragma;
+		if (!DestringizePragma(expanded[i + 2], pragma))
+			throw MacroError("malformed _Pragma string-literal");
+		if (pragma_handler)
+			pragma_handler(pragma);
+		i += 4;
+	}
+}
+
 } // namespace
 
 void MacroFlushText(const vector<PPToken>& text, const MacroTable& table,
 	PostTokenStream& output)
 {
 	FlushText(text, table, output);
+}
+
+void MacroFlushText(const vector<PPToken>& text, const MacroTable& table,
+	PostTokenStream& output, const MacroPragmaHandler& pragma_handler)
+{
+	FlushTextWithPragmas(text, table, output, pragma_handler);
 }
 
 namespace

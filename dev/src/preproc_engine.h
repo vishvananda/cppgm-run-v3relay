@@ -3,6 +3,7 @@
 #include <functional>
 #include <map>
 #include <ostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -39,8 +40,20 @@ public:
 
 private:
 	void ProcessSourceFile(const std::string& srcfile);
-	void ProcessTokens(const std::vector<PPToken>& tokens,
+	void ProcessSourceFile(const std::string& srcfile,
 		PostTokenStream& output);
+	void ProcessTokens(const std::vector<PPToken>& tokens,
+		PostTokenStream& output, int current_file);
+	void ProcessInclude(const std::vector<PPToken>& line,
+		int presumed_file, PostTokenStream& output);
+	void ProcessPragma(const std::vector<PPToken>& line, int current_file);
+	void ProcessPragmaText(const std::string& text, int current_file);
+	void MarkPragmaOnce(int current_file);
+	bool ResolveIncludePath(const std::string& include_name,
+		int presumed_file, std::string& resolved_path,
+		PA5FileId& resolved_id, bool& have_resolved_id) const;
+	bool PathCanBeOpened(const std::string& path) const;
+	bool LookupFileId(const std::string& path, PA5FileId& file_id) const;
 	bool EvaluateCondition(const std::vector<PPToken>& line);
 	bool ParseLineDirective(const std::vector<PPToken>& line,
 		int current_file, std::size_t& line_number,
@@ -56,9 +69,10 @@ private:
 	PreprocBuildInfo build_info_;
 	std::vector<std::string> file_names_;
 	std::map<std::string, int> file_name_ids_;
+	std::set<PA5FileId> pragma_once_files_;
 	MacroTable table_;
-	int active_source_file_;
 	std::size_t counter_;
+	std::size_t include_depth_;
 };
 
 void PreprocRun(const std::vector<std::string>& srcfiles, std::ostream& out,
