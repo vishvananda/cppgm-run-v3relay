@@ -130,6 +130,7 @@ void InstallMacro(map<string, Macro>& macros, const string& name,
 struct Invocation
 {
 	vector<vector<PPToken> > arguments;
+	vector<PPToken> commas;
 	PPToken closing;
 };
 
@@ -177,6 +178,7 @@ bool TakeInvocation(deque<PPToken>& pending, Invocation& invocation)
 		if (IsData(token, ",") && depth == 0)
 		{
 			arguments.push_back(current);
+			invocation.commas.push_back(token);
 			current.clear();
 			saw_top_level_comma = true;
 			continue;
@@ -211,15 +213,6 @@ void ValidateArgumentCount(const Macro& macro, vector<vector<PPToken> >& args)
 		throw MacroError("not enough macro arguments");
 }
 
-bool UsesUnsupportedReplacementOperator(const Macro& macro)
-{
-	for (size_t i = 0; i < macro.replacement.size(); ++i)
-		if (macro.replacement[i].data == "#" ||
-			macro.replacement[i].data == "##")
-			return true;
-	return false;
-}
-
 void Prepend(deque<PPToken>& pending, const vector<PPToken>& tokens)
 {
 	for (vector<PPToken>::const_reverse_iterator it = tokens.rbegin();
@@ -252,11 +245,61 @@ PPToken FunctionReplacementToken(const PPToken& source,
 	return result;
 }
 
-void AppendSubstitutedArgument(vector<PPToken>& replacement,
+bool IsReplacementData(const PPToken& token)
+{
+	return token.kind != PP_TOKEN_NEW_LINE &&
+		token.kind != PP_TOKEN_PLACEMARKER;
+}
+
+bool HasReplacementData(const vector<PPToken>& tokens)
+{
+	for (size_t i = 0; i < tokens.size(); ++i)
+		if (IsReplacementData(tokens[i]))
+			return true;
+	return false;
+}
+
+struct ReplacementElement
+{
+	bool paste;
+	PPToken token;
+
+	ReplacementElement()
+		: paste(true)
+	{
+	}
+
+	explicit ReplacementElement(const PPToken& token)
+		: paste(false), token(token)
+	{
+	}
+};
+
+bool HasVisibleReplacement(const vector<ReplacementElement>& replacement)
+{
+	for (size_t i = 0; i < replacement.size(); ++i)
+		if (!replacement[i].paste &&
+			replacement[i].token.kind != PP_TOKEN_PLACEMARKER)
+			return true;
+	return false;
+}
+
+void AppendSubstitutedArgument(vector<ReplacementElement>& replacement,
 	const vector<PPToken>& argument, const PPToken& occurrence,
 	const PPToken& head, const string& macro_name,
-	bool replacement_list_helper_head)
+	bool replacement_list_helper_head, bool adjacent_to_paste)
 {
+	if (!HasReplacementData(argument))
+	{
+		if (adjacent_to_paste)
+		{
+			PPToken placemarker(PP_TOKEN_PLACEMARKER, string(),
+				occurrence.preceded_by_ws);
+			replacement.push_back(ReplacementElement(placemarker));
+		}
+		return;
+	}
+
 	for (size_t i = 0; i < argument.size(); ++i)
 	{
 		PPToken token = argument[i];
@@ -266,7 +309,7 @@ void AppendSubstitutedArgument(vector<PPToken>& replacement,
 		if (i == 0)
 			token.preceded_by_ws = occurrence.preceded_by_ws;
 		MarkPainted(token);
-		replacement.push_back(token);
+		replacement.push_back(ReplacementElement(token));
 	}
 }
 
@@ -282,57 +325,348 @@ vector<PPToken> PreExpandArgument(const MacroTable& table,
 	return result;
 }
 
+PPToken StringizeArgument(const vector<PPToken>& argument)
+{
+	string spelling(1, '"');
+	PaintSet paint;
+	bool have_token = false;
+	bool whitespace_pending = false;
+
+	for (size_t i = 0; i < argument.size(); ++i)
+	{
+		const PPToken& token = argument[i];
+		if (token.kind == PP_TOKEN_NEW_LINE)
+		{
+			if (have_token)
+				whitespace_pending = true;
+			continue;
+		}
+		if (token.kind == PP_TOKEN_PLACEMARKER)
+			continue;
+
+		if (have_token && (whitespace_pending || token.preceded_by_ws))
+			spelling.push_back(' ');
+		have_token = true;
+		whitespace_pending = false;
+		paint = PaintUnion(paint, token.paint);
+
+		const bool literal =
+			token.kind == PP_TOKEN_STRING_LITERAL ||
+			token.kind == PP_TOKEN_USER_DEFINED_STRING_LITERAL ||
+			token.kind == PP_TOKEN_CHARACTER_LITERAL ||
+			token.kind == PP_TOKEN_USER_DEFINED_CHARACTER_LITERAL;
+		for (size_t j = 0; j < token.data.size(); ++j)
+		{
+			const char c = token.data[j];
+			if (literal && (c == '\\' || c == '"'))
+				spelling.push_back('\\');
+			spelling.push_back(c);
+		}
+	}
+
+	spelling.push_back('"');
+	PPToken result(PP_TOKEN_STRING_LITERAL, spelling, false);
+	result.paint = paint;
+	return result;
+}
+
+PPToken PasteTokens(const PPToken& left, const PPToken& right)
+{
+	if (left.kind == PP_TOKEN_PLACEMARKER &&
+		right.kind == PP_TOKEN_PLACEMARKER)
+	{
+		return PPToken(PP_TOKEN_PLACEMARKER, string(),
+			left.preceded_by_ws);
+	}
+	if (left.kind == PP_TOKEN_PLACEMARKER)
+		return right;
+	if (right.kind == PP_TOKEN_PLACEMARKER)
+		return left;
+
+	PPTokenCollector collector;
+	PPTokenize(left.data + right.data + "\n", collector);
+	vector<PPToken> data;
+	for (size_t i = 0; i < collector.tokens.size(); ++i)
+		if (collector.tokens[i].kind != PP_TOKEN_NEW_LINE)
+			data.push_back(collector.tokens[i]);
+	if (data.size() != 1)
+		throw MacroError("token paste did not form one preprocessing token");
+
+	PPToken result = data[0];
+	result.preceded_by_ws = left.preceded_by_ws;
+	result.paint = PaintUnion(left.paint, right.paint);
+	MarkPainted(result);
+	return result;
+}
+
+vector<PPToken> ResolvePastes(vector<ReplacementElement> replacement)
+{
+	for (size_t i = 0; i < replacement.size(); ++i)
+	{
+		if (!replacement[i].paste)
+			continue;
+
+		size_t left = i;
+		while (left != 0)
+		{
+			--left;
+			if (replacement[left].paste)
+				throw MacroError("token paste without a left operand");
+			if (replacement[left].token.kind != PP_TOKEN_NEW_LINE)
+				break;
+		}
+		if (replacement[left].paste ||
+			replacement[left].token.kind == PP_TOKEN_NEW_LINE)
+			throw MacroError("token paste without a left operand");
+
+		size_t right = i + 1;
+		while (right < replacement.size())
+		{
+			if (replacement[right].paste)
+				throw MacroError("token paste without a right operand");
+			if (replacement[right].token.kind != PP_TOKEN_NEW_LINE)
+				break;
+			++right;
+		}
+		if (right == replacement.size() ||
+			replacement[right].token.kind == PP_TOKEN_NEW_LINE)
+			throw MacroError("token paste without a right operand");
+
+		replacement[left].token = PasteTokens(replacement[left].token,
+			replacement[right].token);
+		replacement.erase(replacement.begin() + left + 1,
+			replacement.begin() + right + 1);
+		i = left;
+	}
+
+	vector<PPToken> result;
+	for (size_t i = 0; i < replacement.size(); ++i)
+	{
+		if (replacement[i].paste)
+			throw MacroError("unresolved token paste");
+		if (replacement[i].token.kind != PP_TOKEN_PLACEMARKER)
+			result.push_back(replacement[i].token);
+	}
+	return result;
+}
+
 vector<PPToken> BuildObjectReplacement(const Macro& macro,
 	const PPToken& head)
 {
-	vector<PPToken> result;
+	vector<ReplacementElement> replacement;
 	for (size_t i = 0; i < macro.replacement.size(); ++i)
-		result.push_back(ObjectReplacementToken(macro.replacement[i], head,
-			head.data, i == 0));
-	return result;
+	{
+		const PPToken& source = macro.replacement[i];
+		if (IsData(source, "##"))
+		{
+			replacement.push_back(ReplacementElement());
+			continue;
+		}
+		replacement.push_back(ReplacementElement(
+			ObjectReplacementToken(source, head, head.data,
+				!HasVisibleReplacement(replacement))));
+	}
+	return ResolvePastes(replacement);
 }
+
+class FunctionReplacementBuilder
+{
+public:
+	FunctionReplacementBuilder(const Macro& macro, const Invocation& invocation,
+		const PPToken& head, const MacroTable& table)
+		: macro_(macro), invocation_(invocation), head_(head),
+			table_(table), expanded_(macro.params.size()),
+			expanded_ready_(macro.params.size(), false),
+			variadic_ready_(false)
+	{
+		for (size_t i = 0; i < macro_.params.size(); ++i)
+			parameter_indexes_[macro_.params[i]] = i;
+		variadic_raw_ = BuildVariadicArgument();
+	}
+
+	vector<PPToken> Build()
+	{
+		vector<ReplacementElement> replacement;
+		for (size_t i = 0; i < macro_.replacement.size(); ++i)
+		{
+			const PPToken& source = macro_.replacement[i];
+
+			if (IsData(source, ",") && i + 2 < macro_.replacement.size() &&
+				IsData(macro_.replacement[i + 1], "##") &&
+				IsVariadicParameter(macro_.replacement[i + 2]))
+			{
+				if (HasReplacementData(variadic_raw_))
+				{
+					AppendLiteral(replacement, source);
+					AppendArgument(replacement, macro_.replacement[i + 2],
+						false, false, false);
+				}
+				++i;
+				++i;
+				continue;
+			}
+
+			if (IsData(source, "##"))
+			{
+				replacement.push_back(ReplacementElement());
+				continue;
+			}
+
+			if (IsData(source, "#"))
+			{
+				if (i + 1 >= macro_.replacement.size())
+					throw MacroError("stringize operator without parameter");
+				bool varargs;
+				size_t index;
+				if (!FindParameter(macro_.replacement[i + 1], varargs,
+					index))
+					throw MacroError("stringize operator without parameter");
+				const vector<PPToken>& argument = RawArgument(varargs, index);
+				PPToken stringized = StringizeArgument(argument);
+				stringized.preceded_by_ws = source.preceded_by_ws;
+				PPToken transformed = FunctionReplacementToken(stringized, head_,
+					invocation_.closing, head_.data,
+					!HasVisibleReplacement(replacement));
+				transformed.paint = PaintUnion(transformed.paint,
+					stringized.paint);
+				MarkPainted(transformed);
+				replacement.push_back(ReplacementElement(transformed));
+				++i;
+				continue;
+			}
+
+			bool varargs;
+			size_t index;
+		if (FindParameter(source, varargs, index))
+		{
+			const bool adjacent_to_paste =
+				(i != 0 && IsData(macro_.replacement[i - 1], "##")) ||
+				(i + 1 < macro_.replacement.size() &&
+					IsData(macro_.replacement[i + 1], "##"));
+			const bool raw = adjacent_to_paste;
+			const bool helper_head = i + 1 < macro_.replacement.size() &&
+				IsData(macro_.replacement[i + 1], "(");
+			AppendArgument(replacement, source, raw, helper_head,
+				adjacent_to_paste);
+			continue;
+		}
+
+			AppendLiteral(replacement, source);
+		}
+		return ResolvePastes(replacement);
+	}
+
+private:
+	vector<PPToken> BuildVariadicArgument() const
+	{
+		vector<PPToken> result;
+		const size_t first = macro_.params.size();
+		for (size_t i = first; i < invocation_.arguments.size(); ++i)
+		{
+			if (i != first)
+			{
+				if (i - 1 >= invocation_.commas.size())
+					throw MacroError("missing variadic argument separator");
+				result.push_back(invocation_.commas[i - 1]);
+			}
+			result.insert(result.end(), invocation_.arguments[i].begin(),
+				invocation_.arguments[i].end());
+		}
+		return result;
+	}
+
+	bool IsVariadicParameter(const PPToken& token) const
+	{
+		return macro_.variadic && token.kind == PP_TOKEN_IDENTIFIER &&
+			token.data == "__VA_ARGS__";
+	}
+
+	bool FindParameter(const PPToken& token, bool& varargs, size_t& index) const
+	{
+		varargs = false;
+		index = 0;
+		if (token.kind != PP_TOKEN_IDENTIFIER)
+			return false;
+		map<string, size_t>::const_iterator parameter =
+			parameter_indexes_.find(token.data);
+		if (parameter != parameter_indexes_.end())
+		{
+			index = parameter->second;
+			return true;
+		}
+		if (IsVariadicParameter(token))
+		{
+			varargs = true;
+			return true;
+		}
+		return false;
+	}
+
+	const vector<PPToken>& RawArgument(bool varargs, size_t index) const
+	{
+		return varargs ? variadic_raw_ : invocation_.arguments[index];
+	}
+
+	const vector<PPToken>& ExpandedArgument(bool varargs, size_t index)
+	{
+		if (varargs)
+		{
+			if (!variadic_ready_)
+			{
+				variadic_expanded_ = PreExpandArgument(table_, variadic_raw_);
+				variadic_ready_ = true;
+			}
+			return variadic_expanded_;
+		}
+		if (!expanded_ready_[index])
+		{
+			expanded_[index] = PreExpandArgument(table_,
+				invocation_.arguments[index]);
+			expanded_ready_[index] = true;
+		}
+		return expanded_[index];
+	}
+
+	void AppendLiteral(vector<ReplacementElement>& replacement,
+		const PPToken& source)
+	{
+		replacement.push_back(ReplacementElement(FunctionReplacementToken(
+			source, head_, invocation_.closing, head_.data,
+			!HasVisibleReplacement(replacement))));
+	}
+
+	void AppendArgument(vector<ReplacementElement>& replacement,
+		const PPToken& source, bool raw, bool helper_head,
+		bool adjacent_to_paste)
+	{
+		bool varargs;
+		size_t index;
+		if (!FindParameter(source, varargs, index))
+			throw MacroError("unknown macro parameter");
+		const vector<PPToken>& argument = raw ? RawArgument(varargs, index) :
+			ExpandedArgument(varargs, index);
+		AppendSubstitutedArgument(replacement, argument, source, head_,
+			head_.data, helper_head, adjacent_to_paste);
+	}
+
+	const Macro& macro_;
+	const Invocation& invocation_;
+	const PPToken& head_;
+	const MacroTable& table_;
+	vector<vector<PPToken> > expanded_;
+	vector<bool> expanded_ready_;
+	map<string, size_t> parameter_indexes_;
+	vector<PPToken> variadic_raw_;
+	vector<PPToken> variadic_expanded_;
+	bool variadic_ready_;
+};
 
 vector<PPToken> BuildFunctionReplacement(const Macro& macro,
 	const Invocation& invocation, const PPToken& head,
 	const MacroTable& table)
 {
-	vector<vector<PPToken> > expanded(macro.params.size());
-	vector<bool> expanded_ready(macro.params.size(), false);
-	map<string, size_t> parameter_indexes;
-	for (size_t i = 0; i < macro.params.size(); ++i)
-		parameter_indexes[macro.params[i]] = i;
-
-	vector<PPToken> result;
-	for (size_t i = 0; i < macro.replacement.size(); ++i)
-	{
-		const PPToken& source = macro.replacement[i];
-		if (source.kind == PP_TOKEN_IDENTIFIER)
-		{
-			map<string, size_t>::const_iterator parameter =
-				parameter_indexes.find(source.data);
-			if (parameter != parameter_indexes.end())
-			{
-				const size_t index = parameter->second;
-				if (!expanded_ready[index])
-				{
-					expanded[index] = PreExpandArgument(table,
-						invocation.arguments[index]);
-					expanded_ready[index] = true;
-				}
-				const bool helper_head = i + 1 < macro.replacement.size() &&
-					IsData(macro.replacement[i + 1], "(");
-				AppendSubstitutedArgument(result, expanded[index], source,
-					head, head.data, helper_head);
-				continue;
-			}
-			if (source.data == "__VA_ARGS__")
-				throw MacroError("variadic substitution is not available");
-		}
-
-		result.push_back(FunctionReplacementToken(source, head,
-			invocation.closing, head.data, result.empty()));
-	}
-	return result;
+	FunctionReplacementBuilder builder(macro, invocation, head, table);
+	return builder.Build();
 }
 
 void ReplayToken(PostTokenStream& output, const PPToken& token)
@@ -655,9 +989,6 @@ void MacroExpander::Expand(const vector<PPToken>& input,
 		}
 
 		ValidateArgumentCount(*macro, invocation.arguments);
-		if (UsesUnsupportedReplacementOperator(*macro))
-			throw MacroError("replacement operators are not available");
-
 		Prepend(pending, BuildFunctionReplacement(*macro, invocation, head,
 			table_));
 	}

@@ -1,8 +1,9 @@
 # PA4 Plan — macro (phases 1–6 + phase-7 tokenization with #define/#undef)
 
-State at CP1 completion: 51/72 pa4 fixtures pass; through-pa3 remains green;
-the pa4 file audit remains green. Oracle: `.ref` files; failing fixtures
-compare exit status only.
+State at CP2 completion: 72/72 pa4 fixtures pass; through-pa3 reports 104/104
+and through-pa4 reports 176/176. The pa4 file audit reports 23 files checked;
+the 100k-expansion probe completed in 1.81s. Oracle: `.ref` files; failing
+fixtures compare exit status only.
 
 ## Stage Design
 
@@ -179,69 +180,36 @@ All 72 failures = one stub; ownership after CP1 split:
   reports 51/72, with the 21 remaining failures confined to the deferred
   #/##/varargs substitution groups; `make test-report-through-pa3` reports
   104/104; `make test-report-through-pa4` reports 155/176; file audit passes.
-- CP2 (ACTIVE) — stringize, paste + re-lex, placemarkers, variadics + GNU
-  comma rule, and ws-flag propagation polish. Proof pending: 72/72
-  `make test-pa4` and clean `make test-report-through-pa4`.
-- CP3 — architecture audit + cleanup: perf probe recorded, optional
-  differential run against `pa4/macro-ref` on generated inputs (observation
-  only), consolidate findings in `pa4/audit.md`. Proof: clean
-  `make test-report-through-pa4`, audit script green, git clean.
+- CP2 (COMPLETE) — stringize, paste + re-lex, placemarkers, variadics + GNU
+  comma rule, and ws-flag propagation polish. Proof: `make test-pa4` reports
+  72/72; `make test-report-through-pa3` reports 104/104;
+  `make test-report-through-pa4` reports 176/176; the file audit passes and
+  the 100k-expansion probe completes in 1.81s.
+- CP3 (ACTIVE) — architecture audit + cleanup: optional differential run
+  against `pa4/macro-ref` on generated inputs (observation only), consolidate
+  findings in `pa4/audit.md`. Proof pending: clean through-pa4, audit script,
+  and git status.
 
-## Active Checkpoint: CP2
+## Active Checkpoint: CP3
 
-Complete the deferred replacement operators and variadic substitution while
-preserving CP1's directive/table ownership and blue-paint rescan.
+Audit the completed macro replacement boundary and record cleanup findings
+without weakening directive/table ownership, deque rescan, paint handling, or
+the single `PostTokenStream` replay.
 
 ### Implementation Packet
 
 Files/symbols:
 
-- EDIT `dev/src/macro_replace.h` / `macro_replace.cpp`:
-  - extend `MacroExpander` substitution context to select raw arguments for
-    `#` and `##`, while retaining lazy pre-expansion for ordinary parameters;
-  - stringize raw spellings using `preceded_by_ws`, escape literal spellings,
-    and preserve raw-string/trigraph spellings;
-  - paste operand spellings, re-lex through `PPTokenize`, require one data
-    token, carry operand paint/flags, and rescan the pasted token;
-  - represent and resolve placemarkers, including empty-argument joins;
-  - collect fixed and variadic arguments, substitute `__VA_ARGS__`, and apply
-    the GNU comma-paste rule.
-- Preserve the existing `MacroTable` define-time validation, deque rescan,
-  helper-head paint boundary, and one `PostTokenStream` replay.
-
-Fixture groups for CP2 verification: `pa4/tests/250-join.t`,
-`500-tricky-join.t`, `700-redef-q.t`, `700-strlit-q.t`,
-`800-placemarker-q.t`, `850-varargs-q.t`,
-`pa4/tests/920-deferred-helper-argument-prescan.t`, and the course operator
-groups listed in the Failure Map.
-
-Required spec facts: spec.md 16.3.1–16.3.5 for raw/expanded argument choice,
-stringization, concatenation, rescanning, and variadic arguments;
-pa4/README.md "Features" + "Design Notes" remain authoritative where they
-diverge from ISO.
+- REVIEW `dev/src/macro_replace.h` / `macro_replace.cpp` for ownership,
+  bounded expansion behavior, and cleanup opportunities exposed by CP2.
+- RECORD the audit and any observation-only differential findings in
+  `pa4/audit.md`; do not regenerate or edit checked-in fixtures.
+- Preserve the existing directive/table validation, deque rescan,
+  helper-head paint boundary, replacement-operator semantics, and one
+  `PostTokenStream` replay.
 
 Commands:
-- focused: `make test-pa4` (builds tool, runs all 72)
-- prior gate: `make test-report-through-pa3`
 - broad: `make test-report-through-pa4`
 - audit: `perl scripts/cppgm_file_audit.pl --stage pa4 --paths dev/src`
-- single fixtures: `dev/macro < pa4/tests/500-tricky-join.t | diff - pa4/tests/500-tricky-join.ref`
-
-Performance probe (after CP1, again at CP3):
-
-    perl -e 'print "#define max(a,b) ((a)>(b)?(a):(b))\n";
-             print "max(1,2)\n" for 1..100000' \
-      | timeout 10 dev/macro > /dev/null   # expect < 2s, linear
-
-Known uncertainties (resolve against ref only if a fixture forces it):
-- Non-define/undef directive lines (`# foo`, null `#`) are outside the input
-  contract; choose EXIT_FAILURE.
-- Duplicate parameter names: error per [cpp.replace]; untested.
-- Paste not yielding exactly one pp-token: choose EXIT_FAILURE
-  (300-double-hash comments deliberately avoid the case).
-- GNU comma rule scope: implement narrowly (literal `,` `##` `__VA_ARGS__`
-  in the replacement list only).
-- Paste-result paint: operand union included (rule 5); fixtures pass with or
-  without.
-- String concatenation across a directive boundary: single-stream design
-  concatenates (standard phase order); untested.
+- optional observation: compare generated inputs with `pa4/macro-ref`
+- final: `git status --short`
