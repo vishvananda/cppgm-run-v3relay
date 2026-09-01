@@ -338,7 +338,8 @@ bool Pa10Parser::can_start_declaration() const
 	if (current.kind == PA6_IDENTIFIER_TOKEN)
 	{
 		const BindKind* binding = scopes_.Lookup(current.spelling);
-		return binding == 0 || *binding == BIND_TYPE || *binding == BIND_TEMPLATE;
+		return binding == 0 || *binding == BIND_TYPE || *binding == BIND_TEMPLATE ||
+			is_simple(OP_COLON2, pos_ + 1);
 	}
 	if (current.kind != PA6_SIMPLE_TOKEN)
 		return false;
@@ -346,7 +347,10 @@ bool Pa10Parser::can_start_declaration() const
 		is_cv_qualifier(current.simple_type) ||
 		is_storage_or_function_specifier(current.simple_type) ||
 		current.IsSimple(KW_DECLTYPE) || current.IsSimple(KW_TYPENAME) ||
-		current.IsSimple(KW_STATIC_ASSERT) || current.IsSimple(KW_USING);
+		current.IsSimple(KW_STATIC_ASSERT) || current.IsSimple(KW_USING) ||
+		current.IsSimple(KW_CLASS) || current.IsSimple(KW_STRUCT) ||
+		current.IsSimple(KW_UNION) || current.IsSimple(KW_ENUM) ||
+		current.IsSimple(KW_NAMESPACE);
 }
 
 bool Pa10Parser::node_has_kind(AstId node, AstKind kind) const
@@ -431,13 +435,60 @@ AstId Pa10Parser::parse_declaration()
 		return parse_empty_declaration();
 	if (is_simple(KW_STATIC_ASSERT))
 		return parse_static_assert_declaration();
+	if (is_simple(KW_NAMESPACE))
+	{
+		const AstId namespace_alias = parse_namespace_alias_definition();
+		if (namespace_alias != 0)
+			return namespace_alias;
+		restore(saved);
+	}
+	if (is_simple(KW_INLINE) || is_simple(KW_NAMESPACE))
+	{
+		const AstId namespace_definition = parse_namespace_definition();
+		if (namespace_definition != 0)
+			return namespace_definition;
+		restore(saved);
+	}
+	if (is_simple(KW_EXTERN))
+	{
+		const AstId linkage = parse_linkage_specification();
+		if (linkage != 0)
+			return linkage;
+		restore(saved);
+	}
 	if (is_simple(KW_USING))
 	{
 		const AstId alias = parse_alias_declaration();
 		if (alias != 0)
 			return alias;
 		restore(saved);
+		const AstId directive = parse_using_directive();
+		if (directive != 0)
+			return directive;
+		restore(saved);
+		const AstId declaration = parse_using_declaration();
+		if (declaration != 0)
+			return declaration;
+		restore(saved);
 	}
+	if (is_simple(KW_CLASS) || is_simple(KW_STRUCT) || is_simple(KW_UNION))
+	{
+		const AstId class_specifier = parse_class_specifier(true);
+		if (class_specifier != 0 && consume_simple(OP_SEMICOLON))
+			return class_specifier;
+		restore(saved);
+	}
+	if (is_simple(KW_ENUM))
+	{
+		const AstId enum_specifier = parse_enum_specifier();
+		if (enum_specifier != 0 && consume_simple(OP_SEMICOLON))
+			return enum_specifier;
+		restore(saved);
+	}
+	const AstId special = parse_special_member_definition();
+	if (special != 0)
+		return special;
+	restore(saved);
 	const AstId function = parse_function_definition();
 	if (function != 0)
 		return function;
@@ -513,7 +564,8 @@ AstId Pa10Parser::parse_statement()
 	{
 		const BindKind* binding = is_kind(PA6_IDENTIFIER_TOKEN) ?
 			scopes_.Lookup(token(pos_).spelling) : 0;
-		if (binding == 0 || *binding != BIND_VALUE)
+		if (binding == 0 || *binding != BIND_VALUE ||
+			is_simple(OP_COLON2, pos_ + 1))
 		{
 			const Mark saved = mark();
 			AstId declaration = parse_declaration();

@@ -259,18 +259,24 @@ turns them.
   parenthesis and 60-level angle probes each complete in 0.00s.
 - CP2 — namespaces, linkage, using/alias forms, class-specifier with bases,
   members, access labels, bit-fields, special members, ctor-initializers,
-  enums (F2). Target ≥ 70/157 (ACTIVE).
+  enums (F2) (COMPLETE). Evidence: the packet and Failure Map F2 fixture
+  sweep passes 18/18; `make test-pa10` reports 94/157, reducing the current
+  stage failures from 99 to 63 without removing coverage. The required
+  `make test-report-through-pa9` reports 432/432, and the pa10 file audit
+  passes with one pre-existing `recog_parser.h` warning. The representative
+  timed suite invocation completes in 0.35s before the first known CP3
+  fixture stops that non-keep-going harness.
 - CP3 — template-declaration, parameter forms, TEMPLATE bindings,
   `typename`/`template` dependent names, explicit instantiation and
   specialization, partial specializations, qualified special-member
-  definitions (F3). Target ≥ 150/157.
+  definitions (F3). Target ≥ 150/157 (ACTIVE).
 - CP4 — closure: remaining quirks, performance probes, audit warnings,
   `make test-report-through-pa10` green; record results in this file.
 
-## Active Checkpoint — CP2: namespaces, classes, enums, and linkage
+## Active Checkpoint — CP3: templates and dependent declarations
 
-Goal: take the current 58/157 baseline to at least 70/157 by adding the
-F2 declaration owners without changing the CP1 dump contract or scope
+Goal: extend the 94/157 CP2 baseline through the template/dependent-name
+fixtures without changing the completed F0–F2 dump contracts or scope
 rollback behavior.
 
 ### Implementation Packet
@@ -278,28 +284,28 @@ rollback behavior.
 Files and symbols:
 
 - `dev/src/parser/ast_model.h/.cpp`: extend the existing kind table only when
-  a CP2 fixture requires a class/enum/namespace spelling.
-- `dev/src/parser/ast_scope.h/.cpp`: use `Push`/`Pop` and the undo log for
-  namespace/class bodies; namespace names bind `BIND_NAMESPACE` and class or
-  enum names bind `BIND_TYPE` at the grammar commit point.
+  a CP3 fixture requires a template/dependent-declaration spelling.
+- `dev/src/parser/ast_scope.h/.cpp`: preserve transactional `Push`/`Pop`,
+  undo-log rollback, and the completed TYPE/NAMESPACE ownership while adding
+  TEMPLATE and template-clause bindings.
 - `dev/src/parser/ast_parser.h`, `ast_parser.cpp`, and
-  `ast_parser_decl.cpp`: implement `parse_namespace_definition`,
-  `parse_namespace_alias_definition`, `parse_linkage_specification`,
-  `parse_using_directive`, `parse_using_declaration`, `parse_class_specifier`,
-  `parse_base_clause`, `parse_member_declaration`,
-  `parse_enum_specifier`, `parse_bit_field_declaration`,
-  `parse_ctor_initializer`, and `parse_mem_initializer`; retain
-  `ast_parser_expr.cpp` behavior.
+  `ast_parser_decl.cpp`: implement the template declaration, parameter,
+  explicit instantiation/specialization, dependent-name, and qualified
+  special-member productions named by the Failure Map; retain the completed
+  namespace/class/enum/member productions.
+- `dev/src/parser/ast_parser_expr.cpp`: only extend dependent/template-id
+  expression ownership where a CP3 fixture requires it.
 - `dev/frontend_source_sets.mk`: keep the PA10 parser/model/scope source set
   complete; do not add PA6/PA7 sources to the cppgm++ target.
 
-Fixture groups: `spec/100-namespace-forms`, `spec/200-bit-field-declaration`,
-`spec/200-class-bases-and-ctor-init`, `general/100-member-declarations`,
-`general/100-special-member-definitions`, `general/100-typedef-struct-union`,
-`general/100-typedef-anonymous-enum`, `general/100-typedef-anonymous-union`,
-`general/100-scoped-enum-underlying-type`, and the F2 linkage/using/member
-fixtures listed in the Failure Map. Preserve all CP1 fixtures and negatives.
+Fixture groups: `spec/100-template-class`, `spec/100-template-parameters`,
+`spec/200-explicit-instantiation-declaration`,
+`spec/200-explicit-specialization-syntax`,
+`spec/200-non-type-template-parameters`,
+`spec/200-qualified-special-member-definition`, and the F3 template,
+dependent-name, attribute, and imported-using fixtures listed in the Failure
+Map. Preserve all F0–F2 fixtures and negatives.
 
-Exit evidence: `make test-pa10`, `make test-report-through-pa9`, and the pa10
-file audit; the next checkpoint must increase the pa10 pass count without
-removing or weakening any fixture.
+Exit evidence: the pa10 stage pass count must increase without removing or
+weakening any fixture; run `make test-pa10`, `make test-report-through-pa9`,
+and the pa10 file audit after source is stable.

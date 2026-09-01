@@ -135,7 +135,10 @@ const char* Names[] =
 	"pack-expansion",
 	"noexcept",
 	"trailing-type",
-	"unknown"
+	"unknown",
+	"inline",
+	"virtual",
+	"enum-key"
 };
 
 } // namespace

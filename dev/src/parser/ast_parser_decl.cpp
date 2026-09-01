@@ -12,7 +12,792 @@ bool IsTypeLikeBinding(const BindKind* binding)
 	return binding == 0 || *binding == BIND_TYPE || *binding == BIND_TEMPLATE;
 }
 
+string Unquote(const string& spelling)
+{
+	if (spelling.size() >= 2 && spelling[0] == '"' &&
+		spelling[spelling.size() - 1] == '"')
+		return spelling.substr(1, spelling.size() - 2);
+	return spelling;
+}
+
 } // namespace
+
+AstId Pa10Parser::parse_namespace_definition()
+{
+	const Mark saved = mark();
+	bool is_inline = false;
+	if (is_simple(KW_INLINE))
+	{
+		++pos_;
+		is_inline = true;
+	}
+	if (!consume_simple(KW_NAMESPACE))
+	{
+		restore(saved);
+		return 0;
+	}
+
+	string name = "<unnamed>";
+	if (is_kind(PA6_IDENTIFIER_TOKEN))
+		name = token(pos_++).spelling;
+	if (!enter_bracket(OP_LBRACE))
+	{
+		restore(saved);
+		return 0;
+	}
+
+	if (name != "<unnamed>")
+		scopes_.Bind(name, BIND_NAMESPACE);
+	scopes_.Push();
+	const AstId result = make(AST_NAMESPACE_DEFINITION, name);
+	if (is_inline)
+		add(result, make(AST_INLINE));
+	while (!is_simple(OP_RBRACE))
+	{
+		if (at_end())
+		{
+			scopes_.Pop();
+			restore(saved);
+			return 0;
+		}
+		const AstId declaration = parse_declaration();
+		if (declaration == 0)
+		{
+			scopes_.Pop();
+			restore(saved);
+			return 0;
+		}
+		add(result, declaration);
+	}
+	if (!leave_bracket(OP_RBRACE))
+	{
+		scopes_.Pop();
+		restore(saved);
+		return 0;
+	}
+	scopes_.Pop();
+	return result;
+}
+
+AstId Pa10Parser::parse_namespace_alias_definition()
+{
+	const Mark saved = mark();
+	if (!consume_simple(KW_NAMESPACE) || !is_kind(PA6_IDENTIFIER_TOKEN))
+	{
+		restore(saved);
+		return 0;
+	}
+	const string name = token(pos_++).spelling;
+	if (!consume_simple(OP_ASS))
+	{
+		restore(saved);
+		return 0;
+	}
+	const size_t target_start = pos_;
+	const AstId target_name = parse_qualified_name(false);
+	if (target_name == 0 || !consume_simple(OP_SEMICOLON))
+	{
+		restore(saved);
+		return 0;
+	}
+	const AstId result = make(AST_NAMESPACE_ALIAS_DEFINITION, name);
+	add(result, make(AST_TARGET, Join(target_start, pos_ - 1)));
+	scopes_.Bind(name, BIND_NAMESPACE);
+	return result;
+}
+
+AstId Pa10Parser::parse_using_directive()
+{
+	const Mark saved = mark();
+	if (!consume_simple(KW_USING) || !consume_simple(KW_NAMESPACE))
+	{
+		restore(saved);
+		return 0;
+	}
+	const size_t target_start = pos_;
+	const AstId target_name = parse_qualified_name(false);
+	if (target_name == 0 || !consume_simple(OP_SEMICOLON))
+	{
+		restore(saved);
+		return 0;
+	}
+	const AstId result = make(AST_USING_DIRECTIVE);
+	add(result, make(AST_TARGET, Join(target_start, pos_ - 1)));
+	return result;
+}
+
+AstId Pa10Parser::parse_using_declaration()
+{
+	const Mark saved = mark();
+	if (!consume_simple(KW_USING))
+	{
+		restore(saved);
+		return 0;
+	}
+	if (consume_simple(KW_TYPENAME) && !is_kind(PA6_IDENTIFIER_TOKEN) &&
+		!is_simple(OP_COLON2))
+	{
+		restore(saved);
+		return 0;
+	}
+	const size_t target_start = pos_;
+	const AstId target_name = parse_qualified_name(false);
+	if (target_name == 0 || !consume_simple(OP_SEMICOLON))
+	{
+		restore(saved);
+		return 0;
+	}
+	const AstId result = make(AST_USING_DECLARATION);
+	add(result, make(AST_TARGET, Join(target_start, pos_ - 1)));
+	return result;
+}
+
+AstId Pa10Parser::parse_linkage_specification()
+{
+	const Mark saved = mark();
+	if (!consume_simple(KW_EXTERN) || !is_kind(PA6_LITERAL_TOKEN))
+	{
+		restore(saved);
+		return 0;
+	}
+	const string language = Unquote(token(pos_++).spelling);
+	const AstId result = make(AST_LINKAGE_SPECIFICATION, language);
+	if (enter_bracket(OP_LBRACE))
+	{
+		while (!is_simple(OP_RBRACE))
+		{
+			if (at_end())
+			{
+				restore(saved);
+				return 0;
+			}
+			const AstId declaration = parse_declaration();
+			if (declaration == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			add(result, declaration);
+		}
+		if (!leave_bracket(OP_RBRACE))
+		{
+			restore(saved);
+			return 0;
+		}
+		return result;
+	}
+
+	const AstId declaration = parse_declaration();
+	if (declaration == 0)
+	{
+		restore(saved);
+		return 0;
+	}
+	add(result, declaration);
+	return result;
+}
+
+AstId Pa10Parser::parse_base_clause()
+{
+	const Mark saved = mark();
+	if (!consume_simple(OP_COLON))
+		return 0;
+	const AstId result = make(AST_BASE_CLAUSE);
+	while (true)
+	{
+		const AstId base = make(AST_BASE_SPECIFIER);
+		bool have_specifier = false;
+		while (is_simple(KW_VIRTUAL) || is_simple(KW_PUBLIC) ||
+			is_simple(KW_PROTECTED) || is_simple(KW_PRIVATE))
+		{
+			const Pa6Token& current = token(pos_++);
+			have_specifier = true;
+			if (current.IsSimple(KW_VIRTUAL))
+				add(base, make(AST_VIRTUAL, token_label(current)));
+			else
+				add(base, make(AST_ACCESS_SPECIFIER, token_label(current)));
+		}
+		const size_t name_start = pos_;
+		const AstId base_name = parse_qualified_name(false);
+		if (base_name == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+		(void)have_specifier;
+		add(base, make(AST_BASE_NAME, Join(name_start, pos_)));
+		add(result, base);
+		if (!consume_simple(OP_COMMA))
+			break;
+	}
+	return result;
+}
+
+AstId Pa10Parser::parse_class_specifier(bool declaration_context)
+{
+	const Mark saved = mark();
+	const size_t key_position = pos_;
+	if (!is_simple(KW_CLASS) && !is_simple(KW_STRUCT) &&
+		!is_simple(KW_UNION))
+		return 0;
+	++pos_;
+	string name;
+	if (is_kind(PA6_IDENTIFIER_TOKEN))
+		name = token(pos_++).spelling;
+
+	AstId bases = 0;
+	if (is_simple(OP_COLON))
+	{
+		bases = parse_base_clause();
+		if (bases == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+	}
+	if (!is_simple(OP_LBRACE))
+	{
+		if (bases != 0)
+		{
+			restore(saved);
+			return 0;
+		}
+		if (!name.empty())
+			scopes_.Bind(name, BIND_TYPE);
+		const AstId result = make(declaration_context ?
+			AST_CLASS_FORWARD_DECLARATION : AST_CLASS_SPECIFIER, name);
+		add(result, make(AST_CLASS_KEY, token_label(token(key_position))));
+		return result;
+	}
+	if (!enter_bracket(OP_LBRACE))
+	{
+		restore(saved);
+		return 0;
+	}
+	if (!name.empty())
+		scopes_.Bind(name, BIND_TYPE);
+	scopes_.Push();
+	const AstId result = make(AST_CLASS_SPECIFIER, name);
+	add(result, make(AST_CLASS_KEY, token_label(token(key_position))));
+	add(result, bases);
+	while (!is_simple(OP_RBRACE))
+	{
+		if (at_end())
+		{
+			scopes_.Pop();
+			restore(saved);
+			return 0;
+		}
+		if ((is_simple(KW_PUBLIC) || is_simple(KW_PROTECTED) ||
+			is_simple(KW_PRIVATE)) && is_simple(OP_COLON, pos_ + 1))
+		{
+			const Pa6Token& access = token(pos_++);
+			++pos_;
+			add(result, make(AST_ACCESS_SPECIFIER, token_label(access)));
+			continue;
+		}
+		const AstId member = parse_member_declaration(name);
+		if (member == 0)
+		{
+			scopes_.Pop();
+			restore(saved);
+			return 0;
+		}
+		add(result, member);
+	}
+	if (!leave_bracket(OP_RBRACE))
+	{
+		scopes_.Pop();
+		restore(saved);
+		return 0;
+	}
+	scopes_.Pop();
+	return result;
+}
+
+AstId Pa10Parser::parse_enum_specifier()
+{
+	const Mark saved = mark();
+	if (!consume_simple(KW_ENUM))
+		return 0;
+	const size_t key_position = pos_;
+	bool scoped = false;
+	if (is_simple(KW_CLASS) || is_simple(KW_STRUCT))
+	{
+		++pos_;
+		scoped = true;
+	}
+	string name;
+	if (is_kind(PA6_IDENTIFIER_TOKEN))
+		name = token(pos_++).spelling;
+	AstId underlying = 0;
+	if (consume_simple(OP_COLON))
+	{
+		underlying = parse_type_id();
+		if (underlying == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+	}
+	if (!name.empty())
+		scopes_.Bind(name, BIND_TYPE);
+	const AstId result = make(AST_ENUM_SPECIFIER, name);
+	if (scoped)
+		add(result, make(AST_ENUM_KEY, token_label(token(key_position))));
+	add(result, underlying);
+	if (!is_simple(OP_LBRACE))
+		return result;
+	if (!enter_bracket(OP_LBRACE))
+	{
+		restore(saved);
+		return 0;
+	}
+	vector<string> enumerator_names;
+	if (!is_simple(OP_RBRACE))
+	{
+		while (true)
+		{
+			if (!is_kind(PA6_IDENTIFIER_TOKEN))
+			{
+				restore(saved);
+				return 0;
+			}
+			const string enumerator_name = token(pos_++).spelling;
+			const AstId enumerator = make(AST_ENUMERATOR, enumerator_name);
+			if (consume_simple(OP_ASS))
+			{
+				const AstId value = parse_assignment_expression();
+				if (value == 0)
+				{
+					restore(saved);
+					return 0;
+				}
+				add(enumerator, value);
+			}
+			add(result, enumerator);
+			enumerator_names.push_back(enumerator_name);
+			if (!consume_simple(OP_COMMA))
+				break;
+			if (is_simple(OP_RBRACE))
+				break;
+		}
+	}
+	if (!leave_bracket(OP_RBRACE))
+	{
+		restore(saved);
+		return 0;
+	}
+	for (size_t i = 0; i < enumerator_names.size(); ++i)
+		scopes_.Bind(enumerator_names[i], BIND_VALUE);
+	return result;
+}
+
+AstId Pa10Parser::parse_bit_field_declaration()
+{
+	const Mark saved = mark();
+	AstId specifiers = parse_decl_specifier_seq();
+	if (specifiers == 0)
+		return 0;
+	AstId declarator = 0;
+	if (!is_simple(OP_COLON))
+		declarator = parse_declarator();
+	if (!consume_simple(OP_COLON))
+	{
+		restore(saved);
+		return 0;
+	}
+	AstId width = parse_assignment_expression();
+	if (width == 0 || !consume_simple(OP_SEMICOLON))
+	{
+		restore(saved);
+		return 0;
+	}
+	const AstId bit_declarator = make(AST_BIT_FIELD_DECLARATOR);
+	add(bit_declarator, declarator);
+	add(bit_declarator, width);
+	const AstId result = make(AST_BIT_FIELD_DECLARATION);
+	add(result, specifiers);
+	add(result, bit_declarator);
+	if (declarator != 0)
+		bind_declarator(declarator, BIND_VALUE);
+	return result;
+}
+
+AstId Pa10Parser::parse_mem_initializer()
+{
+	const Mark saved = mark();
+	const size_t name_start = pos_;
+	const AstId name = parse_qualified_name(false);
+	if (name == 0)
+	{
+		restore(saved);
+		return 0;
+	}
+	const AstId result = make(AST_MEM_INITIALIZER);
+	add(result, make(AST_MEM_INITIALIZER_ID, Join(name_start, pos_)));
+	AstId arguments = 0;
+	if (is_simple(OP_LPAREN))
+		arguments = parse_argument_list(AST_PAREN_ARGUMENT_LIST);
+	else if (is_simple(OP_LBRACE))
+		arguments = parse_braced_init_list();
+	if (arguments == 0)
+	{
+		restore(saved);
+		return 0;
+	}
+	add(result, arguments);
+	return result;
+}
+
+AstId Pa10Parser::parse_ctor_initializer()
+{
+	const Mark saved = mark();
+	if (!consume_simple(OP_COLON))
+		return 0;
+	const AstId result = make(AST_CTOR_INITIALIZER);
+	AstId initializer = parse_mem_initializer();
+	if (initializer == 0)
+	{
+		restore(saved);
+		return 0;
+	}
+	add(result, initializer);
+	while (consume_simple(OP_COMMA))
+	{
+		initializer = parse_mem_initializer();
+		if (initializer == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+		add(result, initializer);
+	}
+	return result;
+}
+
+AstId Pa10Parser::parse_throw_specification()
+{
+	const Mark saved = mark();
+	if (!consume_simple(KW_THROW) || !enter_bracket(OP_LPAREN))
+	{
+		restore(saved);
+		return 0;
+	}
+	vector<AstId> types;
+	if (!is_simple(OP_RPAREN))
+	{
+		while (true)
+		{
+			const AstId type = parse_type_id();
+			if (type == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			types.push_back(type);
+			if (!consume_simple(OP_COMMA))
+				break;
+		}
+	}
+	if (!leave_bracket(OP_RPAREN))
+	{
+		restore(saved);
+		return 0;
+	}
+	const AstId result = make(AST_FUNCTION_QUALIFIER,
+		Join(saved.position, pos_));
+	for (size_t i = 0; i < types.size(); ++i)
+		add(result, types[i]);
+	return result;
+}
+
+bool Pa10Parser::parse_member_function_suffixes(AstId declarator)
+{
+	while (true)
+	{
+		if (is_simple(KW_CONST) || is_simple(KW_VOLATILE))
+		{
+			add(declarator, make(AST_CV_QUALIFIER,
+				token_label(token(pos_++))));
+			continue;
+		}
+		if (is_simple(OP_AMP) || is_simple(OP_LAND))
+		{
+			add(declarator, make(AST_REF_QUALIFIER,
+				token_label(token(pos_++))));
+			continue;
+		}
+		if (is_simple(KW_NOEXCEPT))
+		{
+			const Mark saved = mark();
+			const size_t start = pos_++;
+			AstId expression = 0;
+			if (enter_bracket(OP_LPAREN))
+			{
+				expression = parse_expression();
+				if (expression == 0 || !leave_bracket(OP_RPAREN))
+				{
+					restore(saved);
+					return false;
+				}
+			}
+			const AstId qualifier = make(AST_FUNCTION_QUALIFIER,
+				expression == 0 ? "noexcept" : Join(start, pos_));
+			add(qualifier, expression);
+			add(declarator, qualifier);
+			continue;
+		}
+		if (is_simple(KW_THROW))
+		{
+			AstId qualifier = parse_throw_specification();
+			if (qualifier == 0)
+				return false;
+			add(declarator, qualifier);
+			continue;
+		}
+		if (is_kind(PA6_IDENTIFIER_TOKEN) &&
+			(token(pos_).flags & (PA6_FINAL_FLAG | PA6_OVERRIDE_FLAG)) != 0)
+		{
+			add(declarator, make(AST_VIRT_SPECIFIER, token_label(token(pos_++))));
+			continue;
+		}
+		if (is_simple(OP_ARROW))
+		{
+			const AstId trailing = parse_trailing_return_type();
+			if (trailing == 0)
+				return false;
+			add(declarator, trailing);
+			continue;
+		}
+		return true;
+	}
+}
+
+AstId Pa10Parser::parse_special_member_declaration(const string& class_name)
+{
+	const Mark saved = mark();
+	vector<AstId> member_specifiers;
+	while (is_simple(KW_INLINE) || is_simple(KW_EXPLICIT))
+	{
+		const Pa6Token& current = token(pos_++);
+		const string text = current.IsSimple(KW_EXPLICIT) ?
+			string("explicit") : token_label(current);
+		member_specifiers.push_back(make(AST_SPECIFIER, text));
+	}
+
+	AstId identifier = 0;
+	if (!class_name.empty() && is_kind(PA6_IDENTIFIER_TOKEN) &&
+		token(pos_).spelling == class_name && is_simple(OP_LPAREN, pos_ + 1))
+	{
+		identifier = make(AST_IDENTIFIER, token(pos_++).spelling);
+	}
+	else if (!class_name.empty() && is_simple(OP_COMPL) &&
+		is_kind(PA6_IDENTIFIER_TOKEN, pos_ + 1) &&
+		token(pos_ + 1).spelling == class_name &&
+		is_simple(OP_LPAREN, pos_ + 2))
+	{
+		const size_t start = pos_;
+		pos_ += 2;
+		identifier = make(AST_IDENTIFIER, Join(start, pos_));
+	}
+	else if (is_simple(KW_OPERATOR))
+		identifier = parse_operator_function_id();
+	else
+	{
+		restore(saved);
+		return 0;
+	}
+
+	const AstId declarator = make(AST_DECLARATOR);
+	add(declarator, identifier);
+	const AstId parameters = parse_parameter_clause();
+	if (parameters == 0)
+	{
+		restore(saved);
+		return 0;
+	}
+	add(declarator, parameters);
+	if (!parse_member_function_suffixes(declarator))
+	{
+		restore(saved);
+		return 0;
+	}
+
+	AstId ctor_initializer = 0;
+	if (is_simple(OP_COLON))
+	{
+		ctor_initializer = parse_ctor_initializer();
+		if (ctor_initializer == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+	}
+
+	AstId body = 0;
+	if (is_simple(OP_LBRACE))
+	{
+		body = parse_compound_statement();
+		if (body == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+	}
+	AstId initializer = 0;
+	if (body == 0 && ctor_initializer == 0 && consume_simple(OP_ASS))
+	{
+		if (!is_simple(KW_DEFAULT) && !is_simple(KW_DELETE))
+		{
+			restore(saved);
+			return 0;
+		}
+		const string spelling = token(pos_++).spelling;
+		initializer = make(AST_INITIALIZER, "", vector<AstId>(1,
+			make(AST_SPECIAL_INITIALIZER, spelling)));
+	}
+	if (body == 0 && !consume_simple(OP_SEMICOLON))
+	{
+		restore(saved);
+		return 0;
+	}
+	const string name = arena_.At(identifier).text;
+	const AstId result = make(body == 0 ? AST_SPECIAL_MEMBER_DECLARATION :
+		AST_SPECIAL_MEMBER_DEFINITION, name);
+	for (size_t i = 0; i < member_specifiers.size(); ++i)
+		add(result, member_specifiers[i]);
+	add(result, declarator);
+	add(result, ctor_initializer);
+	add(result, initializer);
+	add(result, body);
+	return result;
+}
+
+AstId Pa10Parser::parse_member_declaration(const string& class_name)
+{
+	const Mark saved = mark();
+	AstId special = parse_special_member_declaration(class_name);
+	if (special != 0)
+		return special;
+	restore(saved);
+	AstId bit_field = parse_bit_field_declaration();
+	if (bit_field != 0)
+		return bit_field;
+	restore(saved);
+	AstId declaration = parse_declaration();
+	if (declaration != 0)
+		return declaration;
+	restore(saved);
+	return 0;
+}
+
+AstId Pa10Parser::parse_special_member_definition()
+{
+	const Mark saved = mark();
+	const size_t start = pos_;
+	if (!is_kind(PA6_IDENTIFIER_TOKEN))
+		return 0;
+	const string first_name = token(pos_).spelling;
+	size_t cursor = pos_ + 1;
+	bool qualified = false;
+	bool conversion = false;
+	bool destructor = false;
+	string final_name;
+	while (is_simple(OP_COLON2, cursor))
+	{
+		qualified = true;
+		++cursor;
+		if (token(cursor).IsSimple(KW_OPERATOR))
+		{
+			conversion = true;
+			++cursor;
+			if (token(cursor).kind == PA6_EOF_TOKEN ||
+				token(cursor).IsSimple(OP_LPAREN) ||
+				token(cursor).IsSimple(OP_PLUS) ||
+				token(cursor).IsSimple(OP_MINUS) ||
+				token(cursor).IsSimple(OP_STAR) ||
+				token(cursor).IsSimple(OP_AMP))
+			{
+				restore(saved);
+				return 0;
+			}
+			while (!token(cursor).IsSimple(OP_LPAREN))
+			{
+				if (token(cursor).kind == PA6_EOF_TOKEN ||
+					token(cursor).IsSimple(OP_SEMICOLON) ||
+					token(cursor).IsSimple(OP_LBRACE))
+				{
+					restore(saved);
+					return 0;
+				}
+				++cursor;
+			}
+			break;
+		}
+		if (token(cursor).IsSimple(OP_COMPL))
+		{
+			destructor = true;
+			++cursor;
+			if (!token(cursor).IsIdentifier())
+			{
+				restore(saved);
+				return 0;
+			}
+			final_name = token(cursor++).spelling;
+			break;
+		}
+		if (!token(cursor).IsIdentifier())
+		{
+			restore(saved);
+			return 0;
+		}
+		final_name = token(cursor++).spelling;
+	}
+	if (!qualified || !token(cursor).IsSimple(OP_LPAREN) ||
+		(!conversion && !destructor && final_name != first_name))
+	{
+		restore(saved);
+		return 0;
+	}
+	pos_ = cursor;
+	const string name = Join(start, pos_);
+	const AstId declarator = make(AST_DECLARATOR);
+	add(declarator, make(AST_IDENTIFIER, name));
+	const AstId parameters = parse_parameter_clause();
+	if (parameters == 0)
+	{
+		restore(saved);
+		return 0;
+	}
+	add(declarator, parameters);
+	if (!parse_member_function_suffixes(declarator))
+	{
+		restore(saved);
+		return 0;
+	}
+	AstId ctor_initializer = 0;
+	if (is_simple(OP_COLON))
+	{
+		ctor_initializer = parse_ctor_initializer();
+		if (ctor_initializer == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+	}
+	AstId body = parse_compound_statement();
+	if (body == 0)
+	{
+		restore(saved);
+		return 0;
+	}
+	const AstId result = make(AST_SPECIAL_MEMBER_DEFINITION, name);
+	add(result, declarator);
+	add(result, ctor_initializer);
+	add(result, body);
+	return result;
+}
 
 AstId Pa10Parser::parse_decl_specifier_seq()
 {
@@ -44,6 +829,46 @@ AstId Pa10Parser::parse_decl_specifier_seq()
 		{
 			AstId specifier = make(AST_DECL_SPECIFIER, token_label(current));
 			++pos_;
+			add(result, specifier);
+			have = true;
+			committed_type = true;
+			continue;
+		}
+		if (current.IsSimple(OP_COLON2))
+		{
+			const size_t start = pos_;
+			if (parse_qualified_name(false) == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			add(result, make(AST_DECL_SPECIFIER, Join(start, pos_)));
+			have = true;
+			committed_type = true;
+			continue;
+		}
+		if (current.IsSimple(KW_CLASS) || current.IsSimple(KW_STRUCT) ||
+			current.IsSimple(KW_UNION))
+		{
+			AstId specifier = parse_class_specifier(false);
+			if (specifier == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			add(result, specifier);
+			have = true;
+			committed_type = true;
+			continue;
+		}
+		if (current.IsSimple(KW_ENUM))
+		{
+			AstId specifier = parse_enum_specifier();
+			if (specifier == 0)
+			{
+				restore(saved);
+				return 0;
+			}
 			add(result, specifier);
 			have = true;
 			committed_type = true;
@@ -83,7 +908,8 @@ AstId Pa10Parser::parse_decl_specifier_seq()
 			if (committed_type)
 				break;
 			const BindKind* binding = scopes_.Lookup(current.spelling);
-			if (binding != 0 && !IsTypeLikeBinding(binding))
+			if (binding != 0 && !IsTypeLikeBinding(binding) &&
+				!is_simple(OP_COLON2, pos_ + 1))
 				break;
 			const size_t start = pos_;
 			AstId name = parse_qualified_name(false);
@@ -149,6 +975,46 @@ AstId Pa10Parser::parse_type_specifier_seq()
 			committed = true;
 			continue;
 		}
+		if (current.IsSimple(OP_COLON2))
+		{
+			const size_t start = pos_;
+			if (parse_qualified_name(false) == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			add(result, make(AST_TYPE_NAME, Join(start, pos_)));
+			have = true;
+			committed = true;
+			continue;
+		}
+		if (current.IsSimple(KW_CLASS) || current.IsSimple(KW_STRUCT) ||
+			current.IsSimple(KW_UNION))
+		{
+			AstId specifier = parse_class_specifier(false);
+			if (specifier == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			add(result, specifier);
+			have = true;
+			committed = true;
+			continue;
+		}
+		if (current.IsSimple(KW_ENUM))
+		{
+			AstId specifier = parse_enum_specifier();
+			if (specifier == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			add(result, specifier);
+			have = true;
+			committed = true;
+			continue;
+		}
 		if (current.IsSimple(KW_DECLTYPE))
 		{
 			AstId specifier = parse_decltype_specifier(true);
@@ -181,7 +1047,8 @@ AstId Pa10Parser::parse_type_specifier_seq()
 			if (committed)
 				break;
 			const BindKind* binding = scopes_.Lookup(current.spelling);
-			if (binding != 0 && !IsTypeLikeBinding(binding))
+			if (binding != 0 && !IsTypeLikeBinding(binding) &&
+				!is_simple(OP_COLON2, pos_ + 1))
 				break;
 			const size_t start = pos_;
 			AstId name = parse_qualified_name(false);
@@ -448,9 +1315,9 @@ AstId Pa10Parser::parse_declarator(bool allow_abstract)
 			add(result, make(AST_REF_QUALIFIER, token_label(token(pos_++))));
 			continue;
 		}
-		if (is_simple(KW_NOEXCEPT))
-		{
-			const size_t start = pos_++;
+			if (is_simple(KW_NOEXCEPT))
+			{
+				const size_t start = pos_++;
 			AstId expression = 0;
 			if (enter_bracket(OP_LPAREN))
 			{
@@ -466,8 +1333,19 @@ AstId Pa10Parser::parse_declarator(bool allow_abstract)
 				add(suffix, expression);
 				add(result, suffix);
 				continue;
-		}
-		if (is_kind(PA6_IDENTIFIER_TOKEN) &&
+			}
+			if (is_simple(KW_THROW))
+			{
+				AstId suffix = parse_throw_specification();
+				if (suffix == 0)
+				{
+					restore(saved);
+					return 0;
+				}
+				add(result, suffix);
+				continue;
+			}
+			if (is_kind(PA6_IDENTIFIER_TOKEN) &&
 			(token(pos_).flags & (PA6_FINAL_FLAG | PA6_OVERRIDE_FLAG)) != 0)
 		{
 			add(result, make(AST_VIRT_SPECIFIER, token_label(token(pos_++))));
@@ -894,6 +1772,17 @@ AstId Pa10Parser::parse_operator_function_id()
 		++pos_;
 		return make(AST_IDENTIFIER, operator_name(start, pos_));
 	}
+	if (is_simple(OP_COLON2))
+	{
+		if (parse_qualified_name(false) == 0)
+		{
+			restore(saved);
+			return 0;
+		}
+		while (is_simple(OP_STAR) || is_simple(OP_AMP) || is_simple(OP_LAND))
+			++pos_;
+		return make(AST_IDENTIFIER, operator_name(start, pos_));
+	}
 	if (is_kind(PA6_IDENTIFIER_TOKEN))
 	{
 		++pos_;
@@ -906,11 +1795,32 @@ AstId Pa10Parser::parse_operator_function_id()
 		return make(AST_IDENTIFIER, operator_name(start, pos_));
 	}
 	const ETokenType type = token(pos_).simple_type;
+	if (type == OP_LSQUARE)
+	{
+		++pos_;
+		if (!consume_simple(OP_RSQUARE))
+		{
+			restore(saved);
+			return 0;
+		}
+		return make(AST_IDENTIFIER, operator_name(start, pos_));
+	}
+	if (type == OP_LPAREN)
+	{
+		++pos_;
+		if (!consume_simple(OP_RPAREN))
+		{
+			restore(saved);
+			return 0;
+		}
+		return make(AST_IDENTIFIER, operator_name(start, pos_));
+	}
 	if (type == OP_LSQUARE || type == OP_RSQUARE || type == OP_ARROW ||
 		type == OP_ARROWSTAR || type == OP_PLUS || type == OP_MINUS ||
 		type == OP_STAR || type == OP_AMP || type == OP_LAND ||
 		type == OP_LOR || type == OP_EQ || type == OP_NE || type == OP_LT ||
-		type == OP_GT || type == OP_COMMA || type == OP_LNOT)
+		type == OP_GT || type == OP_COMMA || type == OP_LNOT ||
+		type == OP_ASS)
 	{
 		++pos_;
 		return make(AST_IDENTIFIER, operator_name(start, pos_));
