@@ -169,9 +169,10 @@ public:
 	const string& buf;
 	size_t pos;
 	bool raw;
+	bool last_was_ucn;
 
 	SourceDecoder(const string& buf)
-		: buf(buf), pos(0), raw(false)
+		: buf(buf), pos(0), raw(false), last_was_ucn(false)
 	{
 		if (buf.size() >= 3 &&
 			static_cast<unsigned char>(buf[0]) == 0xEF &&
@@ -182,6 +183,7 @@ public:
 
 	int next()
 	{
+		last_was_ucn = false;
 		while (true)
 		{
 			int codepoint = NextPhysical();
@@ -212,7 +214,10 @@ public:
 
 				int universal;
 				if (TryDecodeUniversalCharacterName(universal))
+				{
+					last_was_ucn = true;
 					return universal;
+				}
 			}
 			return codepoint;
 		}
@@ -221,17 +226,45 @@ public:
 	int peek(size_t lookahead = 0)
 	{
 		size_t saved = mark();
+		bool saved_last_was_ucn = last_was_ucn;
 		try
 		{
 			int result = EndOfFile;
 			for (size_t i = 0; i <= lookahead; ++i)
 				result = next();
 			rewind(saved);
+			last_was_ucn = saved_last_was_ucn;
 			return result;
 		}
 		catch (...)
 		{
 			rewind(saved);
+			last_was_ucn = saved_last_was_ucn;
+			throw;
+		}
+	}
+
+	bool peek_is_ucn(size_t lookahead = 0)
+	{
+		size_t saved = mark();
+		bool saved_last_was_ucn = last_was_ucn;
+		try
+		{
+			bool result = false;
+			for (size_t i = 0; i <= lookahead; ++i)
+			{
+				next();
+				if (i == lookahead)
+					result = last_was_ucn;
+			}
+			rewind(saved);
+			last_was_ucn = saved_last_was_ucn;
+			return result;
+		}
+		catch (...)
+		{
+			rewind(saved);
+			last_was_ucn = saved_last_was_ucn;
 			throw;
 		}
 	}
@@ -495,6 +528,160 @@ string TakeAscii(SourceDecoder& decoder, const char* spelling)
 	return string(spelling);
 }
 
+bool IsOctalDigit(int codepoint)
+{
+	return codepoint >= '0' && codepoint <= '7';
+}
+
+bool IsSimpleEscape(int codepoint)
+{
+	return codepoint == '\'' || codepoint == '"' || codepoint == '?' ||
+		codepoint == '\\' || codepoint == 'a' || codepoint == 'b' ||
+		codepoint == 'f' || codepoint == 'n' || codepoint == 'r' ||
+		codepoint == 't' || codepoint == 'v';
+}
+
+bool IsRawDelimiterCharacter(int codepoint)
+{
+	return codepoint >= 0x20 && codepoint <= 0x7E &&
+		codepoint != '(' && codepoint != ')' && codepoint != '\\' &&
+		codepoint != '\t' && codepoint != '\v' && codepoint != '\f';
+}
+
+void ScanEscapeSequence(SourceDecoder& decoder, string& token)
+{
+	AppendCodePoint(token, decoder.next()); // backslash
+
+	int escaped = decoder.peek();
+	if (escaped == EndOfFile || escaped == '\n' || escaped == '\r' ||
+		decoder.peek_is_ucn())
+		throw runtime_error("Invalid escape sequence");
+
+	if (IsSimpleEscape(escaped))
+	{
+		AppendCodePoint(token, decoder.next());
+		return;
+	}
+
+	if (escaped == 'x')
+	{
+		AppendCodePoint(token, decoder.next());
+		if (HexValue(decoder.peek()) < 0)
+			throw runtime_error("Invalid hex escape sequence");
+		while (HexValue(decoder.peek()) >= 0)
+			AppendCodePoint(token, decoder.next());
+		return;
+	}
+
+	if (IsOctalDigit(escaped))
+	{
+		for (int digits = 0; digits < 3 && IsOctalDigit(decoder.peek()); ++digits)
+			AppendCodePoint(token, decoder.next());
+		return;
+	}
+
+	throw runtime_error("Invalid escape sequence");
+}
+
+string ScanDelimitedLiteral(SourceDecoder& decoder, char delimiter,
+	const char* prefix, bool character_literal)
+{
+	string token = TakeAscii(decoder, prefix);
+	AppendCodePoint(token, decoder.next()); // opening quote
+	bool has_content = false;
+
+	while (true)
+	{
+		int codepoint = decoder.peek();
+		bool from_ucn = decoder.peek_is_ucn();
+		if (codepoint == EndOfFile || codepoint == '\n' || codepoint == '\r')
+			throw runtime_error("Unterminated literal");
+
+		if (!from_ucn && codepoint == delimiter)
+		{
+			AppendCodePoint(token, decoder.next());
+			if (character_literal && !has_content)
+				throw runtime_error("Empty character literal");
+			return token;
+		}
+
+		if (!from_ucn && codepoint == '\\')
+			ScanEscapeSequence(decoder, token);
+		else
+			AppendCodePoint(token, decoder.next());
+		has_content = true;
+	}
+}
+
+string ScanRawStringLiteral(SourceDecoder& decoder, const char* prefix)
+{
+	string token = TakeAscii(decoder, prefix);
+	TakeAscii(decoder, "\"");
+	token += '"';
+
+	string delimiter;
+	while (true)
+	{
+		int codepoint = decoder.peek();
+		if (codepoint == EndOfFile)
+			throw runtime_error("Unterminated raw string literal");
+		if (codepoint == '(')
+		{
+			AppendCodePoint(token, decoder.next());
+			break;
+		}
+		if (delimiter.size() == 16)
+			throw runtime_error("Raw string delimiter too long");
+		if (!IsRawDelimiterCharacter(codepoint))
+			throw runtime_error("Invalid raw string delimiter");
+		string character;
+		AppendCodePoint(character, decoder.next());
+		delimiter += character;
+		token += character;
+	}
+
+	string closing = ")" + delimiter + '"';
+	decoder.raw = true;
+	try
+	{
+		while (true)
+		{
+			if (decoder.peek() == ')' && MatchAscii(decoder, closing.c_str()))
+			{
+				token += TakeAscii(decoder, closing.c_str());
+				decoder.raw = false;
+				return token;
+			}
+
+			if (decoder.peek() == EndOfFile)
+				throw runtime_error("Unterminated raw string literal");
+			AppendCodePoint(token, decoder.next());
+		}
+	}
+	catch (...)
+	{
+		decoder.raw = false;
+		throw;
+	}
+}
+
+const char* RawStringPrefix(SourceDecoder& decoder)
+{
+	if (MatchAscii(decoder, "u8R\"")) return "u8R";
+	if (MatchAscii(decoder, "uR\"")) return "uR";
+	if (MatchAscii(decoder, "UR\"")) return "UR";
+	if (MatchAscii(decoder, "LR\"")) return "LR";
+	if (MatchAscii(decoder, "R\"")) return "R";
+	return nullptr;
+}
+
+string ScanUserDefinedSuffix(SourceDecoder& decoder)
+{
+	if (!IsIdentifierStart(decoder.peek()))
+		return string();
+	return ScanIdentifier(decoder);
+}
+
 string ScanLessOperator(SourceDecoder& decoder)
 {
 	int fourth = decoder.peek(3);
@@ -659,9 +846,57 @@ bool ConsumeWhitespaceSequence(SourceDecoder& decoder)
 
 void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output)
 {
+	const char* raw_prefix = RawStringPrefix(decoder);
+	if (raw_prefix != nullptr)
+	{
+		string token = ScanRawStringLiteral(decoder, raw_prefix);
+		string suffix = ScanUserDefinedSuffix(decoder);
+		token += suffix;
+		if (suffix.empty())
+			output.emit_string_literal(token);
+		else
+			output.emit_user_defined_string_literal(token);
+		return;
+	}
+
+	const char* character_prefix = nullptr;
+	if (MatchAscii(decoder, "u'")) character_prefix = "u";
+	else if (MatchAscii(decoder, "U'")) character_prefix = "U";
+	else if (MatchAscii(decoder, "L'")) character_prefix = "L";
+	else if (decoder.peek() == '\'') character_prefix = "";
+
+	if (character_prefix != nullptr)
+	{
+		string token = ScanDelimitedLiteral(decoder, '\'', character_prefix, true);
+		string suffix = ScanUserDefinedSuffix(decoder);
+		token += suffix;
+		if (suffix.empty())
+			output.emit_character_literal(token);
+		else
+			output.emit_user_defined_character_literal(token);
+		return;
+	}
+
+	const char* string_prefix = nullptr;
+	if (MatchAscii(decoder, "u8\"")) string_prefix = "u8";
+	else if (MatchAscii(decoder, "u\"")) string_prefix = "u";
+	else if (MatchAscii(decoder, "U\"")) string_prefix = "U";
+	else if (MatchAscii(decoder, "L\"")) string_prefix = "L";
+	else if (decoder.peek() == '"') string_prefix = "";
+
+	if (string_prefix != nullptr)
+	{
+		string token = ScanDelimitedLiteral(decoder, '"', string_prefix, false);
+		string suffix = ScanUserDefinedSuffix(decoder);
+		token += suffix;
+		if (suffix.empty())
+			output.emit_string_literal(token);
+		else
+			output.emit_user_defined_string_literal(token);
+		return;
+	}
+
 	int codepoint = decoder.peek();
-	if (codepoint == '\'' || codepoint == '"')
-		throw NotImplementedException();
 
 	if (IsIdentifierStart(codepoint))
 	{

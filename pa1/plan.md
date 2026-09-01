@@ -127,31 +127,33 @@ Scale is tiny (largest fixture 4.1 KB) but keep the boundary honest:
 | id  | scope                                                      | proof of progress                          | status |
 |-----|------------------------------------------------------------|--------------------------------------------|--------|
 | CP1 | decoder pipeline + core tokenizer + build wiring            | 24 packet core fixtures pass; `make test-pa1` is 25/53 (28 failures vs 53 at start); prior-through and file audit pass | DONE |
-| CP2 | char/string/ud/raw literals + escape validation             | group-2 fixtures pass; ~48/53 green        | ACTIVE |
-| CP3 | header-name context + integration endgame                   | 53/53; `make test-report-through-pa1` clean; file audit still green | todo   |
+| CP2 | char/string/ud/raw literals + escape validation             | all 22 listed group-2 fixtures pass; `make test-pa1` and through report are 49/53 (4 deferred group-3 failures); prior-through and file audit pass | DONE |
+| CP3 | header-name context + integration endgame                   | 53/53; `make test-report-through-pa1` clean; file audit still green | ACTIVE |
 
 Each checkpoint is one commit at a stable ownership boundary. Adding new tests
 is out of scope; progress = existing failure reduction only.
 
-## Active Checkpoint: CP2 — literals + escapes
+## Active Checkpoint: CP3 — header-name context + integration
 
-Replace the intentional `NotImplementedException` quote arm with plain and
-raw character/string literal tokenization, encoding prefixes, UCN and escape
-validation, user-defined suffixes, and the decoder’s raw-mode boundary. Keep
-the CP1 decoder and core-token behavior unchanged; header-name context remains
-CP3.
+Add header-name context tracking to the CP1/CP2 tokenizer: at start of file or
+after a new-line, recognize `#` or `%:` followed by transparent whitespace and
+the identifier `include`, then emit the following `<...>` or `"..."` as a
+header-name token. Preserve ordinary operator/string behavior outside that
+context and keep the public `PPTokenize` boundary unchanged.
 
 ### Implementation Packet
 
 - Files/symbols:
-  - EDIT `dev/src/pptoken_lexer.cpp`: extend `EmitCoreToken` and add bounded
-    literal scanners; use `SourceDecoder::raw` for raw bodies and preserve the
-    one-pass decoder ownership. Validate simple, numeric, hex, octal, and UCN
-    escapes before emitting the complete token.
-  - Keep `dev/src/pptoken_lexer.h`’s public `PPTokenize` boundary and the CP1
-    build wiring unchanged unless a literal-only helper needs a declaration.
-- Fixture groups: target = Failure Map group 2; preserve all 24 CP1 core
-  successes and the intentional header-name gap in group 3.
-- Focused commands: `make -C dev pptoken`, then the group-2 fixture loop.
+  - EDIT `dev/src/pptoken_lexer.cpp`: extend `PPTokenize`/`EmitCoreToken`
+    ownership with bounded header-name scanning and directive context; accept
+    trigraph-, splice-, and comment-formed `#`/`include` sequences.
+  - Keep `dev/src/pptoken_lexer.h`’s public `PPTokenize` boundary and the
+    existing CP1/CP2 build wiring unchanged.
+- Fixture group: target = Failure Map group 3 (`pa1/tests/200-header-name`,
+  `pa1/tests/900-real-world`, `cppgm.tests/course/pa1/200-header-name`,
+  `cppgm.tests/course/pa1/200-alternative-include-header-context`,
+  `cppgm.tests/course/pa1/300-trigraph-line-splice-comment-include`);
+  preserve all prior 49 passing fixtures.
+- Focused commands: `make -C dev pptoken`, then the group-3 fixture loop.
   Broad proof remains `make test-pa1`, `make test-report-through-pa1`, and
   `perl scripts/cppgm_file_audit.pl --stage pa1 --paths dev/src`.
