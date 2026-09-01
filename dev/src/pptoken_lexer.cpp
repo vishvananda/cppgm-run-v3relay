@@ -682,6 +682,58 @@ string ScanUserDefinedSuffix(SourceDecoder& decoder)
 	return ScanIdentifier(decoder);
 }
 
+bool TryScanHeaderName(SourceDecoder& decoder, int opening,
+	string& token)
+{
+	size_t saved = decoder.mark();
+	int closing = opening == '<' ? '>' : '"';
+	token.clear();
+	AppendCodePoint(token, decoder.next());
+
+	while (true)
+	{
+		int codepoint = decoder.next();
+		if (codepoint == EndOfFile || codepoint == '\n' || codepoint == '\r')
+		{
+			decoder.rewind(saved);
+			token.clear();
+			return false;
+		}
+
+		AppendCodePoint(token, codepoint);
+		if (codepoint == closing)
+			return true;
+	}
+}
+
+enum DirectiveContext
+{
+	NoDirective,
+	AfterDirectiveHash,
+	ExpectingHeaderName
+};
+
+void AdvanceDirectiveContext(bool at_start_of_line, const string& token,
+	DirectiveContext& context)
+{
+	if (context == AfterDirectiveHash)
+	{
+		context = token == "include" ? ExpectingHeaderName : NoDirective;
+		return;
+	}
+
+	if (context == ExpectingHeaderName)
+	{
+		context = NoDirective;
+		return;
+	}
+
+	if (at_start_of_line && (token == "#" || token == "%:"))
+		context = AfterDirectiveHash;
+	else
+		context = NoDirective;
+}
+
 string ScanLessOperator(SourceDecoder& decoder)
 {
 	int fourth = decoder.peek(3);
@@ -844,8 +896,24 @@ bool ConsumeWhitespaceSequence(SourceDecoder& decoder)
 	}
 }
 
-void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output)
+void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output,
+	bool at_start_of_line, DirectiveContext& context)
 {
+	if (context == ExpectingHeaderName)
+	{
+		int opening = decoder.peek();
+		if (opening == '<' || opening == '"')
+		{
+			string token;
+			if (TryScanHeaderName(decoder, opening, token))
+			{
+				output.emit_header_name(token);
+				context = NoDirective;
+				return;
+			}
+		}
+	}
+
 	const char* raw_prefix = RawStringPrefix(decoder);
 	if (raw_prefix != nullptr)
 	{
@@ -856,6 +924,7 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output)
 			output.emit_string_literal(token);
 		else
 			output.emit_user_defined_string_literal(token);
+		AdvanceDirectiveContext(at_start_of_line, token, context);
 		return;
 	}
 
@@ -874,6 +943,7 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output)
 			output.emit_character_literal(token);
 		else
 			output.emit_user_defined_character_literal(token);
+		AdvanceDirectiveContext(at_start_of_line, token, context);
 		return;
 	}
 
@@ -893,6 +963,7 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output)
 			output.emit_string_literal(token);
 		else
 			output.emit_user_defined_string_literal(token);
+		AdvanceDirectiveContext(at_start_of_line, token, context);
 		return;
 	}
 
@@ -905,13 +976,16 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output)
 			output.emit_preprocessing_op_or_punc(token);
 		else
 			output.emit_identifier(token);
+		AdvanceDirectiveContext(at_start_of_line, token, context);
 		return;
 	}
 
 	if (IsAsciiDigit(codepoint) ||
 		(codepoint == '.' && IsAsciiDigit(decoder.peek(1))))
 	{
-		output.emit_pp_number(ScanPPNumber(decoder));
+		string token = ScanPPNumber(decoder);
+		output.emit_pp_number(token);
+		AdvanceDirectiveContext(at_start_of_line, token, context);
 		return;
 	}
 
@@ -919,10 +993,13 @@ void EmitCoreToken(SourceDecoder& decoder, IPPTokenStream& output)
 	if (!operator_token.empty())
 	{
 		output.emit_preprocessing_op_or_punc(operator_token);
+		AdvanceDirectiveContext(at_start_of_line, operator_token, context);
 		return;
 	}
 
-	output.emit_non_whitespace_char(encode_utf8(decoder.next()));
+	string token = encode_utf8(decoder.next());
+	output.emit_non_whitespace_char(token);
+	AdvanceDirectiveContext(at_start_of_line, token, context);
 }
 
 } // namespace
@@ -932,6 +1009,8 @@ void PPTokenize(const string& input, IPPTokenStream& output)
 	SourceDecoder decoder(input);
 	bool saw_logical_character = false;
 	bool ended_with_new_line = false;
+	bool at_start_of_line = true;
+	DirectiveContext context = NoDirective;
 
 	while (decoder.peek() != EndOfFile)
 	{
@@ -948,13 +1027,16 @@ void PPTokenize(const string& input, IPPTokenStream& output)
 			decoder.next();
 			saw_logical_character = true;
 			ended_with_new_line = true;
+			at_start_of_line = true;
+			context = NoDirective;
 			output.emit_new_line();
 			continue;
 		}
 
-		EmitCoreToken(decoder, output);
+		EmitCoreToken(decoder, output, at_start_of_line, context);
 		saw_logical_character = true;
 		ended_with_new_line = false;
+		at_start_of_line = false;
 	}
 
 	if (saw_logical_character && !ended_with_new_line)

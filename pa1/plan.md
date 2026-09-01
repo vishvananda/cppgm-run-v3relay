@@ -128,12 +128,12 @@ Scale is tiny (largest fixture 4.1 KB) but keep the boundary honest:
 |-----|------------------------------------------------------------|--------------------------------------------|--------|
 | CP1 | decoder pipeline + core tokenizer + build wiring            | 24 packet core fixtures pass; `make test-pa1` is 25/53 (28 failures vs 53 at start); prior-through and file audit pass | DONE |
 | CP2 | char/string/ud/raw literals + escape validation             | all 22 listed group-2 fixtures pass; `make test-pa1` and through report are 49/53 (4 deferred group-3 failures); prior-through and file audit pass | DONE |
-| CP3 | header-name context + integration endgame                   | 53/53; `make test-report-through-pa1` clean; file audit still green | ACTIVE |
+| CP3 | header-name context + integration endgame                   | all 5 group-3 fixtures pass; `make test-pa1` and `make test-report-through-pa1` are 53/53; prior-through and file audit pass | DONE |
 
 Each checkpoint is one commit at a stable ownership boundary. Adding new tests
 is out of scope; progress = existing failure reduction only.
 
-## Active Checkpoint: CP3 — header-name context + integration
+## Completed Checkpoint: CP3 — header-name context + integration
 
 Add header-name context tracking to the CP1/CP2 tokenizer: at start of file or
 after a new-line, recognize `#` or `%:` followed by transparent whitespace and
@@ -157,3 +157,9 @@ context and keep the public `PPTokenize` boundary unchanged.
 - Focused commands: `make -C dev pptoken`, then the group-3 fixture loop.
   Broad proof remains `make test-pa1`, `make test-report-through-pa1`, and
   `perl scripts/cppgm_file_audit.pl --stage pa1 --paths dev/src`.
+
+## Active Checkpoint: PA2 planning handoff
+
+PA1 is complete through CP3. The next active checkpoint is to packetize PA2
+from its assignment contract before implementation; no PA1 checkpoint remains
+active.
