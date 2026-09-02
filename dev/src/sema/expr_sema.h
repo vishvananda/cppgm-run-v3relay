@@ -86,6 +86,17 @@ private:
                                ScopeId scope,
                                const std::vector<AstId>& arguments);
   SemaId AnalyzeBraced(AstId expression, ScopeId scope, TypeId target);
+  bool IsAggregateType(TypeId type) const;
+  bool IsStringLiteralArrayClause(AstId clause, TypeId target) const;
+  SemaId AnalyzeAggregateClause(const std::vector<AstId>& clauses,
+                                AstId clause, ScopeId scope, TypeId target,
+                                std::size_t& index);
+  void AnalyzeAggregateElements(const std::vector<AstId>& clauses,
+                                std::size_t& index, ScopeId scope,
+                                TypeId target, SemaId result);
+  SemaId AnalyzeElidedAggregate(const std::vector<AstId>& clauses,
+                                std::size_t& index, ScopeId scope,
+                                TypeId target);
 
   Info NodeInfo(SemaId node) const;
   SemaId MakeExpression(SemaKind kind, AstId source, TypeId type,

@@ -441,6 +441,26 @@ AstId Pa10Parser::parse_postfix_suffixes(AstId expression)
 			expression = result;
 			continue;
 		}
+		// C++11 list-initialization of a named class type has the same
+		// postfix shape as a functional cast; retaining the braced list as
+		// the argument node lets semantic analysis select constructors and
+		// apply aggregate rules from the destination type.
+		if (is_simple(OP_LBRACE) &&
+			arena_.At(expression).kind == AST_ID_EXPRESSION &&
+			(saved.position < 2 || !is_simple(OP_STAR, saved.position - 2)))
+		{
+			AstId arguments = parse_braced_init_list();
+			if (arguments == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			const AstId result = make(AST_CALL_EXPRESSION);
+			add(result, expression);
+			add(result, arguments);
+			expression = result;
+			continue;
+		}
 		if (is_simple(OP_LSQUARE))
 		{
 			++pos_;

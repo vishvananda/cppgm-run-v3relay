@@ -454,7 +454,7 @@ void PreprocEngine::MarkPragmaOnce(int presumed_file)
 }
 
 void PreprocEngine::ProcessPragma(const vector<PPToken>& line,
-	int presumed_file)
+	int presumed_file, PostTokenStream& output)
 {
 	if (line.size() >= 3 && line[2].kind == PP_TOKEN_IDENTIFIER &&
 		line[2].data == "once")
@@ -463,13 +463,27 @@ void PreprocEngine::ProcessPragma(const vector<PPToken>& line,
 			throw PreprocError("malformed pragma once");
 		MarkPragmaOnce(presumed_file);
 	}
+	else if (line.size() >= 3 && line[2].kind == PP_TOKEN_IDENTIFIER &&
+		line[2].data == "pack")
+	{
+		string text;
+		for (size_t i = 2; i < line.size(); ++i)
+			text += line[i].data;
+		output.emit_pragma(text);
+	}
 }
 
-void PreprocEngine::ProcessPragmaText(const string& text, int presumed_file)
+void PreprocEngine::ProcessPragmaText(const string& text, int presumed_file,
+	PostTokenStream& output)
 {
 	istringstream words(text);
 	string first;
 	words >> first;
+	if (first == "pack")
+	{
+		output.emit_pragma(text);
+		return;
+	}
 	if (first != "once")
 		return;
 
@@ -500,9 +514,9 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 		if (!text.empty())
 		{
 			MacroFlushText(text, table_, output,
-				[this, &presumed_file](const string& pragma)
+				[this, &presumed_file, &output](const string& pragma)
 				{
-					ProcessPragmaText(pragma, presumed_file);
+					ProcessPragmaText(pragma, presumed_file, output);
 				});
 			text.clear();
 		}
@@ -655,7 +669,7 @@ void PreprocEngine::ProcessTokens(const vector<PPToken>& tokens,
 			else if (active && IsDirective(line, "pragma"))
 			{
 				flush_text();
-				ProcessPragma(line, presumed_file);
+				ProcessPragma(line, presumed_file, output);
 			}
 			else if (active)
 			{

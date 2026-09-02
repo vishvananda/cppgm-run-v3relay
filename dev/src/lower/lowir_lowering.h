@@ -243,6 +243,34 @@ private:
                         TypeId expected);
   Value LowerScalarBinary(SemaId node, Value left, TypeId expected);
   Value LowerAssignment(SemaId node, Value* assigned_lvalue = 0);
+  bool FindBitField(SemaId node, ClassField& field) const;
+  TypeId BitFieldValueType(const ClassField& field) const;
+  long long BitFieldMask(const ClassField& field) const;
+  lowir_model::Operand EncodeBitField(const ClassField& field,
+                                       TypeId value_type,
+                                       const lowir_model::Operand& value,
+                                       TypeId storage_type = 0,
+                                       bool value_first = false);
+  lowir_model::Operand MergeBitField(const ClassField& field,
+                                     const lowir_model::Operand& destination,
+                                     TypeId value_type,
+                                     const lowir_model::Operand& value,
+                                     bool preserve,
+                                     TypeId storage_type = 0,
+                                     bool encode_first = false);
+  void StoreBitField(const ClassField& field,
+                     const lowir_model::Operand& destination,
+                     TypeId value_type,
+                     const lowir_model::Operand& value,
+                     bool preserve,
+                     TypeId storage_type = 0,
+                     bool encode_first = false);
+  Value LoadBitField(SemaId node, const ClassField& field);
+  Value ReadBitField(const Value& field_lvalue,
+                     const ClassField& field);
+  std::string BitFieldUnitKey(const ClassField& field) const;
+  bool BitFieldUnitInitialized(const ClassField& field) const;
+  void MarkBitFieldUnitInitialized(const ClassField& field);
   Value LowerConditional(SemaId node, TypeId expected);
   Value LowerCall(SemaId node, TypeId expected);
   Value LowerUnary(SemaId node, bool postfix, TypeId expected,
@@ -288,6 +316,19 @@ private:
   void LowerReturn(SemaId node);
   void LowerVariableDeclaration(SemaId node);
   void LowerVariable(SemaId variable_node);
+  void LowerAggregateObjectInitializer(
+      SemaId node, TypeId type, const Value& object,
+      const std::vector<std::size_t>& path);
+  bool IsStringLiteralArray(SemaId node, TypeId type) const;
+  lowir_model::Operand AggregateDestination(
+      const Value& object, const std::vector<std::size_t>& path);
+  void LowerAggregateStringInitializer(
+      SemaId node, TypeId type, const Value& object,
+      const std::vector<std::size_t>& path);
+  void LowerAggregateConstructor(SemaId node, TypeId type,
+                                 const lowir_model::Operand& destination);
+  void LowerAggregateDefaultConstructor(
+      TypeId type, const lowir_model::Operand& destination);
   lowir_model::Operand LowerArrayElementAddress(
       const Value& array, TypeId element, std::size_t index);
   void LowerAggregateInitializer(SemaId node, TypeId type,
@@ -353,6 +394,7 @@ private:
   std::map<SemaId, std::string> temporary_slots_;
   std::map<SemaId, lowir_model::Operand> temporary_addresses_;
   std::set<SemaId> constructed_temporaries_;
+  std::set<std::string> initialized_bitfield_units_;
   std::vector<std::string> goto_labels_; // indexed by label ordinal
   std::map<SemaId, std::string> condition_labels_;
   const std::map<SemaId, std::string>* active_switch_labels_;

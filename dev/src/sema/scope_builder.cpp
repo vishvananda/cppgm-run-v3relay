@@ -71,6 +71,9 @@ void ScopeBuilder::BuildNode(AstId node, ScopeId scope, SemaId semantic_parent)
   case AST_SIMPLE_DECLARATION:
     BuildSimpleDeclaration(node, scope, semantic_parent);
     return;
+  case AST_BIT_FIELD_DECLARATION:
+    BuildBitFieldDeclaration(node, scope);
+    return;
   case AST_FUNCTION_DEFINITION: BuildFunctionDefinition(node, scope); return;
   case AST_SPECIAL_MEMBER_DECLARATION:
   case AST_SPECIAL_MEMBER_DEFINITION:
@@ -405,9 +408,20 @@ void ScopeBuilder::BuildAlias(AstId node, ScopeId scope)
   const AstId type_id = FindChild(node, AST_TYPE_ID);
   if (type_id == 0)
     throw std::runtime_error("alias has no type");
-  const TypeId type = BuildTypeId(type_id, scope);
+  const std::string alias_name = IdentifierName(node);
+  const AstNode& type_id_node = arena_.At(type_id);
+  if (type_id_node.children.empty())
+    throw std::runtime_error("alias type-id has no type sequence");
+  // A class-specifier in an alias declaration has no declaration extent of
+  // its own.  The alias is its declaration name, so pass it into the normal
+  // class builder while retaining any declarator suffix (for example `*`).
+  const TypeId base = BuildTypeSequence(type_id_node.children[0], scope, true,
+                                        alias_name);
+  const TypeId type = type_id_node.children.size() == 1 ||
+      type_id_node.children[1] == 0 ? base :
+      BuildDeclaratorType(type_id_node.children[1], base, scope);
   const BindingId binding = model_.AddBinding(
-      scope, IdentifierName(node), BINDING_TYPE_ALIAS, type);
+      scope, alias_name, BINDING_TYPE_ALIAS, type);
   if (tree_ != 0)
     MakeSemantic(SEMA_TYPE_ALIAS, scope, SemanticParent(scope), type, binding);
 }
@@ -788,6 +802,11 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   gotos_.clear();
   initialized_locals_.clear();
   jump_sequence_ = 0;
+  if (model_.ScopeAt(scope).kind == SCOPE_CLASS) {
+    deferred_member_bodies_.push_back(DeferredMemberBody(
+        body, function_scope, function, function_node));
+    return;
+  }
   (void)BuildCompound(body, function_scope, function, 0, 0, function_node);
   for (std::size_t i = 0; i < gotos_.size(); ++i)
   {
@@ -933,9 +952,12 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
           canonical.parameters[i + 1]);
   model_.FunctionAt(function).default_semantic_arguments.swap(
       default_semantic_arguments);
-  BuildMemberInitializers(model_.FunctionAt(function).ctor_initializer,
-                          function_scope,
-                          function_node, function);
+  if (model_.ScopeAt(scope).kind == SCOPE_CLASS) {
+    deferred_member_bodies_.push_back(DeferredMemberBody(
+        model_.FunctionAt(function).body, function_scope, function,
+        function_node));
+    return;
+  }
   labels_.clear();
   gotos_.clear();
   initialized_locals_.clear();
@@ -1285,6 +1307,11 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
     model_.AddBinding(declaring, name.Empty() ? spelling : name.Last(),
                       BINDING_TYPE, type);
 
+  const AstId class_key = FindChild(node, AST_CLASS_KEY);
+  if (class_key != 0 && arena_.At(class_key).first < tokens_.size())
+    model_.ClassAt(entity).requested_alignment =
+        tokens_[arena_.At(class_key).first].pack_alignment;
+
   // Resolve direct bases while the completed class name is already visible
   // to its own member scope.  The entity stores base ids, not copied types,
   // so later layout and member lookup follow the same canonical hierarchy.
@@ -1347,6 +1374,8 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
   member_access_ = saved_access;
   current_class_ = saved_class;
   CompleteClassLayout(entity);
+  BuildCompletedMemberInitializers(entity);
+  BuildCompletedMemberBodies(entity);
   BuildDefaultMemberInitializers(entity);
   if (injected_union)
   {
@@ -1518,13 +1547,15 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
   std::size_t offset = 0;
   std::size_t alignment = 1;
   std::size_t size = 0;
+  const std::size_t pack_alignment = value.requested_alignment;
   for (std::size_t i = 0; i < value.bases.size(); ++i)
   {
     const ClassBase& base = value.bases[i];
     const ClassEntity& base_entity = model_.ClassAt(base.entity);
     if (!base_entity.layout_complete)
       throw std::runtime_error("base class is incomplete");
-    const std::size_t base_alignment = base_entity.alignment;
+    const std::size_t base_alignment = pack_alignment == 0 ?
+        base_entity.alignment : std::min(base_entity.alignment, pack_alignment);
     const std::size_t base_size = base_entity.size;
     alignment = std::max(alignment, base_alignment);
     if (value.is_union)
@@ -1538,14 +1569,88 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
     size = std::max(size, value.is_union ? base_size : offset);
   }
 
+  // A bit-field allocation unit is the storage-sized unit of its declared
+  // type.  Adjacent fields share it only when the next field still fits;
+  // changing type or crossing the unit boundary starts a new aligned unit.
+  // `bit_offset` is measured from the low bit because the x86-64 LowIR model
+  // represents the target's ordinary little-endian allocation convention.
+  std::size_t bit_unit_offset = 0;
+  std::size_t bit_unit_size = 0;
+  unsigned bit_unit_bits = 0;
+  unsigned bit_used = 0;
+  bool have_bit_unit = false;
   for (std::size_t i = 0; i < value.fields.size(); ++i)
   {
     ClassField& field = value.fields[i];
     if (field.static_member)
       continue;
-    const std::size_t field_alignment = types_.AlignOf(field.type);
+    const std::size_t natural_field_alignment = types_.AlignOf(field.type);
+    const std::size_t field_alignment = pack_alignment == 0 ?
+        natural_field_alignment :
+        std::min(natural_field_alignment, pack_alignment);
     const std::size_t field_size = types_.SizeOf(field.type);
     alignment = std::max(alignment, field_alignment);
+    if (field.bit_width != 0 || field.binding == 0)
+    {
+      const TypeId allocation_type = types_.Unqualified(field.type);
+      const TypeId unit_type = types_.Kind(allocation_type) == TYPE_ENUM ?
+          types_.Unqualified(types_.At(allocation_type).base) :
+          allocation_type;
+      const unsigned unit_bits = static_cast<unsigned>(
+          FundamentalSize(types_.At(unit_type).fundamental) * 8);
+      if (field.bit_width == 0)
+      {
+        // A zero-width unnamed field ends the current unit and forces the
+        // following field to begin at the next unit boundary.
+        if (have_bit_unit)
+        {
+          offset = std::max(offset, bit_unit_offset + bit_unit_size);
+          have_bit_unit = false;
+          bit_used = 0;
+        }
+        offset = AlignUp(offset, field_alignment);
+        field.offset = value.is_union ? 0 : offset;
+        field.bit_offset = 0;
+        size = std::max(size, value.is_union ? field_size : offset);
+        continue;
+      }
+      if (value.is_union)
+      {
+        field.offset = 0;
+        field.bit_offset = 0;
+        size = std::max(size, field_size);
+        continue;
+      }
+      if (!have_bit_unit || bit_unit_size != field_size ||
+          bit_used + field.bit_width > unit_bits)
+      {
+        if (have_bit_unit)
+          offset = std::max(offset, bit_unit_offset + bit_unit_size);
+        offset = AlignUp(offset, field_alignment);
+        bit_unit_offset = offset;
+        bit_unit_size = field_size;
+        bit_unit_bits = unit_bits;
+        bit_used = 0;
+        have_bit_unit = true;
+      }
+      field.offset = bit_unit_offset;
+      field.bit_offset = bit_used;
+      bit_used += field.bit_width;
+      size = std::max(size, bit_unit_offset + bit_unit_size);
+      if (bit_used == bit_unit_bits)
+      {
+        offset = bit_unit_offset + bit_unit_size;
+        have_bit_unit = false;
+        bit_used = 0;
+      }
+      continue;
+    }
+    if (have_bit_unit)
+    {
+      offset = std::max(offset, bit_unit_offset + bit_unit_size);
+      have_bit_unit = false;
+      bit_used = 0;
+    }
     if (value.is_union)
       field.offset = 0;
     else
@@ -1556,6 +1661,8 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
     }
     size = std::max(size, value.is_union ? field_size : offset);
   }
+  if (have_bit_unit)
+    offset = std::max(offset, bit_unit_offset + bit_unit_size);
 
   // C++ gives every complete class object a nonzero size, and an object's
   // size is a multiple of its alignment.

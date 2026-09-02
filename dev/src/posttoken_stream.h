@@ -11,6 +11,11 @@ struct IPPTokenStream;
 
 struct IPostTokenOutputStream
 {
+	// Pragmas are normally consumed by the preprocessor.  The default hook
+	// keeps the older diagnostic and conditional-expression sinks source
+	// compatible while allowing the parser token collector to retain layout
+	// state for pragmas that affect later declarations.
+	virtual void emit_pragma(const std::string& text) {}
 	virtual void emit_invalid(const std::string& source) = 0;
 	virtual void emit_simple(const std::string& source, ETokenType token_type) = 0;
 	virtual void emit_identifier(const std::string& source) = 0;
@@ -48,6 +53,8 @@ struct StringSequenceElement
 struct PostTokenStream : IPPTokenStream
 {
 	explicit PostTokenStream(IPostTokenOutputStream& output);
+
+	void emit_pragma(const std::string& text);
 
 	void emit_whitespace_sequence() override;
 	void emit_new_line() override;

@@ -1172,6 +1172,13 @@ void PostTokenStream::emit_non_whitespace_char(const string& data)
 	output_.emit_invalid(data);
 }
 
+void PostTokenStream::emit_pragma(const string& text)
+{
+	flush_string_sequence();
+	operator_pending_ = false;
+	output_.emit_pragma(text);
+}
+
 void PostTokenStream::emit_eof()
 {
 	flush_string_sequence();

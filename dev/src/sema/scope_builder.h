@@ -91,10 +91,13 @@ private:
   void BuildAlias(AstId node, ScopeId scope);
   void BuildSimpleDeclaration(AstId node, ScopeId scope,
                               SemaId semantic_parent = 0);
+  void BuildBitFieldDeclaration(AstId node, ScopeId scope);
   void BuildVariable(BindingId binding, AstId initializer, AstId declarator,
                      ScopeId scope, SemaId variable, bool is_constexpr);
   void BuildFunctionDefinition(AstId node, ScopeId scope);
   void BuildSpecialMember(AstId node, ScopeId scope);
+  void BuildCompletedMemberInitializers(ClassEntityId entity);
+  void BuildCompletedMemberBodies(ClassEntityId entity);
   void BuildDefaultMemberInitializers(ClassEntityId entity);
   void BuildInheritedConstructors(ClassEntityId derived,
                                   ClassEntityId base, ScopeId scope);
@@ -305,5 +308,20 @@ private:
         : template_function(template_function), arguments(arguments),
           function(function), binding(binding), used(used) {}
   };
+  struct DeferredMemberBody
+  {
+    AstId body;
+    ScopeId scope;
+    FunctionEntityId function;
+    SemaId function_node;
+    bool built;
+
+    DeferredMemberBody(AstId body = 0, ScopeId scope = 0,
+                       FunctionEntityId function = 0,
+                       SemaId function_node = 0)
+        : body(body), scope(scope), function(function),
+          function_node(function_node), built(false) {}
+  };
   std::vector<DeferredTemplateInstance> deferred_template_instances_;
+  std::vector<DeferredMemberBody> deferred_member_bodies_;
 };

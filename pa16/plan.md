@@ -209,7 +209,8 @@ comes from the intended check.
 | CP1 class model, layout, members, methods (completed) | parser gaps; class-scope declarations accepted; layout and `sizeof`/`alignof`; `this`, member access, base-chain lookup, static members, implicit-object overloads; object slots, projections, method symbols/mangling, class globals as zero data | 55/243 pa16 tests pass (25/243 at start); through-pa15 remains 1139/1139; file audit passes |
 | CP2 constructors, destructors, lifetime (completed) | user/implicit/inheriting ctors and dtors, mem-initializers, default member initializers, subobject plans, demand-driven C1/C2/D1/D2 with aliases, local and array lifetime at every exit, namespace-scope init/fini, thread_local family, EH cleanup shapes, serializer additions | 97/243 pa16 tests pass (146 failures, down from 188); through-pa15 remains 1139/1139; file audit passes |
 | CP3 operator overloading and ADL (completed) | member/non-member/hidden-friend operators, ADL sets and source-point rules, built-in fallback, functors, subscript/call/increment operators, chained `<<`, enum operators, literal operator | 142/243 pa16 tests pass (101 failures, down from 146); focused operator/conversion set is 12/12; through-pa15 is 1139/1139; file audit passes |
-| CP4 initialization forms and access control | aggregate/brace-elision/value-init of class objects (locals, globals, nested arrays, string members), copy-init through converting ctors with `explicit` rejection, narrowing rejection, placement new, anonymous struct/union members, bit-field access lowering (7 `400-*` fixtures), access checks with the watch-list verified | 243/243 and through-pa16 clean |
+| CP4a aggregate and bit-field initialization/lowering (completed) | local class aggregates, brace elision, nested arrays and string members, reference-member storage, complete-class deferred analysis, pack-state layout, anonymous aliases, and bit-field declaration/read/increment lowering | 149/243 pa16 tests pass (94 failures, down from 101); focused boundary set is 12/15; through-pa15 is 1139/1139; file audit passes with five nonfatal warnings |
+| CP4b copy/list diagnostics, placement new, and access completion | explicit-constructor rejection, narrowing, placement-new argument formation, anonymous storage, and the remaining private/protected/incomplete-reference paths | pending |
 | CP5 audit and cleanup | architecture audit (`audit.md`), performance evidence, dead-path removal | through-pa16 clean; probe timings recorded |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
@@ -241,6 +242,20 @@ warnings. The specified probe measured wide 0.06s/17084KB and doubled
 0.13s/29700KB; deep 0.00s/6556KB and doubled 0.01s/7800KB; exits
 0.02s/10132KB and doubled 0.04s/15164KB after shared cleanup chains removed
 the prior quadratic return-cleanup growth.
+
+CP4a evidence (2026-09-02): aggregate analysis now walks class and array
+subobjects with brace elision, direct class construction, defaulted elements,
+reference-member binding, and character-array string initialization. The
+complete-class semantic pass defers in-class bodies and constructor
+initializers until later members exist; pragma-pack state is carried through
+the canonical token stream into capped class layout, and aliases retain names
+for anonymous class types. Bit-field declarations own width and allocation
+metadata, while lowering performs masked reads, increments, and storage-unit
+preserving writes. The final `make test-pa16` run is 149/243 (94 failures,
+down from 101) with no coverage changes; the focused 15-test boundary set is
+12/15, with the three remaining results being exact LowIR ordering/shape
+comparisons in bit-field emission. `make test-report-through-pa15` is
+1139/1139, and the pa16 file audit passes with five nonfatal warnings.
 
 ## Completed Checkpoint: CP1 — class model, layout, members, methods
 
@@ -445,24 +460,30 @@ separate parser/sema forms. The focused set passes 12/12, including the
 coverage changes; the exact through-PA15 command is 1139/1139 and the pa16
 file audit passes with five nonfatal warnings.
 
-## Active Checkpoint: CP4 — initialization forms and access control
+## Completed Checkpoint: CP4a — aggregate and bit-field initialization/lowering
 
-Goal: complete aggregate and brace-elision initialization, copy/list
-initialization and narrowing diagnostics, placement-new forms, anonymous
-member storage, bit-field expression lowering, and the remaining access
-checks while preserving the CP1–CP3 class, lifetime, and operator paths.
+Goal: establish the canonical aggregate, reference-member, complete-class,
+packing, anonymous-alias, and bit-field facts needed by the remaining
+initialization and access rules while preserving the CP1–CP3 class, lifetime,
+and operator paths. The final `make test-pa16` run is 149/243, through-PA15 is
+1139/1139, and the pa16 file audit passes with five nonfatal warnings.
+
+## Active Checkpoint: CP4b — copy/list diagnostics, placement new, and access completion
+
+Goal: finish copy/list initialization and narrowing diagnostics, placement-new
+forms, anonymous member storage, and the remaining private/protected and
+incomplete-reference access paths on top of CP4a.
 
 ### Implementation Packet
 
 - `dev/src/sema/expr_sema.cpp`, `scope_builder.cpp`, and `conversions.cpp`:
-  own aggregate/value/copy/list initialization, explicit-constructor and
-  narrowing rules, placement-new argument formation, anonymous member lookup,
-  and access checking for private/protected bases and members.
+  own copy/list initialization, explicit-constructor and narrowing rules,
+  placement-new argument formation, anonymous member lookup, and access
+  checking for private/protected bases and members.
 - `dev/src/lower/lowir_expr.cpp`, `lowir_program.cpp`, and
-  `lowir_symbols.cpp`: lower aggregate/string/array initialization,
-  reference-member storage, bit-field reads and increments, and any required
-  placement or anonymous-member projections.
+  `lowir_symbols.cpp`: lower placement and anonymous-member projections and
+  finish any remaining global/static aggregate paths.
 - Focus on the remaining `200-*` initialization/access failures,
-  `300-qualified-friend-function-access`, the anonymous/packed and bit-field
-  fixtures, and the `spec/200-*` list-initialization witnesses. Preserve
-  through-PA15 and the file audit; do not edit fixtures or `.ref` files.
+  the private/protected watch-list, placement-new fixtures, and the
+  `spec/200-*` list-initialization witnesses. Preserve through-PA15 and the
+  file audit; do not edit fixtures or `.ref` files.

@@ -401,30 +401,13 @@ void Lowerer::LowerVariable(SemaId variable_node)
     }
     if (initializer.size() == 1 &&
         tree_.At(initializer[0]).kind == SEMA_BRACED_INIT_LIST) {
-      const ClassEntity& class_entity = model_.ClassAt(
-          types_.At(unqualified).entity);
       // A braced aggregate still begins the lifetime of the complete class
       // object before its fields are initialized.  Preserve that address
       // operation even when no non-trivial constructor call is required.
+      initialized_bitfield_units_.clear();
       (void)AddressValue(object);
-      const std::vector<SemaId> values = Children(initializer[0]);
-      for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
-        const Value address = AddressValue(object);
-        lowir_model::Instruction projection;
-        projection.kind = lowir_model::Instruction::IK_INDEX;
-        projection.dest = NewTemp();
-        projection.type = I8Type();
-        projection.index_projection = lowir_model::IPK_FIELD;
-        projection.first = address.operand;
-        projection.second = Immediate(static_cast<long long>(
-            class_entity.fields[i].offset));
-        Emit(projection);
-        const lowir_model::Operand value = i < values.size() ?
-            LowerRValue(values[i], class_entity.fields[i].type).operand :
-            ZeroOperand(class_entity.fields[i].type);
-        EmitStore(LowTypeOf(class_entity.fields[i].type), value,
-                  TempOperand(projection.dest));
-      }
+      LowerAggregateObjectInitializer(initializer[0], declared, object,
+                                      std::vector<std::size_t>());
       RegisterLiveObject(variable.binding, declared);
       return;
     }
@@ -489,6 +472,325 @@ void Lowerer::LowerVariable(SemaId variable_node)
             SlotOperand(SlotFor(variable.binding)));
 }
 
+bool Lowerer::IsStringLiteralArray(SemaId node, TypeId type) const
+{
+  if (node == 0 || tree_.At(node).kind != SEMA_LITERAL ||
+      !tree_.At(node).HasSpan() || tree_.At(node).first >= tokens_.size())
+    return false;
+  const TypeId unqualified = types_.Unqualified(type);
+  if (types_.Kind(unqualified) != TYPE_ARRAY)
+    return false;
+  const TypeId element = types_.Unqualified(types_.At(unqualified).base);
+  if (types_.Kind(element) != TYPE_FUNDAMENTAL)
+    return false;
+  switch (types_.At(element).fundamental)
+  {
+  case FT_CHAR: case FT_SIGNED_CHAR: case FT_UNSIGNED_CHAR:
+  case FT_WCHAR_T: case FT_CHAR16_T: case FT_CHAR32_T:
+    break;
+  default:
+    return false;
+  }
+  return tokens_[tree_.At(node).first].lit_count != 0;
+}
+
+lowir_model::Operand Lowerer::AggregateDestination(
+    const Value& object, const std::vector<std::size_t>& path)
+{
+  lowir_model::Operand destination = AddressValue(object).operand;
+  TypeId current = types_.Unqualified(object.type);
+  for (std::size_t step = 0; step < path.size(); ++step)
+  {
+    if (types_.Kind(current) == TYPE_CLASS) {
+      const ClassEntity& owner = model_.ClassAt(types_.At(current).entity);
+      TypeId next = 0;
+      for (std::size_t i = 0; i < owner.fields.size(); ++i)
+        if (!owner.fields[i].static_member && owner.fields[i].binding != 0 &&
+            owner.fields[i].offset == path[step]) {
+          next = owner.fields[i].type;
+          break;
+        }
+      if (next == 0)
+        Unsupported("an aggregate field path without metadata");
+      lowir_model::Instruction projection;
+      projection.kind = lowir_model::Instruction::IK_INDEX;
+      projection.dest = NewTemp();
+      projection.type = I8Type();
+      projection.index_projection =
+          types_.Kind(types_.Unqualified(next)) == TYPE_REFERENCE ?
+              lowir_model::IPK_REFERENCE_FIELD : lowir_model::IPK_FIELD;
+      projection.first = destination;
+      projection.second = Immediate(static_cast<long long>(path[step]));
+      Emit(projection);
+      destination = TempOperand(projection.dest);
+      current = types_.Unqualified(next);
+      continue;
+    }
+    if (types_.Kind(current) == TYPE_ARRAY) {
+      const TypeId element = types_.At(current).base;
+      lowir_model::Instruction decay;
+      decay.kind = lowir_model::Instruction::IK_UNARY;
+      decay.dest = NewTemp();
+      decay.op = "decay";
+      decay.type = PtrType();
+      decay.first = destination;
+      Emit(decay);
+      lowir_model::Operand index = Immediate(
+          static_cast<long long>(path[step]));
+      const std::size_t element_size = types_.SizeOf(element);
+      const bool byte_element = types_.Kind(types_.Unqualified(element)) ==
+          TYPE_CLASS;
+      if (byte_element && element_size != 1) {
+        lowir_model::Instruction scale;
+        scale.kind = lowir_model::Instruction::IK_BINARY;
+        scale.dest = NewTemp();
+        scale.op = "mul";
+        scale.type = I64Type();
+        scale.first = index;
+        scale.second = Immediate(static_cast<long long>(element_size));
+        Emit(scale);
+        index = TempOperand(scale.dest);
+      }
+      lowir_model::Instruction projection;
+      projection.kind = lowir_model::Instruction::IK_INDEX;
+      projection.dest = NewTemp();
+      projection.type = byte_element ? I8Type() : LowTypeOf(element);
+      projection.index_projection = lowir_model::IPK_ARRAY_ELEMENT;
+      projection.first = TempOperand(decay.dest);
+      projection.second = index;
+      Emit(projection);
+      destination = TempOperand(projection.dest);
+      current = types_.Unqualified(element);
+      continue;
+    }
+    Unsupported("an aggregate path through a scalar");
+  }
+  return destination;
+}
+
+void Lowerer::LowerAggregateConstructor(
+    SemaId node, TypeId type, const lowir_model::Operand& destination)
+{
+  if (node == 0 || tree_.At(node).kind != SEMA_CONSTRUCTOR_ACTION ||
+      tree_.At(node).function == 0)
+    Unsupported("an aggregate constructor action");
+  const FunctionEntityId function = tree_.At(node).function;
+  const std::vector<SemaId> action_children = Children(node);
+  if (action_children.size() != 1 ||
+      tree_.At(action_children[0]).kind != SEMA_CALL)
+    Unsupported("an aggregate constructor call");
+  const std::vector<SemaId> call_children = Children(action_children[0]);
+  if (call_children.empty() || tree_.At(call_children[0]).kind != SEMA_CALLEE)
+    Unsupported("an aggregate constructor callee");
+  const TypeNode& callable = types_.At(types_.Unqualified(
+      model_.FunctionAt(function).type));
+  if (call_children.size() - 1 > callable.parameters.size() - 1)
+    Unsupported("an aggregate constructor with too many arguments");
+  lowir_model::Instruction call;
+  call.kind = lowir_model::Instruction::IK_CALL;
+  call.type = VoidType();
+  call.call_return_type = VoidType();
+  call.call_returns_void = true;
+  call.first = GlobalOperand(FunctionSymbolName(function));
+  call.args.push_back(destination);
+  for (std::size_t i = 1; i < call_children.size(); ++i) {
+    const TypeId parameter = callable.parameters[i];
+    call.args.push_back(types_.Kind(types_.Unqualified(parameter)) ==
+        TYPE_REFERENCE ? LowerReferenceArgument(
+            call_children[i], parameter).operand :
+        LowerRValue(call_children[i], parameter).operand);
+  }
+  Emit(call);
+  (void)type;
+}
+
+void Lowerer::LowerAggregateDefaultConstructor(
+    TypeId type, const lowir_model::Operand& destination)
+{
+  TypeId unqualified = types_.Unqualified(type);
+  if (types_.Kind(unqualified) != TYPE_CLASS)
+    Unsupported("a default constructor for a non-class aggregate element");
+  const FunctionEntityId function = DefaultConstructor(
+      types_.At(unqualified).entity);
+  if (function == 0)
+    Unsupported("an aggregate element without a default constructor");
+  const FunctionEntity& constructor = model_.FunctionAt(function);
+  if (model_.ClassAt(constructor.member_class).trivial_default_constructor)
+    return;
+  const TypeNode& callable = types_.At(types_.Unqualified(constructor.type));
+  lowir_model::Instruction call;
+  call.kind = lowir_model::Instruction::IK_CALL;
+  call.type = VoidType();
+  call.call_return_type = VoidType();
+  call.call_returns_void = true;
+  call.first = GlobalOperand(FunctionSymbolName(function));
+  call.args.push_back(destination);
+  for (std::size_t parameter = 1; parameter < callable.parameters.size();
+       ++parameter) {
+    if (parameter >= constructor.default_semantic_arguments.size() ||
+        constructor.default_semantic_arguments[parameter] == 0)
+      Unsupported("an aggregate default constructor argument");
+    call.args.push_back(LowerRValue(
+        constructor.default_semantic_arguments[parameter],
+        callable.parameters[parameter]).operand);
+  }
+  Emit(call);
+}
+
+void Lowerer::LowerAggregateStringInitializer(
+    SemaId node, TypeId type, const Value& object,
+    const std::vector<std::size_t>& path)
+{
+  if (!IsStringLiteralArray(node, type))
+    Unsupported("a non-string aggregate array initializer");
+  const Pa6Token& token = tokens_[tree_.At(node).first];
+  const TypeId array = types_.Unqualified(type);
+  const TypeId element = types_.At(array).base;
+  const std::size_t bound = types_.At(array).array_bound;
+  const std::size_t width = FundamentalSize(token.lit_type);
+  for (std::size_t i = 0; i < bound; ++i) {
+    std::vector<std::size_t> element_path(path);
+    element_path.push_back(i);
+    const lowir_model::Operand destination = AggregateDestination(
+        object, element_path);
+    lowir_model::Operand value = ZeroOperand(element);
+    if (i < token.lit_count && width != 0 &&
+        i * width + width <= token.lit_bytes.size()) {
+      unsigned long long raw = 0;
+      for (std::size_t byte = 0; byte < width; ++byte)
+        raw |= static_cast<unsigned long long>(
+            token.lit_bytes[i * width + byte]) << (byte * 8);
+      value = Immediate(static_cast<long long>(raw));
+    }
+    EmitStore(LowTypeOf(element), value, destination);
+  }
+}
+
+void Lowerer::LowerAggregateObjectInitializer(
+    SemaId node, TypeId type, const Value& object,
+    const std::vector<std::size_t>& path)
+{
+  const std::vector<SemaId> values = node == 0 ? std::vector<SemaId>() :
+      Children(node);
+  const TypeId unqualified = types_.Unqualified(type);
+  if (types_.Kind(unqualified) == TYPE_ARRAY) {
+    if (values.size() == 1 && IsStringLiteralArray(values[0], type)) {
+      LowerAggregateStringInitializer(values[0], type, object, path);
+      return;
+    }
+    const TypeId element = types_.At(unqualified).base;
+    const std::size_t bound = types_.At(unqualified).array_bound;
+    for (std::size_t i = 0; i < bound; ++i) {
+      std::vector<std::size_t> element_path(path);
+      element_path.push_back(i);
+      const SemaId value = i < values.size() ? values[i] : 0;
+      const TypeId element_unqualified = types_.Unqualified(element);
+      if (types_.Kind(element_unqualified) == TYPE_CLASS &&
+          model_.ClassAt(types_.At(element_unqualified).entity).aggregate) {
+        LowerAggregateObjectInitializer(value, element, object, element_path);
+      } else if (types_.Kind(element_unqualified) == TYPE_ARRAY) {
+        LowerAggregateObjectInitializer(value, element, object, element_path);
+      } else {
+        const lowir_model::Operand destination = AggregateDestination(
+            object, element_path);
+        if (types_.Kind(element_unqualified) == TYPE_CLASS) {
+          if (value == 0)
+            LowerAggregateDefaultConstructor(element, destination);
+          else if (tree_.At(value).kind == SEMA_CONSTRUCTOR_ACTION)
+            LowerAggregateConstructor(value, element, destination);
+          else
+            EmitStore(LowTypeOf(element),
+                      LowerRValue(value, element).operand, destination);
+        } else {
+          const lowir_model::Operand operand = value == 0 ?
+              ZeroOperand(element) : LowerRValue(value, element).operand;
+          EmitStore(LowTypeOf(element), operand, destination);
+        }
+      }
+    }
+    if (values.size() > bound)
+      Unsupported("an aggregate array with too many values");
+    return;
+  }
+  if (types_.Kind(unqualified) != TYPE_CLASS)
+    Unsupported("a non-class object aggregate initializer");
+  const ClassEntity& class_entity = model_.ClassAt(
+      types_.At(unqualified).entity);
+  std::size_t value_index = 0;
+  for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
+    const ClassField& field = class_entity.fields[i];
+    if (field.static_member || field.binding == 0)
+      continue;
+    std::vector<std::size_t> field_path(path);
+    field_path.push_back(field.offset);
+    const TypeId field_type = types_.Unqualified(field.type);
+    const bool aggregate = types_.Kind(field_type) == TYPE_ARRAY ||
+        (types_.Kind(field_type) == TYPE_CLASS &&
+         model_.ClassAt(types_.At(field_type).entity).aggregate);
+    if (aggregate) {
+      const SemaId value = value_index < values.size() ?
+          values[value_index] : 0;
+      if (value != 0 && IsStringLiteralArray(value, field.type))
+        LowerAggregateStringInitializer(value, field.type, object, field_path);
+      else
+        LowerAggregateObjectInitializer(value, field.type, object, field_path);
+      if (value != 0)
+        ++value_index;
+      continue;
+    }
+
+    if (types_.Kind(field_type) == TYPE_CLASS) {
+      const lowir_model::Operand destination = AggregateDestination(
+          object, field_path);
+      const bool have_value = value_index < values.size();
+      if (!have_value)
+        LowerAggregateDefaultConstructor(field.type, destination);
+      else if (tree_.At(values[value_index]).kind == SEMA_CONSTRUCTOR_ACTION)
+        LowerAggregateConstructor(values[value_index], field.type, destination);
+      else
+        EmitStore(LowTypeOf(field.type),
+                  LowerRValue(values[value_index], field.type).operand,
+                  destination);
+      if (have_value)
+        ++value_index;
+      continue;
+    }
+
+    if (types_.Kind(field_type) == TYPE_REFERENCE) {
+      if (value_index >= values.size())
+        Unsupported("an aggregate reference without an initializer");
+      const lowir_model::Operand address = LowerReferenceArgument(
+          values[value_index], field.type).operand;
+      const lowir_model::Operand destination = AggregateDestination(
+          object, field_path);
+      EmitStore(PtrType(), address, destination);
+      ++value_index;
+      continue;
+    }
+    const lowir_model::Operand destination = AggregateDestination(
+        object, field_path);
+    Value initialized_value;
+    if (value_index < values.size())
+      initialized_value = LowerRValue(values[value_index], field.type);
+    else {
+      initialized_value.type = field.type;
+      initialized_value.operand = ZeroOperand(field.type);
+    }
+    const bool bit_field = field.bit_width != 0;
+    const bool preserve = bit_field && BitFieldUnitInitialized(field);
+    if (bit_field) {
+      StoreBitField(field, destination, initialized_value.type,
+                    initialized_value.operand, preserve, field.type);
+      MarkBitFieldUnitInitialized(field);
+    } else
+      EmitStore(LowTypeOf(field.type), initialized_value.operand, destination);
+    if (value_index < values.size())
+      ++value_index;
+  }
+  if (value_index != values.size())
+    Unsupported("a class aggregate with too many values");
+}
+
 lowir_model::Operand Lowerer::LowerArrayElementAddress(
     const Value& array, TypeId element, std::size_t index)
 {
@@ -536,8 +838,15 @@ void Lowerer::LowerAggregateZero(
         types_.At(unqualified).entity);
     for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
       const ClassField& field = class_entity.fields[i];
-      if (field.static_member)
+      if (field.static_member || field.binding == 0)
         continue;
+      const bool bit_field = field.bit_width != 0;
+      const bool preserve = bit_field &&
+          BitFieldUnitInitialized(field);
+      lowir_model::Operand encoded;
+      if (bit_field && !preserve)
+        encoded = EncodeBitField(field, field.type, ZeroOperand(field.type),
+                                 field.type);
       lowir_model::Instruction projection;
       projection.kind = lowir_model::Instruction::IK_INDEX;
       projection.dest = NewTemp();
@@ -550,6 +859,15 @@ void Lowerer::LowerAggregateZero(
       if (types_.Kind(field_type) == TYPE_CLASS ||
           types_.Kind(field_type) == TYPE_ARRAY)
         LowerAggregateZero(field.type, TempOperand(projection.dest));
+      else if (bit_field) {
+        if (preserve)
+          StoreBitField(field, TempOperand(projection.dest), field.type,
+                        ZeroOperand(field.type), true, field.type);
+        else
+          EmitStore(LowTypeOf(field.type), encoded,
+                    TempOperand(projection.dest));
+        MarkBitFieldUnitInitialized(field);
+      }
       else
         EmitStore(LowTypeOf(field.type), ZeroOperand(field.type),
                   TempOperand(projection.dest));
@@ -616,8 +934,22 @@ void Lowerer::LowerAggregateInitializer(
     std::size_t value_index = 0;
     for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
       const ClassField& field = class_entity.fields[i];
-      if (field.static_member)
+      if (field.static_member || field.binding == 0)
         continue;
+      const bool bit_field = field.bit_width != 0;
+      const bool preserve = bit_field &&
+          BitFieldUnitInitialized(field);
+      Value initialized_value;
+      if (value_index < values.size())
+        initialized_value = LowerRValue(values[value_index], field.type);
+      else {
+        initialized_value.type = field.type;
+        initialized_value.operand = ZeroOperand(field.type);
+      }
+      lowir_model::Operand encoded;
+      if (bit_field && !preserve)
+        encoded = EncodeBitField(field, initialized_value.type,
+                                 initialized_value.operand, field.type);
       lowir_model::Instruction projection;
       projection.kind = lowir_model::Instruction::IK_INDEX;
       projection.dest = NewTemp();
@@ -629,7 +961,26 @@ void Lowerer::LowerAggregateInitializer(
       const lowir_model::Operand field_destination =
           TempOperand(projection.dest);
       const TypeId field_unqualified = types_.Unqualified(field.type);
-      if (value_index >= values.size()) {
+      if (bit_field) {
+        if (preserve) {
+          const lowir_model::Operand merged = MergeBitField(
+              field, field_destination, initialized_value.type,
+              initialized_value.operand, true, field.type);
+          lowir_model::Instruction final_projection;
+          final_projection.kind = lowir_model::Instruction::IK_INDEX;
+          final_projection.dest = NewTemp();
+          final_projection.type = I8Type();
+          final_projection.index_projection = lowir_model::IPK_FIELD;
+          final_projection.first = destination;
+          final_projection.second = Immediate(
+              static_cast<long long>(field.offset));
+          Emit(final_projection);
+          EmitStore(LowTypeOf(field.type), merged,
+                    TempOperand(final_projection.dest));
+        } else
+          EmitStore(LowTypeOf(field.type), encoded, field_destination);
+        MarkBitFieldUnitInitialized(field);
+      } else if (value_index >= values.size()) {
         if (types_.Kind(field_unqualified) == TYPE_CLASS ||
             types_.Kind(field_unqualified) == TYPE_ARRAY)
           LowerAggregateZero(field.type, field_destination);
@@ -643,8 +994,7 @@ void Lowerer::LowerAggregateInitializer(
         LowerAggregateInitializer(values[value_index], field.type,
                                   field_destination);
       } else {
-        EmitStore(LowTypeOf(field.type),
-                  LowerRValue(values[value_index], field.type).operand,
+        EmitStore(LowTypeOf(field.type), initialized_value.operand,
                   field_destination);
       }
       ++value_index;
@@ -736,7 +1086,7 @@ void Lowerer::LowerAggregateMemberLeaves(
     std::size_t value_index = 0;
     for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
       const ClassField& field = class_entity.fields[i];
-      if (field.static_member)
+      if (field.static_member || field.binding == 0)
         continue;
       std::vector<std::pair<bool, std::size_t> > nested_path(path);
       nested_path.push_back(std::make_pair(false, field.offset));
@@ -1020,7 +1370,7 @@ bool Lowerer::NeedsDestructor(ClassEntityId entity) const
     if (NeedsDestructor(owner.bases[i].entity))
       return true;
   for (std::size_t i = 0; i < owner.fields.size(); ++i) {
-    if (owner.fields[i].static_member)
+    if (owner.fields[i].static_member || owner.fields[i].binding == 0)
       continue;
     const TypeId field_type = types_.Unqualified(owner.fields[i].type);
     if (types_.Kind(field_type) == TYPE_CLASS &&
@@ -1043,7 +1393,7 @@ bool Lowerer::HasSubobjectDestructors(ClassEntityId entity) const
     if (NeedsDestructor(owner.bases[i].entity))
       return true;
   for (std::size_t i = 0; i < owner.fields.size(); ++i) {
-    if (owner.fields[i].static_member)
+    if (owner.fields[i].static_member || owner.fields[i].binding == 0)
       continue;
     const TypeId field_type = types_.Unqualified(owner.fields[i].type);
     if (types_.Kind(field_type) == TYPE_CLASS &&
@@ -1183,7 +1533,7 @@ void Lowerer::EmitSubobjectDestructors(ClassEntityId entity)
   const ClassEntity& owner = model_.ClassAt(entity);
   for (std::size_t i = owner.fields.size(); i != 0; --i) {
     const ClassField& field = owner.fields[i - 1];
-    if (field.static_member)
+    if (field.static_member || field.binding == 0)
       continue;
     const TypeId field_type = types_.Unqualified(field.type);
     TypeId element = field_type;
@@ -1348,6 +1698,9 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
        types_.Kind(types_.Unqualified(initializer.type)) == TYPE_ARRAY);
   std::vector<lowir_model::Operand> lowered_arguments;
   bool arguments_lowered = false;
+  ClassField member_field;
+  bool member_bit_field = false;
+  lowir_model::Operand encoded_bit_field;
   if (!is_base && !aggregate_initializer) {
     if (initializer.function != 0) {
       const FunctionEntity& constructor =
@@ -1381,12 +1734,12 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
   }
   lowir_model::Instruction load_this;
   load_this.kind = lowir_model::Instruction::IK_LOAD;
-  load_this.dest = NewTemp();
   load_this.type = PtrType();
   load_this.first = SlotOperand("$this");
-
-  lowir_model::Operand destination = TempOperand(load_this.dest);
+  lowir_model::Operand destination;
   if (is_base) {
+    load_this.dest = NewTemp();
+    destination = TempOperand(load_this.dest);
     const ClassEntityId target_entity = model_.FunctionAt(
         initializer.function).member_class;
     bool found = false;
@@ -1415,11 +1768,22 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
     for (std::size_t i = 0; i < owner_class.fields.size(); ++i)
       if (owner_class.fields[i].binding == initializer.binding) {
         field = owner_class.fields[i];
+        member_field = field;
         found = true;
         break;
       }
     if (!found)
       Unsupported("a field mem-initializer without layout metadata");
+    member_bit_field = member_field.bit_width != 0;
+    if (member_bit_field && initializer.function == 0) {
+      const bool preserve = BitFieldUnitInitialized(member_field);
+      if (!preserve)
+        encoded_bit_field = EncodeBitField(
+            member_field, initializer.type, lowered_arguments[0],
+            member_field.type);
+    }
+    load_this.dest = NewTemp();
+    destination = TempOperand(load_this.dest);
     Emit(load_this);
     lowir_model::Instruction projection;
     projection.kind = lowir_model::Instruction::IK_INDEX;
@@ -1469,6 +1833,34 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
     call.args.insert(call.args.end(), lowered_arguments.begin(),
                      lowered_arguments.end());
     Emit(call);
+    return;
+  }
+  if (member_bit_field) {
+    const bool preserve = BitFieldUnitInitialized(member_field);
+    if (preserve) {
+      const lowir_model::Operand merged = MergeBitField(
+          member_field, destination, initializer.type, lowered_arguments[0],
+          true, member_field.type);
+      lowir_model::Instruction final_load_this;
+      final_load_this.kind = lowir_model::Instruction::IK_LOAD;
+      final_load_this.dest = NewTemp();
+      final_load_this.type = PtrType();
+      final_load_this.first = SlotOperand("$this");
+      Emit(final_load_this);
+      lowir_model::Instruction final_projection;
+      final_projection.kind = lowir_model::Instruction::IK_INDEX;
+      final_projection.dest = NewTemp();
+      final_projection.type = I8Type();
+      final_projection.index_projection = lowir_model::IPK_FIELD;
+      final_projection.first = TempOperand(final_load_this.dest);
+      final_projection.second = Immediate(
+          static_cast<long long>(member_field.offset));
+      Emit(final_projection);
+      EmitStore(LowTypeOf(member_field.type), merged,
+                TempOperand(final_projection.dest));
+    } else
+      EmitStore(LowTypeOf(member_field.type), encoded_bit_field, destination);
+    MarkBitFieldUnitInitialized(member_field);
     return;
   }
   EmitStore(LowTypeOf(initializer.type), lowered_arguments[0], destination);
@@ -1553,7 +1945,7 @@ void Lowerer::LowerConstructorInitializers(FunctionEntityId function,
   }
   for (std::size_t i = 0; i < owner.fields.size(); ++i) {
     const ClassField& field = owner.fields[i];
-    if (field.static_member)
+    if (field.static_member || field.binding == 0)
       continue;
     SemaId explicit_initializer = 0;
     for (std::size_t j = 0; j < member_initializers.size(); ++j)
@@ -1928,8 +2320,14 @@ void Lowerer::LowerReturn(SemaId node)
     }
     return;
   }
-  const Value result = Convert(LowerRValue(children[0]),
-                               function_return_type_id_);
+  Value result = LowerRValue(children[0]);
+  // A bit-field read is lowered through its promoted arithmetic type, but
+  // return conversion starts from the declared member type.  That preserves
+  // the required same-width retag when an unsigned field is returned as int.
+  ClassField bit_field;
+  if (FindBitField(children[0], bit_field))
+    result.type = bit_field.type;
+  result = Convert(result, function_return_type_id_);
   if (shared_return_cleanup_)
     EmitSharedReturn(&result);
   else {

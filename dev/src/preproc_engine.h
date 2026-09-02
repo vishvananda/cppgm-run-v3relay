@@ -51,8 +51,10 @@ private:
 		PostTokenStream& output, int current_file);
 	void ProcessInclude(const std::vector<PPToken>& line,
 		int presumed_file, PostTokenStream& output);
-	void ProcessPragma(const std::vector<PPToken>& line, int presumed_file);
-	void ProcessPragmaText(const std::string& text, int presumed_file);
+	void ProcessPragma(const std::vector<PPToken>& line, int presumed_file,
+		PostTokenStream& output);
+	void ProcessPragmaText(const std::string& text, int presumed_file,
+		PostTokenStream& output);
 	void MarkPragmaOnce(int presumed_file);
 	bool ResolveIncludePath(const std::string& include_name,
 		int presumed_file, std::string& resolved_path,

@@ -682,7 +682,7 @@ void Lowerer::BuildGlobalDefinitions()
           for (std::size_t field_index = 0;
                field_index < class_entity.fields.size(); ++field_index) {
             const ClassField& field = class_entity.fields[field_index];
-            if (field.static_member)
+            if (field.static_member || field.binding == 0)
               continue;
             if (field.offset > cursor) {
               DataItem zero;

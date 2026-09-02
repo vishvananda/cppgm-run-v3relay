@@ -49,6 +49,9 @@ struct Pa6Token
 	std::size_t lit_count;
 	unsigned long long lit_value;
 	std::vector<unsigned char> lit_bytes;
+	// Active #pragma pack alignment at the token's source position.  Zero
+	// means the target's normal ABI alignment.
+	std::size_t pack_alignment;
 
 	Pa6Token(Pa6TokenKind kind, const std::string& spelling,
 		ETokenType simple_type = KW_AUTO);
@@ -71,8 +74,11 @@ public:
 class Pa6TokenCollector : public IPostTokenOutputStream
 {
 public:
+	Pa6TokenCollector();
+
 	std::vector<Pa6Token> tokens;
 
+	void emit_pragma(const std::string& text) override;
 	void emit_invalid(const std::string& source) override;
 	void emit_simple(const std::string& source, ETokenType token_type) override;
 	void emit_identifier(const std::string& source) override;
@@ -95,7 +101,10 @@ public:
 	void emit_eof() override;
 
 private:
+	void append_token(const Pa6Token& token);
 	void append_literal(const std::string& source);
+	std::size_t active_pack_alignment_;
+	std::vector<std::size_t> pack_stack_;
 };
 
 unsigned NameCategoryMask(const std::string& spelling);

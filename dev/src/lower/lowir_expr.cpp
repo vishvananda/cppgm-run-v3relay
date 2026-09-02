@@ -64,6 +64,232 @@ bool ClassEntityForType(const TypeTable& types, TypeId type,
 
 } // namespace
 
+bool Lowerer::FindBitField(SemaId node, ClassField& field) const
+{
+  if (node == 0 || tree_.At(node).kind != SEMA_MEMBER)
+    return false;
+  const BindingId binding = tree_.At(node).binding;
+  if (binding == 0 || !model_.BindingAt(binding).bit_field)
+    return false;
+  const ScopeId scope = model_.BindingAt(binding).scope;
+  if (model_.ScopeAt(scope).kind != SCOPE_CLASS)
+    return false;
+  return FindClassField(model_, model_.ScopeAt(scope).class_entity, binding,
+                        field);
+}
+
+TypeId Lowerer::BitFieldValueType(const ClassField& field) const
+{
+  TypeId type = types_.Unqualified(field.type);
+  if (types_.Kind(type) == TYPE_ENUM)
+    type = types_.Unqualified(types_.At(type).base);
+  if (types_.Kind(type) != TYPE_FUNDAMENTAL)
+    return type;
+  const EFundamentalType fundamental = types_.At(type).fundamental;
+  // Integral promotion of an int bit-field is based on the value width, not
+  // the storage type's ordinary expression promotion.  This is why an
+  // unsigned int : 1 is read as i32 while its allocation unit is u32.
+  if (fundamental == FT_INT || fundamental == FT_UNSIGNED_INT ||
+      fundamental == FT_BOOL || fundamental == FT_CHAR ||
+      fundamental == FT_SIGNED_CHAR || fundamental == FT_UNSIGNED_CHAR ||
+      fundamental == FT_SHORT_INT || fundamental == FT_UNSIGNED_SHORT_INT ||
+      fundamental == FT_WCHAR_T || fundamental == FT_CHAR16_T ||
+      fundamental == FT_CHAR32_T)
+  {
+    const unsigned int_bits = 8 * FundamentalSize(FT_INT);
+    const bool fits_int =
+        FundamentalIsUnsigned(fundamental) ? field.bit_width < int_bits :
+        field.bit_width <= int_bits;
+    if (fits_int)
+      return types_.Fundamental(FT_INT);
+  }
+  return type;
+}
+
+long long Lowerer::BitFieldMask(const ClassField& field) const
+{
+  if (field.bit_width == 0)
+    return 0;
+  const unsigned long long mask = field.bit_width >= 64 ? ~0ULL :
+      ((1ULL << field.bit_width) - 1ULL);
+  return static_cast<long long>(mask);
+}
+
+lowir_model::Operand Lowerer::EncodeBitField(
+    const ClassField& field, TypeId value_type,
+    const lowir_model::Operand& value, TypeId storage_type, bool value_first)
+{
+  const TypeId storage = storage_type == 0 ? field.type : storage_type;
+  Value converted;
+  converted.type = value_type;
+  converted.operand = value;
+  converted = Convert(converted, storage);
+  const lowir_model::LowType low_type = LowTypeOf(storage);
+  lowir_model::Instruction mask;
+  mask.kind = lowir_model::Instruction::IK_BINARY;
+  mask.dest = NewTemp();
+  mask.op = "and";
+  mask.type = low_type;
+  if (value_first) {
+    mask.first = converted.operand;
+    mask.second = Immediate(BitFieldMask(field));
+  } else {
+    mask.first = Immediate(BitFieldMask(field));
+    mask.second = converted.operand;
+  }
+  Emit(mask);
+  lowir_model::Operand encoded = TempOperand(mask.dest);
+  if (field.bit_offset != 0) {
+    lowir_model::Instruction shift;
+    shift.kind = lowir_model::Instruction::IK_BINARY;
+    shift.dest = NewTemp();
+    shift.op = "shl";
+    shift.type = low_type;
+    shift.first = encoded;
+    shift.second = Immediate(static_cast<long long>(field.bit_offset));
+    Emit(shift);
+    encoded = TempOperand(shift.dest);
+  }
+  return encoded;
+}
+
+lowir_model::Operand Lowerer::MergeBitField(
+    const ClassField& field, const lowir_model::Operand& destination,
+    TypeId value_type, const lowir_model::Operand& value, bool preserve,
+    TypeId storage_type, bool encode_first)
+{
+  const TypeId storage = storage_type == 0 ? field.type : storage_type;
+  const lowir_model::LowType low_type = LowTypeOf(storage);
+  lowir_model::Operand encoded;
+  if (encode_first)
+    encoded = EncodeBitField(field, value_type, value, storage, true);
+  lowir_model::Operand stored;
+  if (preserve) {
+    lowir_model::Instruction load;
+    load.kind = lowir_model::Instruction::IK_LOAD;
+    load.dest = NewTemp();
+    load.type = low_type;
+    load.first = destination;
+    Emit(load);
+
+    unsigned long long shifted = field.bit_width >= 64 ? ~0ULL :
+        ((1ULL << field.bit_width) - 1ULL);
+    if (field.bit_offset < 64)
+      shifted <<= field.bit_offset;
+    const unsigned unit_bits = TypeBits(field.type);
+    const unsigned long long unit_mask = unit_bits >= 64 ? ~0ULL :
+        ((1ULL << unit_bits) - 1ULL);
+    const unsigned long long clear_bits = (~shifted) & unit_mask;
+    lowir_model::Operand clear_operand = Immediate(
+        static_cast<long long>(clear_bits));
+    // Keep the allocation-unit mask's unsigned spelling.  LowIR's integer
+    // value is a bit pattern, while its textual immediate is used by the
+    // checked fixtures and should not turn 0xfffffff9 into -7.
+    clear_operand.text = std::to_string(clear_bits);
+    lowir_model::Instruction clear;
+    clear.kind = lowir_model::Instruction::IK_BINARY;
+    clear.dest = NewTemp();
+    clear.op = "and";
+    clear.type = low_type;
+    clear.first = TempOperand(load.dest);
+    clear.second = clear_operand;
+    Emit(clear);
+
+    if (!encode_first)
+      encoded = EncodeBitField(field, value_type, value, storage);
+    lowir_model::Instruction combine;
+    combine.kind = lowir_model::Instruction::IK_BINARY;
+    combine.dest = NewTemp();
+    combine.op = "or";
+    combine.type = low_type;
+    combine.first = TempOperand(clear.dest);
+    combine.second = encoded;
+    Emit(combine);
+    stored = TempOperand(combine.dest);
+  } else {
+    if (!encode_first)
+      encoded = EncodeBitField(field, value_type, value, storage);
+    stored = encoded;
+  }
+  return stored;
+}
+
+void Lowerer::StoreBitField(const ClassField& field,
+                            const lowir_model::Operand& destination,
+                            TypeId value_type,
+                            const lowir_model::Operand& value,
+                            bool preserve,
+                            TypeId storage_type,
+                            bool encode_first)
+{
+  const TypeId storage = storage_type == 0 ? field.type : storage_type;
+  EmitStore(LowTypeOf(storage),
+            MergeBitField(field, destination, value_type, value, preserve,
+                          storage, encode_first),
+            destination);
+}
+
+Lowerer::Value Lowerer::LoadBitField(SemaId node, const ClassField& field)
+{
+  return ReadBitField(LowerLValue(node), field);
+}
+
+Lowerer::Value Lowerer::ReadBitField(const Value& field_lvalue,
+                                     const ClassField& field)
+{
+  const TypeId promoted = BitFieldValueType(field);
+  Value storage = field_lvalue;
+  storage.type = promoted;
+  Value result = LoadValue(storage);
+  const lowir_model::LowType low_type = LowTypeOf(promoted);
+  lowir_model::Operand value = result.operand;
+  if (field.bit_offset != 0) {
+    lowir_model::Instruction shift;
+    shift.kind = lowir_model::Instruction::IK_BINARY;
+    shift.dest = NewTemp();
+    shift.op = IsUnsigned(promoted) ? "ushr" : "shr";
+    shift.type = low_type;
+    shift.first = value;
+    shift.second = Immediate(static_cast<long long>(field.bit_offset));
+    Emit(shift);
+    value = TempOperand(shift.dest);
+  }
+  lowir_model::Instruction mask;
+  mask.kind = lowir_model::Instruction::IK_BINARY;
+  mask.dest = NewTemp();
+  mask.op = "and";
+  mask.type = low_type;
+  mask.first = value;
+  mask.second = Immediate(BitFieldMask(field));
+  Emit(mask);
+  // Keep the declared type at the expression boundary.  The emitted load,
+  // shift, and mask use the promoted LowIR width; consumers that need the
+  // promoted arithmetic type retag the value explicitly.
+  result.type = field.type;
+  result.operand = TempOperand(mask.dest);
+  result.lvalue = false;
+  return result;
+}
+
+std::string Lowerer::BitFieldUnitKey(const ClassField& field) const
+{
+  const BindingId binding = field.binding;
+  const ScopeId scope = binding == 0 ? 0 : model_.BindingAt(binding).scope;
+  return std::to_string(static_cast<unsigned long long>(scope)) + ":" +
+      std::to_string(static_cast<unsigned long long>(field.offset)) + ":" +
+      std::to_string(static_cast<unsigned long long>(types_.SizeOf(field.type)));
+}
+
+bool Lowerer::BitFieldUnitInitialized(const ClassField& field) const
+{
+  return initialized_bitfield_units_.count(BitFieldUnitKey(field)) != 0;
+}
+
+void Lowerer::MarkBitFieldUnitInitialized(const ClassField& field)
+{
+  initialized_bitfield_units_.insert(BitFieldUnitKey(field));
+}
+
 lowir_model::Operand Lowerer::ZeroOperand(TypeId type) const
 {
   if (IsFloatingType(types_, type))
@@ -693,10 +919,25 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
     projection.kind = lowir_model::Instruction::IK_INDEX;
     projection.dest = NewTemp();
     projection.type = I8Type();
-    projection.index_projection = lowir_model::IPK_FIELD;
+    projection.index_projection = types_.Kind(
+        types_.Unqualified(binding.type)) == TYPE_REFERENCE ?
+        lowir_model::IPK_REFERENCE_FIELD : lowir_model::IPK_FIELD;
     projection.first = address.operand;
     projection.second = Immediate(static_cast<long long>(field.offset));
     Emit(projection);
+    if (types_.Kind(types_.Unqualified(binding.type)) == TYPE_REFERENCE) {
+      lowir_model::Instruction referent;
+      referent.kind = lowir_model::Instruction::IK_LOAD;
+      referent.dest = NewTemp();
+      referent.type = PtrType();
+      referent.first = TempOperand(projection.dest);
+      Emit(referent);
+      Value result;
+      result.type = types_.Referent(binding.type);
+      result.lvalue = true;
+      result.operand = TempOperand(referent.dest);
+      return result;
+    }
     Value result;
     result.type = ReferentType(value.type);
     result.lvalue = true;
@@ -871,6 +1112,9 @@ Lowerer::Value Lowerer::LowerRValue(SemaId node, TypeId expected)
       result.operand = Immediate(binding.const_value);
       return Convert(result, expected);
     }
+    ClassField bit_field;
+    if (FindBitField(node, bit_field))
+      return Convert(LoadBitField(node, bit_field), expected);
     return Convert(LoadValue(LowerLValue(node)), expected);
   }
   default:
@@ -962,6 +1206,38 @@ Lowerer::Value Lowerer::LowerIncrement(SemaId node, SemaId operand_node,
 {
   const SemaNode& value = tree_.At(node);
   const bool decrement = value.op == OP_DEC;
+  ClassField bit_field;
+  if (FindBitField(operand_node, bit_field)) {
+    const TypeId arithmetic_type = BitFieldValueType(bit_field);
+    const Value initial_lvalue = LowerLValue(operand_node);
+    Value old = ReadBitField(initial_lvalue, bit_field);
+    old.type = arithmetic_type;
+    lowir_model::Instruction binary;
+    binary.kind = lowir_model::Instruction::IK_BINARY;
+    binary.dest = NewTemp();
+    binary.op = decrement ? "sub" : "add";
+    binary.type = LowTypeOf(arithmetic_type);
+    binary.first = old.operand;
+    binary.second = OneOperand(arithmetic_type);
+    Emit(binary);
+    Value updated;
+    updated.type = arithmetic_type;
+    updated.operand = TempOperand(binary.dest);
+
+    // The read and the write are separate member accesses.  In particular,
+    // the write must read-modify-write the allocation unit so neighboring
+    // fields survive an increment.
+    const Value destination = postfix ? initial_lvalue :
+        LowerLValue(operand_node);
+    StoreBitField(bit_field, destination.operand, arithmetic_type,
+                  updated.operand, true, arithmetic_type, true);
+    if (as_lvalue) {
+      Value result = destination;
+      result.lvalue = true;
+      return result;
+    }
+    return Convert(postfix ? old : updated, expected);
+  }
   Value lvalue = LowerLValue(operand_node);
   const Value old = LoadValue(lvalue);
   Value updated;
@@ -1304,6 +1580,19 @@ Lowerer::Value Lowerer::LowerAssignment(SemaId node, Value* assigned_lvalue)
       rhs.type = target;
       rhs.operand = TempOperand(binary.dest);
     }
+  }
+  ClassField bit_field;
+  if (FindBitField(children[0], bit_field)) {
+    const TypeId storage_type = BitFieldValueType(bit_field);
+    rhs = Convert(rhs, storage_type);
+    StoreBitField(bit_field, lhs.operand, rhs.type, rhs.operand, true,
+                  storage_type);
+    if (assigned_lvalue != 0) {
+      *assigned_lvalue = lhs;
+      assigned_lvalue->lvalue = true;
+    }
+    rhs.lvalue = false;
+    return rhs;
   }
   EmitStore(LowTypeOf(lhs.type), rhs.operand, lhs.operand);
   if (assigned_lvalue != 0) {

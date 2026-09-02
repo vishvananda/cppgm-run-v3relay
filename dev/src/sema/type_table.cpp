@@ -666,8 +666,10 @@ std::size_t TypeTable::SizeOf(TypeId id) const
       return size;
     break;
   }
-  case TYPE_CV: case TYPE_REFERENCE: case TYPE_ENUM:
+  case TYPE_CV: case TYPE_ENUM:
     return SizeOf(node.base);
+  case TYPE_REFERENCE:
+    return 8;
   case TYPE_POINTER:
   case TYPE_MEMBER_POINTER:
     return 8;
@@ -691,9 +693,10 @@ std::size_t TypeTable::SizeOf(TypeId id) const
 std::size_t TypeTable::AlignOf(TypeId id) const
 {
   const TypeNode& node = At(id);
-  if (node.kind == TYPE_ARRAY || node.kind == TYPE_CV ||
-      node.kind == TYPE_REFERENCE)
+  if (node.kind == TYPE_ARRAY || node.kind == TYPE_CV)
     return AlignOf(node.base);
+  if (node.kind == TYPE_REFERENCE)
+    return 8;
   if (node.kind == TYPE_CLASS)
   {
     const std::map<EntityId, std::pair<std::size_t, std::size_t> >::const_iterator
