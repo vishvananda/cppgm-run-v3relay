@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "parser/ast_model.h"
@@ -165,6 +166,7 @@ struct ClassEntity
   ScopeId class_scope; // 0 until defined
   TypeId type; // canonical class type, 0 until declared
   FunctionEntityId default_constructor; // synthesized on first default-init
+  std::vector<FunctionEntityId> constructors; // overload set, declaration order
   // 9.5p5: members injected into the enclosing scope, each naming the
   // synthesized object through Binding::object_binding.
   std::vector<BindingId> injected_members;
@@ -175,8 +177,10 @@ struct ClassEntity
   std::size_t requested_alignment;
   FunctionEntityId constructor;
   FunctionEntityId destructor;
+  ClassEntityId inheriting_constructor_base;
   bool layout_complete;
   bool trivial_default_constructor;
+  bool aggregate;
   bool is_union;
   bool defined;
 
@@ -211,6 +215,11 @@ struct FunctionEntity
   bool c_linkage;
   bool noexcept_qualifier;
   SpecialMemberKind special_member;
+  AstId body;
+  AstId ctor_initializer;
+  std::vector<std::string> parameter_names;
+  bool defaulted;
+  bool deleted;
   bool static_member;
   bool in_class_definition;
   bool synthesized;
@@ -218,6 +227,12 @@ struct FunctionEntity
   // has no default initializer.  The AST initializer remains the canonical
   // source fact and is materialized at each call site by expression sema.
   std::vector<AstId> default_arguments;
+  // Lowering needs the already analyzed form when an implicitly initialized
+  // base or member consumes a constructor default.  These nodes are kept out
+  // of the source semantic tree but retain the declaration-time lookup scope.
+  std::vector<std::size_t> default_semantic_arguments;
+  std::vector<std::pair<BindingId, std::size_t> >
+      default_member_initializers;
   bool defined;
 
   FunctionEntity();

@@ -149,7 +149,7 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    learn `alias object` lines, `storage=thread_local` on globals, and the
    `eh_try` / `eh_cleanup` / `eh_end` / `resume` instructions.
 
-## Failure map (218 failing, 25 passing; 19 fixtures expect EXIT_FAILURE)
+## Failure map at CP1 (218 failing, 25 passing; 19 fixtures expect EXIT_FAILURE)
 
 | first error today | tests | owner | checkpoint |
 | --- | --- | --- | --- |
@@ -207,7 +207,7 @@ comes from the intended check.
 | --- | --- | --- |
 | plan | this commit | stage design, failure map |
 | CP1 class model, layout, members, methods (completed) | parser gaps; class-scope declarations accepted; layout and `sizeof`/`alignof`; `this`, member access, base-chain lookup, static members, implicit-object overloads; object slots, projections, method symbols/mangling, class globals as zero data | 55/243 pa16 tests pass (25/243 at start); through-pa15 remains 1139/1139; file audit passes |
-| CP2 constructors, destructors, lifetime | user/implicit/inheriting ctors and dtors, mem-initializers, default member initializers, subobject plans, demand-driven C1/C2/D1/D2 with aliases, local and array lifetime at every exit, namespace-scope init/fini, thread_local family, EH cleanup shapes, serializer additions | the `unsupported pa11 declaration` group and the lifetime fixtures pass; expected ≥ 160/243 |
+| CP2 constructors, destructors, lifetime (completed) | user/implicit/inheriting ctors and dtors, mem-initializers, default member initializers, subobject plans, demand-driven C1/C2/D1/D2 with aliases, local and array lifetime at every exit, namespace-scope init/fini, thread_local family, EH cleanup shapes, serializer additions | 97/243 pa16 tests pass (146 failures, down from 188); through-pa15 remains 1139/1139; file audit passes |
 | CP3 operator overloading and ADL | member/non-member/hidden-friend operators, ADL sets and source-point rules, built-in fallback, functors, subscript/call/increment operators, chained `<<`, enum operators, literal operator | the operator group (20) passes; expected ≥ 205/243 |
 | CP4 initialization forms and access control | aggregate/brace-elision/value-init of class objects (locals, globals, nested arrays, string members), copy-init through converting ctors with `explicit` rejection, narrowing rejection, placement new, anonymous struct/union members, bit-field access lowering (7 `400-*` fixtures), access checks with the watch-list verified | 243/243 and through-pa16 clean |
 | CP5 audit and cleanup | architecture audit (`audit.md`), performance evidence, dead-path removal | through-pa16 clean; probe timings recorded |
@@ -225,6 +225,22 @@ its three pre-existing header warnings. The required scaling probe measured
 wide 0.06s/16420KB and doubled 0.13s/28452KB; deep 0.00s/6232KB and doubled
 0.01s/7472KB; exits 0.01s/6836KB and doubled 0.02s/9644KB (the destructor
 diagnostic is the planned CP2 boundary).
+
+CP2 evidence (2026-09-02): special-member entities now own constructor and
+destructor state, parameter defaults, mem-initializer targets, inherited
+constructors, and detached default-member-initializer semantics. Lowering
+emits canonical constructor/destructor variants and aliases, declaration-
+ordered base/member initialization, aggregate and array subobject stores,
+scope and return cleanup, EH cleanup edges, global init/fini, and the
+serializer's EH instructions. The packet's constructor, default-member,
+inheriting-constructor, global-init, array-lifecycle, and destructor-body
+fixtures pass. The final `make test-pa16` run reports 97/243 (146 failures,
+42 fewer than the CP2 start) with no coverage changes; `make test-report-
+through-pa15` is 1139/1139. The pa16 file audit passes with four nonfatal
+warnings. The specified probe measured wide 0.06s/17084KB and doubled
+0.13s/29700KB; deep 0.00s/6556KB and doubled 0.01s/7800KB; exits
+0.02s/10132KB and doubled 0.04s/15164KB after shared cleanup chains removed
+the prior quadratic return-cleanup growth.
 
 ## Completed Checkpoint: CP1 — class model, layout, members, methods
 
@@ -360,16 +376,16 @@ Known uncertainties:
 - `400-signed-bit-field-read` masks with `binary and i32 %t, 7` and returns
   that value; the fixtures are the oracle, do not "correct" the sign.
 
-## Active Checkpoint: CP2 — constructors, destructors, lifetime
+## Completed Checkpoint: CP2 — constructors, destructors, lifetime
 
-Goal: lower explicit and synthesized construction/destruction consistently
+Goal achieved: lower explicit and synthesized construction/destruction consistently
 for class subobjects, arrays, locals, globals, thread-local objects, and all
 control-flow exits while preserving CP1's canonical class layout and member
-lookup. A constructor or destructor must either produce the planned helper
-calls and cleanup edges or be rejected cleanly; it must never silently emit
-an uninitialized or partially destroyed object.
+lookup. Constructors and destructors produce the planned helper calls and
+cleanup edges, or reject cleanly; they do not silently emit an uninitialized
+or partially destroyed object.
 
-### Implementation Packet
+### Delivered implementation packet
 
 - `dev/src/parser/ast_parser_decl.cpp` and `dev/src/parser/ast_parser_expr.cpp`:
   retain the special-member AST shape while completing constructor,
@@ -394,3 +410,23 @@ an uninitialized or partially destroyed object.
   `200-global-constructor`, `200-global-class-array-init`, and the
   inheriting-constructor fixtures. Keep the existing pa11–pa15 gate and
   file-audit checks as exit criteria; do not edit fixtures or `.ref` files.
+
+## Active Checkpoint: CP3 — operator overloading and ADL
+
+Goal: resolve and lower member, non-member, hidden-friend, and built-in-fallback
+operator expressions with source-point-correct ADL and overload ranking,
+including functors, subscripting, increments, chained shifts, enum operators,
+and user-defined literals.
+
+### Implementation Packet
+
+- `dev/src/sema/expr_sema.cpp`, `overload.cpp`, `scope_model.*`, and
+  `scope_builder.cpp`: own operator-function lookup, ADL associated sets,
+  hidden-friend visibility, implicit-object ranking, and source-point rules.
+- `dev/src/lower/lowir_expr.cpp`, `lowir_program.cpp`, and
+  `lowir_symbols.cpp`: lower selected operators, callable objects,
+  subscript/increment forms, built-in fallback, and ABI operator spellings.
+- Focus on the operator/ADL failures led by `300-basic-operator-overloads`,
+  member prefix/postfix and subscript calls, chained shift stress tests,
+  hidden-friend calls, enum operators, and the user-defined literal fixture.
+  Preserve the pa11–pa16 gates and do not edit fixtures or `.ref` files.

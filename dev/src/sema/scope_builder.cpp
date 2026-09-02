@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "sema/overload.h"
+
 using std::string;
 using std::vector;
 
@@ -44,6 +46,9 @@ void ScopeBuilder::BuildNode(AstId node, ScopeId scope, SemaId semantic_parent)
     BuildSimpleDeclaration(node, scope, semantic_parent);
     return;
   case AST_FUNCTION_DEFINITION: BuildFunctionDefinition(node, scope); return;
+  case AST_SPECIAL_MEMBER_DECLARATION:
+  case AST_SPECIAL_MEMBER_DEFINITION:
+    BuildSpecialMember(node, scope); return;
   case AST_ENUM_SPECIFIER: case AST_ENUM_DECLARATION:
     if (EmitsSemantics() && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
       MakeSemantic(SEMA_SIMPLE_DECLARATION, scope, SemanticParent(scope));
@@ -246,6 +251,19 @@ void ScopeBuilder::BuildUsingDeclaration(AstId node, ScopeId scope)
     throw std::runtime_error("using-declaration has no target");
   const QualifiedName name = NodeName(target_node);
   const BindingId target = model_.Lookup(scope, name, LOOKUP_ANY);
+  ClassEntityId derived = 0;
+  if (model_.ClassForScope(scope, derived) && name.Qualified() &&
+      name.components.size() == 2 &&
+      name.components[0] == name.components[1]) {
+    const ClassEntity& owner = model_.ClassAt(derived);
+    for (std::size_t i = 0; i < owner.bases.size(); ++i) {
+      const ClassEntity& base = model_.ClassAt(owner.bases[i].entity);
+      if (model_.ScopeAt(base.class_scope).name == name.components[0]) {
+        BuildInheritedConstructors(derived, owner.bases[i].entity, scope);
+        return;
+      }
+    }
+  }
   if (target == 0 || model_.BindingAt(target).kind == BINDING_NAMESPACE)
     throw std::runtime_error("using-declaration target not found");
   const Binding source = model_.BindingAt(target);
@@ -254,6 +272,106 @@ void ScopeBuilder::BuildUsingDeclaration(AstId node, ScopeId scope)
   imported.function = source.function;
   imported.has_const_value = source.has_const_value;
   imported.const_value = source.const_value;
+}
+
+void ScopeBuilder::BuildInheritedConstructors(ClassEntityId derived,
+                                               ClassEntityId base,
+                                               ScopeId scope)
+{
+  ClassEntity& owner = model_.ClassAt(derived);
+  const ClassEntity& base_owner = model_.ClassAt(base);
+  const TypeId derived_type = owner.type;
+  const std::string name = model_.ScopeAt(scope).name;
+  for (std::size_t i = 0; i < base_owner.constructors.size(); ++i) {
+    const FunctionEntityId base_constructor =
+        base_owner.constructors[i];
+    const FunctionEntity& source = model_.FunctionAt(base_constructor);
+    if (source.deleted || source.member_type == 0)
+      continue;
+    const std::vector<AstId> source_default_arguments =
+        source.default_arguments;
+    const std::vector<std::size_t> source_default_semantic_arguments =
+        source.default_semantic_arguments;
+    const std::vector<std::string> source_parameter_names =
+        source.parameter_names;
+    const TypeNode& source_type = types_.At(
+        types_.Unqualified(source.type));
+    std::vector<TypeId> parameters;
+    for (std::size_t parameter = 1;
+         parameter < source_type.parameters.size(); ++parameter)
+      parameters.push_back(source_type.parameters[parameter]);
+    const TypeId function_type = types_.Function(
+        types_.Fundamental(FT_VOID),
+        [&]() {
+          std::vector<TypeId> canonical;
+          canonical.push_back(types_.Pointer(derived_type));
+          canonical.insert(canonical.end(), parameters.begin(),
+                           parameters.end());
+          return canonical;
+        }(), source_type.variadic);
+    const FunctionEntityId inherited = model_.CreateFunction(
+        scope, name, function_type);
+    FunctionEntity& function = model_.FunctionAt(inherited);
+    function.is_member = true;
+    function.member_class = derived;
+    function.member_type = types_.Function(types_.Fundamental(FT_VOID),
+                                           parameters, source_type.variadic);
+    function.member_pointer_type = types_.MemberPointer(
+        derived_type, function.member_type);
+    function.special_member = SPECIAL_MEMBER_CONSTRUCTOR;
+    function.in_class_definition = true;
+    function.synthesized = true;
+    function.default_arguments = source_default_arguments;
+    function.default_semantic_arguments = source_default_semantic_arguments;
+    function.parameter_names = source_parameter_names;
+    const BindingId binding = model_.AddBinding(
+        scope, name, BINDING_FUNCTION, function_type);
+    model_.BindingAt(binding).function = inherited;
+    owner.constructor = inherited;
+    owner.constructors.push_back(inherited);
+
+    if (!EmitsSemantics())
+      continue;
+    const SemaId function_node = MakeDetachedSemantic(
+        SEMA_FUNCTION_DEFINITION, scope, function_type, binding, inherited);
+    DeferSemantic(function_node);
+    const ScopeId function_scope = model_.CreateScope(
+        SCOPE_FUNCTION, name, scope);
+    const BindingId this_binding = model_.AddBinding(
+        function_scope, "this", BINDING_PARAMETER,
+        function_type == 0 ? 0 : types_.At(types_.Unqualified(
+            function_type)).parameters[0]);
+    MakeSemantic(SEMA_PARAMETER, function_scope, function_node,
+                 types_.At(types_.Unqualified(function_type)).parameters[0],
+                 this_binding);
+    const TypeNode& inherited_type = types_.At(
+        types_.Unqualified(function_type));
+    std::vector<BindingId> parameter_bindings;
+    for (std::size_t parameter = 0; parameter < parameters.size();
+         ++parameter) {
+      const std::string parameter_name = parameter <
+          source_parameter_names.size() ? source_parameter_names[parameter] :
+          std::string();
+      const BindingId parameter_binding = model_.AddBinding(
+          function_scope, parameter_name, BINDING_PARAMETER,
+          inherited_type.parameters[parameter + 1]);
+      parameter_bindings.push_back(parameter_binding);
+      MakeSemantic(SEMA_PARAMETER, function_scope, function_node,
+                   inherited_type.parameters[parameter + 1],
+                   parameter_binding);
+    }
+    const SemaId member = MakeSemantic(
+        SEMA_MEMBER_INITIALIZER, function_scope, function_node,
+        base_owner.type, 0, base_constructor);
+    for (std::size_t parameter = 0; parameter < parameter_bindings.size();
+         ++parameter)
+      MakeSemantic(SEMA_ID_EXPRESSION, function_scope, member,
+                   inherited_type.parameters[parameter + 1],
+                   parameter_bindings[parameter], 0, VC_LVALUE);
+    (void)MakeSemantic(SEMA_COMPOUND_STATEMENT, function_scope,
+                       function_node);
+  }
+  owner.inheriting_constructor_base = base;
 }
 
 void ScopeBuilder::BuildAlias(AstId node, ScopeId scope)
@@ -434,6 +552,19 @@ void ScopeBuilder::BuildVariable(BindingId binding, AstId initializer,
 {
   const TypeId type = model_.BindingAt(binding).type;
   const bool records = RecordsConstantValue(type);
+  const TypeId unqualified = types_.Unqualified(type);
+  if (variable != 0) {
+    if (types_.Kind(unqualified) == TYPE_CLASS) {
+      EnsureDestructor(type);
+    } else if (types_.Kind(unqualified) == TYPE_ARRAY) {
+      const TypeId element = types_.Unqualified(types_.At(unqualified).base);
+      if (types_.Kind(element) == TYPE_CLASS) {
+        if (initializer == 0)
+          EnsureDefaultConstructor(element);
+        EnsureDestructor(element);
+      }
+    }
+  }
   if (initializer == 0)
   {
     if (is_constexpr)
@@ -441,6 +572,30 @@ void ScopeBuilder::BuildVariable(BindingId binding, AstId initializer,
     if (variable != 0 && types_.Kind(types_.Unqualified(type)) == TYPE_CLASS)
       AddConstructorAction(variable, scope, type, binding, declarator);
     return;
+  }
+  if (variable != 0 && types_.Kind(unqualified) == TYPE_CLASS)
+  {
+    AstId value = initializer;
+    if (arena_.At(value).kind == AST_INITIALIZER) {
+      if (arena_.At(value).children.size() != 1)
+        throw std::runtime_error("invalid class initializer");
+      value = arena_.At(value).children[0];
+    }
+    const AstKind value_kind = arena_.At(value).kind;
+    if ((value_kind == AST_PAREN_INITIALIZER ||
+         value_kind == AST_BRACED_INIT_LIST) &&
+        !model_.ClassAt(types_.At(unqualified).entity).aggregate &&
+        !model_.ClassAt(types_.At(unqualified).entity).constructors.empty())
+    {
+      AddConstructorActionWithArguments(
+          variable, scope, type, binding, arena_.At(value).children);
+      return;
+    }
+    if (value_kind == AST_BRACED_INIT_LIST &&
+        !model_.ClassAt(types_.At(unqualified).entity).aggregate)
+      throw std::runtime_error("class is not an aggregate");
+    if (value_kind == AST_PAREN_INITIALIZER)
+      throw std::runtime_error("class has no viable constructor");
   }
   if (variable == 0 && !records)
     return;
@@ -586,6 +741,374 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   labels_.clear();
   gotos_.clear();
   initialized_locals_.clear();
+}
+
+// Special members are declarations without a decl-specifier-seq in the AST.
+// They still enter the same canonical FunctionEntity table as ordinary
+// members; the only extra source facts are the constructor-initializer and
+// the special-member kind.  Keeping those facts here lets both overload
+// resolution and lowering refer to one function identity.
+void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
+{
+  ClassEntityId member_class = 0;
+  if (!model_.ClassForScope(scope, member_class))
+    throw std::runtime_error("special member is not declared in a class");
+  const AstId declarator = FindChild(node, AST_DECLARATOR);
+  if (declarator == 0)
+    throw std::runtime_error("special member has no declarator");
+  const AstId identifier = FindIdentifier(declarator);
+  const std::string spelling = identifier == 0 ? std::string() :
+      arena_.At(identifier).text;
+  if (spelling.empty())
+    throw std::runtime_error("special member has no name");
+  const bool destructor = spelling[0] == '~';
+  const std::string name = destructor ? spelling : model_.ScopeAt(scope).name;
+  const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
+  std::vector<ParameterInfo> parameters;
+  bool variadic = false;
+  if (clause != 0)
+    BuildParameters(clause, scope, parameters, variadic);
+  if (destructor && (!parameters.empty() || variadic))
+    throw std::runtime_error("destructor has parameters");
+  const std::vector<TypeId> parameter_types = [&]() {
+    std::vector<TypeId> result;
+    for (std::size_t i = 0; i < parameters.size(); ++i)
+      result.push_back(parameters[i].type);
+    return result;
+  }();
+  const bool member_const = HasConstFunctionQualifier(declarator);
+  const TypeId declared_type = types_.Function(
+      types_.Fundamental(FT_VOID), parameter_types, variadic, member_const);
+  std::vector<AstId> defaults;
+  for (std::size_t i = 0; i < parameters.size(); ++i)
+    defaults.push_back(parameters[i].default_initializer);
+  BindingId binding = 0;
+  const AstId initializer = FindChild(node, AST_INITIALIZER);
+  const AstId special_initializer = FindChild(initializer,
+                                               AST_SPECIAL_INITIALIZER);
+  const bool defaulted = special_initializer != 0 &&
+      arena_.At(special_initializer).text == "default";
+  const bool deleted = special_initializer != 0 &&
+      arena_.At(special_initializer).text == "delete";
+  const bool definition = arena_.At(node).kind ==
+      AST_SPECIAL_MEMBER_DEFINITION || defaulted;
+  const FunctionEntityId function = DeclareFunction(
+      scope, name, declared_type, definition, binding, member_const,
+      false, IsNoThrowDeclarator(declarator, scope), defaults);
+  if (binding == 0)
+    throw std::runtime_error("special member has no binding");
+
+  FunctionEntity& entity = model_.FunctionAt(function);
+  entity.special_member = destructor ? SPECIAL_MEMBER_DESTRUCTOR :
+      SPECIAL_MEMBER_CONSTRUCTOR;
+  entity.parameter_names.clear();
+  for (std::size_t i = 0; i < parameters.size(); ++i)
+    entity.parameter_names.push_back(parameters[i].name);
+  entity.body = FindChild(node, AST_COMPOUND_STATEMENT);
+  entity.ctor_initializer = FindChild(node, AST_CTOR_INITIALIZER);
+  entity.in_class_definition = true;
+  entity.defaulted = defaulted;
+  entity.deleted = deleted;
+  if (destructor)
+    model_.ClassAt(member_class).destructor = function;
+  else
+  {
+    ClassEntity& owner = model_.ClassAt(member_class);
+    owner.constructor = function;
+    if (std::find(owner.constructors.begin(), owner.constructors.end(),
+                  function) == owner.constructors.end())
+      owner.constructors.push_back(function);
+  }
+
+  if (tree_ == 0)
+    return;
+  const SemaKind semantic_kind = definition ? SEMA_FUNCTION_DEFINITION :
+      SEMA_FUNCTION_DECLARATION;
+  const SemaId function_node = MakeDetachedSemantic(
+      semantic_kind, scope, model_.FunctionAt(function).type, binding,
+      function);
+  DeferSemantic(function_node);
+  if (!definition)
+    return;
+
+  const ScopeId function_scope = model_.CreateScope(
+      SCOPE_FUNCTION, name, scope);
+  MapSemanticScope(function_scope, function_node);
+  const TypeNode& canonical = types_.At(
+      types_.Unqualified(model_.FunctionAt(function).type));
+  const BindingId this_binding = model_.AddBinding(
+      function_scope, "this", BINDING_PARAMETER, canonical.parameters[0]);
+  const SemaId this_parameter = tree_->Make(SEMA_PARAMETER);
+  SemaNode& this_node = tree_->At(this_parameter);
+  this_node.scope = function_scope;
+  this_node.type = canonical.parameters[0];
+  this_node.binding = this_binding;
+  tree_->Append(function_node, this_parameter);
+  for (std::size_t i = 0; i < parameters.size(); ++i)
+  {
+    const BindingId parameter = model_.AddBinding(
+        function_scope, parameters[i].name, BINDING_PARAMETER,
+        canonical.parameters[i + 1]);
+    MakeSemantic(SEMA_PARAMETER, function_scope, function_node,
+                 canonical.parameters[i + 1], parameter);
+  }
+  // Keep a semantic copy of each constructor default for implicit base and
+  // member initialization.  Explicit call sites are analyzed below as
+  // usual; these detached nodes cover the separate lowering path used when a
+  // subobject is omitted from the mem-initializer list.
+  std::vector<SemaId> default_semantic_arguments(
+      canonical.parameters.size(), 0);
+  for (std::size_t i = 0; i < parameters.size(); ++i)
+    if (parameters[i].default_initializer != 0)
+      default_semantic_arguments[i + 1] = expression_.AnalyzeInitializer(
+          parameters[i].default_initializer, function_scope,
+          canonical.parameters[i + 1]);
+  model_.FunctionAt(function).default_semantic_arguments.swap(
+      default_semantic_arguments);
+  BuildMemberInitializers(model_.FunctionAt(function).ctor_initializer,
+                          function_scope,
+                          function_node, function);
+  labels_.clear();
+  gotos_.clear();
+  initialized_locals_.clear();
+  jump_sequence_ = 0;
+  if (model_.FunctionAt(function).body != 0)
+    (void)BuildCompound(model_.FunctionAt(function).body, function_scope,
+                        function, 0, 0, function_node);
+  else
+    (void)MakeSemantic(SEMA_COMPOUND_STATEMENT, function_scope,
+                       function_node);
+  labels_.clear();
+  gotos_.clear();
+  initialized_locals_.clear();
+}
+
+FunctionEntityId ScopeBuilder::ResolveConstructor(
+    TypeId type, const std::vector<SemaId>& arguments, ScopeId scope)
+{
+  const TypeId class_type = types_.Unqualified(type);
+  if (types_.Kind(class_type) != TYPE_CLASS)
+    throw std::runtime_error("constructor target is not a class");
+  const ClassEntityId class_entity = types_.At(class_type).entity;
+  ClassEntity& owner = model_.ClassAt(class_entity);
+  if (owner.constructors.empty())
+  {
+    if (arguments.empty())
+      return EnsureDefaultConstructor(class_type);
+    throw std::runtime_error("class has no viable constructor");
+  }
+
+  std::vector<BindingId> candidates;
+  const std::vector<BindingId>& bindings =
+      model_.ScopeAt(owner.class_scope).bindings;
+  for (std::size_t i = 0; i < bindings.size(); ++i)
+  {
+    const Binding& binding = model_.BindingAt(bindings[i]);
+    if (binding.kind != BINDING_FUNCTION || binding.function == 0 ||
+        std::find(owner.constructors.begin(), owner.constructors.end(),
+                  binding.function) == owner.constructors.end() ||
+        model_.FunctionAt(binding.function).deleted)
+      continue;
+    candidates.push_back(bindings[i]);
+  }
+  if (candidates.empty())
+    throw std::runtime_error("class has only deleted constructors");
+  std::vector<OverloadArgument> overload_arguments;
+  overload_arguments.push_back(OverloadArgument(
+      types_.Pointer(class_type), VC_PRVALUE, false, false, true));
+  for (std::size_t i = 0; i < arguments.size(); ++i)
+  {
+    const SemaNode& argument = tree_->At(arguments[i]);
+    overload_arguments.push_back(OverloadArgument(
+        argument.type, argument.category,
+        types_.IsNullPointerType(argument.type),
+        argument.kind == SEMA_ID_EXPRESSION &&
+            types_.Kind(types_.Unqualified(argument.type)) == TYPE_FUNCTION));
+  }
+  const FunctionEntityId selected = SelectBestOverload(
+      model_, types_, candidates, overload_arguments, true);
+  if (selected == 0)
+    throw std::runtime_error("no viable constructor");
+  (void)scope;
+  return selected;
+}
+
+void ScopeBuilder::BuildMemberInitializers(AstId initializer,
+                                           ScopeId function_scope,
+                                           SemaId function_node,
+                                           FunctionEntityId owner_function)
+{
+  if (initializer == 0)
+    return;
+  const FunctionEntity& owner_function_entity =
+      model_.FunctionAt(owner_function);
+  const ClassEntity& owner = model_.ClassAt(owner_function_entity.member_class);
+  const std::vector<AstId>& initializers = arena_.At(initializer).children;
+  for (std::size_t i = 0; i < initializers.size(); ++i)
+  {
+    const AstId mem = initializers[i];
+    const AstId id = FindChild(mem, AST_MEM_INITIALIZER_ID);
+    if (id == 0)
+      throw std::runtime_error("mem-initializer has no target");
+    const QualifiedName name = ReadQualifiedName(
+        tokens_, arena_.At(id).first, arena_.At(id).last);
+    if (name.Empty())
+      throw std::runtime_error("mem-initializer has an invalid target");
+    const AstId argument_list = arena_.At(mem).children.size() > 1 ?
+        arena_.At(mem).children[1] : 0;
+    if (argument_list == 0)
+      throw std::runtime_error("mem-initializer has no arguments");
+
+    BindingId field_binding = 0;
+    TypeId target_type = 0;
+    FunctionEntityId target_constructor = 0;
+    for (std::size_t field = 0; field < owner.fields.size(); ++field)
+    {
+      const Binding& binding = model_.BindingAt(owner.fields[field].binding);
+      if (!owner.fields[field].static_member && binding.name == name.Last())
+      {
+        field_binding = owner.fields[field].binding;
+        target_type = owner.fields[field].type;
+        break;
+      }
+    }
+    if (field_binding == 0)
+    {
+      for (std::size_t base = 0; base < owner.bases.size(); ++base)
+      {
+        const ClassEntity& base_entity =
+            model_.ClassAt(owner.bases[base].entity);
+        if (model_.ScopeAt(base_entity.class_scope).name == name.Last())
+        {
+          target_type = base_entity.type;
+          break;
+        }
+      }
+    }
+    if (target_type == 0)
+      throw std::runtime_error("mem-initializer names no direct subobject");
+
+    const TypeId target_unqualified = types_.Unqualified(target_type);
+    const bool empty_array_value_initializer =
+        types_.Kind(target_unqualified) == TYPE_ARRAY &&
+        (arena_.At(argument_list).kind == AST_PAREN_INITIALIZER ||
+         arena_.At(argument_list).kind == AST_PAREN_ARGUMENT_LIST) &&
+        arena_.At(argument_list).children.empty();
+    const bool aggregate_initializer =
+        types_.Kind(target_unqualified) == TYPE_CLASS &&
+        model_.ClassAt(types_.At(target_unqualified).entity).aggregate &&
+        arena_.At(argument_list).kind == AST_BRACED_INIT_LIST;
+    std::vector<SemaId> arguments;
+    if (empty_array_value_initializer) {
+      const SemaId zero = tree_->Make(SEMA_BRACED_INIT_LIST);
+      SemaNode& zero_node = tree_->At(zero);
+      zero_node.scope = function_scope;
+      zero_node.type = target_type;
+      zero_node.category = VC_PRVALUE;
+      arguments.push_back(zero);
+    } else if (aggregate_initializer) {
+      arguments.clear();
+      arguments.push_back(expression_.AnalyzeInitializer(
+          argument_list, function_scope, target_type));
+    } else {
+      const std::vector<AstId>& argument_nodes =
+          arena_.At(argument_list).children;
+      for (std::size_t argument = 0; argument < argument_nodes.size();
+           ++argument)
+        arguments.push_back(expression_.Analyze(argument_nodes[argument],
+                                                function_scope));
+    }
+    if (!aggregate_initializer && types_.Kind(target_unqualified) == TYPE_CLASS)
+    {
+      target_constructor = ResolveConstructor(target_type, arguments,
+                                               function_scope);
+      const TypeNode& constructor_type = types_.At(types_.Unqualified(
+          model_.FunctionAt(target_constructor).type));
+      std::vector<SemaId> converted;
+      converted.reserve(constructor_type.parameters.size() - 1);
+      for (std::size_t argument = 0; argument < arguments.size(); ++argument)
+        converted.push_back(expression_.Initialize(
+            arguments[argument], constructor_type.parameters[argument + 1]));
+      const FunctionEntity& constructor = model_.FunctionAt(target_constructor);
+      for (std::size_t parameter = arguments.size() + 1;
+           parameter < constructor_type.parameters.size(); ++parameter)
+      {
+        if (parameter >= constructor.default_arguments.size() ||
+            constructor.default_arguments[parameter] == 0)
+          throw std::runtime_error("missing constructor argument");
+        converted.push_back(expression_.AnalyzeInitializer(
+            constructor.default_arguments[parameter], constructor.scope,
+            constructor_type.parameters[parameter]));
+      }
+      arguments.swap(converted);
+    }
+    else if (!aggregate_initializer && !empty_array_value_initializer)
+    {
+      if (arguments.size() != 1)
+        throw std::runtime_error("scalar mem-initializer needs one argument");
+      arguments[0] = expression_.Initialize(arguments[0], target_type);
+    }
+
+    const SemaId member = MakeSemantic(
+        SEMA_MEMBER_INITIALIZER, function_scope, function_node, target_type,
+        field_binding, target_constructor, VC_PRVALUE, KW_AUTO,
+        arena_.At(mem).first, arena_.At(mem).last);
+    for (std::size_t argument = 0; argument < arguments.size(); ++argument)
+      tree_->Append(member, arguments[argument]);
+  }
+}
+
+void ScopeBuilder::AddConstructorActionWithArguments(
+    SemaId variable, ScopeId scope, TypeId type, BindingId binding,
+    const std::vector<AstId>& argument_nodes)
+{
+  if (!EmitsSemantics())
+    return;
+  std::vector<SemaId> arguments;
+  for (std::size_t i = 0; i < argument_nodes.size(); ++i)
+    arguments.push_back(expression_.Analyze(argument_nodes[i], scope));
+  const FunctionEntityId constructor = ResolveConstructor(type, arguments,
+                                                           scope);
+  const FunctionEntity& function = model_.FunctionAt(constructor);
+  const TypeNode& callable = types_.At(types_.Unqualified(function.type));
+  std::vector<SemaId> converted;
+  converted.reserve(callable.parameters.size());
+  for (std::size_t i = 0; i < arguments.size(); ++i)
+    converted.push_back(expression_.Initialize(arguments[i],
+                                               callable.parameters[i + 1]));
+  for (std::size_t parameter = arguments.size() + 1;
+       parameter < callable.parameters.size(); ++parameter)
+  {
+    if (parameter >= function.default_arguments.size() ||
+        function.default_arguments[parameter] == 0)
+      throw std::runtime_error("missing constructor argument");
+    converted.push_back(expression_.AnalyzeInitializer(
+        function.default_arguments[parameter], function.scope,
+        callable.parameters[parameter]));
+  }
+
+  const SemaId action = tree_->Make(SEMA_CONSTRUCTOR_ACTION);
+  SemaNode& action_node = tree_->At(action);
+  action_node.scope = scope;
+  action_node.type = type;
+  action_node.binding = binding;
+  action_node.function = constructor;
+  tree_->Append(variable, action);
+  const SemaId call = MakeSemantic(SEMA_CALL, scope, action,
+                                   types_.Fundamental(FT_VOID), 0,
+                                   constructor, VC_PRVALUE);
+  const SemaId callee = tree_->Make(SEMA_CALLEE);
+  SemaNode& callee_node = tree_->At(callee);
+  callee_node.scope = scope;
+  callee_node.type = function.type;
+  callee_node.function = constructor;
+  tree_->Append(call, callee);
+  const SemaId address = MakeSemantic(SEMA_UNARY, scope, call,
+      types_.Pointer(types_.Unqualified(type)), 0, 0, VC_PRVALUE, OP_AMP);
+  MakeSemantic(SEMA_ID_EXPRESSION, scope, address, type, binding, 0,
+               VC_LVALUE, KW_AUTO);
+  for (std::size_t i = 0; i < converted.size(); ++i)
+    tree_->Append(call, converted[i]);
 }
 
 long long ScopeBuilder::ConstantValue(AstId expression, ScopeId scope)
@@ -746,6 +1269,7 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
   member_access_ = saved_access;
   current_class_ = saved_class;
   CompleteClassLayout(entity);
+  BuildDefaultMemberInitializers(entity);
   if (injected_union)
   {
     const vector<BindingId> members = model_.ScopeAt(class_scope).bindings;
@@ -761,6 +1285,109 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
     }
   }
   return type;
+}
+
+// Default member initializers are complete-class-context expressions
+// (9.2p2): a constructor declared before a later field still sees that field.
+// Analyze them after the whole class body has been collected, and retain the
+// resulting nodes on the constructor entity without adding synthetic nodes
+// to the PA12 source-shaped semantic dump.
+void ScopeBuilder::BuildDefaultMemberInitializers(ClassEntityId entity)
+{
+  if (!EmitsSemantics())
+    return;
+  const ClassEntity& owner = model_.ClassAt(entity);
+  for (std::size_t constructor_index = 0;
+       constructor_index < owner.constructors.size(); ++constructor_index) {
+    const FunctionEntityId constructor = owner.constructors[constructor_index];
+    const FunctionEntity& function = model_.FunctionAt(constructor);
+    if (function.deleted)
+      continue;
+    SemaId function_node = 0;
+    for (std::size_t i = 0; i < deferred_semantics_.size(); ++i) {
+      const SemaId candidate = deferred_semantics_[i];
+      if (candidate != 0 && tree_->At(candidate).function == constructor &&
+          tree_->At(candidate).kind == SEMA_FUNCTION_DEFINITION) {
+        function_node = candidate;
+        break;
+      }
+    }
+    if (function_node == 0)
+      continue;
+    ScopeId function_scope = 0;
+    for (SemaId child = tree_->At(function_node).first_child; child != 0;
+         child = tree_->At(child).next_sibling) {
+      if (tree_->At(child).kind == SEMA_COMPOUND_STATEMENT) {
+        function_scope = tree_->At(child).scope;
+        break;
+      }
+      if (tree_->At(child).kind == SEMA_PARAMETER && function_scope == 0)
+        function_scope = tree_->At(child).scope;
+    }
+    if (function_scope == 0)
+      continue;
+    std::vector<std::pair<BindingId, std::size_t> > defaults;
+    for (std::size_t field_index = 0; field_index < owner.fields.size();
+         ++field_index) {
+      const ClassField& field = owner.fields[field_index];
+      if (field.static_member || field.initializer == 0)
+        continue;
+      AstId source = field.initializer;
+      if (arena_.At(source).kind == AST_INITIALIZER &&
+          arena_.At(source).children.size() == 1)
+        source = arena_.At(source).children[0];
+      SemaId value = 0;
+      const TypeId field_unqualified = types_.Unqualified(field.type);
+      if (types_.Kind(field_unqualified) == TYPE_CLASS &&
+          arena_.At(source).kind == AST_CALL_EXPRESSION &&
+          !model_.ClassAt(types_.At(field_unqualified).entity).aggregate) {
+        const std::vector<AstId>& call_children = arena_.At(source).children;
+        if (call_children.size() != 2)
+          throw std::runtime_error("invalid default member constructor");
+        const std::vector<AstId>& argument_nodes =
+            arena_.At(call_children[1]).children;
+        std::vector<SemaId> arguments;
+        for (std::size_t argument = 0; argument < argument_nodes.size();
+             ++argument)
+          arguments.push_back(expression_.Analyze(argument_nodes[argument],
+                                                  function_scope));
+        const FunctionEntityId target_constructor = ResolveConstructor(
+            field.type, arguments, function_scope);
+        const FunctionEntity& constructor =
+            model_.FunctionAt(target_constructor);
+        const TypeNode& constructor_type = types_.At(types_.Unqualified(
+            constructor.type));
+        std::vector<SemaId> converted;
+        for (std::size_t argument = 0; argument < arguments.size();
+             ++argument)
+          converted.push_back(expression_.Initialize(
+              arguments[argument], constructor_type.parameters[argument + 1]));
+        for (std::size_t parameter = arguments.size() + 1;
+             parameter < constructor_type.parameters.size(); ++parameter) {
+          if (parameter >= constructor.default_arguments.size() ||
+              constructor.default_arguments[parameter] == 0)
+            throw std::runtime_error("missing default member constructor argument");
+          converted.push_back(expression_.AnalyzeInitializer(
+              constructor.default_arguments[parameter], constructor.scope,
+              constructor_type.parameters[parameter]));
+        }
+        value = tree_->Make(SEMA_MEMBER_INITIALIZER);
+        SemaNode& member = tree_->At(value);
+        member.scope = function_scope;
+        member.type = field.type;
+        member.binding = field.binding;
+        member.function = target_constructor;
+        member.category = VC_PRVALUE;
+        for (std::size_t argument = 0; argument < converted.size();
+             ++argument)
+          tree_->Append(value, converted[argument]);
+      } else
+        value = expression_.AnalyzeInitializer(field.initializer,
+                                               function_scope, field.type);
+      defaults.push_back(std::make_pair(field.binding, value));
+    }
+    model_.FunctionAt(constructor).default_member_initializers.swap(defaults);
+  }
 }
 
 namespace
@@ -860,9 +1487,39 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
   value.size = size;
   value.alignment = alignment;
   value.layout_complete = true;
+  value.aggregate = value.bases.empty();
+  for (std::size_t i = 0; i < value.fields.size(); ++i) {
+    const ClassField& field = value.fields[i];
+    if (field.static_member)
+      continue;
+    if (field.access != ACCESS_PUBLIC || field.initializer != 0)
+      value.aggregate = false;
+  }
+  for (std::size_t i = 0; i < value.constructors.size(); ++i) {
+    const FunctionEntity& constructor =
+        model_.FunctionAt(value.constructors[i]);
+    if (!constructor.synthesized && !constructor.defaulted &&
+        !constructor.deleted)
+      value.aggregate = false;
+  }
   value.trivial_default_constructor = true;
+  for (std::size_t i = 0; i < value.constructors.size(); ++i)
+    if (!model_.FunctionAt(value.constructors[i]).synthesized &&
+        !model_.FunctionAt(value.constructors[i]).defaulted &&
+        !model_.FunctionAt(value.constructors[i]).deleted)
+      value.trivial_default_constructor = false;
   for (std::size_t i = 0; i < value.fields.size(); ++i)
     if (value.fields[i].initializer != 0)
+      value.trivial_default_constructor = false;
+    else {
+      const TypeId field_type = types_.Unqualified(value.fields[i].type);
+      if (types_.Kind(field_type) == TYPE_CLASS &&
+          !model_.ClassAt(types_.At(field_type).entity)
+              .trivial_default_constructor)
+        value.trivial_default_constructor = false;
+  }
+  for (std::size_t i = 0; i < value.bases.size(); ++i)
+    if (!model_.ClassAt(value.bases[i].entity).trivial_default_constructor)
       value.trivial_default_constructor = false;
   types_.SetClassLayout(entity, size, alignment);
 }
@@ -1433,6 +2090,28 @@ void ScopeBuilder::CheckJumpTarget(unsigned source_sequence,
   }
 }
 
+bool ScopeBuilder::HasNontrivialDestructor(ClassEntityId entity) const
+{
+  const ClassEntity& owner = model_.ClassAt(entity);
+  if (owner.destructor != 0 &&
+      !model_.FunctionAt(owner.destructor).synthesized)
+    return true;
+  for (std::size_t i = 0; i < owner.bases.size(); ++i)
+    if (HasNontrivialDestructor(owner.bases[i].entity))
+      return true;
+  for (std::size_t i = 0; i < owner.fields.size(); ++i) {
+    if (owner.fields[i].static_member)
+      continue;
+    TypeId field_type = types_.Unqualified(owner.fields[i].type);
+    while (types_.Kind(field_type) == TYPE_ARRAY)
+      field_type = types_.Unqualified(types_.At(field_type).base);
+    if (types_.Kind(field_type) == TYPE_CLASS &&
+        HasNontrivialDestructor(types_.At(field_type).entity))
+      return true;
+  }
+  return false;
+}
+
 FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
 {
   const TypeId class_type = types_.Unqualified(type);
@@ -1444,6 +2123,11 @@ FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
     throw std::runtime_error("default constructor requires a defined class");
   if (owner.default_constructor != 0)
     return owner.default_constructor;
+  if (!owner.constructors.empty())
+  {
+    std::vector<SemaId> no_arguments;
+    return ResolveConstructor(class_type, no_arguments, owner.class_scope);
+  }
 
   const TypeId this_type = types_.Pointer(class_type);
   const std::vector<TypeId> parameters(1, this_type);
@@ -1455,11 +2139,19 @@ FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
   FunctionEntity& function = model_.FunctionAt(constructor);
   function.is_member = true;
   function.member_class = class_entity;
+  function.member_type = types_.Function(types_.Fundamental(FT_VOID),
+                                         std::vector<TypeId>());
+  function.member_pointer_type = types_.MemberPointer(
+      class_type, function.member_type);
+  function.special_member = SPECIAL_MEMBER_CONSTRUCTOR;
+  function.in_class_definition = true;
   function.synthesized = true;
   const BindingId binding = model_.AddBinding(
       owner.class_scope, name, BINDING_FUNCTION, constructor_type);
   model_.BindingAt(binding).function = constructor;
   owner.default_constructor = constructor;
+  owner.constructor = constructor;
+  owner.constructors.push_back(constructor);
 
   if (EmitsSemantics())
   {
@@ -1480,7 +2172,67 @@ FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
                                      function_scope, function_node);
     MapSemanticScope(function_scope, body);
   }
+  BuildDefaultMemberInitializers(class_entity);
   return constructor;
+}
+
+FunctionEntityId ScopeBuilder::EnsureDestructor(TypeId type)
+{
+  const TypeId class_type = types_.Unqualified(type);
+  if (types_.Kind(class_type) != TYPE_CLASS)
+    throw std::runtime_error("destructor requires a class type");
+  const ClassEntityId class_entity = types_.At(class_type).entity;
+  ClassEntity& owner = model_.ClassAt(class_entity);
+  if (!owner.defined || owner.class_scope == 0)
+    throw std::runtime_error("destructor requires a defined class");
+  if (owner.destructor != 0)
+    return owner.destructor;
+  if (!HasNontrivialDestructor(class_entity))
+    return 0;
+
+  const TypeId this_type = types_.Pointer(class_type);
+  const std::vector<TypeId> parameters(1, this_type);
+  const TypeId destructor_type = types_.Function(
+      types_.Fundamental(FT_VOID), parameters);
+  const std::string name = "~" + model_.ScopeAt(owner.class_scope).name;
+  const FunctionEntityId destructor = model_.CreateFunction(
+      owner.class_scope, name, destructor_type);
+  FunctionEntity& function = model_.FunctionAt(destructor);
+  function.is_member = true;
+  function.member_class = class_entity;
+  function.member_type = types_.Function(types_.Fundamental(FT_VOID),
+                                         std::vector<TypeId>());
+  function.member_pointer_type = types_.MemberPointer(
+      class_type, function.member_type);
+  function.special_member = SPECIAL_MEMBER_DESTRUCTOR;
+  function.in_class_definition = true;
+  function.synthesized = true;
+  const BindingId binding = model_.AddBinding(
+      owner.class_scope, name, BINDING_FUNCTION, destructor_type);
+  model_.BindingAt(binding).function = destructor;
+  owner.destructor = destructor;
+
+  if (EmitsSemantics())
+  {
+    const SemaId function_node = MakeDetachedSemantic(
+        SEMA_FUNCTION_DEFINITION, owner.class_scope, destructor_type,
+        binding, destructor);
+    DeferSemantic(function_node);
+    const ScopeId function_scope = model_.CreateScope(
+        SCOPE_FUNCTION, name, owner.class_scope);
+    const SemaId this_parameter = tree_->Make(SEMA_PARAMETER);
+    SemaNode& parameter = tree_->At(this_parameter);
+    parameter.scope = function_scope;
+    parameter.type = this_type;
+    parameter.binding = model_.AddBinding(
+        function_scope, "this", BINDING_PARAMETER, this_type);
+    tree_->Append(function_node, this_parameter);
+    const SemaId body = MakeSemantic(SEMA_COMPOUND_STATEMENT,
+                                     function_scope, function_node);
+    MapSemanticScope(function_scope, body);
+    function.body = 0;
+  }
+  return destructor;
 }
 
 // `constructor-action A::A` with the synthesized call `A::A(&object)`; the
@@ -1489,33 +2241,9 @@ void ScopeBuilder::AddConstructorAction(SemaId variable, ScopeId scope,
                                         TypeId type, BindingId binding,
                                         AstId declarator)
 {
-  if (!EmitsSemantics())
-    return;
-  const FunctionEntityId constructor = EnsureDefaultConstructor(type);
-  const FunctionEntity& function = model_.FunctionAt(constructor);
-  const SemaId action = tree_->Make(SEMA_CONSTRUCTOR_ACTION);
-  SemaNode& action_node = tree_->At(action);
-  action_node.scope = scope;
-  action_node.function = constructor;
-  tree_->Append(variable, action);
-
-  const SemaId call = MakeSemantic(SEMA_CALL, scope, action,
-      types_.Fundamental(FT_VOID), 0, constructor, VC_PRVALUE);
-  const SemaId callee = tree_->Make(SEMA_CALLEE);
-  SemaNode& callee_node = tree_->At(callee);
-  callee_node.scope = scope;
-  callee_node.type = function.type;
-  callee_node.function = constructor;
-  tree_->Append(call, callee);
-
-  const TypeId class_type = types_.Unqualified(type);
-  const SemaId address = MakeSemantic(SEMA_UNARY, scope, call,
-      types_.Pointer(class_type), 0, 0, VC_PRVALUE, OP_AMP);
-  const AstId identifier = FindIdentifier(declarator);
-  MakeSemantic(SEMA_ID_EXPRESSION, scope, address, type, binding, 0,
-               VC_LVALUE, KW_AUTO,
-               identifier == 0 ? 0 : arena_.At(identifier).first,
-               identifier == 0 ? 0 : arena_.At(identifier).last);
+  (void)declarator;
+  AddConstructorActionWithArguments(variable, scope, type, binding,
+                                    std::vector<AstId>());
 }
 
 void ScopeBuilder::BuildAnonymousUnionStorage(AstId node, ScopeId scope,

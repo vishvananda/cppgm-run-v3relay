@@ -22,8 +22,9 @@ Scope::Scope()
 ClassEntity::ClassEntity()
     : class_scope(0), type(0), default_constructor(0),
       size(0), alignment(1), requested_alignment(0), constructor(0),
-      destructor(0), layout_complete(false), trivial_default_constructor(true),
-      is_union(false), defined(false)
+      destructor(0), inheriting_constructor_base(0), layout_complete(false),
+      trivial_default_constructor(true),
+      aggregate(true), is_union(false), defined(false)
 {
 }
 
@@ -37,7 +38,10 @@ FunctionEntity::FunctionEntity()
       member_class(0), is_member(false), member_const(false),
       is_template(false), internal_linkage(false), c_linkage(false),
       noexcept_qualifier(false), special_member(SPECIAL_MEMBER_NONE),
+      body(0), ctor_initializer(0), parameter_names(), defaulted(false),
+      deleted(false),
       static_member(false), in_class_definition(false), synthesized(false),
+      default_semantic_arguments(), default_member_initializers(),
       defined(false)
 {
 }

@@ -92,6 +92,10 @@ private:
   void BuildVariable(BindingId binding, AstId initializer, AstId declarator,
                      ScopeId scope, SemaId variable, bool is_constexpr);
   void BuildFunctionDefinition(AstId node, ScopeId scope);
+  void BuildSpecialMember(AstId node, ScopeId scope);
+  void BuildDefaultMemberInitializers(ClassEntityId entity);
+  void BuildInheritedConstructors(ClassEntityId derived,
+                                  ClassEntityId base, ScopeId scope);
   void BuildStaticAssert(AstId node, ScopeId scope);
   void BuildLinkage(AstId node, ScopeId scope);
   ScopeId BuildCompound(AstId node, ScopeId parent,
@@ -133,9 +137,20 @@ private:
   std::string AnonymousTypeName(AstId node, const char* kind) const;
   bool HasConstFunctionQualifier(AstId declarator) const;
   bool IsNoThrowDeclarator(AstId declarator, ScopeId scope);
+  bool HasNontrivialDestructor(ClassEntityId entity) const;
   FunctionEntityId EnsureDefaultConstructor(TypeId type);
+  FunctionEntityId EnsureDestructor(TypeId type);
+  FunctionEntityId ResolveConstructor(TypeId type,
+                                      const std::vector<SemaId>& arguments,
+                                      ScopeId scope);
   void AddConstructorAction(SemaId variable, ScopeId scope, TypeId type,
                             BindingId binding, AstId declarator);
+  void AddConstructorActionWithArguments(
+      SemaId variable, ScopeId scope, TypeId type, BindingId binding,
+      const std::vector<AstId>& arguments);
+  void BuildMemberInitializers(AstId initializer, ScopeId function_scope,
+                               SemaId function_node,
+                               FunctionEntityId owner);
   void BuildAnonymousUnionStorage(AstId node, ScopeId scope,
                                   SemaId semantic_parent, TypeId type);
   void EmitDeferredSemantics();

@@ -47,6 +47,12 @@ private:
   unsigned init_temp_counter_;
   unsigned init_label_counter_;
   unsigned init_slot_counter_;
+  lowir_model::Function fini_function_;
+  bool has_fini_;
+  bool needs_init_function_;
+  unsigned fini_temp_counter_;
+  unsigned fini_label_counter_;
+  unsigned fini_slot_counter_;
   unsigned string_literal_counter_; // @__strlit__N, first use across units
 };
 
@@ -74,16 +80,43 @@ private:
     std::string continue_label;
   };
 
+  struct LiveObject
+  {
+    BindingId binding;
+    TypeId type;
+
+    LiveObject(BindingId binding = 0, TypeId type = 0)
+        : binding(binding), type(type) {}
+  };
+
+  struct SharedCleanupNode
+  {
+    std::string label;
+    std::string next;
+    LiveObject object;
+
+    SharedCleanupNode(const std::string& label = std::string(),
+                      const std::string& next = std::string(),
+                      const LiveObject& object = LiveObject())
+        : label(label), next(next), object(object) {}
+  };
+
   // One entry per function entity the unit names, keyed by the entity.
   struct FunctionSymbol
   {
     std::string name;   // LowIR symbol, unique in the program
     std::string object; // ABI object name; the source name for C linkage
+    std::string base_name;   // constructor/destructor base-subobject helper
+    std::string base_object;
     SemaId declaration; // first declaration or definition node
     SemaId definition;  // 0 when the unit has no body for it
     bool referenced;    // named by a call, an address, or an initializer
+    bool base_required;
+    bool base_emitted;
 
-    FunctionSymbol() : declaration(0), definition(0), referenced(false) {}
+    FunctionSymbol()
+        : declaration(0), definition(0), referenced(false),
+          base_required(false), base_emitted(false) {}
   };
 
   // One entry per namespace-scope object, keyed by its first binding.
@@ -109,8 +142,10 @@ private:
     std::string symbol;
     std::size_t byte_offset;
     TypeId type;
+    bool constructor_action;
 
-    DynamicInitializer() : expression(0), byte_offset(0), type(0) {}
+    DynamicInitializer()
+        : expression(0), byte_offset(0), type(0), constructor_action(false) {}
   };
 
   // Symbols.
@@ -125,6 +160,7 @@ private:
   std::string FunctionObjectName(FunctionEntityId id) const;
   std::string GlobalObjectName(const GlobalSymbol& symbol) const;
   const std::string& FunctionSymbolName(FunctionEntityId id);
+  const std::string& FunctionBaseSymbolName(FunctionEntityId id);
   BindingId CanonicalBinding(BindingId id) const;
   const GlobalSymbol* GlobalFor(BindingId id) const;
   void BuildGlobalDefinitions();
@@ -132,10 +168,14 @@ private:
                           lowir_model::GlobalDefinition::DataItem& item);
   bool GlobalAddress(SemaId node, std::string& symbol, long long& addend);
   void BuildGlobalInitializers();
+  void BuildGlobalFinalizers();
   void BuildDeclarations();
   lowir_model::Function BuildFunction(const FunctionSymbol& symbol);
+  lowir_model::Function BuildFunctionVariant(const FunctionSymbol& symbol,
+                                              bool base_variant);
   lowir_model::FunctionDeclaration BuildFunctionDeclaration(
-      FunctionEntityId id, const FunctionSymbol& symbol);
+      FunctionEntityId id, const FunctionSymbol& symbol,
+      bool base_variant = false);
 
   // Type and ABI ownership.
   LowInfo LowInfoOf(TypeId type) const;
@@ -150,6 +190,8 @@ private:
                      const lowir_model::LowType& return_type);
   void ResumeInitFunction();
   void SuspendInitFunction();
+  void ResumeFiniFunction();
+  void SuspendFiniFunction();
   lowir_model::Block& CurrentBlock();
   void StartBlock(const std::string& label);
   std::string NewBlockLabel(const std::string& stem);
@@ -211,6 +253,9 @@ private:
   std::string BinaryName(ETokenType op, TypeId type) const;
   std::string CompareName(ETokenType op, TypeId type) const;
   std::string ConversionName(TypeId from, TypeId to) const;
+  std::string MangleFunction(FunctionEntityId id, bool base_variant) const;
+  std::string FunctionObjectName(FunctionEntityId id,
+                                 bool base_variant) const;
   bool IsCharacterLiteral(SemaId node) const;
   bool IsNullptrLiteral(SemaId node) const;
   bool IsZeroLiteral(SemaId node) const;
@@ -240,6 +285,38 @@ private:
   void LowerReturn(SemaId node);
   void LowerVariableDeclaration(SemaId node);
   void LowerVariable(SemaId variable_node);
+  lowir_model::Operand LowerArrayElementAddress(
+      const Value& array, TypeId element, std::size_t index);
+  void LowerAggregateInitializer(SemaId node, TypeId type,
+                                 const lowir_model::Operand& destination);
+  void LowerAggregateZero(TypeId type,
+                          const lowir_model::Operand& destination);
+  void LowerAggregateMemberInitializer(SemaId node, TypeId type,
+                                       BindingId binding,
+                                       FunctionEntityId owner);
+  void LowerAggregateMemberLeaves(
+      SemaId node, TypeId type, TypeId root_type, BindingId binding,
+      FunctionEntityId owner,
+      const std::vector<std::pair<bool, std::size_t> >& path);
+  void LowerAggregateMemberArrayLeaves(
+      SemaId node, TypeId type, TypeId root_type, BindingId binding,
+      FunctionEntityId owner,
+      const std::vector<std::pair<bool, std::size_t> >& path);
+  void RegisterLiveObject(BindingId binding, TypeId type);
+  void EmitObjectDestructor(const LiveObject& object);
+  void EmitScopeDestructors(ScopeId scope);
+  void EmitActiveDestructors();
+  std::size_t CountReturnStatements(SemaId node) const;
+  void EmitSharedReturn(const Value* value);
+  void EmitSharedReturnCleanups();
+  bool NeedsDestructor(ClassEntityId entity) const;
+  bool HasSubobjectDestructors(ClassEntityId entity) const;
+  void EmitSubobjectDestructors(ClassEntityId entity);
+  void EmitDestructorBody(FunctionEntityId function, SemaId function_node);
+  void LowerConstructorInitializers(FunctionEntityId function,
+                                    SemaId function_node);
+  void LowerMemberInitializer(SemaId node, FunctionEntityId owner);
+  FunctionEntityId DefaultConstructor(ClassEntityId entity) const;
   void PushControl(const std::string& break_label,
                    const std::string& continue_label);
   void PopControl();
@@ -273,10 +350,19 @@ private:
   std::map<SemaId, std::string> condition_labels_;
   const std::map<SemaId, std::string>* active_switch_labels_;
   std::vector<ControlTarget> controls_;
+  std::vector<ScopeId> lowering_scopes_;
+  std::map<ScopeId, std::vector<LiveObject> > live_objects_;
+  std::vector<std::string> shared_cleanup_scope_heads_;
+  std::vector<SharedCleanupNode> shared_cleanup_nodes_;
+  std::string shared_cleanup_head_;
+  std::string shared_return_end_label_;
+  std::string shared_return_slot_;
+  bool shared_return_cleanup_;
   unsigned temp_counter_;
   unsigned label_counter_;
   unsigned generated_slot_counter_;
   TypeId function_return_type_id_;
+  bool building_base_variant_;
 };
 
 }  // namespace lowir_lowering

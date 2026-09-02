@@ -1450,8 +1450,13 @@ SemaId ExpressionAnalyzer::AnalyzeBraced(AstId expression, ScopeId scope,
     const SemaId result = MakeExpression(SEMA_BRACED_INIT_LIST, expression,
                                          target, VC_PRVALUE, scope);
     for (size_t i = 0; i < children.size(); ++i) {
-      const SemaId child = Analyze(children[i], scope);
-      Initialize(child, class_entity.fields[i].type);
+      const bool nested_braced = arena_.At(children[i]).kind ==
+          AST_BRACED_INIT_LIST;
+      const SemaId child = nested_braced ?
+          AnalyzeBraced(children[i], scope, class_entity.fields[i].type) :
+          Analyze(children[i], scope);
+      if (!nested_braced)
+        Initialize(child, class_entity.fields[i].type);
       Append(result, child);
     }
     return result;
@@ -1478,7 +1483,9 @@ SemaId ExpressionAnalyzer::AnalyzeBraced(AstId expression, ScopeId scope,
                                        target, VC_LVALUE, scope);
   for (size_t i = 0; i < children.size(); ++i)
   {
-    const SemaId child = Analyze(children[i], scope);
+    const SemaId child = arena_.At(children[i]).kind == AST_BRACED_INIT_LIST ?
+        AnalyzeBraced(children[i], scope, element) :
+        Analyze(children[i], scope);
     Initialize(child, element);
     Append(result, child);
   }

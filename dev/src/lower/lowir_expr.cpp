@@ -463,7 +463,7 @@ Lowerer::Value Lowerer::LowerArrayDecay(SemaId node)
       lvalue.operand.kind == lowir_model::Operand::OP_GLOBAL;
   if (addressable)
     lvalue = AddressValue(lvalue);
-  if (kind == TYPE_FUNCTION || addressable) {
+  if (kind == TYPE_FUNCTION || addressable || kind == TYPE_ARRAY) {
     lowir_model::Instruction decay;
     decay.kind = lowir_model::Instruction::IK_UNARY;
     decay.dest = NewTemp();
@@ -488,12 +488,27 @@ Lowerer::Value Lowerer::LowerSubscript(SemaId node, bool lvalue)
   const TypeKind base_kind = types_.Kind(types_.Unqualified(base_type));
   const Value base = base_kind == TYPE_ARRAY || base_kind == TYPE_FUNCTION ?
       LowerArrayDecay(children[0]) : LowerRValue(children[0]);
-  const Value index = LowerRValue(children[1]);
+  Value index = LowerRValue(children[1]);
   const TypeId element = ReferentType(value.type);
+  const TypeId element_unqualified = types_.Unqualified(element);
+  if (types_.Kind(element_unqualified) == TYPE_CLASS &&
+      types_.SizeOf(element_unqualified) != 1) {
+    lowir_model::Instruction scale;
+    scale.kind = lowir_model::Instruction::IK_BINARY;
+    scale.dest = NewTemp();
+    scale.op = "mul";
+    scale.type = I64Type();
+    scale.first = index.operand;
+    scale.second = Immediate(static_cast<long long>(
+        types_.SizeOf(element_unqualified)));
+    Emit(scale);
+    index.operand = TempOperand(scale.dest);
+  }
   lowir_model::Instruction projection;
   projection.kind = lowir_model::Instruction::IK_INDEX;
   projection.dest = NewTemp();
-  projection.type = LowTypeOf(element);
+  projection.type = types_.Kind(element_unqualified) == TYPE_CLASS ?
+      I8Type() : LowTypeOf(element);
   projection.index_projection = lowir_model::IPK_ARRAY_ELEMENT;
   projection.first = base.operand;
   projection.second = index.operand;
@@ -711,7 +726,9 @@ Lowerer::Value Lowerer::LowerRValue(SemaId node, TypeId expected)
       return LowerRValue(children[0], expected);
     Value zero;
     zero.type = expected == 0 ? value.type : expected;
-    zero.operand = Immediate(0);
+    zero.operand = (types_.IsNullPointerType(zero.type) ||
+                    types_.IsPointer(zero.type)) ?
+        NullptrImmediate() : Immediate(0);
     return zero;
   }
   case SEMA_CALL:

@@ -11,8 +11,12 @@ Lowerer::Lowerer(ProgramLowering& shared, const std::vector<Pa6Token>& tokens,
                  SemaModel& model, const SemaTree& tree)
     : shared_(shared), tokens_(tokens), model_(model), tree_(tree),
       types_(model.Types()), program_(shared.program_), current_block_(0),
-      active_switch_labels_(0), temp_counter_(0), label_counter_(0),
-      generated_slot_counter_(0), function_return_type_id_(0)
+      active_switch_labels_(0), shared_cleanup_scope_heads_(),
+      shared_cleanup_nodes_(), shared_cleanup_head_(),
+      shared_return_end_label_(), shared_return_slot_(),
+      shared_return_cleanup_(false), temp_counter_(0), label_counter_(0),
+      generated_slot_counter_(0), function_return_type_id_(0),
+      building_base_variant_(false)
 {
 }
 
@@ -40,6 +44,14 @@ void Lowerer::ResetFunction(const std::string& name,
   goto_labels_.clear();
   condition_labels_.clear();
   controls_.clear();
+  lowering_scopes_.clear();
+  live_objects_.clear();
+  shared_cleanup_scope_heads_.clear();
+  shared_cleanup_nodes_.clear();
+  shared_cleanup_head_.clear();
+  shared_return_end_label_.clear();
+  shared_return_slot_.clear();
+  shared_return_cleanup_ = false;
   temp_counter_ = 0;
   label_counter_ = 0;
   generated_slot_counter_ = 0;
@@ -76,6 +88,35 @@ void Lowerer::SuspendInitFunction()
   shared_.init_temp_counter_ = temp_counter_;
   shared_.init_label_counter_ = label_counter_;
   shared_.init_slot_counter_ = generated_slot_counter_;
+}
+
+void Lowerer::ResumeFiniFunction()
+{
+  ResetFunction("@__cppgm_fini", VoidType());
+  if (!shared_.has_fini_) {
+    function_.metadata.role = lowir_model::SR_FINI;
+    function_.metadata.binding = lowir_model::SBM_INTERNAL;
+    StartBlock("^entry");
+    return;
+  }
+  function_ = std::move(shared_.fini_function_);
+  temp_counter_ = shared_.fini_temp_counter_;
+  label_counter_ = shared_.fini_label_counter_;
+  generated_slot_counter_ = shared_.fini_slot_counter_;
+  for (std::size_t i = 0; i < function_.slots.size(); ++i)
+    slot_names_.insert(function_.slots[i].first);
+  for (std::size_t i = 0; i < function_.blocks.size(); ++i)
+    block_labels_.insert(function_.blocks[i].label);
+  current_block_ = function_.blocks.size() - 1;
+}
+
+void Lowerer::SuspendFiniFunction()
+{
+  shared_.fini_function_ = std::move(function_);
+  shared_.has_fini_ = true;
+  shared_.fini_temp_counter_ = temp_counter_;
+  shared_.fini_label_counter_ = label_counter_;
+  shared_.fini_slot_counter_ = generated_slot_counter_;
 }
 
 lowir_model::Block& Lowerer::CurrentBlock()
@@ -295,11 +336,19 @@ void Lowerer::AddParameterSlots(SemaId function_node)
 
 lowir_model::Function Lowerer::BuildFunction(const FunctionSymbol& symbol)
 {
+  return BuildFunctionVariant(symbol, false);
+}
+
+lowir_model::Function Lowerer::BuildFunctionVariant(
+    const FunctionSymbol& symbol, bool base_variant)
+{
   const SemaId node = symbol.definition;
   const FunctionEntityId id = tree_.At(node).function;
   const FunctionEntity& entity = model_.FunctionAt(id);
   const TypeNode& type = types_.At(types_.Unqualified(entity.type));
-  ResetFunction(symbol.name, LowTypeOf(type.result));
+  building_base_variant_ = base_variant;
+  ResetFunction(base_variant ? symbol.base_name : symbol.name,
+                LowTypeOf(type.result));
   function_return_type_id_ = type.result;
   function_.boundary.arity = type.variadic ? lowir_model::CAM_VARIADIC :
       lowir_model::CAM_FIXED;
@@ -316,7 +365,8 @@ lowir_model::Function Lowerer::BuildFunction(const FunctionSymbol& symbol)
     function_.metadata.role = lowir_model::SR_ENTRY;
     function_.metadata.keep_internal_alias = true;
   } else if (!entity.c_linkage) {
-    function_.metadata.object_symbol = symbol.object;
+    function_.metadata.object_symbol = base_variant ? symbol.base_object :
+        symbol.object;
   }
 
   std::vector<SemaId> parameters;
@@ -356,13 +406,28 @@ lowir_model::Function Lowerer::BuildFunction(const FunctionSymbol& symbol)
   const SemaId body = FunctionBody(node);
   if (body == 0)
     Unsupported("a function without a body");
+  // A return that destroys a long prefix of the same local-object stack at
+  // every source exit would duplicate that suffix quadratically.  For large
+  // return sets, route exits through one linked cleanup chain; small
+  // functions retain the direct form used by the normal LowIR shape.
+  shared_return_cleanup_ = CountReturnStatements(body) >= 32;
+  if (shared_return_cleanup_) {
+    shared_return_end_label_ = NewBlockLabel("return_cleanup_end");
+    if (!IsVoidType(types_, type.result))
+      shared_return_slot_ = NewGeneratedSlot("return", LowTypeOf(type.result));
+  }
   std::set<BindingId> source_slots;
   CollectSlots(body, source_slots);
   StartBlock("^entry");
   for (std::size_t i = 0; i < function_.params.size(); ++i)
     EmitStore(function_.params[i].type, TempOperand(function_.params[i].name),
               SlotOperand(function_.slots[i].first));
-  LowerSequence(body);
+  if (entity.special_member == SPECIAL_MEMBER_CONSTRUCTOR)
+    LowerConstructorInitializers(id, node);
+  if (entity.special_member == SPECIAL_MEMBER_DESTRUCTOR)
+    EmitDestructorBody(id, node);
+  else
+    LowerSequence(body);
   if (!Terminated()) {
     // 6.6.3p2/3.6.1p5: main returns 0 when it falls off the end.  Any other
     // value-returning function that can fall off the end gets the same
@@ -375,6 +440,7 @@ lowir_model::Function Lowerer::BuildFunction(const FunctionSymbol& symbol)
       EmitReturn(&zero);
     }
   }
+  EmitSharedReturnCleanups();
   return std::move(function_);
 }
 

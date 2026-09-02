@@ -187,6 +187,18 @@ std::string instruction_text(const Instruction& instruction)
       out << ", " << operand(instruction.args[i]) << ":"
           << operand(instruction.args[i + 1]);
     break;
+  case Instruction::IK_EH_TRY:
+    out << "eh_try " << operand(instruction.first);
+    break;
+  case Instruction::IK_EH_CLEANUP:
+    out << "eh_cleanup " << operand(instruction.first);
+    break;
+  case Instruction::IK_EH_END:
+    out << "eh_end";
+    break;
+  case Instruction::IK_RESUME:
+    out << "resume";
+    break;
   case Instruction::IK_RETURN:
     out << "return " << instruction.type.text;
     if (!instruction.first.text.empty() || instruction.first.kind != Operand::OP_INTEGER)
