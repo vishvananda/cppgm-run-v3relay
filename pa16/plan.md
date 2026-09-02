@@ -258,6 +258,7 @@ comes from the intended check.
 | CP6 thread-local and static storage (completed) | canonical `Binding`/`GlobalSymbol` storage facts, TLS ABI wrapper and guarded initializer family, qualified private nested-type context, and use-sensitive constant declaration elision | 180/243 pa16 tests pass (63 failures, down from 68); packet 5/5; through-pa15 1139/1139; through-pa16 1319/1382; file audit passes with five warnings; specified scaling probe completed |
 | review 2 (completed; `audit.md`) | CP4b.2 regression restored (using-declaration through a private base); unqualified lookup owns the base-chain search; friendship indexed by the befriended entity, bounded protected access; declaration-only globals emitted on demand; dead state removed | 185/243 (58 failures); no fixture that passed at review 1 or at the turn start fails; through-pa15 1139/1139; through-pa16 1324/1382; file audit passes with five warnings; probes linear |
 | CP7 qualified and deferred member type contexts (completed) | declaration-scope trailing-return construction, injected-class-name and `decltype` qualified lookup, bounded ambiguous direct-initializer classification, deferred local reference binding, and derived-over-base same-signature member lookup | 192/243 pa16 tests pass (51 failures, down from 58); packet 7/7; through-pa15 1139/1139; through-pa16 1331/1382; file audit passes with five warnings |
+| CP8 enclosing-scope destruction and incomplete types (completed) | qualified special-member ownership for deferred bodies, explicit and pseudo-destructor targets, base/complete ABI variants and aliases, reference-address initialization, incomplete class return declarations, and qualified nested-type mangling | 200/243 pa16 tests pass (43 failures, down from 51); packet 6/6 exact; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -616,25 +617,46 @@ Delivered: resolved the packet's remaining out-of-class and deferred member
 type contexts through one scope-aware semantic path while preserving the
 through-pa16 gate.
 
-## Active Checkpoint: CP8 — enclosing-scope destruction and incomplete types
+## Completed Checkpoint: CP8 — enclosing-scope destruction and incomplete types
 
-Goal: make completed-class and enclosing-namespace type ownership consistent
-for deferred constructors, explicit/pseudo-destructor calls, and incomplete
-object/reference contexts.
+Delivered: qualified special-member definitions now resolve their owning
+class before parameter/body analysis, so nested out-of-class constructors and
+namespace-scope destructor definitions retain canonical function scopes and
+strong C1/D1 plus base C2/D2 variants.  Explicit destructor expressions share
+the class destructor entity; scalar pseudo-destructors preserve evaluation as
+a semantic no-op.  Reference globals lower dynamic initializers as addresses,
+incomplete class function declarations use the pointer-sized declaration
+boundary, and nested class/namespace names feed one qualified ABI spelling.
+
+Evidence (2026-09-02): the six packet fixtures pass exact LowIR comparison:
+`200-nested-out-of-class-constructor-enclosing-type`,
+`300-const-pointer-explicit-destructor-call`,
+`300-explicit-destructor-call-enclosing-namespace-type`,
+`300-scalar-pseudo-destructor-call`,
+`100-global-reference-incomplete-referent`, and
+`100-incomplete-class-return-function-address`.  The required
+`make test-pa16` result is 200/243 (43 failures, down from 51) with unchanged
+coverage; `make test-report-through-pa15` is 1139/1139, and the pa16 file
+audit passes with five nonfatal warnings.  The implementation is split across
+the sema ownership path and its direct LowIR consumers; no fixtures or
+reference files changed.
+
+## Active Checkpoint: CP9 — remaining member initialization and layout paths
+
+Goal: resolve the remaining class member-initializer/reference and layout
+lowering failures without disturbing the completed CP1–CP8 ownership paths.
 
 ### Implementation Packet
 
-- Own the next semantic boundary in `dev/src/sema` (and its direct lowering
-  consumer only if the semantic result is already correct); do not edit
+- Own the next semantic boundary in `dev/src/sema` and its direct lowering
+  consumer only when the semantic result is already correct; do not edit
   fixtures or `.ref` files.
-- Start with `200-nested-out-of-class-constructor-enclosing-type`,
-  `300-const-pointer-explicit-destructor-call`,
-  `300-explicit-destructor-call-enclosing-namespace-type`,
-  `300-scalar-pseudo-destructor-call`,
-  `100-global-reference-incomplete-referent`, and
-  `100-incomplete-class-return-function-address`.
-- Trace the canonical type/completeness and destruction-target facts from
-  deferred body analysis through semantic cleanup/lowering; keep ordinary
-  class completion and overload paths unchanged.  Require a focused
+- Start with `200-aliased-base-mem-initializer-match`,
+  `200-derived-pointer-member-init`, `200-reference-member-class-init`,
+  `200-reference-member-conditional-lvalue`, `300-alignas-class-layout`,
+  and `400-bitfield-aggregate-init`.
+- Trace canonical member target, reference storage, and completed-layout facts
+  through initialization and projection lowering; keep ordinary destructor,
+  pseudo-destructor, and incomplete-type paths unchanged.  Require a focused
   comparison, `make test-pa16`, the through-pa16 report, and the pa16 file
   audit before closing the checkpoint.

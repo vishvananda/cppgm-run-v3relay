@@ -241,6 +241,7 @@ private:
   // Type and ABI ownership.
   LowInfo LowInfoOf(TypeId type) const;
   lowir_model::LowType LowTypeOf(TypeId type) const;
+  std::string QualifiedTypeName(TypeId type) const;
   bool IsUnsigned(TypeId type) const;
   unsigned TypeBits(TypeId type) const;
   abi_mangle::AbiType AbiTypeOf(TypeId type) const;
@@ -294,6 +295,7 @@ private:
   Value LowerSubscript(SemaId node, bool lvalue);
   Value LowerConditionalLValue(SemaId node);
   Value LowerReferenceArgument(SemaId node, TypeId parameter);
+  Value LowerClassArgument(SemaId node, TypeId parameter);
   void ProjectDerivedReference(Value& value, TypeId source, TypeId target);
   Value LoadValue(const Value& lvalue);
   Value AddressValue(const Value& lvalue);

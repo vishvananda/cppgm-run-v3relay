@@ -71,6 +71,7 @@ const char* KindName(SemaKind kind)
   case SEMA_CONDITIONAL: return "conditional-expression";
   case SEMA_SUBSCRIPT: return "subscript-expression";
   case SEMA_MEMBER: return "member-expression";
+  case SEMA_PSEUDO_DESTRUCTOR: return "pseudo-destructor-expression";
   case SEMA_CAST: return "cast-expression";
   case SEMA_SIZEOF: return "sizeof-expression";
   case SEMA_BRACED_INIT_LIST: return "braced-init-list";
@@ -230,6 +231,15 @@ void PrintNode(std::ostream& out, const SemaTree& tree, const SemaModel& model,
       PrintOperator(out, node, tokens);
     else
       out << model.BindingAt(node.binding).name;
+    break;
+  case SEMA_PSEUDO_DESTRUCTOR:
+    out << ' ' << Category(node.category) << ' ';
+    model.Types().Spell(out, node.type);
+    if (node.op != KW_AUTO)
+    {
+      out << ' ';
+      PrintOperator(out, node, tokens);
+    }
     break;
   case SEMA_CONSTRUCTOR_ACTION:
     if (node.function != 0)

@@ -435,9 +435,15 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
   std::set<BindingId> source_slots;
   CollectSlots(body, source_slots);
   StartBlock("^entry");
-  for (std::size_t i = 0; i < function_.params.size(); ++i)
+  for (std::size_t i = 0; i < function_.params.size(); ++i) {
+    // Object parameters are opaque LowIR values.  Their storage is only
+    // materialized at a use site; an empty class parameter with no semantic
+    // use must not acquire an observable copy at function entry.
+    if (types_.Kind(types_.Unqualified(type.parameters[i])) == TYPE_CLASS)
+      continue;
     EmitStore(function_.params[i].type, TempOperand(function_.params[i].name),
               SlotOperand(function_.slots[i].first));
+  }
   if (entity.special_member == SPECIAL_MEMBER_CONSTRUCTOR)
     LowerConstructorInitializers(id, node);
   if (entity.special_member == SPECIAL_MEMBER_DESTRUCTOR)

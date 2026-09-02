@@ -1211,6 +1211,19 @@ Lowerer::Value Lowerer::LowerRValue(SemaId node, TypeId expected)
     return LowerCall(node, expected);
   case SEMA_SUBSCRIPT:
     return Convert(LoadValue(LowerSubscript(node, false)), expected);
+  case SEMA_PSEUDO_DESTRUCTOR:
+  {
+    const std::vector<SemaId> children = Children(node);
+    if (children.size() != 1)
+      Unsupported("a pseudo-destructor without one object");
+    if (value.op == OP_ARROW)
+      (void)LowerRValue(children[0]);
+    else
+      (void)AddressValue(LowerLValue(children[0]));
+    Value result;
+    result.type = value.type;
+    return result;
+  }
   case SEMA_CALLEE:
     Unsupported("a callee outside a call");
     break;
@@ -1871,6 +1884,38 @@ Lowerer::Value Lowerer::LowerConditional(SemaId node, TypeId expected)
   return Convert(result, expected);
 }
 
+// 5.2.2p4: passing a class object by value materializes the parameter
+// object before evaluating the source object.  The current LowIR object
+// boundary carries the opaque object slot itself; the source is still
+// evaluated as an lvalue so member access, comma expressions, and other
+// side effects retain their source-order semantics.
+Lowerer::Value Lowerer::LowerClassArgument(SemaId node, TypeId parameter)
+{
+  const TypeId object_type = types_.Unqualified(parameter);
+  if (types_.Kind(object_type) != TYPE_CLASS)
+    Unsupported("a non-class object argument");
+
+  const std::string slot = NewGeneratedSlot("argobj", LowTypeOf(parameter));
+  Value destination;
+  destination.type = parameter;
+  destination.lvalue = true;
+  destination.operand = SlotOperand(slot);
+  // Keep the materialized destination's address in the instruction stream;
+  // the opaque object operand passed to the call is the slot itself.
+  (void)AddressValue(destination);
+
+  const SemaNode& source = tree_.At(node);
+  if (source.category == VC_LVALUE)
+    (void)AddressValue(LowerLValue(node));
+  else
+    (void)LowerRValue(node, parameter);
+
+  Value result;
+  result.type = parameter;
+  result.operand = SlotOperand(slot);
+  return result;
+}
+
 // 8.5.3: a reference parameter receives the address of an lvalue, of the
 // object a comma expression selects, or of a slot holding the converted
 // temporary.
@@ -1978,6 +2023,9 @@ Lowerer::Value Lowerer::LowerCall(SemaId node, TypeId expected)
     if (types_.Kind(types_.Unqualified(parameter_type)) == TYPE_REFERENCE)
       call.args.push_back(
           LowerReferenceArgument(children[i], parameter_type).operand);
+    else if (types_.Kind(types_.Unqualified(parameter_type)) == TYPE_CLASS &&
+             tree_.At(children[i]).category == VC_LVALUE)
+      call.args.push_back(LowerClassArgument(children[i], parameter_type).operand);
     else
       call.args.push_back(LowerRValue(children[i], parameter_type).operand);
   }

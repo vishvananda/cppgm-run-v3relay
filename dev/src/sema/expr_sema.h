@@ -56,13 +56,16 @@ private:
     QualifiedName name;
     std::vector<BindingId> bindings;
     SemaId implicit_object;
+    SemaId pseudo_expression;
     bool member_callee;
     bool named_callee;
     bool has_implicit_object;
+    bool pseudo_destructor;
 
     CallResolution()
-        : implicit_object(0), member_callee(false), named_callee(false),
-          has_implicit_object(false) {}
+        : implicit_object(0), pseudo_expression(0), member_callee(false),
+          named_callee(false), has_implicit_object(false),
+          pseudo_destructor(false) {}
   };
 
   SemaId AnalyzeNode(AstId expression, ScopeId scope);
@@ -146,7 +149,8 @@ private:
   SemaId BuildResolvedCall(AstId source, ScopeId scope,
                            FunctionEntityId function,
                            SemaId implicit_object,
-                           const std::vector<SemaId>& arguments);
+                           const std::vector<SemaId>& arguments,
+                           bool bypass_implicit_object = false);
   SemaId TryOperatorCall(AstId source, ScopeId scope, ETokenType op,
                          const std::vector<SemaId>& operands,
                          bool allow_member = true,

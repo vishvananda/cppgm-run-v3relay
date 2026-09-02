@@ -1,6 +1,7 @@
 // Translation-unit entry, condition lowering, and statement lowering.
 #include "lower/lowir_lowering.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -111,6 +112,18 @@ void Lowerer::Run()
         model_.FunctionAt(function_order_[i]).in_class_definition &&
         referenced_functions_.count(function_order_[i]) != 0;
   NameSymbols();
+  // Out-of-class special-member definitions own strong complete-object
+  // entries.  Their Itanium base-subobject entry is part of the same emitted
+  // definition even when this unit does not contain a derived class that
+  // happens to request it.
+  for (std::size_t i = 0; i < function_order_.size(); ++i) {
+    const FunctionEntity& entity = model_.FunctionAt(function_order_[i]);
+    FunctionSymbol& symbol = functions_[function_order_[i]];
+    if (symbol.definition != 0 &&
+        entity.special_member != SPECIAL_MEMBER_NONE &&
+        !entity.in_class_definition)
+      symbol.base_required = true;
+  }
   BuildGlobalDefinitions();
   // Finalization roots are outside the semantic call graph.  Mark their
   // complete destructor entries before deciding which weak bodies to emit.
@@ -142,6 +155,13 @@ void Lowerer::Run()
       const FunctionEntityId id = function_order_[i];
       FunctionSymbol& symbol = functions_[id];
       const FunctionEntity& entity = model_.FunctionAt(id);
+      const bool base_was_required = symbol.base_required;
+      if (symbol.definition != 0 && base_was_required &&
+          !symbol.base_emitted && emitted.count(id) == 0) {
+        program_.functions.push_back(BuildFunctionVariant(symbol, true));
+        symbol.base_emitted = true;
+        emitted_one = true;
+      }
       if (symbol.definition != 0 && emitted.count(id) == 0 &&
           (!entity.in_class_definition || symbol.referenced)) {
         program_.functions.push_back(BuildFunction(symbol));
@@ -163,6 +183,21 @@ void Lowerer::Run()
       }
     }
   }
+  // Base-entry ownership is the first semantic reason for an object alias;
+  // keep those aliases ahead of aliases for complete-only weak definitions,
+  // while preserving function order within each ownership class.
+  std::set<std::string> base_alias_targets;
+  for (std::size_t i = 0; i < function_order_.size(); ++i)
+    if (functions_[function_order_[i]].base_required)
+      base_alias_targets.insert(functions_[function_order_[i]].name);
+  std::stable_sort(program_.object_aliases.begin(),
+                   program_.object_aliases.end(),
+                   [&base_alias_targets](const lowir_model::ObjectAlias& left,
+                                         const lowir_model::ObjectAlias& right) {
+    const bool left_base = base_alias_targets.count(left.target) != 0;
+    const bool right_base = base_alias_targets.count(right.target) != 0;
+    return left_base && !right_base;
+  });
   BuildThreadLocalInitializers();
   BuildGlobalInitializers();
   BuildGlobalFinalizers();

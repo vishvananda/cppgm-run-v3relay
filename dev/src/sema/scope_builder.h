@@ -60,6 +60,10 @@ public:
                                        const std::vector<SemaId>& arguments,
                                        ScopeId scope,
                                        bool copy_initialization = false);
+  // Explicit destructor expressions use the same canonical target as
+  // lifetime synthesis.  A trivial class returns zero, which is the
+  // semantic no-op required for a destructor with no runtime body.
+  FunctionEntityId ResolveDestructor(TypeId type);
 
 private:
   struct ParameterInfo

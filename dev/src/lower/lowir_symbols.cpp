@@ -1198,15 +1198,21 @@ void Lowerer::BuildGlobalInitializers()
         (void)LowerRValue(dynamic.expression, types_.Fundamental(FT_VOID));
       continue;
     }
-    const Value value = LowerRValue(dynamic.expression, dynamic.type);
+    const bool reference_initializer =
+        types_.Kind(types_.Unqualified(dynamic.type)) == TYPE_REFERENCE;
+    const Value value = reference_initializer ?
+        AddressValue(LowerLValue(dynamic.expression)) :
+        LowerRValue(dynamic.expression, dynamic.type);
     lowir_model::Operand destination = GlobalOperand(dynamic.symbol);
+    const lowir_model::LowType stored_type = reference_initializer ?
+        PtrType() : LowTypeOf(dynamic.type);
     if (dynamic.aggregate_subobject) {
       Value aggregate;
       aggregate.type = dynamic.aggregate_type;
       aggregate.lvalue = true;
       aggregate.operand = destination;
       destination = AggregateDestination(aggregate, dynamic.aggregate_path);
-      EmitStore(LowTypeOf(dynamic.type), value.operand, destination);
+      EmitStore(stored_type, value.operand, destination);
       continue;
     }
     if (dynamic.byte_offset != 0) {
@@ -1226,7 +1232,7 @@ void Lowerer::BuildGlobalInitializers()
       Emit(projection);
       destination = TempOperand(projection.dest);
     }
-    EmitStore(LowTypeOf(dynamic.type), value.operand, destination);
+    EmitStore(stored_type, value.operand, destination);
   }
   SuspendInitFunction();
 }
@@ -1327,7 +1333,10 @@ lowir_model::FunctionDeclaration Lowerer::BuildFunctionDeclaration(
   result.name = base_variant ? symbol.base_name : symbol.name;
   const FunctionEntity& entity = model_.FunctionAt(id);
   const TypeNode& type = types_.At(types_.Unqualified(entity.type));
-  result.return_type = LowTypeOf(type.result);
+  const TypeId result_type = types_.Unqualified(type.result);
+  result.return_type = types_.Kind(result_type) == TYPE_CLASS &&
+      !model_.ClassAt(types_.At(result_type).entity).layout_complete ?
+      VoidType() : LowTypeOf(type.result);
   result.boundary.arity = type.variadic ? lowir_model::CAM_VARIADIC :
       lowir_model::CAM_FIXED;
   result.metadata.binding = base_variant ? lowir_model::SBM_STRONG :

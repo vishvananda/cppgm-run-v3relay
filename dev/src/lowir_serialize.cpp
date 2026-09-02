@@ -106,6 +106,89 @@ void append_call_boundary(std::ostringstream& out,
   append_boundary_metadata(out, boundary);
 }
 
+void append_function_metadata(std::ostringstream& out,
+                              const FunctionBoundaryMetadata& boundary,
+                              const SymbolMetadata& metadata)
+{
+  bool first = true;
+  std::ostringstream body;
+  if (boundary.arity != CAM_FIXED) {
+    body << "arity=" << (boundary.arity == CAM_VARIADIC ?
+        "variadic" : "prototype_relaxed");
+    first = false;
+  }
+  if (boundary.effects != CFXM_DEFAULT) {
+    body << (first ? "" : ", ") << "effects=" <<
+        (boundary.effects == CFXM_READNONE ? "readnone" :
+         boundary.effects == CFXM_READONLY ? "readonly" : "readwrite");
+    first = false;
+  }
+  if (boundary.unwind != CUM_DEFAULT) {
+    body << (first ? "" : ", ") << "unwind=" <<
+        (boundary.unwind == CUM_MAY ? "may" : "no");
+    first = false;
+  }
+  if (boundary.returns != CRM_DEFAULT) {
+    body << (first ? "" : ", ") << "return=" <<
+        (boundary.returns == CRM_RETURNS ? "returns" : "noreturn");
+    first = false;
+  }
+  if (metadata.role != SR_NONE) {
+    body << (first ? "" : ", ") << "role=" << role_name(metadata.role);
+    first = false;
+  }
+  if (metadata.linkage != LLM_DEFAULT) {
+    body << (first ? "" : ", ") << "linkage=" <<
+        (metadata.linkage == LLM_C ? "c" : "cpp");
+    first = false;
+  }
+  if (metadata.binding != SBM_DEFAULT) {
+    const char* value = metadata.binding == SBM_INTERNAL ? "internal" :
+        metadata.binding == SBM_STRONG ? "strong" : "weak";
+    body << (first ? "" : ", ") << "binding=" << value;
+    first = false;
+  }
+  if (!metadata.object_symbol.empty()) {
+    body << (first ? "" : ", ") << "object=" << metadata.object_symbol;
+    first = false;
+  }
+  if (!metadata.tls_for_symbol.empty()) {
+    body << (first ? "" : ", ") << "tls_for=" << metadata.tls_for_symbol;
+    first = false;
+  }
+  if (!metadata.section_segment.empty()) {
+    body << (first ? "" : ", ") << "section_segment=" <<
+        metadata.section_segment;
+    first = false;
+  }
+  if (!metadata.section_name.empty()) {
+    body << (first ? "" : ", ") << "section=" << metadata.section_name;
+    first = false;
+  }
+  if (metadata.keep_internal_alias) {
+    body << (first ? "" : ", ") << "keep_alias=yes";
+    first = false;
+  }
+  if (metadata.prefer_local_object_binding) {
+    body << (first ? "" : ", ") << "prefer_local=yes";
+    first = false;
+  }
+  if (metadata.object_output_root) {
+    body << (first ? "" : ", ") << "object_root=yes";
+    first = false;
+  }
+  if (metadata.object_trivial_lifecycle) {
+    body << (first ? "" : ", ") << "trivial_lifecycle=yes";
+    first = false;
+  }
+  if (metadata.force_inline) {
+    body << (first ? "" : ", ") << "force_inline=yes";
+    first = false;
+  }
+  if (!first)
+    out << " [" << body.str() << "]";
+}
+
 std::string instruction_text(const Instruction& instruction)
 {
   std::ostringstream out;
@@ -231,8 +314,7 @@ std::string function_text(const Function& function)
     out << metadata.str();
   }
   out << ") -> " << function.return_type.text;
-  append_boundary_metadata(out, function.boundary);
-  append_symbol_metadata(out, function.metadata);
+  append_function_metadata(out, function.boundary, function.metadata);
   if (function.debug_location.present())
     out << " !dbg (" << function.debug_location.file << ", "
         << function.debug_location.line << ", "
@@ -265,8 +347,7 @@ std::string declaration_text(const FunctionDeclaration& declaration)
     out << metadata.str();
   }
   out << ") -> " << declaration.return_type.text;
-  append_boundary_metadata(out, declaration.boundary);
-  append_symbol_metadata(out, declaration.metadata);
+  append_function_metadata(out, declaration.boundary, declaration.metadata);
   return out.str();
 }
 
@@ -347,6 +428,9 @@ std::string serialize_lowir_program(const Program& program)
   std::string functions;
   for (std::size_t i = 0; i < program.functions.size(); ++i)
     functions += function_text(program.functions[i]);
+  for (std::size_t i = 0; i < program.object_aliases.size(); ++i)
+    functions += "alias object " + program.object_aliases[i].object_symbol +
+        " = " + program.object_aliases[i].target + "\n";
   const std::string* groups[] = { &declarations, &globals, &functions };
   std::string out;
   for (std::size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); ++i) {

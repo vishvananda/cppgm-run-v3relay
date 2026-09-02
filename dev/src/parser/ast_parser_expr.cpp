@@ -481,8 +481,26 @@ AstId Pa10Parser::parse_postfix_suffixes(AstId expression)
 			const size_t op_at = pos_++;
 			const size_t name_start = pos_;
 			const bool dependent_template = consume_simple(KW_TEMPLATE);
-			AstId member = is_simple(KW_OPERATOR) ?
-				parse_operator_function_id() : parse_id_expression();
+			AstId member = 0;
+			// A pseudo-destructor-id is the one postfix member form whose
+			// name is not an ordinary id-expression.  Keep its complete token
+			// span as the member identifier so semantic analysis can resolve
+			// the object type before deciding whether this is a real destructor
+			// call or the scalar no-op form.
+			if (is_simple(OP_COMPL))
+			{
+				++pos_;
+				if (!is_kind(PA6_IDENTIFIER_TOKEN))
+				{
+					restore(saved);
+					return 0;
+				}
+				++pos_;
+				member = make_join(AST_IDENTIFIER, name_start, pos_);
+			}
+			else
+				member = is_simple(KW_OPERATOR) ?
+					parse_operator_function_id() : parse_id_expression();
 			if (member == 0)
 			{
 				restore(saved);

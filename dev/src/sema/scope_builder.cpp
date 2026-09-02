@@ -921,135 +921,6 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
 // They still enter the same canonical FunctionEntity table as ordinary
 // members; the only extra source facts are the constructor-initializer and
 // the special-member kind.  Keeping those facts here lets both overload
-// resolution and lowering refer to one function identity.
-void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
-{
-  ClassEntityId member_class = 0;
-  if (!model_.ClassForScope(scope, member_class))
-    throw std::runtime_error("special member is not declared in a class");
-  const AstId declarator = FindChild(node, AST_DECLARATOR);
-  if (declarator == 0)
-    throw std::runtime_error("special member has no declarator");
-  const AstId member_specifiers = FindChild(node, AST_MEMBER_SPECIFIERS);
-  const bool explicit_constructor = member_specifiers != 0 &&
-      SequenceHasKeyword(member_specifiers, KW_EXPLICIT);
-  const AstId identifier = FindIdentifier(declarator);
-  const std::string spelling = identifier == 0 ? std::string() :
-      arena_.At(identifier).text;
-  if (spelling.empty())
-    throw std::runtime_error("special member has no name");
-  const bool destructor = spelling[0] == '~';
-  const std::string name = destructor ? spelling : model_.ScopeAt(scope).name;
-  const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
-  std::vector<ParameterInfo> parameters;
-  bool variadic = false;
-  if (clause != 0)
-    BuildParameters(clause, scope, parameters, variadic);
-  if (destructor && (!parameters.empty() || variadic))
-    throw std::runtime_error("destructor has parameters");
-  const std::vector<TypeId> parameter_types = [&]() {
-    std::vector<TypeId> result;
-    for (std::size_t i = 0; i < parameters.size(); ++i)
-      result.push_back(parameters[i].type);
-    return result;
-  }();
-  const bool member_const = HasConstFunctionQualifier(declarator);
-  const bool member_volatile = HasVolatileFunctionQualifier(declarator);
-  const TypeId declared_type = types_.Function(
-      types_.Fundamental(FT_VOID), parameter_types, variadic, member_const);
-  std::vector<AstId> defaults;
-  for (std::size_t i = 0; i < parameters.size(); ++i)
-    defaults.push_back(parameters[i].default_initializer);
-  BindingId binding = 0;
-  const AstId initializer = FindChild(node, AST_INITIALIZER);
-  const AstId special_initializer = FindChild(initializer,
-                                               AST_SPECIAL_INITIALIZER);
-  const bool defaulted = special_initializer != 0 &&
-      arena_.At(special_initializer).text == "default";
-  const bool deleted = special_initializer != 0 &&
-      arena_.At(special_initializer).text == "delete";
-  const bool definition = arena_.At(node).kind ==
-      AST_SPECIAL_MEMBER_DEFINITION || defaulted;
-  const FunctionEntityId function = DeclareFunction(
-      scope, name, declared_type, definition, binding, member_const,
-      member_volatile,
-      false, IsNoThrowDeclarator(declarator, scope), defaults,
-      explicit_constructor);
-  if (binding == 0)
-    throw std::runtime_error("special member has no binding");
-
-  FunctionEntity& entity = model_.FunctionAt(function);
-  entity.special_member = destructor ? SPECIAL_MEMBER_DESTRUCTOR :
-      SPECIAL_MEMBER_CONSTRUCTOR;
-  entity.parameter_names.clear();
-  for (std::size_t i = 0; i < parameters.size(); ++i)
-    entity.parameter_names.push_back(parameters[i].name);
-  entity.body = FindChild(node, AST_COMPOUND_STATEMENT);
-  entity.ctor_initializer = FindChild(node, AST_CTOR_INITIALIZER);
-  entity.in_class_definition = true;
-  entity.defaulted = defaulted;
-  entity.deleted = deleted;
-  if (destructor)
-    model_.ClassAt(member_class).destructor = function;
-  else
-  {
-    ClassEntity& owner = model_.ClassAt(member_class);
-    if (std::find(owner.constructors.begin(), owner.constructors.end(),
-                  function) == owner.constructors.end())
-      owner.constructors.push_back(function);
-  }
-
-  if (tree_ == 0)
-    return;
-  const SemaKind semantic_kind = definition ? SEMA_FUNCTION_DEFINITION :
-      SEMA_FUNCTION_DECLARATION;
-  const SemaId function_node = MakeDetachedSemantic(
-      semantic_kind, scope, model_.FunctionAt(function).type, binding,
-      function);
-  DeferSemantic(function_node);
-  if (!definition)
-    return;
-
-  const ScopeId function_scope = model_.CreateScope(
-      SCOPE_FUNCTION, name, scope);
-  model_.ScopeAt(function_scope).function_entity = function;
-  MapSemanticScope(function_scope, function_node);
-  const TypeNode& canonical = types_.At(
-      types_.Unqualified(model_.FunctionAt(function).type));
-  const BindingId this_binding = model_.AddBinding(
-      function_scope, "this", BINDING_PARAMETER, canonical.parameters[0]);
-  const SemaId this_parameter = tree_->Make(SEMA_PARAMETER);
-  SemaNode& this_node = tree_->At(this_parameter);
-  this_node.scope = function_scope;
-  this_node.type = canonical.parameters[0];
-  this_node.binding = this_binding;
-  tree_->Append(function_node, this_parameter);
-  for (std::size_t i = 0; i < parameters.size(); ++i)
-  {
-    const BindingId parameter = model_.AddBinding(
-        function_scope, parameters[i].name, BINDING_PARAMETER,
-        canonical.parameters[i + 1]);
-    MakeSemantic(SEMA_PARAMETER, function_scope, function_node,
-                 canonical.parameters[i + 1], parameter);
-  }
-  // Keep a semantic copy of each constructor default for implicit base and
-  // member initialization.  Explicit call sites are analyzed below as
-  // usual; these detached nodes cover the separate lowering path used when a
-  // subobject is omitted from the mem-initializer list.
-  std::vector<SemaId> default_semantic_arguments(
-      canonical.parameters.size(), 0);
-  for (std::size_t i = 0; i < parameters.size(); ++i)
-    if (parameters[i].default_initializer != 0)
-      default_semantic_arguments[i + 1] = expression_.AnalyzeInitializer(
-          parameters[i].default_initializer, function_scope,
-          canonical.parameters[i + 1]);
-  model_.FunctionAt(function).default_semantic_arguments.swap(
-      default_semantic_arguments);
-  deferred_member_bodies_.push_back(DeferredMemberBody(
-      model_.FunctionAt(function).body, function_scope, function,
-      function_node));
-}
-
 FunctionEntityId ScopeBuilder::ResolveConstructor(
     TypeId type, const std::vector<SemaId>& arguments, ScopeId scope,
     bool copy_initialization)
@@ -2482,6 +2353,11 @@ FunctionEntityId ScopeBuilder::EnsureDestructor(TypeId type)
     function.body = 0;
   }
   return destructor;
+}
+
+FunctionEntityId ScopeBuilder::ResolveDestructor(TypeId type)
+{
+  return EnsureDestructor(type);
 }
 
 // `constructor-action A::A` with the synthesized call `A::A(&object)`; the

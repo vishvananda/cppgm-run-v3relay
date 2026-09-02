@@ -32,6 +32,22 @@ bool IsVoid(const TypeTable& types, TypeId type)
       types.At(type).fundamental == FT_VOID;
 }
 
+bool IsPseudoDestructorName(const std::vector<Pa6Token>& tokens,
+                            const AstNode& node)
+{
+  return node.first < node.last && node.first < tokens.size() &&
+      tokens[node.first].IsSimple(OP_COMPL);
+}
+
+std::string PseudoDestructorName(const std::vector<Pa6Token>& tokens,
+                                 const AstNode& node)
+{
+  if (node.first + 2 != node.last || node.first + 1 >= tokens.size() ||
+      !tokens[node.first + 1].IsIdentifier())
+    throw std::runtime_error("invalid pseudo-destructor-id");
+  return tokens[node.first + 1].spelling;
+}
+
 // 4.7 integral conversion of a folded value to a fundamental integral type
 // or to the underlying type of an enumeration; false for other targets.
 bool ConvertIntegral(const TypeTable& types, long long value, TypeId type,
@@ -888,7 +904,8 @@ SemaId ExpressionAnalyzer::BuildConstructorTemporary(
 
 SemaId ExpressionAnalyzer::BuildResolvedCall(
     AstId source, ScopeId scope, FunctionEntityId function,
-    SemaId implicit_object, const vector<SemaId>& arguments)
+    SemaId implicit_object, const vector<SemaId>& arguments,
+    bool bypass_implicit_object)
 {
   if (function == 0)
     throw std::runtime_error("operator call has no function");
@@ -913,7 +930,8 @@ SemaId ExpressionAnalyzer::BuildResolvedCall(
   vector<SemaId> converted;
   converted.reserve(callable.parameters.size());
   if (member_object)
-    converted.push_back(BindImplicitObject(implicit_object,
+    converted.push_back(bypass_implicit_object ? implicit_object :
+                        BindImplicitObject(implicit_object,
                                            callable.parameters[0]));
   for (size_t i = 0; i < arguments.size(); ++i)
   {
@@ -1138,6 +1156,10 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
   if (arena_.At(expression).children.size() != 2)
     throw std::runtime_error("invalid member expression");
   const SemaId object = Analyze(Child(expression, 0), scope);
+  const AstId member_name = Child(expression, 1);
+  const AstNode& member_name_node = arena_.At(member_name);
+  const bool pseudo_destructor = IsPseudoDestructorName(
+      tokens_, member_name_node);
   TypeId object_type = NodeInfo(object).type;
   if (types_.Kind(object_type) == TYPE_REFERENCE)
     object_type = types_.Referent(object_type);
@@ -1162,14 +1184,66 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
         (types_.Kind(pointee) == TYPE_CV && types_.At(pointee).is_volatile);
     class_type = types_.Unqualified(pointee);
   }
+
+  if (pseudo_destructor)
+  {
+    const std::string target_name = PseudoDestructorName(
+        tokens_, member_name_node);
+    if (types_.Kind(class_type) == TYPE_CLASS)
+    {
+      ScopeId class_scope = 0;
+      if (!model_.ScopeOfType(class_type, class_scope))
+        throw std::runtime_error("pseudo-destructor names an incomplete class");
+      const std::string class_name = model_.ScopeAt(class_scope).name;
+      if (target_name != class_name)
+        throw std::runtime_error("pseudo-destructor names a different class");
+
+      const FunctionEntityId destructor =
+          builder_.ResolveDestructor(class_type);
+      const SemaKind kind = destructor == 0 ? SEMA_PSEUDO_DESTRUCTOR :
+          SEMA_MEMBER;
+      const SemaId result = MakeExpression(
+          kind, expression, types_.Fundamental(FT_VOID), VC_PRVALUE, scope,
+          op);
+      SemaNode& semantic = tree_.At(result);
+      semantic.function = destructor;
+      semantic.first = member_name_node.first;
+      semantic.last = member_name_node.last;
+      if (destructor != 0)
+      {
+        std::vector<BindingId> destructor_bindings;
+        model_.DirectBindings(class_scope, "~" + class_name,
+                              LOOKUP_FUNCTIONS, destructor_bindings);
+        FilterAccessibleBindings(scope, destructor_bindings);
+        for (std::size_t i = 0; i < destructor_bindings.size(); ++i)
+          if (model_.BindingAt(destructor_bindings[i]).function == destructor)
+          {
+            semantic.binding = destructor_bindings[i];
+            break;
+          }
+        if (semantic.binding == 0)
+          throw std::runtime_error("inaccessible pseudo-destructor");
+      }
+      Append(result, object);
+      return result;
+    }
+
+    // A scalar pseudo-destructor expression has no callable entity and no
+    // runtime effect, but its object expression is still evaluated.
+    const SemaId result = MakeExpression(
+        SEMA_PSEUDO_DESTRUCTOR, expression,
+        types_.Fundamental(FT_VOID), VC_PRVALUE, scope, op);
+    Append(result, object);
+    return result;
+  }
+
   if (types_.Kind(class_type) != TYPE_CLASS)
     throw std::runtime_error("member access requires a class object");
   ScopeId class_scope = 0;
   if (!model_.ScopeOfType(class_type, class_scope))
     throw std::runtime_error("member access names an incomplete class");
-  const AstId member_name = Child(expression, 1);
   const QualifiedName name = ReadQualifiedName(
-      tokens_, arena_.At(member_name).first, arena_.At(member_name).last);
+      tokens_, member_name_node.first, member_name_node.last);
   if (name.Qualified())
     throw std::runtime_error("member access has a qualified member name");
   std::vector<BindingId> candidates;
@@ -1198,8 +1272,8 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
   semantic.binding = binding;
   semantic.has_value = member.has_const_value;
   semantic.value = member.const_value;
-  semantic.first = arena_.At(member_name).first;
-  semantic.last = arena_.At(member_name).last;
+  semantic.first = member_name_node.first;
+  semantic.last = member_name_node.last;
   Append(result, object);
   return result;
 }
@@ -1865,6 +1939,11 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
       callee_node.kind == AST_IDENTIFIER;
   if (result.member_callee) {
     const SemaId member = Analyze(callee, scope);
+    if (tree_.At(member).kind == SEMA_PSEUDO_DESTRUCTOR)
+    {
+      result.pseudo_expression = member;
+      return;
+    }
     std::vector<SemaId> member_children;
     for (SemaId child = tree_.At(member).first_child; child != 0;
          child = tree_.At(child).next_sibling)
@@ -1880,6 +1959,30 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
     object_type = types_.Unqualified(object_type);
     if (types_.Kind(object_type) != TYPE_CLASS)
       throw std::runtime_error("member call object is not a class");
+
+    if (tree_.At(member).function != 0 &&
+        model_.FunctionAt(tree_.At(member).function).special_member ==
+            SPECIAL_MEMBER_DESTRUCTOR)
+    {
+      if (tree_.At(member).binding == 0)
+        throw std::runtime_error("member destructor has no binding");
+      result.bindings.push_back(tree_.At(member).binding);
+      result.implicit_object = object;
+      if (tokens_[arena_.At(callee).first].IsSimple(OP_DOT)) {
+        TypeId address_type = NodeInfo(object).type;
+        if (types_.Kind(address_type) == TYPE_REFERENCE)
+          address_type = types_.Referent(address_type);
+        const SemaId address = MakeExpression(
+            SEMA_UNARY, 0, types_.Pointer(address_type), VC_PRVALUE, scope,
+            OP_AMP);
+        Append(address, object);
+        result.implicit_object = address;
+      }
+      result.has_implicit_object = true;
+      result.pseudo_destructor = true;
+      return;
+    }
+
     const AstId member_name = Child(callee, 1);
     model_.LookupMember(types_.At(object_type).entity,
                         arena_.At(member_name).text, LOOKUP_FUNCTIONS,
@@ -2017,6 +2120,21 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
 
   CallResolution resolution;
   ResolveCallCallee(callee, scope, resolution);
+  if (resolution.pseudo_expression != 0)
+  {
+    if (!args.empty())
+      throw std::runtime_error("pseudo-destructor takes no arguments");
+    return resolution.pseudo_expression;
+  }
+  if (resolution.pseudo_destructor)
+  {
+    if (!args.empty() || resolution.bindings.size() != 1)
+      throw std::runtime_error("invalid pseudo-destructor call");
+    const Binding& binding = model_.BindingAt(resolution.bindings[0]);
+    return BuildResolvedCall(
+        expression, scope, binding.function, resolution.implicit_object,
+        std::vector<SemaId>(), true);
+  }
   const bool member_callee = resolution.member_callee;
   const bool named_callee = resolution.named_callee;
   QualifiedName& name = resolution.name;

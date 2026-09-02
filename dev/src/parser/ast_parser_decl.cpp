@@ -904,6 +904,7 @@ AstId Pa10Parser::parse_special_member_definition()
 	bool conversion = false;
 	bool destructor = false;
 	string final_name;
+	string previous_component = first_name;
 	while (is_simple(OP_COLON2, cursor))
 	{
 		qualified = true;
@@ -955,9 +956,12 @@ AstId Pa10Parser::parse_special_member_definition()
 			return 0;
 		}
 		final_name = token(cursor++).spelling;
+		if (token(cursor).IsSimple(OP_COLON2))
+			previous_component = final_name;
 	}
 	if (!token(cursor).IsSimple(OP_LPAREN) ||
-		(qualified && !conversion && !destructor && final_name != first_name))
+		(qualified && !conversion && !destructor &&
+		 final_name != previous_component))
 	{
 		restore(saved);
 		return 0;

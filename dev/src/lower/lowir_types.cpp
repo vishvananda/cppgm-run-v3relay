@@ -1,6 +1,7 @@
 // Type classification, LowIR type rendering, and the PA14 ABI type adapter.
 #include "lower/lowir_lowering.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace lowir_lowering {
@@ -261,18 +262,6 @@ unsigned Lowerer::TypeBits(TypeId type) const
   return info.Integer() ? info.bits : 0;
 }
 
-namespace {
-
-std::string NamedType(const TypeTable& types, TypeId type)
-{
-  const TypeNode& node = types.At(types.Unqualified(type));
-  if (node.name.empty())
-    return "<anonymous>";
-  return node.name;
-}
-
-}  // namespace
-
 abi_mangle::AbiType Lowerer::AbiTypeOf(TypeId type) const
 {
   if (type == 0)
@@ -344,11 +333,49 @@ abi_mangle::AbiType Lowerer::AbiTypeOf(TypeId type) const
     abi_mangle::AbiType result;
     result.kind = node.kind == TYPE_CLASS ?
         abi_mangle::ABI_TYPE_NAME_OR_REFERENCE : abi_mangle::ABI_TYPE_NAMED;
-    result.name = NamedType(types_, type);
+    result.name = QualifiedTypeName(type);
     return result;
   }
   Unsupported("an ABI type");
   return abi_mangle::AbiType();
+}
+
+std::string Lowerer::QualifiedTypeName(TypeId type) const
+{
+  const TypeNode& node = types_.At(types_.Unqualified(type));
+  if (node.name.empty())
+    return "<anonymous>";
+
+  ScopeId scope = 0;
+  if (node.kind == TYPE_CLASS && node.entity != 0)
+    scope = model_.ClassAt(node.entity).class_scope;
+  else if (node.kind == TYPE_ENUM && node.entity != 0)
+    scope = model_.EnumAt(node.entity).enum_scope;
+  if (scope == 0)
+    return node.name;
+
+  // The type node owns the leaf spelling (including template arguments);
+  // declaration scopes own only its enclosing namespace/class path.
+  std::vector<std::string> pieces;
+  scope = model_.ScopeAt(scope).parent;
+  while (scope != model_.GlobalScope()) {
+    const Scope& owner = model_.ScopeAt(scope);
+    if ((owner.kind == SCOPE_NAMESPACE || owner.kind == SCOPE_CLASS) &&
+        !owner.name.empty() && owner.name != "<unnamed>")
+      pieces.push_back(owner.name);
+    scope = owner.parent;
+  }
+  std::reverse(pieces.begin(), pieces.end());
+  std::string result;
+  for (std::size_t i = 0; i < pieces.size(); ++i) {
+    if (!result.empty())
+      result += "::";
+    result += pieces[i];
+  }
+  if (!result.empty())
+    result += "::";
+  result += node.name;
+  return result;
 }
 
 }  // namespace lowir_lowering
