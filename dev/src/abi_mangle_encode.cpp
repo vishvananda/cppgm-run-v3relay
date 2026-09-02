@@ -56,6 +56,67 @@ std::string source_name(const std::string & name)
   return std::to_string(name.size()) + name;
 }
 
+bool is_dash(const std::string & word)
+{
+  return word.empty() || word == "-";
+}
+
+std::string signed_number(long long value)
+{
+  if(value >= 0) {
+    return std::to_string(static_cast<unsigned long long>(value));
+  }
+  const unsigned long long magnitude = 0ULL -
+    static_cast<unsigned long long>(value);
+  return "n" + std::to_string(magnitude);
+}
+
+std::string operator_code(const std::string & name)
+{
+  if(name == "new") return "nw";
+  if(name == "new-array") return "na";
+  if(name == "delete") return "dl";
+  if(name == "delete-array") return "da";
+  if(name == "plus") return "pl";
+  if(name == "minus") return "mi";
+  if(name == "multiply") return "ml";
+  if(name == "divide") return "dv";
+  if(name == "modulo") return "rm";
+  if(name == "plus-assign") return "pL";
+  if(name == "minus-assign") return "mI";
+  if(name == "multiply-assign") return "mL";
+  if(name == "divide-assign") return "dV";
+  if(name == "modulo-assign") return "rM";
+  if(name == "equal") return "eq";
+  if(name == "not-equal") return "ne";
+  if(name == "less") return "lt";
+  if(name == "greater") return "gt";
+  if(name == "less-equal") return "le";
+  if(name == "greater-equal") return "ge";
+  if(name == "subscript") return "ix";
+  if(name == "call") return "cl";
+  if(name == "arrow") return "pt";
+  if(name == "arrow-star") return "pm";
+  if(name == "dereference") return "de";
+  if(name == "address-of") return "ad";
+  if(name == "increment") return "pp";
+  if(name == "decrement") return "mm";
+  if(name == "unary-plus") return "ps";
+  if(name == "unary-minus") return "ng";
+  if(name == "bit-and") return "an";
+  if(name == "bit-or") return "or";
+  if(name == "bit-xor") return "eo";
+  if(name == "complement") return "co";
+  if(name == "logical-not") return "nt";
+  if(name == "logical-and") return "aa";
+  if(name == "logical-or") return "oo";
+  if(name == "comma") return "cm";
+  if(name == "assign") return "aS";
+  if(name == "spaceship") return "ss";
+  if(name == "co-await") return "aw";
+  throw std::logic_error("unknown ABI operator terminal '" + name + "'");
+}
+
 bool needs_nested_name(const std::vector<std::string> & components)
 {
   if(components.size() == 1) return false;
@@ -99,15 +160,25 @@ std::string Mangler::mangle_prefix_chain(
   if(standard) {
     result = "St";
   }
-  for(std::size_t i = first_prefix; i + 1 < components.size(); ++i) {
-    const std::string key = joined_components(components, i);
-    std::string spelling;
-    if(substitutions_.lookup(key, &spelling)) {
-      result += spelling;
-    } else {
-      result += source_name(components[i]);
-      substitutions_.add(key);
+  std::size_t substitution_end = components.size();
+  std::string substitution;
+  if(components.size() > first_prefix + 1) {
+    for(std::size_t i = components.size() - 2; i >= first_prefix; --i) {
+      if(substitutions_.lookup(joined_components(components, i), &substitution)) {
+        substitution_end = i;
+        break;
+      }
+      if(i == first_prefix) break;
     }
+  }
+  if(substitution_end != components.size()) {
+    result.clear();
+    result += substitution;
+  }
+  for(std::size_t i = first_prefix; i + 1 < components.size(); ++i) {
+    if(substitution_end != components.size() && i <= substitution_end) continue;
+    result += source_name(components[i]);
+    substitutions_.add(joined_components(components, i));
   }
   result += source_name(components.back());
   if(!abi_tags.empty()) {
@@ -128,6 +199,413 @@ std::string Mangler::mangle_qualified_name(
   const std::string body = mangle_prefix_chain(qualified_name, register_last,
                                                abi_tags);
   return nested ? "N" + body + "E" : body;
+}
+
+std::string Mangler::mangle_function_terminal(const AbiFunctionRecord & record)
+{
+  if(record.kind == ABI_FUNCTION_RECORD_TERMINAL_SOURCE) {
+    if(is_dash(record.terminal)) {
+      throw std::logic_error("empty function terminal source");
+    }
+    return source_name(record.terminal);
+  }
+  if(record.kind == ABI_FUNCTION_RECORD_CONVERSION_TERMINAL) {
+    return "cv" + mangle_type(record.type);
+  }
+  if(record.kind == ABI_FUNCTION_RECORD_OPERATOR_TERMINAL) {
+    if(record.terminal == "literal") {
+      return "li" + source_name(record.literal_suffix);
+    }
+    return operator_code(record.terminal);
+  }
+  if(record.kind == ABI_FUNCTION_RECORD_TERMINAL) {
+    if(record.terminal == "constructor-complete") return "C1";
+    if(record.terminal == "constructor-base") return "C2";
+    if(record.terminal == "destructor-deleting") return "D0";
+    if(record.terminal == "destructor-complete") return "D1";
+    if(record.terminal == "destructor-base") return "D2";
+    throw std::logic_error("unknown ABI function terminal '" +
+      record.terminal + "'");
+  }
+  throw std::logic_error("invalid ABI function terminal record");
+}
+
+std::string Mangler::mangle_function_name(
+  const std::vector<AbiFunctionRecord> & records,
+  std::vector<std::string> * template_arguments,
+  bool * has_template_encoding)
+{
+  struct NamePiece
+  {
+    const AbiFunctionRecord * record;
+    bool template_name;
+  };
+
+  std::vector<NamePiece> pieces;
+  const AbiFunctionRecord * terminal = 0;
+  std::vector<AbiFunctionQualifier> qualifiers;
+  std::vector<std::string> tags;
+  std::vector<std::string> template_prefixes;
+  bool standard = false;
+  std::string standard_substitution;
+  if(has_template_encoding) *has_template_encoding = false;
+
+  for(std::size_t i = 0; i < records.size(); ++i) {
+    const AbiFunctionRecord & record = records[i];
+    switch(record.kind) {
+    case ABI_FUNCTION_RECORD_NAME_SOURCE:
+      if(!is_dash(record.source_name)) {
+        NamePiece piece = {&record, false};
+        pieces.push_back(piece);
+      }
+      break;
+    case ABI_FUNCTION_RECORD_NAME_STD:
+      standard = true;
+      standard_substitution = record.standard_substitution;
+      break;
+    case ABI_FUNCTION_RECORD_NAME_TEMPLATE: {
+      NamePiece piece = {&record, true};
+      pieces.push_back(piece);
+      break;
+    }
+    case ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_ARGUMENT:
+      if(template_arguments) {
+        template_arguments->push_back(record.substitution);
+      }
+      if(has_template_encoding) *has_template_encoding = true;
+      break;
+    case ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_PREFIX:
+      if(!is_dash(record.substitution)) {
+        template_prefixes.push_back(record.substitution);
+      }
+      break;
+    case ABI_FUNCTION_RECORD_QUALIFIER:
+      qualifiers.insert(qualifiers.end(), record.qualifiers.begin(),
+                        record.qualifiers.end());
+      break;
+    case ABI_FUNCTION_RECORD_ABI_TAG:
+      tags.push_back(record.name);
+      break;
+    case ABI_FUNCTION_RECORD_TERMINAL_SOURCE:
+    case ABI_FUNCTION_RECORD_TERMINAL:
+    case ABI_FUNCTION_RECORD_OPERATOR_TERMINAL:
+    case ABI_FUNCTION_RECORD_CONVERSION_TERMINAL:
+      if(terminal) {
+        throw std::logic_error("multiple ABI function terminals");
+      }
+      terminal = &record;
+      break;
+    default:
+      break;
+    }
+  }
+
+  // The source-level "operator" component and the dash component are
+  // placeholders when a terminal record supplies the ABI unqualified name.
+  if(terminal && !pieces.empty() && !pieces.back().template_name &&
+     (pieces.back().record->source_name == "operator" ||
+      is_dash(pieces.back().record->source_name))) {
+    pieces.pop_back();
+  }
+  if(pieces.empty() && !terminal) {
+    throw std::logic_error("ABI function has no name");
+  }
+
+  const std::size_t component_count = (standard ? 1 : 0) + pieces.size() +
+    (terminal ? 1 : 0);
+  const bool nested = component_count > 1 &&
+    !(standard && component_count == 2 && pieces.size() == 1 && !terminal);
+
+  std::string result;
+  if(nested) result += "N";
+  bool has_volatile = false;
+  bool has_const = false;
+  bool has_lvalue_ref = false;
+  bool has_rvalue_ref = false;
+  for(std::size_t i = 0; i < qualifiers.size(); ++i) {
+    has_volatile = has_volatile ||
+      qualifiers[i] == ABI_FUNCTION_QUALIFIER_VOLATILE;
+    has_const = has_const || qualifiers[i] == ABI_FUNCTION_QUALIFIER_CONST;
+    has_lvalue_ref = has_lvalue_ref ||
+      qualifiers[i] == ABI_FUNCTION_QUALIFIER_LVALUE_REFERENCE;
+    has_rvalue_ref = has_rvalue_ref ||
+      qualifiers[i] == ABI_FUNCTION_QUALIFIER_RVALUE_REFERENCE;
+  }
+  if(has_volatile) result += "V";
+  if(has_const) result += "K";
+  if(has_lvalue_ref) result += "R";
+  if(has_rvalue_ref) result += "O";
+  if(standard) {
+    result += standard_substitution.empty() ? "St" : standard_substitution;
+  }
+
+  const std::size_t final_piece = terminal ? pieces.size() :
+    pieces.size() - 1;
+  if(!terminal && pieces[final_piece].template_name && has_template_encoding) {
+    *has_template_encoding = true;
+  }
+  for(std::size_t i = 0; i < pieces.size(); ++i) {
+    if(!terminal && i == final_piece) break;
+    const AbiFunctionRecord & record = *pieces[i].record;
+    if(pieces[i].template_name) {
+      if(!is_dash(record.substitution)) substitutions_.add(record.substitution);
+      if(!is_dash(record.standard_substitution) &&
+         !record.standard_substitution.empty()) {
+        result += record.standard_substitution;
+        if(!record.standard_substitution_includes_arguments) {
+          result += mangle_template_args(record.argument_refs);
+        }
+      } else {
+        result += source_name(record.name);
+        result += mangle_template_args(record.argument_refs);
+      }
+      if(!is_dash(record.complete_substitution)) {
+        substitutions_.add(record.complete_substitution);
+      }
+    } else {
+      result += source_name(record.source_name);
+      if(!is_dash(record.substitution)) substitutions_.add(record.substitution);
+    }
+  }
+
+  if(terminal) {
+    result += mangle_function_terminal(*terminal);
+  } else {
+    const AbiFunctionRecord & record = *pieces[final_piece].record;
+    if(pieces[final_piece].template_name) {
+      if(!is_dash(record.standard_substitution) &&
+         !record.standard_substitution.empty()) {
+        result += record.standard_substitution;
+        if(!record.standard_substitution_includes_arguments) {
+          result += mangle_template_args(record.argument_refs);
+        }
+      } else {
+        result += source_name(record.name);
+        result += mangle_template_args(record.argument_refs);
+      }
+      if(!is_dash(record.complete_substitution)) {
+        substitutions_.add(record.complete_substitution);
+      }
+    } else {
+      result += source_name(record.source_name);
+      if(!is_dash(record.substitution)) substitutions_.add(record.substitution);
+    }
+  }
+  if(!tags.empty()) result += mangle_tag_list(tags);
+  for(std::size_t i = 0; i < template_prefixes.size(); ++i) {
+    substitutions_.add(template_prefixes[i]);
+  }
+  if(template_arguments && !template_arguments->empty()) {
+    result += mangle_template_args(*template_arguments);
+  }
+  if(nested) result += "E";
+  return result;
+}
+
+std::string Mangler::mangle_path_name(
+  const AbiFunctionTarget & target,
+  const std::vector<AbiFunctionRecord> & records,
+  const std::vector<std::string> & template_arguments)
+{
+  const std::vector<std::string> components = name_components(
+    target.qualified_name);
+  const bool nested = needs_nested_name(components);
+  const bool standard = components[0] == "std";
+  const std::size_t first_prefix = standard ? 1 : 0;
+  const AbiFunctionRecord * terminal = 0;
+  std::vector<std::string> tags;
+  std::vector<AbiFunctionQualifier> qualifiers;
+  for(std::size_t i = 0; i < records.size(); ++i) {
+    const AbiFunctionRecord & record = records[i];
+    if(record.kind == ABI_FUNCTION_RECORD_ABI_TAG) {
+      tags.push_back(record.name);
+    } else if(record.kind == ABI_FUNCTION_RECORD_QUALIFIER) {
+      qualifiers.insert(qualifiers.end(), record.qualifiers.begin(),
+                        record.qualifiers.end());
+    } else if(record.kind == ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_PREFIX) {
+      if(!is_dash(record.substitution)) substitutions_.add(record.substitution);
+    } else if(record.kind == ABI_FUNCTION_RECORD_TERMINAL_SOURCE ||
+              record.kind == ABI_FUNCTION_RECORD_TERMINAL ||
+              record.kind == ABI_FUNCTION_RECORD_OPERATOR_TERMINAL ||
+              record.kind == ABI_FUNCTION_RECORD_CONVERSION_TERMINAL) {
+      if(terminal) {
+        throw std::logic_error("multiple ABI function terminals");
+      }
+      terminal = &record;
+    }
+  }
+
+  std::string prefix_result;
+  if(standard) prefix_result = "St";
+  std::size_t substitution_end = components.size();
+  std::string substitution;
+  if(components.size() > first_prefix + 1) {
+    for(std::size_t i = components.size() - 2; i >= first_prefix; --i) {
+      if(substitutions_.lookup(joined_components(components, i), &substitution)) {
+        substitution_end = i;
+        break;
+      }
+      if(i == first_prefix) break;
+    }
+  }
+  if(substitution_end != components.size()) {
+    prefix_result = substitution;
+  }
+  for(std::size_t i = first_prefix; i + 1 < components.size(); ++i) {
+    if(substitution_end != components.size() && i <= substitution_end) continue;
+    prefix_result += source_name(components[i]);
+    substitutions_.add(joined_components(components, i));
+  }
+
+  std::string result;
+  if(nested) result += "N";
+  bool has_volatile = false;
+  bool has_const = false;
+  bool has_lvalue_ref = false;
+  bool has_rvalue_ref = false;
+  for(std::size_t i = 0; i < qualifiers.size(); ++i) {
+    has_volatile = has_volatile ||
+      qualifiers[i] == ABI_FUNCTION_QUALIFIER_VOLATILE;
+    has_const = has_const || qualifiers[i] == ABI_FUNCTION_QUALIFIER_CONST;
+    has_lvalue_ref = has_lvalue_ref ||
+      qualifiers[i] == ABI_FUNCTION_QUALIFIER_LVALUE_REFERENCE;
+    has_rvalue_ref = has_rvalue_ref ||
+      qualifiers[i] == ABI_FUNCTION_QUALIFIER_RVALUE_REFERENCE;
+  }
+  if(has_volatile) result += "V";
+  if(has_const) result += "K";
+  if(has_lvalue_ref) result += "R";
+  if(has_rvalue_ref) result += "O";
+  result += prefix_result;
+  if(terminal) {
+    result += mangle_function_terminal(*terminal);
+  } else {
+    result += source_name(components.back());
+  }
+  if(!tags.empty()) result += mangle_tag_list(tags);
+  if(!template_arguments.empty()) {
+    result += mangle_template_args(template_arguments);
+    substitutions_.add(normalized_name(target.qualified_name));
+  }
+  if(nested) result += "E";
+  return result;
+}
+
+std::string Mangler::mangle_function_path(const AbiFunctionShape & shape)
+{
+  const AbiFunctionTarget & target = shape.target;
+  std::vector<std::string> template_arguments;
+  std::vector<AbiType> path_parameters;
+  bool path_variadic = false;
+  for(std::size_t i = 0; i < target.path_operands.size(); ++i) {
+    const AbiFunctionPathOperand & operand = target.path_operands[i];
+    if(operand.kind == ABI_FUNCTION_PATH_TEMPLATE_ARGUMENT) {
+      if(argument_definition(operand.argument_ref)) {
+        template_arguments.push_back(operand.argument_ref);
+      } else if(type_definition(operand.argument_ref)) {
+        AbiType type;
+        type.kind = ABI_TYPE_NAME_OR_REFERENCE;
+        type.name = operand.argument_ref;
+        path_parameters.push_back(type);
+      } else {
+        throw std::logic_error("unknown ABI path operand '" +
+          operand.argument_ref + "'");
+      }
+    } else if(operand.kind == ABI_FUNCTION_PATH_TYPE) {
+      path_parameters.push_back(operand.type);
+    } else if(operand.kind == ABI_FUNCTION_PATH_VARIADIC) {
+      path_variadic = true;
+    }
+  }
+
+  std::vector<AbiType> parameters;
+  std::vector<AbiType> results;
+  bool explicit_parameters = false;
+  bool variadic = path_variadic;
+  for(std::size_t i = 0; i < shape.records.size(); ++i) {
+    const AbiFunctionRecord & record = shape.records[i];
+    if(record.kind == ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_ARGUMENT) {
+      template_arguments.push_back(record.substitution);
+    } else if(record.kind == ABI_FUNCTION_RECORD_PARAMETER) {
+      explicit_parameters = true;
+      parameters.push_back(record.type);
+    } else if(record.kind == ABI_FUNCTION_RECORD_RESULT) {
+      results.push_back(record.type);
+    } else if(record.kind == ABI_FUNCTION_RECORD_VARIADIC) {
+      variadic = true;
+    }
+  }
+  if(!explicit_parameters) parameters = path_parameters;
+
+  std::string result = "_Z" + mangle_path_name(target, shape.records,
+                                                 template_arguments);
+  if(!template_arguments.empty()) {
+    for(std::size_t i = 0; i < results.size(); ++i) {
+      result += mangle_type(results[i]);
+    }
+  }
+  if(parameters.empty()) {
+    result += "v";
+  } else {
+    for(std::size_t i = 0; i < parameters.size(); ++i) {
+      result += mangle_type(parameters[i]);
+    }
+  }
+  if(variadic) result += "z";
+  return result;
+}
+
+std::string Mangler::mangle_function_encoding(const AbiFunctionShape & shape)
+{
+  std::vector<std::string> template_arguments;
+  bool has_template_encoding = false;
+  const std::string name = mangle_function_name(shape.records,
+                                                &template_arguments,
+                                                &has_template_encoding);
+  std::vector<AbiType> parameters;
+  std::vector<AbiType> results;
+  bool variadic = false;
+  for(std::size_t i = 0; i < shape.records.size(); ++i) {
+    const AbiFunctionRecord & record = shape.records[i];
+    if(record.kind == ABI_FUNCTION_RECORD_PARAMETER) {
+      parameters.push_back(record.type);
+    } else if(record.kind == ABI_FUNCTION_RECORD_RESULT) {
+      results.push_back(record.type);
+    } else if(record.kind == ABI_FUNCTION_RECORD_VARIADIC) {
+      variadic = true;
+    }
+  }
+  std::string result = "_Z" + name;
+  if(has_template_encoding) {
+    for(std::size_t i = 0; i < results.size(); ++i) {
+      result += mangle_type(results[i]);
+    }
+  }
+  if(parameters.empty()) {
+    result += "v";
+  } else {
+    for(std::size_t i = 0; i < parameters.size(); ++i) {
+      result += mangle_type(parameters[i]);
+    }
+  }
+  if(variadic) result += "z";
+  return result;
+}
+
+std::string Mangler::mangle_function(const AbiFunctionShape & shape)
+{
+  if(shape.target.kind == ABI_FUNCTION_TARGET_PATH) {
+    return mangle_function_path(shape);
+  }
+  if(shape.target.kind == ABI_FUNCTION_TARGET_ENCODING) {
+    return mangle_function_encoding(shape);
+  }
+  throw std::logic_error("unsupported function target");
+}
+
+std::string Mangler::mangle_call_offset(long long offset) const
+{
+  return "h" + signed_number(offset) + "_";
 }
 
 std::string Mangler::mangle_internal_name(const std::string & qualified_name)
@@ -173,10 +651,45 @@ std::string Mangler::mangle_special_target(const AbiTargetRecord & target)
 
 std::string Mangler::mangle_target(const AbiTargetRecord & target)
 {
+  AbiFunctionShape shape;
   if(target.kind == ABI_TARGET_FACT_FUNCTION ||
      target.kind == ABI_TARGET_FACT_THUNK ||
      target.kind == ABI_TARGET_FACT_VIRTUAL_BASE_THUNK) {
-    throw std::logic_error("unsupported target");
+    shape.target = target.function;
+  }
+  return mangle_target(target, shape);
+}
+
+std::string Mangler::mangle_target(const AbiTargetRecord & target,
+                                   const AbiFunctionShape & shape)
+{
+  if(target.kind == ABI_TARGET_FACT_FUNCTION) {
+    if(target.c_linkage) return target.function.qualified_name;
+    return mangle_function(shape);
+  }
+  if(target.kind == ABI_TARGET_FACT_THUNK ||
+     target.kind == ABI_TARGET_FACT_VIRTUAL_BASE_THUNK) {
+    const std::string base = mangle_function(shape);
+    if(base.compare(0, 2, "_Z") != 0) {
+      throw std::logic_error("thunk function is not Itanium-mangled");
+    }
+    const std::string encoding = base.substr(2);
+    if(target.kind == ABI_TARGET_FACT_VIRTUAL_BASE_THUNK) {
+      return "_ZTv0_" + signed_number(target.vcall_offset) + "_" + encoding;
+    }
+    std::string result = "_ZT";
+    if(target.has_result_adjust) {
+      result += "c";
+    }
+    result += mangle_call_offset(target.this_adjust);
+    if(target.has_result_adjust) {
+      if(target.result_adjust_virtual) {
+        result += "v0_" + signed_number(target.result_vcall_offset) + "_";
+      } else {
+        result += mangle_call_offset(target.result_adjust);
+      }
+    }
+    return result + encoding;
   }
   return mangle_special_target(target);
 }
@@ -185,6 +698,7 @@ std::string mangle_fact_case(const AbiFactCase & fact_case)
 {
   AbiDefinitionTable definitions;
   const AbiTargetRecord * target = 0;
+  AbiFunctionShape shape;
   for(std::size_t i = 0; i < fact_case.records.size(); ++i) {
     const AbiFactRecord & record = fact_case.records[i];
     if(record.kind == ABI_FACT_RECORD_DEFINITION) {
@@ -194,12 +708,15 @@ std::string mangle_fact_case(const AbiFactCase & fact_case)
         throw std::logic_error("ABI case must contain exactly one target");
       }
       target = &record.target;
+    } else if(record.kind == ABI_FACT_RECORD_FUNCTION) {
+      shape.records.push_back(record.function);
     }
   }
   if(!target) {
     throw std::logic_error("ABI case must contain exactly one target");
   }
-  return abi_mangle::Mangler(definitions).mangle_target(*target);
+  shape.target = target->function;
+  return abi_mangle::Mangler(definitions).mangle_target(*target, shape);
 }
 
 std::string mangle_fact_files(const std::vector<std::string> & input_paths)

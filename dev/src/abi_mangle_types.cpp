@@ -234,6 +234,12 @@ std::string Mangler::key_of_type_impl(const AbiType & input,
                                       std::size_t depth)
 {
   check_depth(depth);
+  if(input.is_const || input.is_volatile) {
+    AbiType base = input;
+    base.is_const = false;
+    base.is_volatile = false;
+    return cv_key(input, key_of_type_impl(base, depth + 1));
+  }
   if(input.kind == ABI_TYPE_NAME_OR_REFERENCE) {
     if(type_definition(input.name)) {
       return type_key_ref(input.name, depth);
@@ -241,12 +247,6 @@ std::string Mangler::key_of_type_impl(const AbiType & input,
     AbiType named = input;
     named.kind = ABI_TYPE_NAMED;
     return key_of_type_impl(named, depth + 1);
-  }
-  if(input.is_const || input.is_volatile) {
-    AbiType base = input;
-    base.is_const = false;
-    base.is_volatile = false;
-    return cv_key(input, key_of_type_impl(base, depth + 1));
   }
   switch(input.kind) {
   case ABI_TYPE_NAME_OR_REFERENCE:
@@ -695,6 +695,13 @@ std::string Mangler::mangle_named_type(const AbiType & type, std::size_t depth)
   if(lookup_substitution(&substitutions_, key, &spelling)) {
     return spelling;
   }
+  // Function-name prefixes and named types share the ABI substitution
+  // sequence, although the fact model records the former by source spelling
+  // and the latter by a structural key.
+  if(type.abi_tags.empty() &&
+     lookup_substitution(&substitutions_, strip_scope(type.name), &spelling)) {
+    return spelling;
+  }
   const std::string result = mangle_qualified_name(type.name, false,
     type.abi_tags);
   substitutions_.add(key);
@@ -726,6 +733,10 @@ bool nested_name(const std::string & qualified_name)
 std::string Mangler::mangle_template_name(const std::string & qualified_name)
 {
   const bool nested = nested_name(qualified_name);
+  std::string spelling;
+  if(substitutions_.lookup(strip_scope(qualified_name), &spelling)) {
+    return nested ? "N" + spelling : spelling;
+  }
   const std::string body = mangle_prefix_chain(qualified_name, true);
   return nested ? "N" + body : body;
 }
@@ -734,13 +745,16 @@ std::string Mangler::mangle_template_type(const AbiType & type,
                                           std::size_t depth)
 {
   if(type.kind == ABI_TYPE_TEMPLATE_PARAMETER_SPECIALIZATION) {
+    const std::string key = key_of_type_impl(type, depth + 1);
+    std::string spelling;
+    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
     std::string result = "T";
     if(type.index != 0) {
-      result += number_word(static_cast<unsigned long long>(type.index));
+      result += number_word(static_cast<unsigned long long>(type.index - 1));
     }
-    result += "_I";
+    result += "_";
     result += mangle_template_args(type.argument_refs);
-    result += "E";
+    substitutions_.add(key);
     return result;
   }
   if(type.kind == ABI_TYPE_STD_TEMPLATE_SPECIALIZATION) {
@@ -793,6 +807,27 @@ std::string Mangler::mangle_owner_prefix(const AbiType & input,
   if(input.kind == ABI_TYPE_NAMED) {
     return mangle_type_body_without_outer_name(
       mangle_qualified_name(input.name, false, input.abi_tags));
+  }
+  if(input.kind == ABI_TYPE_TEMPLATE_SPECIALIZATION) {
+    std::string prefix;
+    if(!substitutions_.lookup(strip_scope(input.name), &prefix)) {
+      prefix = mangle_template_name(input.name);
+      if(!prefix.empty() && prefix[0] == 'N') {
+        prefix.erase(0, 1);
+      }
+    }
+    std::string result = prefix + mangle_template_args(input.argument_refs);
+    return result;
+  }
+  if(input.kind == ABI_TYPE_STD_TEMPLATE_SPECIALIZATION) {
+    if(input.standard_substitution.empty()) {
+      throw std::logic_error("standard template owner needs a substitution code");
+    }
+    std::string result = input.standard_substitution;
+    if(!input.standard_substitution_includes_arguments) {
+      result += mangle_template_args(input.argument_refs);
+    }
+    return result;
   }
   const std::string full = mangle_type_impl(input, depth + 1);
   return mangle_type_body_without_outer_name(full);
@@ -893,7 +928,7 @@ std::string Mangler::mangle_template_arg(const AbiTemplateArgument & argument)
   if(argument.kind == ABI_TEMPLATE_ARGUMENT_TEMPLATE_PARAMETER_TEMPLATE) {
     std::string result = "T";
     if(argument.index != 0) {
-      result += number_word(static_cast<unsigned long long>(argument.index));
+      result += number_word(static_cast<unsigned long long>(argument.index - 1));
     }
     return result + "_";
   }
@@ -966,7 +1001,9 @@ std::string Mangler::mangle_entity_impl(const AbiEntityFact & entity,
     return entity.qualified_name;
   }
   if(entity.kind == ABI_ENTITY_FACT_FUNCTION) {
-    throw std::logic_error("unsupported target");
+    AbiFunctionShape shape;
+    shape.target = entity.function;
+    return mangle_function(shape);
   }
   const std::string name = entity.internal_linkage ?
     mangle_internal_name(entity.qualified_name) :

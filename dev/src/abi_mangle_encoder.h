@@ -39,6 +39,9 @@ public:
   std::string mangle_template_args(const std::vector<std::string> & refs);
   std::string mangle_special_target(const AbiTargetRecord & target);
   std::string mangle_target(const AbiTargetRecord & target);
+  std::string mangle_target(const AbiTargetRecord & target,
+                            const AbiFunctionShape & shape);
+  std::string mangle_function(const AbiFunctionShape & shape);
 
   std::string key_of_type(const AbiType & type);
   std::string key_of_argument(const AbiTemplateArgument & argument);
@@ -64,6 +67,18 @@ private:
   std::string mangle_entity_impl(const AbiEntityFact & entity,
                                  std::size_t depth);
   std::string mangle_internal_name(const std::string & qualified_name);
+  std::string mangle_function_path(const AbiFunctionShape & shape);
+  std::string mangle_function_encoding(const AbiFunctionShape & shape);
+  std::string mangle_path_name(
+    const AbiFunctionTarget & target,
+    const std::vector<AbiFunctionRecord> & records,
+    const std::vector<std::string> & template_arguments);
+  std::string mangle_function_name(
+    const std::vector<AbiFunctionRecord> & records,
+    std::vector<std::string> * template_arguments,
+    bool * has_template_encoding);
+  std::string mangle_function_terminal(const AbiFunctionRecord & record);
+  std::string mangle_call_offset(long long offset) const;
 
   std::string key_of_type_impl(const AbiType & type, std::size_t depth);
   std::string key_of_argument_impl(const AbiTemplateArgument & argument,

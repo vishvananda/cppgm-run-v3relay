@@ -327,6 +327,12 @@ struct AbiFunctionRecord
   std::vector<AbiFunctionQualifier> qualifiers;
 };
 
+struct AbiFunctionShape
+{
+  AbiFunctionTarget target;
+  std::vector<AbiFunctionRecord> records;
+};
+
 struct AbiFactRecord
 {
   AbiFactRecordKind kind = ABI_FACT_RECORD_TARGET;

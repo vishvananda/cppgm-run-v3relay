@@ -277,9 +277,12 @@ static tables built at runtime per call, no per-case reparsing.
   74).  `make test-report-through-pa13` is clean at 919/919, the pa14 file
   audit passes, and the 10k/20k probe scales 2.85s → 5.60s at ~48 MB RSS;
   the 5k pointer chain completes in 0.12s without stack overflow.
-- CP2 — `FunctionShape` lowering and emission for compact, `path` and
-  `encoding` forms; terminals, qualifiers, tags, template prefixes/args,
-  results, thunks, `c-function`, function entities: ≥ 83/111.
+- CP2 (complete) — `FunctionShape` lowering and emission for compact, `path`
+  and `encoding` forms; terminals, qualifiers, tags, template prefixes/args,
+  results, thunks, `c-function`, function entities: all 48 CP2 cases pass;
+  stage total is 85/111 (failures 74 → 26).  `make
+  test-report-through-pa13` remains clean at 919/919 and the pa14 file audit
+  passes with three non-fatal structural warnings.
 - CP3 — local-name contexts (`function`/`raw`), local types, lambda closures
   and their call operators sharing the substitution table: ≥ 93/111.
 - CP4 — dependent expressions, decltype, type traits, entity-reference
@@ -383,13 +386,13 @@ implement the obvious Itanium spelling or reject, never guess silently;
 semantics; `Tn` and the `member-template-entity` slot order are
 fixture-pinned quirks to keep even where they diverge from GCC/Clang.
 
-## Active Checkpoint: CP2 — FunctionShape lowering and emission
+## Completed Checkpoint: CP2 — FunctionShape lowering and emission
 
-Goal: lower compact, `path`, and `encoding` function targets through one
-structured emitter, including terminals, qualifiers, tags, template prefixes
-and arguments, results, C-linkage functions, function entities, and thunks;
-preserve the CP1 reader/model and reach at least 83/111 while all earlier PAs
-remain clean.
+Goal and evidence: lower compact, `path`, and `encoding` function targets
+through one structured emitter, including terminals, qualifiers, tags,
+template prefixes and arguments, results, C-linkage functions, function
+entities, and thunks.  The CP1 37/37 pass set was preserved; the broad pa14
+run reached 85/111, with only the planned CP3/CP4 boundaries failing.
 
 ### Implementation Packet
 
@@ -407,3 +410,25 @@ Fixture group: the 48 CP2 cases in the failure map—100-level function forms,
 non-local 200-level functions/operators/thunks, the CP2 300-level cases, and
 the four listed 600-level cases. Preserve the CP1 pass set and ensure every
 later fixture still parses before its unsupported encoder boundary.
+
+## Active Checkpoint: CP3 — Local-name contexts and lambdas
+
+Goal: lower local-name contexts, local types, lambda closures, and their call
+operators through the same function/name substitution state while preserving
+the 85/111 CP2 result and all earlier PAs.
+
+### Implementation Packet
+
+Files/symbols:
+
+- `dev/src/abi_mangle.h` and `dev/src/abi_mangle_encoder.h`: extend the
+  function shape for context ownership and local-name discriminators.
+- `dev/src/abi_mangle_encode.cpp`: emit raw/function contexts, local names,
+  lambda call operators, and their shared substitution order.
+- `dev/src/abi_mangle_types.cpp`: lower local, lambda, and namespace-lambda
+  type candidates without changing CP2 ordering.
+
+Fixture group: the 10 CP3 cases in the failure map—seven 200-level
+local/lambda cases and the three 600-level function-template local-argument
+cases. Keep all 48 CP2 cases green and let CP4 dependent-expression fixtures
+fail only at their unsupported boundary.
