@@ -66,6 +66,9 @@ struct Binding
   ScopeId namespace_scope; // BINDING_NAMESPACE: the nominated namespace
   FunctionEntityId function; // BINDING_FUNCTION: canonical function entity
   BindingId object_binding; // injected member: implicit anonymous-union object
+  bool internal_linkage;
+  bool c_linkage;
+  bool noexcept_qualifier;
   bool has_const_value;
   long long const_value;
 
@@ -140,6 +143,9 @@ struct FunctionEntity
   bool member_const;
   bool is_template;
   std::vector<TypeId> template_parameters; // TYPE_TEMPLATE_PARAM types, in order
+  bool internal_linkage;
+  bool c_linkage;
+  bool noexcept_qualifier;
   bool defined;
 
   FunctionEntity();

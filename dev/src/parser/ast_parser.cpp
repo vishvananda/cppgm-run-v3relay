@@ -1191,7 +1191,8 @@ AstId Pa10Parser::parse_jump_statement()
 	{
 		AstId expression = 0;
 		if (!is_simple(OP_SEMICOLON))
-			expression = parse_expression();
+			expression = is_simple(OP_LBRACE) ? parse_braced_init_list() :
+			parse_expression();
 		if (!is_simple(OP_SEMICOLON) || !consume_simple(OP_SEMICOLON))
 		{
 			restore(saved);

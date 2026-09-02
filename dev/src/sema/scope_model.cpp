@@ -6,6 +6,7 @@
 Binding::Binding()
     : kind(BINDING_VARIABLE), type(0), scope(0), namespace_scope(0),
       function(0), object_binding(0),
+      internal_linkage(false), c_linkage(false), noexcept_qualifier(false),
       has_const_value(false), const_value(0)
 {
 }
@@ -30,7 +31,8 @@ EnumEntity::EnumEntity()
 FunctionEntity::FunctionEntity()
     : scope(0), type(0), member_type(0), member_pointer_type(0),
       member_class(0), is_member(false), member_const(false),
-      is_template(false), defined(false)
+      is_template(false), internal_linkage(false), c_linkage(false),
+      noexcept_qualifier(false), defined(false)
 {
 }
 

@@ -719,7 +719,9 @@ std::string Mangler::mangle_special_target(const AbiTargetRecord & target)
   case ABI_TARGET_FACT_THREAD_LOCAL_WRAPPER:
     return "_ZTW" + mangle_qualified_name(target.qualified_name);
   case ABI_TARGET_FACT_VARIABLE:
-    return "_Z" + mangle_qualified_name(target.qualified_name);
+    return "_Z" + (target.internal_linkage ?
+      mangle_internal_name(target.qualified_name) :
+      mangle_qualified_name(target.qualified_name));
   default:
     throw std::logic_error("unsupported ABI target");
   }

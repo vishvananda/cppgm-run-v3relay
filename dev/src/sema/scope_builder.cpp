@@ -336,7 +336,9 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     {
       const FunctionEntityId function = DeclareFunction(
           target_scope, name, type, false, binding,
-          HasConstFunctionQualifier(declarator));
+          HasConstFunctionQualifier(declarator),
+          SequenceHasKeyword(specifiers, KW_STATIC),
+          HasNoexceptQualifier(declarator));
       ClassEntityId member_class = 0;
       const bool is_member = model_.ClassForScope(target_scope, member_class);
       if (EmitsSemantics() && !is_member)
@@ -347,6 +349,9 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
       continue;
     }
     binding = model_.AddBinding(target_scope, name, kind, type);
+    model_.BindingAt(binding).internal_linkage =
+        SequenceHasKeyword(specifiers, KW_STATIC);
+    model_.BindingAt(binding).c_linkage = c_linkage_depth_ != 0;
     SemaId variable = 0;
     if (EmitsSemantics() && model_.ScopeAt(target_scope).kind != SCOPE_CLASS)
       variable = MakeSemantic(is_typedef ? SEMA_TYPE_ALIAS : SEMA_VARIABLE,
@@ -432,7 +437,9 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   BindingId binding = 0;
   const FunctionEntityId function = DeclareFunction(
       target_scope, name, type, true, binding,
-      HasConstFunctionQualifier(declarator));
+      HasConstFunctionQualifier(declarator),
+      SequenceHasKeyword(specifiers, KW_STATIC),
+      HasNoexceptQualifier(declarator));
   ClassEntityId member_class = 0;
   const bool is_member = model_.ClassForScope(target_scope, member_class);
   SemaId function_node = 0;
@@ -519,9 +526,14 @@ void ScopeBuilder::BuildStaticAssert(AstId node, ScopeId scope)
 
 void ScopeBuilder::BuildLinkage(AstId node, ScopeId scope)
 {
+  const bool is_c = arena_.At(node).text == "C";
+  if (is_c)
+    ++c_linkage_depth_;
   const vector<AstId>& children = arena_.At(node).children;
   for (std::size_t i = 0; i < children.size(); ++i)
     BuildNode(children[i], scope);
+  if (is_c)
+    --c_linkage_depth_;
 }
 
 // Identity for a type declared without a name or declarator: the token
@@ -718,6 +730,45 @@ TypeId ScopeBuilder::BuildEnum(AstId node, ScopeId scope,
       ResolveQualifierScope(scope, name.Prefix()) : scope;
   TypeId underlying = underlying_node == 0 ? types_.Fundamental(FT_INT) :
       BuildTypeId(underlying_node, scope);
+  if (underlying_node == 0 && !scoped) {
+    long long previous = -1;
+    long long minimum = 0;
+    long long maximum = 0;
+    bool have_value = false;
+    bool need_wider = false;
+    bool values_known = true;
+    for (std::size_t i = 0; i < enumerators.size(); ++i) {
+      const AstNode& enumerator = arena_.At(enumerators[i]);
+      long long value = 0;
+      if (!enumerator.children.empty()) {
+        try {
+          value = ConstantValue(enumerator.children[0], scope);
+        } catch (const std::exception&) {
+          values_known = false;
+          break;
+        }
+      } else if (previous != std::numeric_limits<long long>::max()) {
+        value = previous + 1;
+      } else {
+        values_known = false;
+        break;
+      }
+      if (value < std::numeric_limits<int>::min() ||
+          value > std::numeric_limits<int>::max())
+        need_wider = true;
+      if (!have_value || value < minimum) minimum = value;
+      if (!have_value || value > maximum) maximum = value;
+      have_value = true;
+      previous = value;
+    }
+    if (values_known && have_value && need_wider) {
+      const long long unsigned_int_max =
+          static_cast<long long>(std::numeric_limits<unsigned int>::max());
+      underlying = (minimum >= 0 && maximum <= unsigned_int_max) ?
+          types_.Fundamental(FT_UNSIGNED_INT) :
+          types_.Fundamental(FT_LONG_INT);
+    }
+  }
   const TypeId underlying_kind = types_.Unqualified(underlying);
   if (types_.Kind(underlying_kind) != TYPE_FUNDAMENTAL ||
       !FundamentalIsIntegral(types_.At(underlying_kind).fundamental))
@@ -1016,6 +1067,27 @@ bool ScopeBuilder::HasConstFunctionQualifier(AstId declarator) const
     else if (have_parameters && value.kind == AST_CV_QUALIFIER &&
              value.first < tokens_.size() &&
              tokens_[value.first].IsSimple(KW_CONST))
+      return true;
+  }
+  return false;
+}
+
+bool ScopeBuilder::HasNoexceptQualifier(AstId declarator) const
+{
+  if (declarator == 0)
+    return false;
+  const AstNode& node = arena_.At(declarator);
+  bool have_parameters = false;
+  for (std::size_t i = 0; i < node.children.size(); ++i)
+  {
+    const AstId child = node.children[i];
+    const AstNode& value = arena_.At(child);
+    if (value.kind == AST_PARAMETER_CLAUSE)
+      have_parameters = true;
+    else if (have_parameters &&
+             (value.kind == AST_NOEXCEPT_SPECIFICATION ||
+              (value.kind == AST_FUNCTION_QUALIFIER &&
+               value.text.find("noexcept") != string::npos)))
       return true;
   }
   return false;
@@ -1380,7 +1452,9 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
                                                TypeId declared_type,
                                                bool definition,
                                                BindingId& binding,
-                                               bool member_const)
+                                               bool member_const,
+                                               bool internal_linkage,
+                                               bool noexcept_qualifier)
 {
   const TypeId unqualified = types_.Unqualified(declared_type);
   if (types_.Kind(unqualified) != TYPE_FUNCTION)
@@ -1449,15 +1523,24 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
         entity.is_member = true;
         entity.member_const = member_const;
       }
+      entity.internal_linkage = entity.internal_linkage || internal_linkage;
+      entity.c_linkage = entity.c_linkage || c_linkage_depth_ != 0;
+      entity.noexcept_qualifier = entity.noexcept_qualifier ||
+          noexcept_qualifier;
       binding = model_.AddBinding(scope, name, BINDING_FUNCTION,
                                   declared_type);
       model_.BindingAt(binding).function = prior.function;
+      model_.BindingAt(binding).internal_linkage = entity.internal_linkage;
+      model_.BindingAt(binding).c_linkage = entity.c_linkage;
+      model_.BindingAt(binding).noexcept_qualifier = entity.noexcept_qualifier;
       return prior.function;
     }
   }
   const FunctionEntityId function = model_.CreateFunction(scope, name,
                                                             canonical);
   model_.FunctionAt(function).defined = definition;
+  model_.FunctionAt(function).internal_linkage = internal_linkage;
+  model_.FunctionAt(function).c_linkage = c_linkage_depth_ != 0;
   if (is_member)
   {
     FunctionEntity& entity = model_.FunctionAt(function);
@@ -1468,8 +1551,11 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     entity.is_member = true;
     entity.member_const = member_const;
   }
+  model_.FunctionAt(function).noexcept_qualifier = noexcept_qualifier;
   binding = model_.AddBinding(scope, name, BINDING_FUNCTION, declared_type);
   model_.BindingAt(binding).function = function;
+  model_.BindingAt(binding).internal_linkage = internal_linkage;
+  model_.BindingAt(binding).c_linkage = c_linkage_depth_ != 0;
   return function;
 }
 

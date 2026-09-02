@@ -423,6 +423,7 @@ struct AbiTargetRecord
 {
   AbiTargetFactKind kind = ABI_TARGET_FACT_TYPE;
   bool c_linkage = false;
+  bool internal_linkage = false;
   AbiType type;
   AbiType base_type;
   AbiFunctionTarget function;

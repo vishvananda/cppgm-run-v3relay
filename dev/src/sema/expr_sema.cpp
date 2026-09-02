@@ -1224,12 +1224,16 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
 SemaId ExpressionAnalyzer::AnalyzeBraced(AstId expression, ScopeId scope,
                                          TypeId target)
 {
+  const vector<AstId>& children = arena_.At(expression).children;
   if (target == 0)
     throw std::runtime_error("braced initializer requires an array target");
-  if (types_.Kind(target) != TYPE_ARRAY)
+  if (types_.Kind(target) != TYPE_ARRAY) {
+    if (children.empty())
+      return MakeExpression(SEMA_BRACED_INIT_LIST, expression, target,
+                            VC_PRVALUE, scope);
     throw std::runtime_error("braced initializer target is not an array");
+  }
   const TypeId element = types_.At(target).base;
-  const vector<AstId>& children = arena_.At(expression).children;
   if (children.size() != types_.At(target).array_bound)
     throw std::runtime_error("initializer list has the wrong bound");
   const SemaId result = MakeExpression(SEMA_BRACED_INIT_LIST, expression,

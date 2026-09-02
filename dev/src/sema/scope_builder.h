@@ -129,6 +129,7 @@ private:
                        TypeId type);
   std::string AnonymousTypeName(AstId node, const char* kind) const;
   bool HasConstFunctionQualifier(AstId declarator) const;
+  bool HasNoexceptQualifier(AstId declarator) const;
   FunctionEntityId EnsureDefaultConstructor(TypeId type);
   void AddConstructorAction(SemaId variable, ScopeId scope, TypeId type,
                             BindingId binding, AstId declarator);
@@ -196,7 +197,9 @@ private:
   FunctionEntityId DeclareFunction(ScopeId scope, const std::string& name,
                                    TypeId declared_type, bool definition,
                                    BindingId& binding,
-                                   bool member_const = false);
+                                   bool member_const = false,
+                                   bool internal_linkage = false,
+                                   bool noexcept_qualifier = false);
   SemaId MakeDetachedSemantic(SemaKind kind, ScopeId scope, TypeId type,
                               BindingId binding, FunctionEntityId function);
   TypeId SubstituteTemplateType(TypeId type, const TemplateBindings& values);
@@ -219,6 +222,7 @@ private:
   std::vector<SemaId> semantic_scopes_; // indexed by ScopeId
   unsigned unnamed_local_enum_counter_;
   unsigned unnamed_local_class_counter_;
+  unsigned c_linkage_depth_;
   bool suppress_semantics_;
   std::vector<SemaId> deferred_semantics_;
   struct DeferredTemplateInstance

@@ -9,6 +9,8 @@
 #include "sema/scope_builder.h"
 #include "sema/semantics_dump.h"
 #include "sema/types_dump.h"
+#include "lower/lowir_lowering.h"
+#include "lowir_model.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -491,8 +493,48 @@ int run_emit_semantics_mode(const vector<string> & args)
 
 int run_emit_lowir_mode(const vector<string> & args)
 {
-  parse_source_output_invocation(args, true);
-  return run_unimplemented_mode("--emit-lowir", "PA14");
+  const SourceOutputInvocation invocation =
+      parse_source_output_invocation(args, true);
+  ofstream out(invocation.outfile.c_str());
+  if(!out) {
+    throw runtime_error("unable to open output file");
+  }
+
+  lowir_model::Program program;
+  const PreprocBuildInfo build_info = PreprocHostBuildInfo();
+  for(size_t i = 0; i < invocation.inputs.size(); ++i) {
+    ostringstream discarded_preproc_output;
+    PreprocEngine preprocessor(discarded_preproc_output, PA5GetFileId,
+                               build_info);
+    Pa6TokenCollector collector;
+    preprocessor.RunSingleFile(invocation.inputs[i], collector);
+    AstArena arena;
+    Pa10Parser parser(collector.tokens, arena);
+    const AstId root = parser.ParseTranslationUnit();
+    if(root == 0)
+      throw runtime_error("parse failed");
+    TypeTable types;
+    SemaModel model(types);
+    SemaTree tree;
+    ScopeBuilder builder(collector.tokens, arena, model, tree);
+    builder.Build(root);
+    const lowir_model::Program unit = lowir_lowering::LowerTranslationUnit(
+        collector.tokens, arena, root, model, tree);
+    program.global_declarations.insert(program.global_declarations.end(),
+        unit.global_declarations.begin(), unit.global_declarations.end());
+    program.globals.insert(program.globals.end(), unit.globals.begin(),
+                           unit.globals.end());
+    program.function_declarations.insert(program.function_declarations.end(),
+        unit.function_declarations.begin(), unit.function_declarations.end());
+    program.functions.insert(program.functions.end(), unit.functions.begin(),
+                             unit.functions.end());
+    program.object_aliases.insert(program.object_aliases.end(),
+        unit.object_aliases.begin(), unit.object_aliases.end());
+    program.exported_symbols.insert(program.exported_symbols.end(),
+        unit.exported_symbols.begin(), unit.exported_symbols.end());
+  }
+  out << lowir_model::serialize_lowir_program(program);
+  return EXIT_SUCCESS;
 }
 
 int run_driver_mode(const vector<string> & args)

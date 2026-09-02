@@ -343,25 +343,25 @@ re-parsed.  No static mutable state (batch runner).
 | checkpoint | commit | outcome |
 | --- | --- | --- |
 | plan | this commit | stage design, failure map, conventions |
-| CP1 (active) serializer, driver mode, symbols, scalar procedural lowering | pending | target 39/109 (failures 109 → 70); through-pa14 1030/1030; audit clean |
-| CP2 PA12 semantic boundary: parser gaps, default arguments, goto/labels, array/typedef/cast/comma/volatile/return rules, scoped-enum rejection | pending | target 48/109; all 109 inputs accepted or rejected as the refs require |
+| CP1 serializer, driver mode, symbols, scalar procedural lowering | this checkpoint | 39 CP1 fixtures pass; pa15 42/109 (67 failures); through-pa14 1030/1030; file audit passed with 2 pre-existing header warnings |
+| CP2 (active) PA12 semantic boundary: parser gaps, default arguments, goto/labels, array/typedef/cast/comma/volatile/return rules, scoped-enum rejection | pending | target 48/109; all 109 inputs accepted or rejected as the refs require |
 | CP3 memory objects: references, pointers, arrays, string literals, indirect calls, refarg temporaries | pending | target 82/109 |
 | CP4 globals, constant initializers, structured data, declarations, `@__cppgm_init` | pending | target 109/109; through-pa15 clean |
 | CP5 architecture audit and cleanup (one naming authority, one conversion table, perf probe evidence in `audit.md`) | pending | 109/109; through-pa15 clean |
 
-## Active Checkpoint: CP1 — serializer, driver mode, symbols, scalar lowering
+## Completed Checkpoint: CP1 — serializer, driver mode, symbols, scalar lowering
 
-Goal: `--emit-lowir` runs the PA12 pipeline and lowers every function
+Delivered: `--emit-lowir` runs the PA12 pipeline and lowers every function
 definition whose body uses only scalar locals/parameters, literals,
 enumerators, arithmetic/bitwise/shift/comparison/logical/conditional/comma
 operators, casts among scalars, `sizeof`, direct calls, and the full
 statement set (if/while/do/for/switch/break/continue, condition
 declarations), with fixture-exact naming, slot layout, metadata and
-mangled object names.  Progress proof: the 39 CP1 fixtures pass (38 newly
-plus the excess-initializer rejection), no other fixture regresses (they
-keep failing with EXIT_FAILURE from a deliberate `logic_error("unsupported
-in CP1: …")` in the lowering, never from a crash or malformed LowIR), and
-`make test-report-through-pa14` stays at 1030/1030.
+mangled object names.  Evidence: all 39 CP1 fixtures pass, the stage gate
+is 42/109 (67 failures, down from 109), through-pa14 is 1030/1030, and
+the file audit passes.  The packet scaling probe completed at 10k and 20k
+functions in 3.02s/759136 KB and 6.02s/1519872 KB, respectively, showing
+approximately linear time and memory growth.
 
 ### Implementation Packet
 
@@ -376,8 +376,9 @@ Files/symbols:
   `TypeTable types; SemaModel model(types); SemaTree tree; ScopeBuilder
   builder(tokens, arena, model, tree); builder.Build(root);` per input,
   then `LowerTranslationUnit(...)` into one `lowir_model::Program`; write
-  `serialize_lowir_program(program)`; require a `main` definition
-  (README: "a required main definition") → `runtime_error` otherwise.
+  `serialize_lowir_program(program)`.  Emit mode accepts a translation unit
+  without `main`, as pinned by `100-sizeof-local-value-shadows-type-name`;
+  the link-time main requirement does not apply to LowIR emission.
 - `dev/src/lowir_serialize.cpp` (new): `std::string
   lowir_model::serialize_lowir_program(const Program &)` printing the
   layout in Stage Design.  Operand text: `Operand::text` verbatim for
@@ -502,3 +503,23 @@ later `__strlit__` numbering for repeated identical literals (dedupe by
 content assumed); whether static functions outside `extern "C"` mangle
 with `L` (the PA14 encoder cannot, so they do not); switch on `char`/enum
 prints case values as plain integers (assumed from the `switch` grammar).
+
+## Active Checkpoint: CP2 — semantic boundary and control-flow handoff
+
+Goal: move the PA12-owned parser and semantic facts needed by the next
+LowIR families across the boundary without changing earlier assignment
+fixtures.  Focus first on default arguments, braced scalar/array
+initialization, comma value categories, function typedef/reference casts,
+array/function decay, volatile lvalues, goto/labels, and the scoped-enum
+conversion rejection; keep lowering unsupported memory/global constructs
+explicit and bounded.
+
+Implementation packet: start with the failing fixtures named in the CP2
+row above and trace each fact through `dev/src/parser/ast_parser*.cpp`,
+`dev/src/sema/expr_sema.cpp`, `dev/src/sema/stmt_builder.cpp`,
+`dev/src/sema/scope_builder.cpp`, and the corresponding `lowir_expr.cpp` /
+`lowir_program.cpp` consumer.  Preserve the canonical semantic tree as
+the owner of conversions and default arguments.  Use focused `check`
+targets for each repaired boundary, then the pa15 stage gate and
+through-pa14 gate; the next checkpoint is complete only when it increases
+the accepted fixture count without weakening coverage.
