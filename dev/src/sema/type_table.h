@@ -119,6 +119,11 @@ public:
   std::string Spell(TypeId id) const;
   std::size_t SizeOf(TypeId id) const;
   std::size_t AlignOf(TypeId id) const;
+  // Class layout is completed by the scope builder once all direct members
+  // and bases have been collected.  TypeTable owns the immutable lookup used
+  // by sizeof, arrays and lowering thereafter.
+  void SetClassLayout(EntityId entity, std::size_t size,
+                      std::size_t alignment);
 
 private:
   struct FunctionKey
@@ -142,4 +147,5 @@ private:
   std::map<std::pair<EntityId, std::pair<TypeKeyword, std::string> >, TypeId>
       class_types_;
   std::map<std::pair<TypeId, TypeId>, TypeId> member_pointers_;
+  std::map<EntityId, std::pair<std::size_t, std::size_t> > class_layouts_;
 };

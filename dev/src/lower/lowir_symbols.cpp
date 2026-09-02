@@ -3,6 +3,7 @@
 #include "lower/lowir_lowering.h"
 
 #include <algorithm>
+#include <functional>
 #include <stdexcept>
 
 namespace lowir_lowering {
@@ -56,6 +57,10 @@ void Lowerer::CollectSymbols(SemaId node)
   if (value.kind == SEMA_FUNCTION_DEFINITION ||
       value.kind == SEMA_FUNCTION_DECLARATION) {
     if (value.function != 0) {
+      const FunctionEntity& entity = model_.FunctionAt(value.function);
+      if (entity.synthesized && entity.member_class != 0 &&
+          model_.ClassAt(entity.member_class).trivial_default_constructor)
+        return;
       FunctionSymbol& symbol = functions_[value.function];
       if (symbol.declaration == 0) {
         symbol.declaration = node;
@@ -86,6 +91,84 @@ void Lowerer::CollectSymbols(SemaId node)
     CollectSymbols(child);
 }
 
+void Lowerer::CollectReferencedFunctions(
+    SemaId node, std::set<FunctionEntityId>& result) const
+{
+  if (node == 0)
+    return;
+  const SemaNode& value = tree_.At(node);
+  if (value.kind == SEMA_FUNCTION_DEFINITION ||
+      value.kind == SEMA_FUNCTION_DECLARATION) {
+    for (SemaId child = value.first_child; child != 0;
+         child = tree_.At(child).next_sibling)
+      CollectReferencedFunctions(child, result);
+    return;
+  }
+  if ((value.kind == SEMA_CALLEE || value.kind == SEMA_ID_EXPRESSION) &&
+      value.function != 0)
+    result.insert(value.function);
+  for (SemaId child = value.first_child; child != 0;
+       child = tree_.At(child).next_sibling)
+    CollectReferencedFunctions(child, result);
+}
+
+void Lowerer::ComputeReferencedFunctions()
+{
+  referenced_functions_.clear();
+  std::vector<FunctionEntityId> pending;
+  for (std::size_t i = 0; i < function_order_.size(); ++i) {
+    const FunctionEntity& entity = model_.FunctionAt(function_order_[i]);
+    const FunctionSymbol& symbol = functions_[function_order_[i]];
+    // Non-inline definitions are emitted independently of use.  Their
+    // callees, and only their transitive callees, keep declarations alive.
+    if (symbol.definition != 0 && !entity.in_class_definition)
+      pending.push_back(function_order_[i]);
+  }
+
+  // Global initializers are roots too.  Do not descend into function
+  // definitions here: an unreferenced inline body must not retain an
+  // external declaration used only by that body.
+  std::function<void(SemaId)> collect_globals =
+      [&](SemaId node) {
+        if (node == 0)
+          return;
+        const SemaNode& value = tree_.At(node);
+        if (value.kind == SEMA_FUNCTION_DEFINITION ||
+            value.kind == SEMA_FUNCTION_DECLARATION)
+          return;
+        if ((value.kind == SEMA_CALLEE ||
+             value.kind == SEMA_ID_EXPRESSION) && value.function != 0)
+          referenced_functions_.insert(value.function);
+        for (SemaId child = value.first_child; child != 0;
+             child = tree_.At(child).next_sibling)
+          collect_globals(child);
+      };
+  collect_globals(tree_.Root());
+
+  std::set<FunctionEntityId> visited;
+  while (!pending.empty()) {
+    const FunctionEntityId function = pending.back();
+    pending.pop_back();
+    if (!visited.insert(function).second)
+      continue;
+    const std::map<FunctionEntityId, FunctionSymbol>::const_iterator found =
+        functions_.find(function);
+    if (found == functions_.end() || found->second.definition == 0)
+      continue;
+    std::set<FunctionEntityId> references;
+    CollectReferencedFunctions(found->second.definition, references);
+    for (std::set<FunctionEntityId>::const_iterator reference =
+             references.begin(); reference != references.end(); ++reference) {
+      referenced_functions_.insert(*reference);
+      const std::map<FunctionEntityId, FunctionSymbol>::const_iterator
+          callee = functions_.find(*reference);
+      if (callee != functions_.end() && callee->second.definition != 0 &&
+          model_.FunctionAt(*reference).in_class_definition)
+        pending.push_back(*reference);
+    }
+  }
+}
+
 BindingId Lowerer::CanonicalBinding(BindingId id) const
 {
   const BindingId first = model_.BindingAt(id).redeclared_binding;
@@ -105,10 +188,16 @@ const Lowerer::GlobalSymbol* Lowerer::GlobalFor(BindingId id) const
 // joined with `::` at its API boundary.
 void Lowerer::NameSymbols()
 {
-  for (std::size_t i = 0; i < function_order_.size(); ++i) {
-    FunctionSymbol& symbol = functions_[function_order_[i]];
-    const FunctionEntity& entity = model_.FunctionAt(function_order_[i]);
-    symbol.object = FunctionObjectName(function_order_[i]);
+  // Deferred class definitions are emitted in canonical reverse order, but
+  // overload suffixes are declaration-order facts.  Entity ids are assigned
+  // in that source order, so name from a sorted copy and emit from the
+  // semantic order retained by function_order_.
+  std::vector<FunctionEntityId> naming_order = function_order_;
+  std::sort(naming_order.begin(), naming_order.end());
+  for (std::size_t i = 0; i < naming_order.size(); ++i) {
+    FunctionSymbol& symbol = functions_[naming_order[i]];
+    const FunctionEntity& entity = model_.FunctionAt(naming_order[i]);
+    symbol.object = FunctionObjectName(naming_order[i]);
     symbol.name = TopLevelName(
         "@" + Join(NamespacePieces(entity.scope), "__", entity.name),
         entity.internal_linkage ? std::string() : symbol.object);
@@ -157,8 +246,8 @@ std::vector<std::string> Lowerer::NamespacePieces(ScopeId scope) const
   std::vector<std::string> pieces;
   while (scope != model_.GlobalScope()) {
     const Scope& value = model_.ScopeAt(scope);
-    if (value.kind == SCOPE_NAMESPACE && !value.name.empty() &&
-        value.name != "<unnamed>")
+    if ((value.kind == SCOPE_NAMESPACE || value.kind == SCOPE_CLASS) &&
+        !value.name.empty() && value.name != "<unnamed>")
       pieces.push_back(value.name);
     scope = value.parent;
   }
@@ -209,7 +298,16 @@ std::string Lowerer::MangleFunction(FunctionEntityId id) const
   }
   const bool encoding =
       target.function.kind == abi_mangle::ABI_FUNCTION_TARGET_ENCODING;
-  const TypeNode& type = types_.At(types_.Unqualified(entity.type));
+  const TypeId signature = entity.is_member && entity.member_type != 0 ?
+      entity.member_type : entity.type;
+  const TypeNode& type = types_.At(types_.Unqualified(signature));
+  if (entity.is_member && entity.member_const)
+  {
+    abi_mangle::AbiFunctionRecord qualifier;
+    qualifier.kind = abi_mangle::ABI_FUNCTION_RECORD_QUALIFIER;
+    qualifier.qualifiers.push_back(abi_mangle::ABI_FUNCTION_QUALIFIER_CONST);
+    records.push_back(qualifier);
+  }
   for (std::size_t i = 0; i < type.parameters.size(); ++i) {
     if (encoding) {
       abi_mangle::AbiFunctionRecord parameter;
@@ -473,6 +571,21 @@ void Lowerer::BuildGlobalDefinitions()
       continue;
     }
 
+    if (types_.Kind(object_type) == TYPE_CLASS) {
+      global.structured = true;
+      DataItem zero;
+      zero.kind = DataItem::ITEM_ZERO;
+      zero.zero_bytes = types_.SizeOf(binding.type);
+      global.data_items.push_back(zero);
+      program_.globals.push_back(global);
+      // A complete class object participates in program startup even when
+      // its currently supported default construction is trivial.  Keep one
+      // canonical empty init function for that lifecycle boundary.
+      ResumeInitFunction();
+      SuspendInitFunction();
+      continue;
+    }
+
     global.type = LowTypeOf(binding.type);
     global.init_kind = lowir_model::GlobalDefinition::INIT_ZERO;
     DataItem item;
@@ -551,7 +664,8 @@ lowir_model::FunctionDeclaration Lowerer::BuildFunctionDeclaration(
   result.boundary.arity = type.variadic ? lowir_model::CAM_VARIADIC :
       lowir_model::CAM_FIXED;
   result.metadata.binding = entity.internal_linkage ?
-      lowir_model::SBM_INTERNAL : lowir_model::SBM_STRONG;
+      lowir_model::SBM_INTERNAL : entity.in_class_definition ?
+      lowir_model::SBM_WEAK : lowir_model::SBM_STRONG;
   result.metadata.linkage = entity.c_linkage ? lowir_model::LLM_C :
       lowir_model::LLM_DEFAULT;
   if (!entity.c_linkage)

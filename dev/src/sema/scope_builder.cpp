@@ -332,6 +332,10 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
         declarator, base, target_scope, false,
         incomplete_bound);
     const bool is_function = types_.Kind(type) == TYPE_FUNCTION;
+    ClassEntityId member_class = 0;
+    const bool is_member = model_.ClassForScope(target_scope, member_class);
+    const bool static_member = is_member &&
+        SequenceHasKeyword(specifiers, KW_STATIC);
     // 7.1.5p9: a constexpr object is const.
     if (is_constexpr && !is_typedef && !is_function)
       type = types_.Cv(type, true);
@@ -354,8 +358,6 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
           HasConstFunctionQualifier(declarator),
           SequenceHasKeyword(specifiers, KW_STATIC),
           IsNoThrowDeclarator(declarator, target_scope), default_arguments);
-      ClassEntityId member_class = 0;
-      const bool is_member = model_.ClassForScope(target_scope, member_class);
       if (EmitsSemantics() && !is_member)
         MakeSemantic(SEMA_FUNCTION_DECLARATION, target_scope,
                      declaration_node != 0 ? declaration_node :
@@ -364,6 +366,9 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
       continue;
     }
     binding = model_.AddBinding(target_scope, name, kind, type);
+    model_.BindingAt(binding).access = is_member ? member_access_ :
+        ACCESS_PUBLIC;
+    model_.BindingAt(binding).static_member = static_member;
     TypeId linkage_type = type;
     while (linkage_type != 0 &&
            types_.Kind(types_.Unqualified(linkage_type)) == TYPE_ARRAY)
@@ -382,6 +387,13 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
         initializer == 0 && SequenceHasKeyword(specifiers, KW_EXTERN);
     if (kind == BINDING_VARIABLE)
     {
+      if (is_member && !static_member)
+      {
+        ClassField field(binding, type);
+        field.access = member_access_;
+        field.initializer = initializer;
+        model_.ClassAt(member_class).fields.push_back(field);
+      }
       if (model_.ScopeAt(target_scope).kind == SCOPE_NAMESPACE)
         LinkRedeclaration(binding, target_scope, name, type);
       else if (initializer != 0 &&
@@ -486,11 +498,19 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
       SequenceHasKeyword(specifiers, KW_STATIC),
       IsNoThrowDeclarator(declarator, target_scope), default_arguments);
   ClassEntityId member_class = 0;
-  const bool is_member = model_.ClassForScope(target_scope, member_class);
+  const bool is_member = model_.ClassForScope(target_scope, member_class) &&
+      model_.FunctionAt(function).is_member;
+  const bool has_implicit_object = is_member &&
+      !model_.FunctionAt(function).static_member;
+  // In-class definitions and explicitly inline out-of-class definitions
+  // have weak ODR linkage in LowIR.  The same bit also tells lowering that
+  // an unused inline body may be omitted.
+  model_.FunctionAt(function).in_class_definition = is_member &&
+      (scope == target_scope || SequenceHasKeyword(specifiers, KW_INLINE));
   SemaId function_node = 0;
   if (EmitsSemantics())
   {
-    if (is_member)
+    if (is_member && scope == target_scope)
     {
       function_node = MakeDetachedSemantic(
           SEMA_FUNCTION_DEFINITION, target_scope,
@@ -507,7 +527,7 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   if (function_node != 0)
     MapSemanticScope(function_scope, function_node);
 
-  if (is_member && function_node != 0)
+  if (has_implicit_object && function_node != 0)
   {
     const TypeNode& canonical = model_.Types().At(
         model_.FunctionAt(function).type);
@@ -534,7 +554,7 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
       {
         const TypeNode& canonical = model_.Types().At(
             model_.FunctionAt(function).type);
-        const std::size_t canonical_index = is_member ? i + 1 : i;
+        const std::size_t canonical_index = has_implicit_object ? i + 1 : i;
         const TypeId parameter_type = canonical_index <
             canonical.parameters.size() ? canonical.parameters[canonical_index] :
             parameters[i].type;
@@ -663,12 +683,69 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
   if (!injected_union)
     model_.AddBinding(declaring, name.Empty() ? spelling : name.Last(),
                       BINDING_TYPE, type);
+
+  // Resolve direct bases while the completed class name is already visible
+  // to its own member scope.  The entity stores base ids, not copied types,
+  // so later layout and member lookup follow the same canonical hierarchy.
+  const AstId base_clause = FindChild(node, AST_BASE_CLAUSE);
+  if (base_clause != 0)
+  {
+    const std::vector<AstId>& bases = arena_.At(base_clause).children;
+    for (std::size_t i = 0; i < bases.size(); ++i)
+    {
+      const AstId base = bases[i];
+      const AstId base_name = FindChild(base, AST_BASE_NAME);
+      if (base_name == 0)
+        throw std::runtime_error("base specifier has no type name");
+      const TypeId base_type = LookupType(class_scope, NodeName(base_name));
+      const TypeId unqualified_base = types_.Unqualified(base_type);
+      if (types_.Kind(unqualified_base) != TYPE_CLASS)
+        throw std::runtime_error("base specifier does not name a class");
+      AccessKind access = key == TK_CLASS ? ACCESS_PRIVATE : ACCESS_PUBLIC;
+      const AstId access_node = FindChild(base, AST_ACCESS_SPECIFIER);
+      if (access_node != 0 && arena_.At(access_node).first < tokens_.size())
+      {
+        switch (tokens_[arena_.At(access_node).first].simple_type)
+        {
+        case KW_PRIVATE: access = ACCESS_PRIVATE; break;
+        case KW_PROTECTED: access = ACCESS_PROTECTED; break;
+        case KW_PUBLIC: access = ACCESS_PUBLIC; break;
+        default: break;
+        }
+      }
+      model_.ClassAt(entity).bases.push_back(
+          ClassBase(types_.At(unqualified_base).entity, access));
+    }
+  }
+
+  const AccessKind saved_access = member_access_;
+  const ClassEntityId saved_class = current_class_;
+  member_access_ = key == TK_CLASS ? ACCESS_PRIVATE : ACCESS_PUBLIC;
+  current_class_ = entity;
   for (std::size_t i = 0; i < value.children.size(); ++i)
   {
     const AstKind kind = arena_.At(value.children[i]).kind;
+    if (kind == AST_ACCESS_SPECIFIER)
+    {
+      const AstNode& access = arena_.At(value.children[i]);
+      if (access.first < tokens_.size())
+      {
+        switch (tokens_[access.first].simple_type)
+        {
+        case KW_PUBLIC: member_access_ = ACCESS_PUBLIC; break;
+        case KW_PROTECTED: member_access_ = ACCESS_PROTECTED; break;
+        case KW_PRIVATE: member_access_ = ACCESS_PRIVATE; break;
+        default: break;
+        }
+      }
+      continue;
+    }
     if (kind != AST_CLASS_KEY && kind != AST_BASE_CLAUSE)
       BuildNode(value.children[i], class_scope);
   }
+  member_access_ = saved_access;
+  current_class_ = saved_class;
+  CompleteClassLayout(entity);
   if (injected_union)
   {
     const vector<BindingId> members = model_.ScopeAt(class_scope).bindings;
@@ -684,6 +761,110 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
     }
   }
   return type;
+}
+
+namespace
+{
+
+std::size_t AlignUp(std::size_t value, std::size_t alignment)
+{
+  if (alignment <= 1)
+    return value;
+  const std::size_t remainder = value % alignment;
+  return remainder == 0 ? value : value + alignment - remainder;
+}
+
+bool LayoutKnown(const SemaModel& model, const TypeTable& types, TypeId type)
+{
+  const TypeNode& node = types.At(type);
+  switch (node.kind)
+  {
+  case TYPE_CV: case TYPE_REFERENCE:
+    return LayoutKnown(model, types, node.base);
+  case TYPE_FUNDAMENTAL:
+    return FundamentalSize(node.fundamental) != 0;
+  case TYPE_POINTER: case TYPE_MEMBER_POINTER: case TYPE_ENUM:
+    return true;
+  case TYPE_ARRAY:
+    return node.array_bound != 0 && LayoutKnown(model, types, node.base);
+  case TYPE_CLASS:
+    return model.ClassAt(node.entity).layout_complete;
+  case TYPE_TEMPLATE_PARAM: case TYPE_FUNCTION: case TYPE_INVALID:
+    return false;
+  }
+  return false;
+}
+
+} // namespace
+
+void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
+{
+  ClassEntity& value = model_.ClassAt(entity);
+  if (value.layout_complete)
+    return;
+
+  // A primary class template is a layout pattern until its template
+  // parameters are substituted.  Preserve the fields for lookup, but defer
+  // sizeof/alignment and offset assignment while one of them is incomplete.
+  for (std::size_t i = 0; i < value.fields.size(); ++i)
+    if (!LayoutKnown(model_, types_, value.fields[i].type))
+      return;
+
+  std::size_t offset = 0;
+  std::size_t alignment = 1;
+  std::size_t size = 0;
+  for (std::size_t i = 0; i < value.bases.size(); ++i)
+  {
+    const ClassBase& base = value.bases[i];
+    const ClassEntity& base_entity = model_.ClassAt(base.entity);
+    if (!base_entity.layout_complete)
+      throw std::runtime_error("base class is incomplete");
+    const std::size_t base_alignment = base_entity.alignment;
+    const std::size_t base_size = base_entity.size;
+    alignment = std::max(alignment, base_alignment);
+    if (value.is_union)
+      value.bases[i].offset = 0;
+    else
+    {
+      offset = AlignUp(offset, base_alignment);
+      value.bases[i].offset = offset;
+      offset += base_size;
+    }
+    size = std::max(size, value.is_union ? base_size : offset);
+  }
+
+  for (std::size_t i = 0; i < value.fields.size(); ++i)
+  {
+    ClassField& field = value.fields[i];
+    if (field.static_member)
+      continue;
+    const std::size_t field_alignment = types_.AlignOf(field.type);
+    const std::size_t field_size = types_.SizeOf(field.type);
+    alignment = std::max(alignment, field_alignment);
+    if (value.is_union)
+      field.offset = 0;
+    else
+    {
+      offset = AlignUp(offset, field_alignment);
+      field.offset = offset;
+      offset += field_size;
+    }
+    size = std::max(size, value.is_union ? field_size : offset);
+  }
+
+  // C++ gives every complete class object a nonzero size, and an object's
+  // size is a multiple of its alignment.
+  if (size == 0)
+    size = 1;
+  size = AlignUp(size, alignment);
+  value.size = size;
+  value.alignment = alignment;
+  value.layout_complete = true;
+  value.trivial_default_constructor = true;
+  for (std::size_t i = 0; i < value.fields.size(); ++i)
+    if (value.fields[i].initializer != 0)
+      value.trivial_default_constructor = false;
+  types_.SetClassLayout(entity, size, alignment);
 }
 
 // `struct S;` declares S in the current scope unless the scope already
@@ -1274,6 +1455,7 @@ FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
   FunctionEntity& function = model_.FunctionAt(constructor);
   function.is_member = true;
   function.member_class = class_entity;
+  function.synthesized = true;
   const BindingId binding = model_.AddBinding(
       owner.class_scope, name, BINDING_FUNCTION, constructor_type);
   model_.BindingAt(binding).function = constructor;
@@ -1362,8 +1544,13 @@ void ScopeBuilder::EmitDeferredSemantics()
 {
   if (tree_ == 0)
     return;
-  for (std::size_t i = 0; i < deferred_semantics_.size(); ++i)
-    tree_->Append(semantic_root_, deferred_semantics_[i]);
+  // Class bodies are completed before the enclosing translation unit is
+  // walked.  Replaying their definitions in reverse declaration order
+  // preserves the canonical LowIR order: callers and the most recently
+  // declared overload are encountered first, while the source tree remains
+  // the owner of every deferred node.
+  for (std::size_t i = deferred_semantics_.size(); i != 0; --i)
+    tree_->Append(semantic_root_, deferred_semantics_[i - 1]);
 }
 
 namespace
@@ -1629,6 +1816,10 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     parameters.push_back(types_.AdjustParameter(declared.parameters[i]));
   ClassEntityId member_class = 0;
   const bool is_member = model_.ClassForScope(scope, member_class);
+  // For a class member the declaration's existing `static` linkage fact is
+  // also the canonical fact that no implicit object parameter is present.
+  const bool static_member = is_member && internal_linkage;
+  const bool effective_internal_linkage = is_member ? false : internal_linkage;
   TypeId member_type = 0;
   vector<TypeId> canonical_parameters = parameters;
   if (is_member)
@@ -1638,15 +1829,18 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
       throw std::runtime_error("member function has no class type");
     member_type = types_.Function(declared.result, parameters,
                                   declared.variadic, member_const);
-    const TypeId this_type = types_.Pointer(
-        member_const ? types_.Cv(class_type, true) : class_type);
-    canonical_parameters.insert(canonical_parameters.begin(), this_type);
+    if (!static_member)
+    {
+      const TypeId this_type = types_.Pointer(
+          member_const ? types_.Cv(class_type, true) : class_type);
+      canonical_parameters.insert(canonical_parameters.begin(), this_type);
+    }
   }
   const TypeId canonical = types_.Function(declared.result,
                                            canonical_parameters,
                                            declared.variadic);
   vector<AstId> canonical_defaults = default_arguments;
-  if (is_member)
+  if (is_member && !static_member)
     canonical_defaults.insert(canonical_defaults.begin(), 0);
 
   // 13.1/3.3.10: a prior declaration of the name in this scope with the
@@ -1685,9 +1879,11 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
             model_.ClassAt(member_class).type, member_type);
         entity.member_class = member_class;
         entity.is_member = true;
+        entity.static_member = static_member;
         entity.member_const = member_const;
       }
-      entity.internal_linkage = entity.internal_linkage || internal_linkage;
+      entity.internal_linkage = entity.internal_linkage ||
+          effective_internal_linkage;
       entity.c_linkage = entity.c_linkage || c_linkage_depth_ != 0;
       entity.noexcept_qualifier = entity.noexcept_qualifier ||
           noexcept_qualifier;
@@ -1700,6 +1896,8 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
       binding = model_.AddBinding(scope, name, BINDING_FUNCTION,
                                   declared_type);
       model_.BindingAt(binding).function = prior.function;
+      model_.BindingAt(binding).access = member_access_;
+      model_.BindingAt(binding).static_member = static_member;
       model_.BindingAt(binding).internal_linkage = entity.internal_linkage;
       model_.BindingAt(binding).c_linkage = entity.c_linkage;
       model_.BindingAt(binding).noexcept_qualifier = entity.noexcept_qualifier;
@@ -1709,7 +1907,7 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
   const FunctionEntityId function = model_.CreateFunction(scope, name,
                                                             canonical);
   model_.FunctionAt(function).defined = definition;
-  model_.FunctionAt(function).internal_linkage = internal_linkage;
+  model_.FunctionAt(function).internal_linkage = effective_internal_linkage;
   model_.FunctionAt(function).c_linkage = c_linkage_depth_ != 0;
   if (is_member)
   {
@@ -1719,13 +1917,16 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
         model_.ClassAt(member_class).type, member_type);
     entity.member_class = member_class;
     entity.is_member = true;
+    entity.static_member = static_member;
     entity.member_const = member_const;
   }
   model_.FunctionAt(function).noexcept_qualifier = noexcept_qualifier;
   model_.FunctionAt(function).default_arguments = canonical_defaults;
   binding = model_.AddBinding(scope, name, BINDING_FUNCTION, declared_type);
   model_.BindingAt(binding).function = function;
-  model_.BindingAt(binding).internal_linkage = internal_linkage;
+  model_.BindingAt(binding).access = member_access_;
+  model_.BindingAt(binding).static_member = static_member;
+  model_.BindingAt(binding).internal_linkage = effective_internal_linkage;
   model_.BindingAt(binding).c_linkage = c_linkage_depth_ != 0;
   return function;
 }

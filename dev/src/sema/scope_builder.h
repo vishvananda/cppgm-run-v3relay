@@ -117,6 +117,7 @@ private:
   // Class and enum declarations; each returns the type the specifier denotes.
   TypeId BuildClassDefinition(AstId node, ScopeId scope,
                               const std::string& anonymous_name);
+  void CompleteClassLayout(ClassEntityId entity);
   TypeId BuildClassForward(AstId node, ScopeId scope);
   TypeId BuildElaboratedClass(AstId node, ScopeId scope,
                               bool may_declare);
@@ -262,6 +263,8 @@ private:
   unsigned unnamed_local_enum_counter_;
   unsigned unnamed_local_class_counter_;
   unsigned c_linkage_depth_;
+  AccessKind member_access_;
+  ClassEntityId current_class_;
   bool suppress_semantics_;
   unsigned jump_sequence_;
   std::vector<SemaId> deferred_semantics_;

@@ -304,7 +304,8 @@ lowir_model::Function Lowerer::BuildFunction(const FunctionSymbol& symbol)
   function_.boundary.arity = type.variadic ? lowir_model::CAM_VARIADIC :
       lowir_model::CAM_FIXED;
   function_.metadata.binding = entity.internal_linkage ?
-      lowir_model::SBM_INTERNAL : lowir_model::SBM_STRONG;
+      lowir_model::SBM_INTERNAL : entity.in_class_definition ?
+      lowir_model::SBM_WEAK : lowir_model::SBM_STRONG;
   function_.metadata.linkage = entity.c_linkage ? lowir_model::LLM_C :
       lowir_model::LLM_DEFAULT;
   if (entity.noexcept_qualifier)

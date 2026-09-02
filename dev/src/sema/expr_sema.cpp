@@ -276,6 +276,19 @@ SemaId ExpressionAnalyzer::AnalyzeLiteral(AstId expression, ScopeId scope)
   ETokenType op = KW_AUTO;
   if (ast.kind == AST_KEYWORD_LITERAL)
   {
+    if (token.IsSimple(KW_THIS))
+    {
+      const BindingId this_binding = model_.LookupUnqualified(
+          scope, "this", LOOKUP_VALUES);
+      if (this_binding == 0)
+        throw std::runtime_error("this used outside a member function");
+      const Binding& binding = model_.BindingAt(this_binding);
+      const SemaId result = MakeExpression(SEMA_ID_EXPRESSION, expression,
+                                           binding.type, VC_PRVALUE, scope,
+                                           KW_THIS);
+      tree_.At(result).binding = this_binding;
+      return result;
+    }
     if (token.IsSimple(KW_NULLPTR))
       type = types_.Fundamental(FT_NULLPTR_T);
     else if (token.IsSimple(KW_TRUE) || token.IsSimple(KW_FALSE))
@@ -348,6 +361,34 @@ SemaId ExpressionAnalyzer::AnalyzeName(AstId expression, ScopeId scope)
     SemaNode& node = tree_.At(result);
     node.binding = binding;
     node.function = value.function;
+    return result;
+  }
+
+  // An unqualified name in a member function can denote a member declared in
+  // the enclosing class.  Preserve that fact as the same member projection
+  // used by explicit `object.member` syntax, with the canonical `this`
+  // parameter as its object for non-static members.
+  if ((value.kind == BINDING_VARIABLE || value.kind == BINDING_PARAMETER) &&
+      model_.ScopeAt(value.scope).kind == SCOPE_CLASS)
+  {
+    const SemaId result = MakeExpression(SEMA_MEMBER, expression, value.type,
+                                         VC_LVALUE, scope);
+    SemaNode& member = tree_.At(result);
+    member.binding = binding;
+    member.has_value = value.has_const_value;
+    member.value = value.const_value;
+    if (!value.static_member)
+    {
+      const BindingId this_binding = model_.LookupUnqualified(
+          scope, "this", LOOKUP_VALUES);
+      if (this_binding == 0)
+        throw std::runtime_error("non-static member used outside a member function");
+      const SemaId object = MakeExpression(SEMA_ID_EXPRESSION, 0,
+                                           model_.BindingAt(this_binding).type,
+                                           VC_PRVALUE, scope, KW_THIS);
+      tree_.At(object).binding = this_binding;
+      Append(result, object);
+    }
     return result;
   }
 
@@ -512,18 +553,31 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
       tokens_, arena_.At(member_name).first, arena_.At(member_name).last);
   if (name.Qualified())
     throw std::runtime_error("member access has a qualified member name");
-  const BindingId binding = model_.DirectBinding(
-      class_scope, name.Last(), LOOKUP_ANY);
-  if (binding == 0)
+  std::vector<BindingId> candidates;
+  model_.LookupMember(types_.At(class_type).entity, name.Last(), LOOKUP_ANY,
+                      candidates);
+  if (candidates.empty())
     throw std::runtime_error("unknown class member");
+  BindingId binding = candidates.back();
+  for (std::size_t i = 0; i < candidates.size(); ++i)
+    if (model_.BindingAt(candidates[i]).kind != BINDING_FUNCTION)
+    {
+      if (binding != candidates[i] &&
+          model_.BindingAt(binding).kind != BINDING_FUNCTION)
+        throw std::runtime_error("ambiguous class member");
+      binding = candidates[i];
+      break;
+    }
   const Binding& member = model_.BindingAt(binding);
   TypeId type = member.type;
-  if (object_const || object_volatile)
+  if (!member.static_member && (object_const || object_volatile))
     type = types_.Cv(type, object_const, object_volatile);
   const SemaId result = MakeExpression(SEMA_MEMBER, expression, type,
                                        VC_LVALUE, scope, op);
   SemaNode& semantic = tree_.At(result);
   semantic.binding = binding;
+  semantic.has_value = member.has_const_value;
+  semantic.value = member.const_value;
   semantic.first = arena_.At(member_name).first;
   semantic.last = arena_.At(member_name).last;
   Append(result, object);
@@ -1037,6 +1091,80 @@ SemaId ExpressionAnalyzer::AnalyzeSizeof(AstId expression, ScopeId scope)
   return result;
 }
 
+void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
+                                            CallResolution& result)
+{
+  const AstNode& callee_node = arena_.At(callee);
+  result.member_callee = callee_node.kind == AST_MEMBER_EXPRESSION;
+  result.named_callee = result.member_callee ||
+      callee_node.kind == AST_ID_EXPRESSION ||
+      callee_node.kind == AST_IDENTIFIER;
+  if (result.member_callee) {
+    const SemaId member = Analyze(callee, scope);
+    std::vector<SemaId> member_children;
+    for (SemaId child = tree_.At(member).first_child; child != 0;
+         child = tree_.At(child).next_sibling)
+      member_children.push_back(child);
+    if (member_children.empty())
+      throw std::runtime_error("member call has no object");
+    const SemaId object = member_children[0];
+    TypeId object_type = NodeInfo(object).type;
+    if (types_.Kind(object_type) == TYPE_REFERENCE)
+      object_type = types_.Referent(object_type);
+    if (types_.IsPointer(object_type))
+      object_type = types_.At(types_.Unqualified(object_type)).base;
+    object_type = types_.Unqualified(object_type);
+    if (types_.Kind(object_type) != TYPE_CLASS)
+      throw std::runtime_error("member call object is not a class");
+    const AstId member_name = Child(callee, 1);
+    model_.LookupMember(types_.At(object_type).entity,
+                        arena_.At(member_name).text, LOOKUP_FUNCTIONS,
+                        result.bindings);
+    if (result.bindings.empty())
+      throw std::runtime_error("member call names no function");
+    for (std::size_t i = 0; i < result.bindings.size(); ++i) {
+      const FunctionEntity& function = model_.FunctionAt(
+          model_.BindingAt(result.bindings[i]).function);
+      if (!function.is_member || function.static_member)
+        continue;
+      result.implicit_object = object;
+      if (tokens_[arena_.At(callee).first].IsSimple(OP_DOT)) {
+        TypeId address_type = NodeInfo(object).type;
+        if (types_.Kind(address_type) == TYPE_REFERENCE)
+          address_type = types_.Referent(address_type);
+        const SemaId address = MakeExpression(
+            SEMA_UNARY, 0, types_.Pointer(address_type), VC_PRVALUE, scope,
+            OP_AMP);
+        Append(address, object);
+        result.implicit_object = address;
+      }
+      result.has_implicit_object = true;
+      break;
+    }
+  } else if (result.named_callee) {
+    result.name = ExpressionName(callee);
+    LookupNameBindings(result.name, scope, result.bindings);
+    for (std::size_t i = 0; i < result.bindings.size(); ++i) {
+      const Binding& binding = model_.BindingAt(result.bindings[i]);
+      if (binding.kind != BINDING_FUNCTION || binding.function == 0)
+        continue;
+      const FunctionEntity& function = model_.FunctionAt(binding.function);
+      if (!function.is_member || function.static_member)
+        continue;
+      const BindingId this_binding = model_.LookupUnqualified(
+          scope, "this", LOOKUP_VALUES);
+      if (this_binding != 0) {
+        result.implicit_object = MakeExpression(
+            SEMA_ID_EXPRESSION, 0,
+            model_.BindingAt(this_binding).type, VC_PRVALUE, scope, KW_THIS);
+        tree_.At(result.implicit_object).binding = this_binding;
+        result.has_implicit_object = true;
+      }
+      break;
+    }
+  }
+}
+
 SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
 {
   if (arena_.At(expression).children.size() != 2)
@@ -1080,16 +1208,14 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
   if (functional_cast)
     return AnalyzeFunctionalCast(expression, target, scope, args);
 
-  const AstNode& callee_node = arena_.At(callee);
-  const bool named_callee = callee_node.kind == AST_ID_EXPRESSION ||
-      callee_node.kind == AST_IDENTIFIER;
-  QualifiedName name;
-  vector<BindingId> bindings;
-  if (named_callee)
-  {
-    name = ExpressionName(callee);
-    LookupNameBindings(name, scope, bindings);
-  }
+  CallResolution resolution;
+  ResolveCallCallee(callee, scope, resolution);
+  const bool member_callee = resolution.member_callee;
+  const bool named_callee = resolution.named_callee;
+  QualifiedName& name = resolution.name;
+  vector<BindingId>& bindings = resolution.bindings;
+  const SemaId implicit_object = resolution.implicit_object;
+  const bool has_implicit_object = resolution.has_implicit_object;
 
   // Analyze arguments before selecting a candidate so every source
   // expression is owned by the semantic tree in source order.  Conversion
@@ -1097,7 +1223,7 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
   vector<SemaId> analyzed_arguments;
   vector<OverloadArgument> overload_arguments;
   analyzed_arguments.reserve(args.size());
-  overload_arguments.reserve(args.size());
+  overload_arguments.reserve(args.size() + (has_implicit_object ? 1 : 0));
   for (size_t i = 0; i < args.size(); ++i)
   {
     const SemaId argument = Analyze(args[i], scope);
@@ -1111,6 +1237,14 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
       FunctionCandidates(
           ReadQualifiedName(tokens_, semantic.first, semantic.last, true),
           semantic.scope, overload_arguments.back().function_candidates);
+  }
+  if (has_implicit_object)
+  {
+    const Info object_info = NodeInfo(implicit_object);
+    overload_arguments.insert(overload_arguments.begin(), OverloadArgument(
+        object_info.type, member_callee ? VC_PRVALUE : object_info.category,
+        IsNullPointerConstant(implicit_object), object_info.is_function_lvalue,
+        true));
   }
 
   // Template candidates are instantiated from the already-typed arguments
@@ -1158,7 +1292,7 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
   if (named_callee && has_function_binding)
   {
     function = SelectBestOverload(model_, types_, bindings,
-                                  overload_arguments);
+                                  overload_arguments, has_implicit_object);
     if (function == 0)
       throw std::runtime_error("no unique viable function overload");
     function_type = model_.FunctionAt(function).type;
@@ -1200,8 +1334,10 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
     while (required > 0 && required <= entity.default_arguments.size() &&
            entity.default_arguments[required - 1] != 0)
       --required;
-    if (args.size() < required ||
-        (!callable.variadic && args.size() > callable.parameters.size()))
+    const std::size_t supplied = args.size() +
+        (entity.is_member && !entity.static_member ? 1 : 0);
+    if (supplied < required ||
+        (!callable.variadic && supplied > callable.parameters.size()))
       throw std::runtime_error("wrong number of call arguments");
   }
   else if ((!callable.variadic && callable.parameters.size() != args.size()) ||
@@ -1210,16 +1346,23 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
 
   vector<SemaId> converted_arguments;
   converted_arguments.reserve(callable.parameters.size());
+  const bool selected_implicit_object = function != 0 &&
+      model_.FunctionAt(function).is_member &&
+      !model_.FunctionAt(function).static_member;
+  if (selected_implicit_object)
+    converted_arguments.push_back(Initialize(
+        implicit_object, callable.parameters[0]));
   for (size_t i = 0; i < analyzed_arguments.size(); ++i)
   {
     SemaId argument = analyzed_arguments[i];
-    if (i < callable.parameters.size())
-      argument = Initialize(argument, callable.parameters[i]);
+    const size_t parameter = i + (selected_implicit_object ? 1 : 0);
+    if (parameter < callable.parameters.size())
+      argument = Initialize(argument, callable.parameters[parameter]);
     converted_arguments.push_back(argument);
   }
   if (function != 0)
-    AppendDefaultArguments(function, function_type, analyzed_arguments.size(),
-                           converted_arguments);
+    AppendDefaultArguments(function, function_type, converted_arguments.size(),
+                            converted_arguments);
 
   const TypeId result_type = callable.result;
   ValueCategory result_category = VC_PRVALUE;
@@ -1298,6 +1441,21 @@ SemaId ExpressionAnalyzer::AnalyzeBraced(AstId expression, ScopeId scope,
   const vector<AstId>& children = arena_.At(expression).children;
   if (target == 0)
     throw std::runtime_error("braced initializer requires an array target");
+  const TypeId target_unqualified = types_.Unqualified(target);
+  if (types_.Kind(target_unqualified) == TYPE_CLASS) {
+    const ClassEntity& class_entity = model_.ClassAt(
+        types_.At(target_unqualified).entity);
+    if (children.size() > class_entity.fields.size())
+      throw std::runtime_error("initializer list has the wrong bound");
+    const SemaId result = MakeExpression(SEMA_BRACED_INIT_LIST, expression,
+                                         target, VC_PRVALUE, scope);
+    for (size_t i = 0; i < children.size(); ++i) {
+      const SemaId child = Analyze(children[i], scope);
+      Initialize(child, class_entity.fields[i].type);
+      Append(result, child);
+    }
+    return result;
+  }
   if (types_.Kind(target) != TYPE_ARRAY) {
     if (children.empty() || children.size() == 1)
     {
@@ -1436,9 +1594,8 @@ void ExpressionAnalyzer::FoldUnary(SemaId node, ETokenType op, SemaId operand)
   }
   catch (const std::runtime_error&)
   {
+    }
   }
-}
-
 // 5.19p2: an operation with undefined behaviour (overflow, division by
 // zero, a shift out of range or of a negative value) is not a constant
 // expression; the node simply has no value.

@@ -50,6 +50,20 @@ private:
           is_function_lvalue(is_function_lvalue) {}
   };
 
+  struct CallResolution
+  {
+    QualifiedName name;
+    std::vector<BindingId> bindings;
+    SemaId implicit_object;
+    bool member_callee;
+    bool named_callee;
+    bool has_implicit_object;
+
+    CallResolution()
+        : implicit_object(0), member_callee(false), named_callee(false),
+          has_implicit_object(false) {}
+  };
+
   SemaId AnalyzeNode(AstId expression, ScopeId scope);
   SemaId AnalyzeLiteral(AstId expression, ScopeId scope);
   SemaId AnalyzeName(AstId expression, ScopeId scope);
@@ -63,6 +77,7 @@ private:
   SemaId AnalyzeCast(AstId expression, ScopeId scope);
   SemaId AnalyzeSizeof(AstId expression, ScopeId scope);
   SemaId AnalyzeCall(AstId expression, ScopeId scope);
+  void ResolveCallCallee(AstId callee, ScopeId scope, CallResolution& result);
   SemaId AnalyzeFunctionalCast(AstId expression, TypeId target,
                                ScopeId scope,
                                const std::vector<AstId>& arguments);

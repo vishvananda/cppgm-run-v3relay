@@ -96,7 +96,8 @@ bool CallableFunctionType(TypeTable& types, TypeId type,
 FunctionEntityId SelectBestOverload(
     const SemaModel& model, TypeTable& types,
     const std::vector<BindingId>& bindings,
-    const std::vector<OverloadArgument>& arguments)
+    const std::vector<OverloadArgument>& arguments,
+    bool has_implicit_object)
 {
   struct Candidate
   {
@@ -127,21 +128,58 @@ FunctionEntityId SelectBestOverload(
       continue;
     const TypeNode& function = types.At(types.Unqualified(function_type));
     const FunctionEntity& entity = model.FunctionAt(entities[i]);
-    std::size_t required = function.parameters.size();
-    while (required > 0 && required <= entity.default_arguments.size() &&
-           entity.default_arguments[required - 1] != 0)
+    const bool member_object = entity.is_member && !entity.static_member;
+    const bool supplied_object = has_implicit_object &&
+        !arguments.empty() && arguments[0].is_implicit_object;
+    if (member_object && !supplied_object)
+      continue;
+    const std::size_t parameter_start = member_object ? 1 : 0;
+    if (parameter_start > function.parameters.size())
+      continue;
+    const std::size_t explicit_parameters = function.parameters.size() -
+        parameter_start;
+    std::size_t required = explicit_parameters;
+    while (required > 0 && parameter_start + required <=
+           entity.default_arguments.size() &&
+           entity.default_arguments[parameter_start + required - 1] != 0)
       --required;
-    if (arguments.size() < required ||
-        (!function.variadic && arguments.size() > function.parameters.size()))
+    const std::size_t argument_start = supplied_object ? 1 : 0;
+    if (arguments.size() < argument_start + required ||
+        (!function.variadic && arguments.size() >
+            argument_start + explicit_parameters))
       continue;
 
     Candidate candidate;
     candidate.function = entities[i];
     candidate.conversions.reserve(arguments.size());
     bool viable_candidate = true;
-    for (std::size_t argument = 0; argument < arguments.size(); ++argument)
+    if (supplied_object && !member_object)
     {
-      if (argument >= function.parameters.size())
+      // The same source call may be an overload set containing a static and
+      // a non-static member.  Static candidates ignore the implicit object,
+      // but keep an exact placeholder so conversion vectors remain aligned.
+      ImplicitConversion ignored;
+      ignored.rank = RANK_EXACT;
+      ignored.kind = CONV_IDENTITY;
+      candidate.conversions.push_back(ignored);
+    }
+    if (member_object)
+    {
+      const OverloadArgument& object = arguments[0];
+      const ImplicitConversion conversion = Classify(
+          types, object.type, object.category, object.is_null_literal,
+          object.is_function_lvalue, function.parameters[0]);
+      if (!conversion.Viable())
+        viable_candidate = false;
+      else
+        candidate.conversions.push_back(conversion);
+    }
+    for (std::size_t argument = argument_start;
+         viable_candidate && argument < arguments.size(); ++argument)
+    {
+      const std::size_t explicit_argument = argument - argument_start;
+      const std::size_t parameter = parameter_start + explicit_argument;
+      if (parameter >= function.parameters.size())
       {
         ImplicitConversion ellipsis;
         ellipsis.rank = RANK_ELLIPSIS;
@@ -149,13 +187,13 @@ FunctionEntityId SelectBestOverload(
         continue;
       }
       const OverloadArgument& source = arguments[argument];
-      const TypeId parameter = function.parameters[argument];
+      const TypeId parameter_type = function.parameters[parameter];
       TypeId source_type = source.type;
       ValueCategory source_category = source.category;
       bool function_lvalue = source.is_function_lvalue;
       TypeId target_function = 0;
       if (!source.function_candidates.empty() &&
-          TargetFunctionType(types, parameter, target_function))
+          TargetFunctionType(types, parameter_type, target_function))
       {
         const FunctionEntityId matched = MatchFunctionArgument(
             model, source.function_candidates, target_function);
@@ -170,7 +208,7 @@ FunctionEntityId SelectBestOverload(
       }
       const ImplicitConversion conversion = Classify(
           types, source_type, source_category, source.is_null_literal,
-          function_lvalue, parameter);
+          function_lvalue, parameter_type);
       if (!conversion.Viable())
       {
         viable_candidate = false;

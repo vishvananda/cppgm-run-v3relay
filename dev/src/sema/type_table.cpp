@@ -673,7 +673,15 @@ std::size_t TypeTable::SizeOf(TypeId id) const
     return 8;
   case TYPE_ARRAY:
     return SizeOf(node.base) * node.array_bound;
-  case TYPE_CLASS: case TYPE_FUNCTION: case TYPE_TEMPLATE_PARAM:
+  case TYPE_CLASS:
+  {
+    const std::map<EntityId, std::pair<std::size_t, std::size_t> >::const_iterator
+        found = class_layouts_.find(node.entity);
+    if (found != class_layouts_.end() && found->second.first != 0)
+      return found->second.first;
+    break;
+  }
+  case TYPE_FUNCTION: case TYPE_TEMPLATE_PARAM:
   case TYPE_INVALID:
     break;
   }
@@ -686,5 +694,21 @@ std::size_t TypeTable::AlignOf(TypeId id) const
   if (node.kind == TYPE_ARRAY || node.kind == TYPE_CV ||
       node.kind == TYPE_REFERENCE)
     return AlignOf(node.base);
+  if (node.kind == TYPE_CLASS)
+  {
+    const std::map<EntityId, std::pair<std::size_t, std::size_t> >::const_iterator
+        found = class_layouts_.find(node.entity);
+    if (found != class_layouts_.end() && found->second.second != 0)
+      return found->second.second;
+    throw std::runtime_error("alignof incomplete class type");
+  }
   return SizeOf(id);
+}
+
+void TypeTable::SetClassLayout(EntityId entity, std::size_t size,
+                               std::size_t alignment)
+{
+  if (entity == 0 || size == 0 || alignment == 0)
+    throw std::runtime_error("invalid class layout");
+  class_layouts_[entity] = std::make_pair(size, alignment);
 }

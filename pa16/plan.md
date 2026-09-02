@@ -206,13 +206,27 @@ comes from the intended check.
 | checkpoint | scope | proves progress by |
 | --- | --- | --- |
 | plan | this commit | stage design, failure map |
-| CP1 class model, layout, members, methods (Active) | parser gaps; class-scope declarations accepted; layout and `sizeof`/`alignof`; `this`, member access, base-chain lookup, static members, implicit-object overloads; object slots, projections, method symbols/mangling, class globals as zero data | the `parse failed` (9), `sizeof` (10), object-lowering (31) and `this` (11) groups disappear; expected ≥ 70/243 with through-pa15 still 1139/1139 |
+| CP1 class model, layout, members, methods (completed) | parser gaps; class-scope declarations accepted; layout and `sizeof`/`alignof`; `this`, member access, base-chain lookup, static members, implicit-object overloads; object slots, projections, method symbols/mangling, class globals as zero data | 55/243 pa16 tests pass (25/243 at start); through-pa15 remains 1139/1139; file audit passes |
 | CP2 constructors, destructors, lifetime | user/implicit/inheriting ctors and dtors, mem-initializers, default member initializers, subobject plans, demand-driven C1/C2/D1/D2 with aliases, local and array lifetime at every exit, namespace-scope init/fini, thread_local family, EH cleanup shapes, serializer additions | the `unsupported pa11 declaration` group and the lifetime fixtures pass; expected ≥ 160/243 |
 | CP3 operator overloading and ADL | member/non-member/hidden-friend operators, ADL sets and source-point rules, built-in fallback, functors, subscript/call/increment operators, chained `<<`, enum operators, literal operator | the operator group (20) passes; expected ≥ 205/243 |
 | CP4 initialization forms and access control | aggregate/brace-elision/value-init of class objects (locals, globals, nested arrays, string members), copy-init through converting ctors with `explicit` rejection, narrowing rejection, placement new, anonymous struct/union members, bit-field access lowering (7 `400-*` fixtures), access checks with the watch-list verified | 243/243 and through-pa16 clean |
 | CP5 audit and cleanup | architecture audit (`audit.md`), performance evidence, dead-path removal | through-pa16 clean; probe timings recorded |
 
-## Active Checkpoint: CP1 — class model, layout, members, methods
+CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
+fields, access/static metadata, layout size/alignment and member lookup; the
+lowerer emits class object slots, field/base projections, implicit-`this` and
+static calls, qualified/const member mangling, and zero-initialized class
+globals. The focused member/layout loop passed. `make test-pa16` is 55/243
+(188 failures, down from 218); the remaining failures are in the deferred
+constructor/lifetime, inheritance completion, access-control, parser/layout
+extensions, initialization, and operator groups. `make
+test-report-through-pa15` is 1139/1139. The pa16 file audit passes with only
+its three pre-existing header warnings. The required scaling probe measured
+wide 0.06s/16420KB and doubled 0.13s/28452KB; deep 0.00s/6232KB and doubled
+0.01s/7472KB; exits 0.01s/6836KB and doubled 0.02s/9644KB (the destructor
+diagnostic is the planned CP2 boundary).
+
+## Completed Checkpoint: CP1 — class model, layout, members, methods
 
 Goal: every class-scope declaration in the suite is accepted and modeled,
 complete classes have layout, member access and non-static / static member
@@ -345,3 +359,38 @@ Known uncertainties:
   than a slot-typed direct operand.
 - `400-signed-bit-field-read` masks with `binary and i32 %t, 7` and returns
   that value; the fixtures are the oracle, do not "correct" the sign.
+
+## Active Checkpoint: CP2 — constructors, destructors, lifetime
+
+Goal: lower explicit and synthesized construction/destruction consistently
+for class subobjects, arrays, locals, globals, thread-local objects, and all
+control-flow exits while preserving CP1's canonical class layout and member
+lookup. A constructor or destructor must either produce the planned helper
+calls and cleanup edges or be rejected cleanly; it must never silently emit
+an uninitialized or partially destroyed object.
+
+### Implementation Packet
+
+- `dev/src/parser/ast_parser_decl.cpp` and `dev/src/parser/ast_parser_expr.cpp`:
+  retain the special-member AST shape while completing constructor,
+  destructor, mem-initializer, explicit destructor-call, and qualified-member
+  parsing needed by the lifetime fixtures.
+- `dev/src/sema/scope_model.*` and `dev/src/sema/scope_builder.cpp`:
+  model special-member declarations/definitions, default member initializers,
+  mem-initializer targets, inherited constructors, deleted/defaulted state,
+  and complete-class body/default-argument contexts.
+- `dev/src/sema/expr_sema.cpp` and `dev/src/sema/overload.cpp`: resolve
+  constructor actions and explicit destructor calls through the canonical
+  class entities, including aliases, bases, and default arguments.
+- `dev/src/lower/lowir_program.cpp`, `lowir_function.cpp`,
+  `lowir_symbols.cpp`, and `lowir_expr.cpp`: build demand-driven C1/C2/D1/D2
+  helpers, lower subobject/array construction, maintain a per-scope live
+  object cleanup stack for every return/branch exit, and emit namespace/global
+  and `thread_local` initialization/finalization.
+- Focus first on `200-constructor-member-init`,
+  `200-derived-base-constructor-member-init`,
+  `200-destructor-body-local-before-base-destruction`,
+  `200-member-object-lifetime`, `200-local-default-class-array-lifecycle`,
+  `200-global-constructor`, `200-global-class-array-init`, and the
+  inheriting-constructor fixtures. Keep the existing pa11–pa15 gate and
+  file-audit checks as exit criteria; do not edit fixtures or `.ref` files.

@@ -4,9 +4,51 @@
 #include <cstdlib>
 #include <stdexcept>
 
+#include <algorithm>
+
 #include "sema/overload.h"
 
 namespace lowir_lowering {
+
+namespace {
+
+bool FindClassField(const SemaModel& model, ClassEntityId entity,
+                   BindingId binding, ClassField& field)
+{
+  if (entity == 0)
+    return false;
+  const ClassEntity& value = model.ClassAt(entity);
+  for (std::size_t i = 0; i < value.fields.size(); ++i)
+    if (value.fields[i].binding == binding)
+    {
+      field = value.fields[i];
+      return true;
+    }
+  return false;
+}
+
+bool FindBasePath(const SemaModel& model, ClassEntityId from,
+                  ClassEntityId target, std::vector<ClassBase>& path,
+                  std::vector<ClassEntityId>& visited)
+{
+  if (from == target)
+    return true;
+  if (from == 0 ||
+      std::find(visited.begin(), visited.end(), from) != visited.end())
+    return false;
+  visited.push_back(from);
+  const ClassEntity& value = model.ClassAt(from);
+  for (std::size_t i = 0; i < value.bases.size(); ++i)
+  {
+    path.push_back(value.bases[i]);
+    if (FindBasePath(model, value.bases[i].entity, target, path, visited))
+      return true;
+    path.pop_back();
+  }
+  return false;
+}
+
+} // namespace
 
 lowir_model::Operand Lowerer::ZeroOperand(TypeId type) const
 {
@@ -468,6 +510,71 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
   if (node == 0)
     Unsupported("a missing lvalue");
   const SemaNode& value = tree_.At(node);
+  if (value.kind == SEMA_MEMBER)
+  {
+    const Binding& binding = model_.BindingAt(value.binding);
+    if (binding.kind == BINDING_FUNCTION || binding.static_member)
+      Unsupported("a static or function member lvalue");
+    const std::vector<SemaId> children = Children(node);
+    if (children.size() != 1)
+      Unsupported("a member without one object");
+    const SemaId object_node = children[0];
+    TypeId object_type = tree_.At(object_node).type;
+    if (types_.Kind(object_type) == TYPE_REFERENCE)
+      object_type = types_.Referent(object_type);
+    bool pointer_object = types_.IsPointer(object_type);
+    TypeId class_type = pointer_object ?
+        types_.At(types_.Unqualified(object_type)).base : object_type;
+    class_type = types_.Unqualified(class_type);
+    if (types_.Kind(class_type) != TYPE_CLASS)
+      Unsupported("a member object that is not a class");
+
+    Value address;
+    if (pointer_object || value.op == OP_ARROW || value.op == KW_AUTO)
+      address = LowerRValue(object_node);
+    else
+      address = AddressValue(LowerLValue(object_node));
+    const ClassEntityId object_entity = types_.At(class_type).entity;
+    ClassEntityId owner_entity = 0;
+    if (model_.ScopeAt(binding.scope).kind == SCOPE_CLASS)
+      owner_entity = model_.ScopeAt(binding.scope).class_entity;
+    if (owner_entity == 0)
+      Unsupported("a member without a class owner");
+
+    std::vector<ClassBase> path;
+    std::vector<ClassEntityId> visited;
+    if (!FindBasePath(model_, object_entity, owner_entity, path, visited))
+      Unsupported("a member whose class is unrelated to its object");
+    for (std::size_t i = 0; i < path.size(); ++i)
+    {
+      lowir_model::Instruction projection;
+      projection.kind = lowir_model::Instruction::IK_INDEX;
+      projection.dest = NewTemp();
+      projection.type = I8Type();
+      projection.index_projection = lowir_model::IPK_BASE_SUBOBJECT;
+      projection.first = address.operand;
+      projection.second = Immediate(
+          static_cast<long long>(path[i].offset));
+      Emit(projection);
+      address.operand = TempOperand(projection.dest);
+    }
+    ClassField field;
+    if (!FindClassField(model_, owner_entity, value.binding, field))
+      Unsupported("a member without layout metadata");
+    lowir_model::Instruction projection;
+    projection.kind = lowir_model::Instruction::IK_INDEX;
+    projection.dest = NewTemp();
+    projection.type = I8Type();
+    projection.index_projection = lowir_model::IPK_FIELD;
+    projection.first = address.operand;
+    projection.second = Immediate(static_cast<long long>(field.offset));
+    Emit(projection);
+    Value result;
+    result.type = ReferentType(value.type);
+    result.lvalue = true;
+    result.operand = TempOperand(projection.dest);
+    return result;
+  }
   if (value.kind == SEMA_ID_EXPRESSION) {
     const Binding& binding = model_.BindingAt(value.binding);
     if (binding.kind == BINDING_VARIABLE || binding.kind == BINDING_PARAMETER) {
@@ -615,8 +722,25 @@ Lowerer::Value Lowerer::LowerRValue(SemaId node, TypeId expected)
     Unsupported("a callee outside a call");
     break;
   case SEMA_MEMBER:
-    Unsupported("member expressions");
-    break;
+  {
+    const Binding& binding = model_.BindingAt(value.binding);
+    if (binding.kind == BINDING_ENUMERATOR && binding.has_const_value) {
+      Value result;
+      result.type = binding.type;
+      result.operand = Immediate(binding.const_value);
+      return Convert(result, expected);
+    }
+    if (binding.static_member && binding.has_const_value)
+    {
+      if (value.type == 0)
+        Unsupported("a static member without a type");
+      Value result;
+      result.type = binding.type;
+      result.operand = Immediate(binding.const_value);
+      return Convert(result, expected);
+    }
+    return Convert(LoadValue(LowerLValue(node)), expected);
+  }
   default:
     Unsupported("this expression");
   }

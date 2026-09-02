@@ -89,12 +89,23 @@ void ProgramLowering::Finish()
 void Lowerer::Run()
 {
   CollectSymbols(tree_.Root());
+  ComputeReferencedFunctions();
+  // Deferred in-class definitions are visited in declaration order, while a
+  // call from a later body may refer to an earlier member.  Apply the complete
+  // reference set after the walk before deciding which weak inline bodies are
+  // ODR-used.
+  for (std::size_t i = 0; i < function_order_.size(); ++i)
+    functions_[function_order_[i]].referenced =
+        model_.FunctionAt(function_order_[i]).in_class_definition &&
+        referenced_functions_.count(function_order_[i]) != 0;
   NameSymbols();
   BuildGlobalDefinitions();
   for (std::size_t i = 0; i < function_order_.size(); ++i) {
     const FunctionSymbol& symbol =
         functions_.find(function_order_[i])->second;
-    if (symbol.definition != 0)
+    const FunctionEntity& entity = model_.FunctionAt(function_order_[i]);
+    if (symbol.definition != 0 &&
+        (!entity.in_class_definition || symbol.referenced))
       program_.functions.push_back(BuildFunction(symbol));
   }
   BuildGlobalInitializers();
@@ -269,10 +280,74 @@ void Lowerer::LowerVariable(SemaId variable_node)
 {
   const SemaNode& variable = tree_.At(variable_node);
   const std::vector<SemaId> initializer = Children(variable_node);
-  if (initializer.empty())
-    return;
   const TypeId declared = variable.type;
   const TypeId unqualified = types_.Unqualified(declared);
+  if (types_.Kind(unqualified) == TYPE_CLASS)
+  {
+    Value object;
+    object.type = declared;
+    object.lvalue = true;
+    object.operand = SlotOperand(SlotFor(variable.binding));
+    (void)AddressValue(object);
+    // Trivial default initialization has no emitted constructor body yet;
+    // the storage address is nevertheless a real observable local fact.
+    if (initializer.empty())
+      return;
+    if (initializer.size() == 1 &&
+        tree_.At(initializer[0]).kind == SEMA_CONSTRUCTOR_ACTION) {
+      const std::vector<SemaId> action_children = Children(initializer[0]);
+      if (action_children.size() != 1 ||
+          tree_.At(action_children[0]).kind != SEMA_CALL)
+        Unsupported("this constructor action");
+      const SemaNode& call_node = tree_.At(action_children[0]);
+      const FunctionEntityId function = call_node.function;
+      if (function == 0)
+        Unsupported("a constructor action without a function");
+      if (model_.FunctionAt(function).synthesized &&
+          model_.ClassAt(model_.FunctionAt(function).member_class)
+              .trivial_default_constructor)
+        return;
+      const TypeNode& callable = types_.At(types_.Unqualified(
+          model_.FunctionAt(function).type));
+      if (callable.parameters.size() != 1)
+        Unsupported("a constructor action with arguments");
+      lowir_model::Instruction call;
+      call.kind = lowir_model::Instruction::IK_CALL;
+      call.type = LowTypeOf(callable.result);
+      call.call_return_type = call.type;
+      call.call_returns_void = IsVoidType(types_, callable.result);
+      call.first = GlobalOperand(FunctionSymbolName(function));
+      call.args.push_back(AddressValue(object).operand);
+      Emit(call);
+      return;
+    }
+    if (initializer.size() == 1 &&
+        tree_.At(initializer[0]).kind == SEMA_BRACED_INIT_LIST) {
+      const ClassEntity& class_entity = model_.ClassAt(
+          types_.At(unqualified).entity);
+      const std::vector<SemaId> values = Children(initializer[0]);
+      for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
+        const Value address = AddressValue(object);
+        lowir_model::Instruction projection;
+        projection.kind = lowir_model::Instruction::IK_INDEX;
+        projection.dest = NewTemp();
+        projection.type = I8Type();
+        projection.index_projection = lowir_model::IPK_FIELD;
+        projection.first = address.operand;
+        projection.second = Immediate(static_cast<long long>(
+            class_entity.fields[i].offset));
+        Emit(projection);
+        const lowir_model::Operand value = i < values.size() ?
+            LowerRValue(values[i], class_entity.fields[i].type).operand :
+            ZeroOperand(class_entity.fields[i].type);
+        EmitStore(LowTypeOf(class_entity.fields[i].type), value,
+                  TempOperand(projection.dest));
+      }
+      return;
+    }
+  }
+  if (initializer.empty())
+    return;
   if (types_.Kind(unqualified) == TYPE_REFERENCE) {
     const TypeId referent = types_.Referent(unqualified);
     const SemaId source = initializer[0];

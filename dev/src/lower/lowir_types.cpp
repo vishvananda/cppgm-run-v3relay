@@ -213,6 +213,12 @@ LowInfo Lowerer::LowInfoOf(TypeId type) const
     result.alignment = types_.AlignOf(type);
     return result;
   }
+  case TYPE_CLASS: {
+    LowInfo result = KindInfo(LowInfo::LK_OBJECT);
+    result.bytes = types_.SizeOf(type);
+    result.alignment = types_.AlignOf(type);
+    return result;
+  }
   case TYPE_FUNDAMENTAL:
     switch (node.fundamental) {
     case FT_VOID: return KindInfo(LowInfo::LK_VOID);
@@ -336,7 +342,8 @@ abi_mangle::AbiType Lowerer::AbiTypeOf(TypeId type) const
   }
   if (node.kind == TYPE_ENUM || node.kind == TYPE_CLASS) {
     abi_mangle::AbiType result;
-    result.kind = abi_mangle::ABI_TYPE_NAMED;
+    result.kind = node.kind == TYPE_CLASS ?
+        abi_mangle::ABI_TYPE_NAME_OR_REFERENCE : abi_mangle::ABI_TYPE_NAMED;
     result.name = NamedType(types_, type);
     return result;
   }

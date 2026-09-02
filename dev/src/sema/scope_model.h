@@ -43,6 +43,23 @@ enum BindingKind
   BINDING_PARAMETER
 };
 
+// Access and layout facts belong to the class entity, rather than to the
+// parser's declaration nodes.  Keeping these as small enums/records also
+// lets lookup and lowering share one canonical member identity.
+enum AccessKind
+{
+  ACCESS_PUBLIC,
+  ACCESS_PROTECTED,
+  ACCESS_PRIVATE
+};
+
+enum SpecialMemberKind
+{
+  SPECIAL_MEMBER_NONE,
+  SPECIAL_MEMBER_CONSTRUCTOR,
+  SPECIAL_MEMBER_DESTRUCTOR
+};
+
 enum LookupFilter
 {
   LOOKUP_TYPES = 1u << 0,
@@ -71,6 +88,10 @@ struct Binding
   bool c_linkage;
   bool extern_declaration;
   bool noexcept_qualifier;
+  AccessKind access;
+  bool static_member;
+  bool bit_field;
+  unsigned bit_width;
   // BINDING_VARIABLE at namespace scope: the first binding of the same
   // object when this declaration redeclares it (3.3.10); 0 when this is the
   // first declaration.  Consumers that need one symbol per object key on it.
@@ -79,6 +100,34 @@ struct Binding
   long long const_value;
 
   Binding();
+};
+
+struct ClassBase
+{
+  ClassEntityId entity;
+  AccessKind access;
+  std::size_t offset;
+
+  ClassBase(ClassEntityId entity = 0, AccessKind access = ACCESS_PUBLIC,
+            std::size_t offset = 0)
+      : entity(entity), access(access), offset(offset) {}
+};
+
+struct ClassField
+{
+  BindingId binding;
+  TypeId type;
+  std::size_t offset;
+  std::size_t bit_offset;
+  unsigned bit_width;
+  AccessKind access;
+  AstId initializer;
+  bool static_member;
+
+  ClassField(BindingId binding = 0, TypeId type = 0)
+      : binding(binding), type(type), offset(0), bit_offset(0),
+        bit_width(0), access(ACCESS_PUBLIC), initializer(0),
+        static_member(false) {}
 };
 
 struct Scope
@@ -119,6 +168,15 @@ struct ClassEntity
   // 9.5p5: members injected into the enclosing scope, each naming the
   // synthesized object through Binding::object_binding.
   std::vector<BindingId> injected_members;
+  std::vector<ClassBase> bases;
+  std::vector<ClassField> fields;
+  std::size_t size;
+  std::size_t alignment;
+  std::size_t requested_alignment;
+  FunctionEntityId constructor;
+  FunctionEntityId destructor;
+  bool layout_complete;
+  bool trivial_default_constructor;
   bool is_union;
   bool defined;
 
@@ -152,6 +210,10 @@ struct FunctionEntity
   bool internal_linkage;
   bool c_linkage;
   bool noexcept_qualifier;
+  SpecialMemberKind special_member;
+  bool static_member;
+  bool in_class_definition;
+  bool synthesized;
   // One entry per canonical parameter; a zero entry means that parameter
   // has no default initializer.  The AST initializer remains the canonical
   // source fact and is materialized at each call site by expression sema.
@@ -217,6 +279,10 @@ public:
   bool NominatedScope(BindingId binding, ScopeId& scope) const;
   // Member scope of a class type or enumerator scope of an enum type.
   bool ScopeOfType(TypeId type, ScopeId& scope) const;
+  // Class member lookup applies ordinary hiding at each class level, then
+  // searches bases.  The result may contain an overload set or an ambiguity.
+  void LookupMember(ClassEntityId entity, const std::string& name,
+                    unsigned filter, std::vector<BindingId>& result) const;
 
   ClassEntityId CreateClass(bool is_union);
   ClassEntity& ClassAt(ClassEntityId id);
@@ -265,6 +331,9 @@ private:
   void CollectMember(ScopeId scope, EntityId unscoped_enum,
                      const std::string& name, unsigned filter,
                      std::vector<BindingId>& result) const;
+  void CollectClassMember(ClassEntityId entity, const std::string& name,
+                          unsigned filter, std::vector<ClassEntityId>& visited,
+                          std::vector<BindingId>& result) const;
 
   static const ScopeId kNoScope = static_cast<ScopeId>(-1);
 

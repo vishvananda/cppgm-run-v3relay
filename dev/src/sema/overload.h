@@ -13,15 +13,18 @@ struct OverloadArgument
   ValueCategory category;
   bool is_null_literal;
   bool is_function_lvalue;
+  bool is_implicit_object;
   // An overloaded function name as an argument: the entities it may denote
   // (13.4 selects among them per parameter type).
   std::vector<FunctionEntityId> function_candidates;
 
   OverloadArgument(TypeId type = 0, ValueCategory category = VC_PRVALUE,
                    bool is_null_literal = false,
-                   bool is_function_lvalue = false)
+                   bool is_function_lvalue = false,
+                   bool is_implicit_object = false)
       : type(type), category(category), is_null_literal(is_null_literal),
-        is_function_lvalue(is_function_lvalue) {}
+        is_function_lvalue(is_function_lvalue),
+        is_implicit_object(is_implicit_object) {}
 };
 
 // Resolve one overload set (13.3.3).  The lookup level has already been
@@ -32,7 +35,8 @@ struct OverloadArgument
 FunctionEntityId SelectBestOverload(
     const SemaModel& model, TypeTable& types,
     const std::vector<BindingId>& bindings,
-    const std::vector<OverloadArgument>& arguments);
+    const std::vector<OverloadArgument>& arguments,
+    bool has_implicit_object = false);
 
 // Select the unique function entity denoted by an overloaded function name
 // when the surrounding initialization supplies a pointer/reference-to-

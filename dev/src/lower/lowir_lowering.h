@@ -115,6 +115,9 @@ private:
 
   // Symbols.
   void CollectSymbols(SemaId node);
+  void CollectReferencedFunctions(SemaId node,
+                                  std::set<FunctionEntityId>& result) const;
+  void ComputeReferencedFunctions();
   void NameSymbols();
   std::string TopLevelName(const std::string& base,
                            const std::string& external_object);
@@ -254,6 +257,7 @@ private:
   // Unit-level symbol state.
   std::map<FunctionEntityId, FunctionSymbol> functions_;
   std::vector<FunctionEntityId> function_order_;
+  std::set<FunctionEntityId> referenced_functions_;
   std::map<BindingId, GlobalSymbol> globals_;
   std::vector<BindingId> global_order_;
   std::vector<DynamicInitializer> dynamic_initializers_;

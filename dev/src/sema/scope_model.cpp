@@ -7,7 +7,8 @@ Binding::Binding()
     : kind(BINDING_VARIABLE), type(0), scope(0), namespace_scope(0),
       function(0), object_binding(0),
       internal_linkage(false), c_linkage(false), extern_declaration(false),
-      noexcept_qualifier(false), redeclared_binding(0),
+      noexcept_qualifier(false), access(ACCESS_PUBLIC), static_member(false),
+      bit_field(false), bit_width(0), redeclared_binding(0),
       has_const_value(false), const_value(0)
 {
 }
@@ -20,6 +21,8 @@ Scope::Scope()
 
 ClassEntity::ClassEntity()
     : class_scope(0), type(0), default_constructor(0),
+      size(0), alignment(1), requested_alignment(0), constructor(0),
+      destructor(0), layout_complete(false), trivial_default_constructor(true),
       is_union(false), defined(false)
 {
 }
@@ -33,7 +36,9 @@ FunctionEntity::FunctionEntity()
     : scope(0), type(0), member_type(0), member_pointer_type(0),
       member_class(0), is_member(false), member_const(false),
       is_template(false), internal_linkage(false), c_linkage(false),
-      noexcept_qualifier(false), defined(false)
+      noexcept_qualifier(false), special_member(SPECIAL_MEMBER_NONE),
+      static_member(false), in_class_definition(false), synthesized(false),
+      defined(false)
 {
 }
 
@@ -366,6 +371,36 @@ bool SemaModel::ScopeOfType(TypeId type, ScopeId& scope) const
     return true;
   }
   return false;
+}
+
+void SemaModel::CollectClassMember(
+    ClassEntityId entity, const std::string& name, unsigned filter,
+    std::vector<ClassEntityId>& visited,
+    std::vector<BindingId>& result) const
+{
+  if (entity == 0 || entity >= classes_.size() ||
+      std::find(visited.begin(), visited.end(), entity) != visited.end())
+    return;
+  visited.push_back(entity);
+  const ClassEntity& value = classes_[entity];
+  const std::size_t before = result.size();
+  if (value.class_scope != 0)
+    DirectBindings(value.class_scope, name, filter, result);
+  // A declaration in the derived class hides every base declaration of the
+  // same name, including declarations that are not viable overloads.
+  if (result.size() != before)
+    return;
+  for (std::size_t i = 0; i < value.bases.size(); ++i)
+    CollectClassMember(value.bases[i].entity, name, filter, visited, result);
+}
+
+void SemaModel::LookupMember(ClassEntityId entity, const std::string& name,
+                             unsigned filter,
+                             std::vector<BindingId>& result) const
+{
+  result.clear();
+  std::vector<ClassEntityId> visited;
+  CollectClassMember(entity, name, filter, visited, result);
 }
 
 bool SemaModel::NominatedScope(BindingId binding, ScopeId& scope) const
