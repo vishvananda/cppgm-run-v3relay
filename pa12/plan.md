@@ -352,7 +352,9 @@ listed):
 - CP4 class-aware fixtures (anonymous/local unions with constructor actions,
   member expressions, member pointers, `this`-first member functions,
   static_cast over overloaded member/template names, appended instantiation
-  declarations) — 166/166.
+  declarations) — completed at 166/166; all nine packet fixtures pass, the
+  through-pa11 report is 657/657, and the file audit passes with its existing
+  one header-layout warning.
 - CP5 architecture audit and cleanup (`audit.md`): single expression
   implementation, no textual downgrades (operator/name/literal facts typed,
   presentation rendered on demand), bounded lookup and resolution, probe
@@ -560,26 +562,25 @@ coverage.  `make test-report-through-pa11` reports 657/657.
 `perl scripts/cppgm_file_audit.pl --stage pa12 --paths dev/src` passes with
 one pre-existing `recog_parser.h` implementation-body warning.
 
-## Active Checkpoint: CP4 — class/member/constructor semantic ownership
+## Completed Checkpoint: CP4 — class/member/constructor semantic ownership
 
-Goal: preserve the CP3 157/166 baseline while closing the nine deferred
-class/member/constructor fixtures and reach 166/166 without reducing coverage.
+Outcome: class and anonymous-union ownership now drives synthesized storage
+and constructor actions, cv-aware member expressions, member-pointer types and
+addresses, `this`-first member function entities, class-qualified overload
+sets, and selected template-id declarations.  Unused template instances and
+class data members stay out of the semantic dump.
 
-Implementation boundary: begin with
-`pa12/tests/general/200-local-anonymous-union-variable.t`,
-`pa12/tests/general/300-block-anonymous-union-injected-members.t`,
-`pa12/tests/general/300-elaborated-local-struct-copy-init.t`,
-`pa12/tests/general/300-member-function-pointer-return-pointer-const.t`,
-`pa12/tests/general/300-member-function-pointer-type-alias-and-function.t`,
-`pa12/tests/general/300-member-pointer-type-alias-and-function.t`,
-`pa12/tests/general/300-reference-binding-pointee-const-pointer.t`,
-`pa12/tests/general/300-static-cast-member-overload-prefers-nontemplate.t`,
-and
-`pa12/tests/general/300-static-cast-overloaded-function-template-argument.t`.
-Trace class/member declarations, constructor actions, member-pointer type
-construction, and member/template overload selection through their canonical
-semantic owners.
+Evidence: the nine packet fixtures pass 9/9 and `make test-pa12` reports
+166/166; `make test-report-through-pa11` reports 657/657; the pa12 file audit
+passes with one pre-existing `recog_parser.h` implementation-body warning; and
+the representative anonymous-union semantic probe completes in 0.00 s with
+4684 KiB maximum resident memory.
 
-Exit evidence: focused CP4 fixtures, `make test-pa12`,
-`make test-report-through-pa11`, and the pa12 file audit, with all earlier PAs
-passing and no coverage reduction.
+## Active Checkpoint: CP5 — architecture audit and release hygiene
+
+Goal: document the completed PA12 ownership boundaries and verify that the
+final semantic implementation remains bounded, typed, and coverage-preserving.
+
+Implementation boundary: review the final `dev/src/sema/` diff against the
+stage design, record findings in `pa12/audit.md`, and retain the clean
+through-pa12, file-audit, and representative-probe evidence.

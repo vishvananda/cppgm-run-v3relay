@@ -49,24 +49,58 @@ QualifiedName ReadQualifiedName(const std::vector<Pa6Token>& tokens,
                                 std::size_t first, std::size_t last)
 {
   QualifiedName result;
+  std::size_t i = first;
   bool expect_identifier = true;
-  for (std::size_t i = first; i < last && i < tokens.size(); ++i)
+  while (i < last && i < tokens.size())
   {
     const Pa6Token& token = tokens[i];
     if (token.kind == PA6_IDENTIFIER_TOKEN && expect_identifier)
     {
-      result.components.push_back(token.spelling);
+      std::string component = token.spelling;
+      ++i;
+      if (i < last && i < tokens.size() && tokens[i].IsSimple(OP_LT))
+      {
+        std::size_t depth = 0;
+        while (i < last && i < tokens.size())
+        {
+          const Pa6Token& argument = tokens[i];
+          if (argument.IsSimple(OP_LT))
+          {
+            ++depth;
+            component += '<';
+          }
+          else if (argument.IsSimple(OP_GT) || argument.IsRshiftPart())
+          {
+            if (depth == 0)
+              throw std::runtime_error("template name has unmatched >");
+            --depth;
+            component += '>';
+          }
+          else
+            component += argument.spelling;
+          ++i;
+          if (depth == 0)
+            break;
+        }
+        if (depth != 0)
+          throw std::runtime_error("template name has an incomplete argument list");
+      }
+      result.components.push_back(component);
       expect_identifier = false;
       continue;
     }
     if (token.IsSimple(OP_COLON2) && expect_identifier && i == first)
     {
       result.global = true;
+      ++i;
       continue;
     }
     if (token.IsSimple(OP_COLON2) && !expect_identifier)
     {
       expect_identifier = true;
+      ++i;
+      if (i < last && i < tokens.size() && tokens[i].IsSimple(KW_TEMPLATE))
+        ++i;
       continue;
     }
     throw std::runtime_error("unsupported name form in PA11");

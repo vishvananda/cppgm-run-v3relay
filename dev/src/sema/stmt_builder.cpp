@@ -25,7 +25,7 @@ ScopeId ScopeBuilder::BuildCompound(AstId node, ScopeId parent,
 {
   const ScopeId block = model_.CreateScope(SCOPE_BLOCK, std::string(), parent);
   SemaId compound = semantic_parent;
-  if (tree_ != 0)
+  if (tree_ != 0 && !suppress_semantics_)
   {
     compound = MakeSemantic(SEMA_COMPOUND_STATEMENT, block,
                             semantic_parent != 0 ? semantic_parent :
@@ -360,6 +360,21 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
   if (node == 0)
     return;
   const AstKind kind = arena_.At(node).kind;
+  if (suppress_semantics_)
+  {
+    if (kind == AST_COMPOUND_STATEMENT)
+      BuildCompound(node, context.scope, context.function,
+                    context.loop_depth, context.switch_depth);
+    else if (IsDeclarationKind(kind))
+      BuildNode(node, context.scope);
+    else
+    {
+      const vector<AstId>& children = arena_.At(node).children;
+      for (size_t i = 0; i < children.size(); ++i)
+        BuildStatement(children[i], context);
+    }
+    return;
+  }
   if (IsDeclarationKind(kind))
   {
     // The statement context owns the semantic placement, while the scope

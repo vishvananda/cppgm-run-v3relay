@@ -65,6 +65,7 @@ private:
   SemaId AnalyzeName(AstId expression, ScopeId scope);
   SemaId AnalyzeUnary(AstId expression, ScopeId scope);
   SemaId AnalyzePostfix(AstId expression, ScopeId scope);
+  SemaId AnalyzeMember(AstId expression, ScopeId scope);
   SemaId AnalyzeBinary(AstId expression, ScopeId scope);
   SemaId AnalyzeAssignment(AstId expression, ScopeId scope);
   SemaId AnalyzeConditional(AstId expression, ScopeId scope);
@@ -89,6 +90,13 @@ private:
   bool IsFunctionType(TypeId type) const;
   bool IsModifiableLvalue(SemaId node) const;
   bool RetargetFunctionName(SemaId expression, TypeId target);
+  bool RetargetFunctionAddress(SemaId expression, TypeId target);
+  bool TemplateArgumentTypes(std::size_t first, std::size_t last,
+                             ScopeId scope,
+                             std::vector<TypeId>& arguments) const;
+  void LookupNameBindings(const QualifiedName& name, std::size_t first,
+                          std::size_t last,
+                          ScopeId scope, std::vector<BindingId>& bindings);
   TypeId ExpressionType(SemaId node) const;
   TypeId CommonConditionalType(SemaId left, SemaId right) const;
   bool CanConvert(SemaId expression, TypeId target) const;

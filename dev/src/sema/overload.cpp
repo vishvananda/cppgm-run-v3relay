@@ -41,6 +41,24 @@ bool TargetFunctionType(TypeTable& types, TypeId target, TypeId& function)
   return true;
 }
 
+bool TargetMemberFunctionType(TypeTable& types, TypeId target,
+                              TypeId& member_class, TypeId& function)
+{
+  if (target == 0)
+    return false;
+  if (types.Kind(target) == TYPE_REFERENCE)
+    target = types.Referent(target);
+  target = types.Unqualified(target);
+  if (types.Kind(target) != TYPE_MEMBER_POINTER)
+    return false;
+  const TypeNode& member = types.At(target);
+  if (types.Kind(types.Unqualified(member.base)) != TYPE_FUNCTION)
+    return false;
+  member_class = member.member_class;
+  function = types.Unqualified(member.base);
+  return true;
+}
+
 } // namespace
 
 bool CallableFunctionType(TypeTable& types, TypeId type,
@@ -85,7 +103,8 @@ bool SelectBestOverload(const SemaModel& model, TypeTable& types,
   {
     const Binding& binding = model.BindingAt(bindings[i]);
     if (binding.kind != BINDING_FUNCTION || binding.function == 0 ||
-        Contains(seen, binding.function))
+        Contains(seen, binding.function) ||
+        model.FunctionAt(binding.function).is_template)
       continue;
     seen.push_back(binding.function);
 
@@ -185,8 +204,14 @@ bool SelectTargetFunction(const SemaModel& model, TypeTable& types,
                           TypeId target, BindingId& binding,
                           FunctionEntityId& function)
 {
+  TypeId target_member_class = 0;
+  TypeId target_member_function = 0;
+  const bool member_target = TargetMemberFunctionType(
+      types, target, target_member_class, target_member_function);
+  (void)target_member_class;
+  (void)target_member_function;
   TypeId target_function = 0;
-  if (!TargetFunctionType(types, target, target_function))
+  if (!member_target && !TargetFunctionType(types, target, target_function))
     return false;
 
   std::vector<FunctionEntityId> matches;
@@ -195,8 +220,19 @@ bool SelectTargetFunction(const SemaModel& model, TypeTable& types,
   {
     const Binding& candidate = model.BindingAt(bindings[i]);
     if (candidate.kind != BINDING_FUNCTION || candidate.function == 0 ||
-        types.Unqualified(model.FunctionAt(candidate.function).type) !=
-            target_function)
+        model.FunctionAt(candidate.function).is_template)
+      continue;
+    const FunctionEntity& entity = model.FunctionAt(candidate.function);
+    if (member_target)
+    {
+      if (!entity.is_member || entity.member_class == 0 ||
+          !entity.member_type ||
+          entity.member_pointer_type == 0 ||
+          types.Unqualified(entity.member_pointer_type) !=
+              types.Unqualified(target))
+        continue;
+    }
+    else if (types.Unqualified(entity.type) != target_function)
       continue;
     if (!Contains(matches, candidate.function))
     {

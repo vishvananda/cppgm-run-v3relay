@@ -137,6 +137,8 @@ string OperatorText(const SemaNode& node, const vector<Pa6Token>& tokens)
     return name + ":";
   if (node.op == OP_RSHIFT)
     return name + ":>>";
+  if (!node.operator_spelling.empty())
+    return name + ":" + node.operator_spelling;
   string spelling;
   if (node.first < tokens.size())
     spelling = tokens[node.first].spelling;
@@ -181,7 +183,8 @@ void PrintNode(std::ostream& out, const SemaTree& tree, const SemaModel& model,
   case SEMA_ID_EXPRESSION:
     out << ' ' << Category(node.category) << ' ';
     model.Types().Spell(out, node.type);
-    out << ' ' << Span(node, tokens);
+    out << ' ' << (node.expression_name.empty() ? Span(node, tokens) :
+        node.expression_name);
     break;
   case SEMA_LITERAL:
     out << ' ' << Category(node.category) << ' ';
@@ -225,14 +228,24 @@ void PrintNode(std::ostream& out, const SemaTree& tree, const SemaModel& model,
         out << ' ' << op;
     }
     break;
-  case SEMA_CONDITIONAL: case SEMA_SUBSCRIPT: case SEMA_MEMBER:
+  case SEMA_CONDITIONAL: case SEMA_SUBSCRIPT:
   case SEMA_SIZEOF:
     out << ' ' << Category(node.category) << ' ';
     model.Types().Spell(out, node.type);
     break;
+  case SEMA_MEMBER:
+    out << ' ' << Category(node.category) << ' ';
+    model.Types().Spell(out, node.type);
+    out << ' ' << (node.expression_name.empty() ?
+        OperatorText(node, tokens) : node.expression_name);
+    break;
   case SEMA_BRACED_INIT_LIST:
     out << ' ' << Category(node.category) << ' ';
     model.Types().Spell(out, node.type);
+    break;
+  case SEMA_CONSTRUCTOR_ACTION:
+    if (node.function != 0)
+      out << ' ' << FunctionName(model, node.function);
     break;
   default:
     break;

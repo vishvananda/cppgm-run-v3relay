@@ -7,9 +7,9 @@
 #include "parser/recog_token.h"
 
 // A name read once from its token span: an optional leading `::` and the
-// identifier components.  PA11 supports no template-ids, operator names,
-// destructor names, or decltype qualifiers, so any other token in the span is
-// rejected here rather than being folded into a component spelling.
+// identifier components.  Template-id arguments are retained in the last
+// component's presentation spelling (for example `hello<stream>`); semantic
+// lookup strips that spelling only when it performs template instantiation.
 struct QualifiedName
 {
   bool global;

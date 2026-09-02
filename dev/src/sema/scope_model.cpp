@@ -5,7 +5,7 @@
 
 Binding::Binding()
     : kind(BINDING_VARIABLE), type(0), scope(0), namespace_scope(0),
-      function(0),
+      function(0), object_binding(0),
       has_const_value(false), const_value(0)
 {
 }
@@ -17,7 +17,9 @@ Scope::Scope()
 }
 
 ClassEntity::ClassEntity()
-    : class_scope(0), is_union(false), defined(false)
+    : class_scope(0), type(0), default_constructor(0),
+      anonymous_storage(0),
+      is_union(false), defined(false)
 {
 }
 
@@ -27,7 +29,9 @@ EnumEntity::EnumEntity()
 }
 
 FunctionEntity::FunctionEntity()
-    : scope(0), type(0), defined(false)
+    : scope(0), type(0), member_type(0), member_pointer_type(0),
+      member_class(0), is_member(false), member_const(false),
+      is_constructor(false), is_template(false), defined(false)
 {
 }
 
@@ -478,8 +482,11 @@ void SemaModel::LookupQualifiedSet(ScopeId scope, const QualifiedName& name,
         types_.At(types_.Unqualified(bindings_[prefix_binding].type));
     const EntityId unscoped = prefix_type.kind == TYPE_ENUM &&
         !prefix_type.scoped ? prefix_type.entity : 0;
-    AppendUnique(result, SearchMember(current, unscoped,
-                                      name.components.back(), filter));
+    if (unscoped != 0)
+      AppendUnique(result, SearchMember(current, unscoped,
+                                        name.components.back(), filter));
+    else
+      CollectDirect(current, name.components.back(), filter, result);
   }
 }
 
@@ -660,6 +667,26 @@ const ClassEntity& SemaModel::ClassAt(ClassEntityId id) const
   if (id == 0 || id >= classes_.size())
     throw std::out_of_range("invalid class entity");
   return classes_[id];
+}
+
+bool SemaModel::ClassForScope(ScopeId scope, ClassEntityId& entity) const
+{
+  if (scope >= scopes_.size())
+    return false;
+  for (ScopeId current = scope;; current = scopes_[current].parent)
+  {
+    for (ClassEntityId candidate = 1; candidate < classes_.size();
+         ++candidate)
+      if (classes_[candidate].class_scope != 0 &&
+          classes_[candidate].class_scope == current)
+      {
+        entity = candidate;
+        return true;
+      }
+    if (current == GlobalScope())
+      break;
+  }
+  return false;
 }
 
 EnumEntityId SemaModel::CreateEnum(bool scoped, TypeId underlying)

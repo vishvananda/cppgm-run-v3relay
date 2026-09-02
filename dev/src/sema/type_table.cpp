@@ -7,8 +7,8 @@
 TypeNode::TypeNode()
     : kind(TYPE_INVALID), fundamental(FT_INT), base(0), result(0),
       array_bound(0), is_const(false), is_volatile(false),
-      lvalue_reference(true), variadic(false), scoped(false),
-      keyword(TK_NONE), entity(0)
+      lvalue_reference(true), variadic(false), function_const(false),
+      scoped(false), keyword(TK_NONE), entity(0), member_class(0)
 {
 }
 
@@ -83,6 +83,8 @@ bool TypeTable::FunctionKey::operator<(const FunctionKey& other) const
     return result < other.result;
   if (variadic != other.variadic)
     return variadic < other.variadic;
+  if (function_const != other.function_const)
+    return function_const < other.function_const;
   return parameters < other.parameters;
 }
 
@@ -249,7 +251,7 @@ TypeId TypeTable::Array(TypeId element, std::size_t bound)
 }
 
 TypeId TypeTable::Function(TypeId result, const std::vector<TypeId>& parameters,
-                           bool variadic)
+                           bool variadic, bool function_const)
 {
   if (result == 0)
     throw std::runtime_error("function has no return type");
@@ -259,6 +261,7 @@ TypeId TypeTable::Function(TypeId result, const std::vector<TypeId>& parameters,
   FunctionKey key;
   key.result = result;
   key.variadic = variadic;
+  key.function_const = function_const;
   key.parameters = parameters;
   const std::map<FunctionKey, TypeId>::const_iterator found =
       functions_.find(key);
@@ -269,6 +272,7 @@ TypeId TypeTable::Function(TypeId result, const std::vector<TypeId>& parameters,
   node.result = result;
   node.parameters = parameters;
   node.variadic = variadic;
+  node.function_const = function_const;
   return functions_[key] = Add(node);
 }
 
@@ -309,6 +313,33 @@ TypeId TypeTable::TemplateParam(TypeKeyword key, const std::string& name)
   node.keyword = key;
   node.name = name;
   return Add(node);
+}
+
+TypeId TypeTable::MemberPointer(TypeId member_class, TypeId member,
+                                bool member_const)
+{
+  if (member_class == 0 || member == 0)
+    throw std::runtime_error("member pointer has an incomplete type");
+  const TypeId class_type = Unqualified(member_class);
+  if (Kind(class_type) != TYPE_CLASS)
+    throw std::runtime_error("member pointer class is not a class type");
+  TypeId member_type = member;
+  if (member_const && Kind(Unqualified(member_type)) == TYPE_FUNCTION)
+  {
+    const TypeNode& function = At(Unqualified(member_type));
+    member_type = Function(function.result, function.parameters,
+                           function.variadic, true);
+  }
+  const std::pair<TypeId, TypeId> key(class_type, member_type);
+  const std::map<std::pair<TypeId, TypeId>, TypeId>::const_iterator found =
+      member_pointers_.find(key);
+  if (found != member_pointers_.end())
+    return found->second;
+  TypeNode node;
+  node.kind = TYPE_MEMBER_POINTER;
+  node.base = member_type;
+  node.member_class = class_type;
+  return member_pointers_[key] = Add(node);
 }
 
 const TypeNode& TypeTable::At(TypeId id) const
@@ -400,6 +431,7 @@ bool TypeTable::IsScalar(TypeId id) const
     return false;
   id = Unqualified(id);
   return IsArithmetic(id) || Kind(id) == TYPE_POINTER ||
+      Kind(id) == TYPE_MEMBER_POINTER ||
       (Kind(id) == TYPE_FUNDAMENTAL &&
        At(id).fundamental == FT_NULLPTR_T);
 }
@@ -573,7 +605,10 @@ void TypeTable::Spell(std::ostream& out, TypeId id) const
     }
     if (node.variadic)
       out << (node.parameters.empty() ? "..." : ", ...");
-    out << ") returning ";
+    out << ')';
+    if (node.function_const)
+      out << " const";
+    out << " returning ";
     Spell(out, node.result);
     return;
   case TYPE_CLASS: case TYPE_TEMPLATE_PARAM:
@@ -581,6 +616,12 @@ void TypeTable::Spell(std::ostream& out, TypeId id) const
     return;
   case TYPE_ENUM:
     out << (node.scoped ? "enum class " : "enum ") << node.name;
+    return;
+  case TYPE_MEMBER_POINTER:
+    out << "member-pointer of ";
+    Spell(out, node.member_class);
+    out << " to ";
+    Spell(out, node.base);
     return;
   case TYPE_INVALID:
     break;
@@ -610,6 +651,7 @@ std::size_t TypeTable::SizeOf(TypeId id) const
   case TYPE_CV: case TYPE_REFERENCE: case TYPE_ENUM:
     return SizeOf(node.base);
   case TYPE_POINTER:
+  case TYPE_MEMBER_POINTER:
     return 8;
   case TYPE_ARRAY:
     return SizeOf(node.base) * node.array_bound;

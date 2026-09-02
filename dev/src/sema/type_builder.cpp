@@ -14,7 +14,7 @@ ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens,
       const_eval_(tokens, arena, model, *this), tree_(0), expression_(0),
       semantic_root_(0),
       pending_array_bound_(0), unnamed_local_enum_counter_(0),
-      unnamed_local_class_counter_(0)
+      unnamed_local_class_counter_(0), suppress_semantics_(false)
 {
 }
 
@@ -25,7 +25,7 @@ ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens,
       const_eval_(tokens, arena, model, *this), tree_(&tree), expression_(0),
       semantic_root_(0),
       pending_array_bound_(0), unnamed_local_enum_counter_(0),
-      unnamed_local_class_counter_(0)
+      unnamed_local_class_counter_(0), suppress_semantics_(false)
 {
   expression_ = new ExpressionAnalyzer(tokens_, arena_, model_, tree,
                                         *this);
@@ -327,6 +327,7 @@ TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
     return base;
   const AstNode& node = arena_.At(declarator);
   vector<AstId> prefix;
+  vector<AstId> member_prefix;
   vector<AstId> suffix;
   AstId nested = 0;
   bool seen_direct = false;
@@ -340,20 +341,77 @@ TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
       if (kind == AST_NESTED_DECLARATOR)
         nested = child;
     }
-    else if (!seen_direct &&
-             (kind == AST_PTR_OPERATOR || kind == AST_CV_QUALIFIER))
+    else if (!seen_direct && kind == AST_PTR_OPERATOR)
+    {
+      bool member_operator = false;
+      for (std::size_t token = arena_.At(child).first;
+           token < arena_.At(child).last && token < tokens_.size(); ++token)
+        if (tokens_[token].IsSimple(OP_COLON2))
+        {
+          member_operator = true;
+          break;
+        }
+      (member_operator ? member_prefix : prefix).push_back(child);
+    }
+    else if (!seen_direct && kind == AST_CV_QUALIFIER)
       prefix.push_back(child);
     else if (kind != AST_PARAMETER_PACK)
       suffix.push_back(child);
   }
   const TypeId declared = ApplySuffix(ApplyPrefix(base, prefix), suffix,
                                       lookup_scope, parameter_context);
+  TypeId result = declared;
+  bool nested_function_const = false;
+  for (std::size_t i = 0; i < suffix.size(); ++i)
+  {
+    const AstNode& node = arena_.At(suffix[i]);
+    if (node.kind == AST_CV_QUALIFIER && node.first < tokens_.size() &&
+        tokens_[node.first].IsSimple(KW_CONST))
+      nested_function_const = true;
+  }
+  if (nested != 0 && nested_function_const &&
+      types_.Kind(types_.Unqualified(result)) == TYPE_FUNCTION)
+  {
+    const TypeNode& function = types_.At(types_.Unqualified(result));
+    result = types_.Function(function.result, function.parameters,
+                             function.variadic, true);
+  }
+  for (std::size_t i = member_prefix.size(); i != 0; --i)
+  {
+    const AstId pointer = member_prefix[i - 1];
+    const AstNode& pointer_node = arena_.At(pointer);
+    std::size_t star = pointer_node.last;
+    while (star != pointer_node.first)
+    {
+      --star;
+      if (tokens_[star].IsSimple(OP_STAR))
+        break;
+    }
+    if (star == pointer_node.first)
+      throw std::runtime_error("invalid pointer-to-member operator");
+    std::size_t class_last = star;
+    if (class_last != pointer_node.first &&
+        tokens_[class_last - 1].IsSimple(OP_COLON2))
+      --class_last;
+    const QualifiedName class_name = ReadQualifiedName(
+        tokens_, pointer_node.first, class_last);
+    const TypeId class_type = LookupType(lookup_scope, class_name);
+    bool member_const = false;
+    for (std::size_t i = 0; i < suffix.size(); ++i)
+    {
+      const AstNode& node = arena_.At(suffix[i]);
+      if (node.kind == AST_CV_QUALIFIER && node.first < tokens_.size() &&
+          tokens_[node.first].IsSimple(KW_CONST))
+        member_const = true;
+    }
+    result = types_.MemberPointer(class_type, result, member_const);
+  }
   if (nested == 0)
-    return declared;
+    return result;
   const AstNode& inner = arena_.At(nested);
   if (inner.children.size() != 1)
     throw std::runtime_error("invalid nested declarator");
-  return BuildDeclaratorType(inner.children[0], declared, lookup_scope,
+  return BuildDeclaratorType(inner.children[0], result, lookup_scope,
                              false);
 }
 

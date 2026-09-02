@@ -65,6 +65,7 @@ struct Binding
   ScopeId scope; // owning declaration scope
   ScopeId namespace_scope; // BINDING_NAMESPACE: the nominated namespace
   FunctionEntityId function; // BINDING_FUNCTION: canonical function entity
+  BindingId object_binding; // injected member: implicit anonymous-union object
   bool has_const_value;
   long long const_value;
 
@@ -99,6 +100,10 @@ struct Scope
 struct ClassEntity
 {
   ScopeId class_scope; // 0 until defined
+  TypeId type; // canonical class type, 0 until declared
+  FunctionEntityId default_constructor; // synthesized on first default-init
+  BindingId anonymous_storage; // bare anonymous union's synthesized object
+  std::vector<BindingId> injected_members; // bindings injected into its scope
   bool is_union;
   bool defined;
 
@@ -122,6 +127,14 @@ struct FunctionEntity
   ScopeId scope; // declaration scope, not the function body's block scope
   std::string name;
   TypeId type; // canonical function type with adjusted parameters
+  TypeId member_type; // member signature without the implicit this parameter
+  TypeId member_pointer_type; // address-of type for a member function
+  ClassEntityId member_class;
+  bool is_member;
+  bool member_const;
+  bool is_constructor;
+  bool is_template;
+  std::vector<std::string> template_parameters;
   bool defined;
 
   FunctionEntity();
@@ -180,6 +193,7 @@ public:
   ClassEntityId CreateClass(bool is_union);
   ClassEntity& ClassAt(ClassEntityId id);
   const ClassEntity& ClassAt(ClassEntityId id) const;
+  bool ClassForScope(ScopeId scope, ClassEntityId& entity) const;
   EnumEntityId CreateEnum(bool scoped, TypeId underlying);
   EnumEntity& EnumAt(EnumEntityId id);
   const EnumEntity& EnumAt(EnumEntityId id) const;

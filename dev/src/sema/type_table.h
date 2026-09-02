@@ -29,7 +29,8 @@ enum TypeKind
   TYPE_FUNCTION,
   TYPE_CLASS,
   TYPE_ENUM,
-  TYPE_TEMPLATE_PARAM
+  TYPE_TEMPLATE_PARAM,
+  TYPE_MEMBER_POINTER
 };
 
 // Keyword spelled before a named type: the class-key of a class type or the
@@ -56,9 +57,11 @@ struct TypeNode
   bool is_volatile;
   bool lvalue_reference;
   bool variadic;
+  bool function_const;            // TYPE_FUNCTION: member-function cv
   bool scoped;                    // TYPE_ENUM
   TypeKeyword keyword;            // TYPE_CLASS, TYPE_TEMPLATE_PARAM
   EntityId entity;                // TYPE_CLASS, TYPE_ENUM
+  TypeId member_class;             // TYPE_MEMBER_POINTER
   std::string name;               // declared spelling of a named type
 
   TypeNode();
@@ -86,11 +89,13 @@ public:
   TypeId Reference(TypeId base, bool lvalue = true);
   TypeId Array(TypeId element, std::size_t bound);
   TypeId Function(TypeId result, const std::vector<TypeId>& parameters,
-                  bool variadic = false);
+                  bool variadic = false, bool function_const = false);
   TypeId Class(EntityId entity, TypeKeyword key, const std::string& name);
   TypeId Enum(EntityId entity, bool scoped, TypeId underlying,
               const std::string& name);
   TypeId TemplateParam(TypeKeyword key, const std::string& name);
+  TypeId MemberPointer(TypeId member_class, TypeId member,
+                       bool member_const = false);
 
   const TypeNode& At(TypeId id) const;
   TypeKind Kind(TypeId id) const;
@@ -119,6 +124,7 @@ private:
   {
     TypeId result;
     bool variadic;
+    bool function_const;
     std::vector<TypeId> parameters;
     bool operator<(const FunctionKey& other) const;
   };
@@ -134,4 +140,5 @@ private:
   std::map<FunctionKey, TypeId> functions_;
   std::map<std::pair<EntityId, std::pair<TypeKeyword, std::string> >, TypeId>
       class_types_;
+  std::map<std::pair<TypeId, TypeId>, TypeId> member_pointers_;
 };

@@ -153,6 +153,7 @@ SemaId ExpressionAnalyzer::AnalyzeNode(AstId expression, ScopeId scope)
     return AnalyzeName(expression, scope);
   case AST_UNARY_EXPRESSION: return AnalyzeUnary(expression, scope);
   case AST_POSTFIX_EXPRESSION: return AnalyzePostfix(expression, scope);
+  case AST_MEMBER_EXPRESSION: return AnalyzeMember(expression, scope);
   case AST_BINARY_EXPRESSION: return AnalyzeBinary(expression, scope);
   case AST_ASSIGNMENT_EXPRESSION: return AnalyzeAssignment(expression, scope);
   case AST_CONDITIONAL_EXPRESSION: return AnalyzeConditional(expression, scope);
@@ -241,9 +242,7 @@ SemaId ExpressionAnalyzer::AnalyzeName(AstId expression, ScopeId scope)
   const AstNode& ast = arena_.At(expression);
   const QualifiedName name = ReadQualifiedName(tokens_, ast.first, ast.last);
   vector<BindingId> candidates;
-  model_.LookupSet(scope, name.Joined(), LOOKUP_ANY, candidates);
-  if (name.Qualified())
-    model_.LookupQualifiedSet(scope, name, LOOKUP_ANY, candidates);
+  LookupNameBindings(name, ast.first, ast.last, scope, candidates);
   if (candidates.empty())
     throw std::runtime_error("unknown name in expression");
 
@@ -291,6 +290,195 @@ SemaId ExpressionAnalyzer::AnalyzeName(AstId expression, ScopeId scope)
   node.binding = binding;
   node.has_value = value.has_const_value;
   node.value = value.const_value;
+  if (value.object_binding != 0)
+  {
+    node.kind = SEMA_MEMBER;
+    node.expression_name = name.Last();
+    const Binding& object = model_.BindingAt(value.object_binding);
+    const SemaId object_node = tree_.Make(SEMA_ID_EXPRESSION);
+    SemaNode& object_semantic = tree_.At(object_node);
+    object_semantic.category = VC_LVALUE;
+    object_semantic.type = object.type;
+    object_semantic.binding = value.object_binding;
+    object_semantic.scope = scope;
+    object_semantic.expression_name = object.name;
+    tree_.Append(result, object_node);
+  }
+  return result;
+}
+
+void ExpressionAnalyzer::LookupNameBindings(const QualifiedName& name,
+                                            size_t first, size_t last,
+                                            ScopeId scope,
+                                            vector<BindingId>& bindings)
+{
+  QualifiedName lookup = name;
+  const std::string spelling = name.Last();
+  const std::string::size_type template_start = spelling.find('<');
+  const bool template_id = template_start != std::string::npos;
+  if (template_id)
+    lookup.components.back() = spelling.substr(0, template_start);
+
+  if (lookup.Qualified())
+    model_.LookupQualifiedSet(scope, lookup, LOOKUP_ANY, bindings);
+  else
+    model_.LookupSet(scope, lookup.Last(), LOOKUP_ANY, bindings);
+  if (!template_id)
+    return;
+
+  vector<TypeId> arguments;
+  if (!TemplateArgumentTypes(first, last, scope, arguments))
+  {
+    bindings.clear();
+    return;
+  }
+  const vector<BindingId> templates = bindings;
+  bindings.clear();
+  for (size_t i = 0; i < templates.size(); ++i)
+  {
+    const Binding& candidate = model_.BindingAt(templates[i]);
+    if (candidate.kind != BINDING_FUNCTION || candidate.function == 0 ||
+        !model_.FunctionAt(candidate.function).is_template)
+      continue;
+    FunctionEntityId function = 0;
+    BindingId binding = 0;
+    if (builder_.InstantiateFunctionTemplate(candidate.function, arguments,
+                                             function, binding))
+      bindings.push_back(binding);
+  }
+}
+
+bool ExpressionAnalyzer::TemplateArgumentTypes(
+    size_t first, size_t last, ScopeId scope, vector<TypeId>& arguments) const
+{
+  arguments.clear();
+  if (first >= last)
+    return false;
+  size_t open = last;
+  for (size_t i = first; i < last && i < tokens_.size(); ++i)
+    if (tokens_[i].IsSimple(OP_LT))
+    {
+      open = i;
+      break;
+    }
+  if (open == last)
+    return false;
+
+  vector<std::pair<size_t, size_t> > spans;
+  size_t start = open + 1;
+  size_t depth = 0;
+  size_t close = last;
+  for (size_t i = start; i < last && i < tokens_.size(); ++i)
+  {
+    const Pa6Token& token = tokens_[i];
+    if (token.IsSimple(OP_LT))
+      ++depth;
+    else if (token.IsSimple(OP_GT) || token.IsRshiftPart())
+    {
+      if (depth == 0)
+      {
+        close = i;
+        if (i > start)
+          spans.push_back(std::make_pair(start, i));
+        break;
+      }
+      --depth;
+    }
+    else if (token.IsSimple(OP_COMMA) && depth == 0)
+    {
+      if (i == start)
+        return false;
+      spans.push_back(std::make_pair(start, i));
+      start = i + 1;
+    }
+  }
+  if (close == last || depth != 0)
+    return false;
+
+  for (size_t i = 0; i < spans.size(); ++i)
+  {
+    const size_t first = spans[i].first;
+    const size_t last = spans[i].second;
+    if (first >= last)
+      return false;
+    vector<ETokenType> fundamental;
+    bool all_fundamental = true;
+    for (size_t token = first; token < last; ++token)
+    {
+      if (tokens_[token].kind != PA6_SIMPLE_TOKEN ||
+          !IsFundamentalTypeKeyword(tokens_[token].simple_type))
+      {
+        all_fundamental = false;
+        break;
+      }
+      fundamental.push_back(tokens_[token].simple_type);
+    }
+    if (all_fundamental && !fundamental.empty())
+      arguments.push_back(types_.FundamentalFromKeywords(fundamental));
+    else
+    {
+      const QualifiedName type_name = ReadQualifiedName(tokens_, first, last);
+      arguments.push_back(builder_.TypeForName(type_name, scope));
+    }
+  }
+  return true;
+}
+
+SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
+{
+  if (arena_.At(expression).children.size() != 2)
+    throw std::runtime_error("invalid member expression");
+  const SemaId object = Analyze(Child(expression, 0), scope);
+  const TypeId raw_object_type = NodeInfo(object).type;
+  TypeId object_type = raw_object_type;
+  if (types_.Kind(object_type) == TYPE_REFERENCE)
+    object_type = types_.Referent(object_type);
+  bool object_const = false;
+  bool object_volatile = false;
+  if (types_.Kind(object_type) == TYPE_CV)
+  {
+    object_const = types_.At(object_type).is_const;
+    object_volatile = types_.At(object_type).is_volatile;
+  }
+
+  const ETokenType op = Operator(expression);
+  TypeId class_type = types_.Unqualified(object_type);
+  if (op == OP_ARROW)
+  {
+    if (!types_.IsPointer(object_type))
+      throw std::runtime_error("arrow requires a pointer to class");
+    const TypeId pointee = types_.At(types_.Unqualified(object_type)).base;
+    object_const = object_const ||
+        (types_.Kind(pointee) == TYPE_CV && types_.At(pointee).is_const);
+    object_volatile = object_volatile ||
+        (types_.Kind(pointee) == TYPE_CV && types_.At(pointee).is_volatile);
+    class_type = types_.Unqualified(pointee);
+  }
+  if (types_.Kind(class_type) != TYPE_CLASS)
+    throw std::runtime_error("member access requires a class object");
+  ScopeId class_scope = 0;
+  if (!model_.ScopeOfType(class_type, class_scope))
+    throw std::runtime_error("member access names an incomplete class");
+  const AstId member_name = Child(expression, 1);
+  const QualifiedName name = ReadQualifiedName(
+      tokens_, arena_.At(member_name).first, arena_.At(member_name).last);
+  if (name.Qualified())
+    throw std::runtime_error("member access has a qualified member name");
+  const BindingId binding = model_.DirectBinding(
+      class_scope, name.Last(), LOOKUP_ANY);
+  if (binding == 0)
+    throw std::runtime_error("unknown class member");
+  const Binding& member = model_.BindingAt(binding);
+  TypeId type = member.type;
+  if (object_const || object_volatile)
+    type = types_.Cv(type, object_const, object_volatile);
+  const SemaId result = MakeExpression(SEMA_MEMBER, expression, type,
+                                       VC_LVALUE, scope, op);
+  SemaNode& semantic = tree_.At(result);
+  semantic.binding = binding;
+  semantic.first = arena_.At(member_name).first;
+  semantic.last = arena_.At(member_name).last;
+  Append(result, object);
   return result;
 }
 
@@ -322,8 +510,13 @@ SemaId ExpressionAnalyzer::AnalyzeUnary(AstId expression, ScopeId scope)
   case OP_AMP:
     if (info.category != VC_LVALUE && !info.is_function_lvalue)
       throw std::runtime_error("address-of requires an lvalue");
-    result_type = types_.Pointer(types_.Kind(info.type) == TYPE_REFERENCE ?
-        types_.Referent(info.type) : info.type);
+    if (info.is_function_lvalue && tree_.At(operand).function != 0 &&
+        model_.FunctionAt(tree_.At(operand).function).is_member)
+      result_type = model_.FunctionAt(tree_.At(operand).function).
+          member_pointer_type;
+    else
+      result_type = types_.Pointer(types_.Kind(info.type) == TYPE_REFERENCE ?
+          types_.Referent(info.type) : info.type);
     break;
   case OP_STAR:
   {
@@ -402,10 +595,7 @@ bool ExpressionAnalyzer::RetargetFunctionName(SemaId expression,
   const QualifiedName name = ReadQualifiedName(tokens_, source.first,
                                                source.last);
   vector<BindingId> bindings;
-  if (name.Qualified())
-    model_.LookupQualifiedSet(source.scope, name, LOOKUP_ANY, bindings);
-  else
-    model_.LookupSet(source.scope, name.Last(), LOOKUP_ANY, bindings);
+  LookupNameBindings(name, source.first, source.last, source.scope, bindings);
   BindingId binding = 0;
   FunctionEntityId function = 0;
   if (!SelectTargetFunction(model_, types_, bindings, target, binding,
@@ -415,6 +605,26 @@ bool ExpressionAnalyzer::RetargetFunctionName(SemaId expression,
   retargeted.binding = binding;
   retargeted.function = function;
   retargeted.type = model_.FunctionAt(function).type;
+  builder_.MarkTemplateInstanceUsed(function);
+  return true;
+}
+
+bool ExpressionAnalyzer::RetargetFunctionAddress(SemaId expression,
+                                                  TypeId target)
+{
+  if (expression == 0 || tree_.At(expression).kind != SEMA_UNARY ||
+      tree_.At(expression).op != OP_AMP ||
+      tree_.At(expression).first_child == 0)
+    return false;
+  const SemaId name_node = tree_.At(expression).first_child;
+  if (tree_.At(name_node).kind != SEMA_ID_EXPRESSION)
+    return false;
+  if (!RetargetFunctionName(name_node, target))
+    return false;
+  const FunctionEntityId function = tree_.At(name_node).function;
+  const FunctionEntity& entity = model_.FunctionAt(function);
+  tree_.At(expression).type = entity.is_member ? entity.member_pointer_type :
+      types_.Pointer(entity.type);
   return true;
 }
 
@@ -703,6 +913,9 @@ SemaId ExpressionAnalyzer::AnalyzeCast(AstId expression, ScopeId scope)
     throw std::runtime_error("invalid cast expression");
   const TypeId target = builder_.TypeIdForSemantics(Child(expression, 0), scope);
   const SemaId operand = Analyze(Child(expression, 1), scope);
+  if (types_.Kind(types_.Unqualified(target)) == TYPE_POINTER ||
+      types_.Kind(types_.Unqualified(target)) == TYPE_MEMBER_POINTER)
+    (void)RetargetFunctionAddress(operand, target);
   if (types_.Kind(target) == TYPE_REFERENCE)
   {
     const Info source = NodeInfo(operand);
@@ -719,12 +932,16 @@ SemaId ExpressionAnalyzer::AnalyzeCast(AstId expression, ScopeId scope)
   }
   if (types_.Kind(types_.Unqualified(target)) != TYPE_FUNDAMENTAL &&
       types_.Kind(types_.Unqualified(target)) != TYPE_ENUM &&
-      !types_.IsPointer(target))
+      !types_.IsPointer(target) &&
+      types_.Kind(types_.Unqualified(target)) != TYPE_MEMBER_POINTER)
     throw std::runtime_error("unsupported cast target");
   if (!types_.IsScalar(target) &&
       !(types_.Kind(types_.Unqualified(target)) == TYPE_FUNDAMENTAL &&
         types_.At(types_.Unqualified(target)).fundamental == FT_VOID))
     throw std::runtime_error("unsupported cast target");
+  if (types_.Kind(types_.Unqualified(target)) == TYPE_MEMBER_POINTER &&
+      types_.Unqualified(tree_.At(operand).type) == types_.Unqualified(target))
+    return operand;
   const SemaId result = MakeExpression(SEMA_CAST, expression, target,
                                        VC_PRVALUE, scope, Operator(expression));
   Append(result, operand);
@@ -840,10 +1057,8 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
   if (named_callee)
   {
     name = ReadQualifiedName(tokens_, callee_node.first, callee_node.last);
-    if (name.Qualified())
-      model_.LookupQualifiedSet(scope, name, LOOKUP_ANY, bindings);
-    else
-      model_.LookupSet(scope, name.Last(), LOOKUP_ANY, bindings);
+    LookupNameBindings(name, callee_node.first, callee_node.last, scope,
+                       bindings);
   }
 
   // Analyze arguments before selecting a candidate so every source
@@ -891,6 +1106,36 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
     overload_arguments.push_back(overload_argument);
   }
 
+  // Template candidates are instantiated from the already-typed arguments
+  // before ordinary overload ranking.  This keeps deduction in the semantic
+  // owner of template entities and gives SelectBestOverload only canonical
+  // concrete function types to compare.
+  if (named_callee)
+  {
+    vector<BindingId> resolved;
+    for (size_t i = 0; i < bindings.size(); ++i)
+    {
+      const Binding& candidate = model_.BindingAt(bindings[i]);
+      if (candidate.kind != BINDING_FUNCTION || candidate.function == 0 ||
+          !model_.FunctionAt(candidate.function).is_template)
+      {
+        resolved.push_back(bindings[i]);
+        continue;
+      }
+      vector<TypeId> argument_types;
+      argument_types.reserve(overload_arguments.size());
+      for (size_t argument = 0; argument < overload_arguments.size();
+           ++argument)
+        argument_types.push_back(overload_arguments[argument].type);
+      FunctionEntityId function = 0;
+      BindingId binding = 0;
+      if (builder_.DeduceFunctionTemplate(candidate.function, argument_types,
+                                          function, binding))
+        resolved.push_back(binding);
+    }
+    bindings.swap(resolved);
+  }
+
   FunctionEntityId function = 0;
   TypeId function_type = 0;
   SemaId indirect_callee = 0;
@@ -909,6 +1154,7 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
       throw std::runtime_error("no unique viable function overload");
     function = selection.function;
     function_type = model_.FunctionAt(function).type;
+    builder_.MarkTemplateInstanceUsed(function);
   }
   else if (named_callee && bindings.empty() && name.components.size() == 1 &&
            !name.global && name.Last() == "__builtin_abort")

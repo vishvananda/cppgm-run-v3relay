@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <vector>
 
 #include "posttoken_types.h"
@@ -69,6 +70,8 @@ struct SemaNode
   ValueCategory category;
   TypeId type;
   ETokenType op;
+  std::string operator_spelling; // synthesized operators have no source token
+  std::string expression_name; // synthesized names have no source token span
   BindingId binding;
   FunctionEntityId function;
   ScopeId scope;

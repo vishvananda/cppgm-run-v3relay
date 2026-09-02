@@ -45,6 +45,20 @@ public:
   bool IsSemantic() const { return tree_ != 0; }
   SemaTree* SemanticTree() const { return tree_; }
 
+  // Template entities are owned by the scope builder until a use supplies
+  // concrete arguments.  Instances are interned here so overload resolution
+  // and the deferred semantic dump observe the same function entity.
+  bool InstantiateFunctionTemplate(FunctionEntityId template_function,
+                                   const std::vector<TypeId>& arguments,
+                                   FunctionEntityId& function,
+                                   BindingId& binding);
+  void MarkTemplateInstanceUsed(FunctionEntityId function);
+  bool DeduceFunctionTemplate(FunctionEntityId template_function,
+                              const std::vector<TypeId>& arguments,
+                              FunctionEntityId& function,
+                              BindingId& binding);
+  TypeId TypeForName(const QualifiedName& name, ScopeId scope) const;
+
 private:
   struct ParameterInfo
   {
@@ -125,6 +139,16 @@ private:
   void BindEnumerators(const std::vector<AstId>& enumerators, ScopeId scope,
                        TypeId type);
   std::string AnonymousTypeName(AstId node, const char* kind) const;
+  bool HasConstFunctionQualifier(AstId declarator) const;
+  FunctionEntityId EnsureDefaultConstructor(TypeId type);
+  void AddConstructorAction(SemaId variable, ScopeId scope, TypeId type,
+                            BindingId binding, AstId declarator,
+                            const std::string& object_name = std::string());
+  void BuildAnonymousUnionStorage(AstId node, ScopeId scope,
+                                  SemaId semantic_parent, TypeId type);
+  void EmitDeferredSemantics();
+  void EmitTemplateInstances();
+  void DeferSemantic(SemaId node);
 
   // Types (type_builder.cpp).
   TypeId BuildSpecifierType(AstId specifier_sequence, ScopeId lookup_scope,
@@ -173,7 +197,17 @@ private:
   void MapSemanticScope(ScopeId scope, SemaId node);
   FunctionEntityId DeclareFunction(ScopeId scope, const std::string& name,
                                    TypeId declared_type, bool definition,
-                                   BindingId& binding);
+                                   BindingId& binding,
+                                   bool member_const = false);
+  SemaId MakeDetachedSemantic(SemaKind kind, ScopeId scope, TypeId type,
+                              BindingId binding, FunctionEntityId function);
+  TypeId SubstituteTemplateType(TypeId type,
+                                const std::map<std::string, TypeId>& values);
+  bool DeduceTemplateType(TypeId pattern, TypeId argument,
+                          std::map<std::string, TypeId>& values) const;
+  bool BuildTemplateInstance(FunctionEntityId template_function,
+                             const std::map<std::string, TypeId>& values,
+                             FunctionEntityId& function, BindingId& binding);
   bool HasIncompleteArray(AstId declarator) const;
   std::size_t InitializerBound(AstId initializer) const;
 
@@ -189,4 +223,24 @@ private:
   std::size_t pending_array_bound_;
   unsigned unnamed_local_enum_counter_;
   unsigned unnamed_local_class_counter_;
+  bool suppress_semantics_;
+  std::vector<SemaId> deferred_semantics_;
+  struct DeferredTemplateInstance
+  {
+    FunctionEntityId template_function;
+    std::vector<TypeId> arguments;
+    FunctionEntityId function;
+    BindingId binding;
+    bool used;
+
+    DeferredTemplateInstance(FunctionEntityId template_function = 0,
+                             const std::vector<TypeId>& arguments =
+                                 std::vector<TypeId>(),
+                             FunctionEntityId function = 0,
+                             BindingId binding = 0,
+                             bool used = false)
+        : template_function(template_function), arguments(arguments),
+          function(function), binding(binding), used(used) {}
+  };
+  std::vector<DeferredTemplateInstance> deferred_template_instances_;
 };
