@@ -334,11 +334,20 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     BindingId binding = 0;
     if (is_function)
     {
+      vector<ParameterInfo> parameters;
+      bool variadic = false;
+      const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
+      if (clause != 0)
+        BuildParameters(clause, target_scope, parameters, variadic);
+      vector<AstId> default_arguments;
+      for (std::size_t parameter = 0; parameter < parameters.size();
+           ++parameter)
+        default_arguments.push_back(parameters[parameter].default_initializer);
       const FunctionEntityId function = DeclareFunction(
           target_scope, name, type, false, binding,
           HasConstFunctionQualifier(declarator),
           SequenceHasKeyword(specifiers, KW_STATIC),
-          HasNoexceptQualifier(declarator));
+          HasNoexceptQualifier(declarator), default_arguments);
       ClassEntityId member_class = 0;
       const bool is_member = model_.ClassForScope(target_scope, member_class);
       if (EmitsSemantics() && !is_member)
@@ -435,11 +444,19 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   if (types_.Kind(type) != TYPE_FUNCTION)
     throw std::runtime_error("function definition is not a function");
   BindingId binding = 0;
+  vector<ParameterInfo> parameters;
+  bool variadic = false;
+  const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
+  if (clause != 0)
+    BuildParameters(clause, target_scope, parameters, variadic);
+  vector<AstId> default_arguments;
+  for (std::size_t parameter = 0; parameter < parameters.size(); ++parameter)
+    default_arguments.push_back(parameters[parameter].default_initializer);
   const FunctionEntityId function = DeclareFunction(
       target_scope, name, type, true, binding,
       HasConstFunctionQualifier(declarator),
       SequenceHasKeyword(specifiers, KW_STATIC),
-      HasNoexceptQualifier(declarator));
+      HasNoexceptQualifier(declarator), default_arguments);
   ClassEntityId member_class = 0;
   const bool is_member = model_.ClassForScope(target_scope, member_class);
   SemaId function_node = 0;
@@ -478,12 +495,8 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
     tree_->Append(function_node, this_parameter);
   }
 
-  const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
   if (clause != 0)
   {
-    vector<ParameterInfo> parameters;
-    bool variadic = false;
-    BuildParameters(clause, target_scope, parameters, variadic);
     for (std::size_t i = 0; i < parameters.size(); ++i)
     {
       const BindingId parameter = model_.AddBinding(
@@ -502,7 +515,14 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
       }
     }
   }
+  labels_.clear();
+  gotos_.clear();
   (void)BuildCompound(body, function_scope, function, 0, 0, function_node);
+  for (std::size_t i = 0; i < gotos_.size(); ++i)
+    if (labels_.find(gotos_[i]) == labels_.end())
+      throw std::runtime_error("goto target does not name a label");
+  labels_.clear();
+  gotos_.clear();
 }
 
 long long ScopeBuilder::ConstantValue(AstId expression, ScopeId scope)
@@ -891,6 +911,18 @@ QualifiedName ScopeBuilder::NodeName(AstId node) const
   if (node == 0)
     return QualifiedName();
   const AstNode& value = arena_.At(node);
+  // Operator function identifiers are represented by a single AST span
+  // beginning at `operator`, while qualified-name parsing expects ordinary
+  // identifier components.  Preserve the parser's canonical spelling here
+  // so declarations such as `operator delete(void*, void*)` enter the same
+  // function entity path as every other unqualified declaration.
+  if (value.first < value.last && value.first < tokens_.size() &&
+      tokens_[value.first].IsSimple(KW_OPERATOR))
+  {
+    QualifiedName result;
+    result.components.push_back(value.text);
+    return result;
+  }
   return ReadQualifiedName(tokens_, value.first, value.last);
 }
 
@@ -1454,7 +1486,9 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
                                                BindingId& binding,
                                                bool member_const,
                                                bool internal_linkage,
-                                               bool noexcept_qualifier)
+                                               bool noexcept_qualifier,
+                                               const vector<AstId>&
+                                                   default_arguments)
 {
   const TypeId unqualified = types_.Unqualified(declared_type);
   if (types_.Kind(unqualified) != TYPE_FUNCTION)
@@ -1484,6 +1518,9 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
   const TypeId canonical = types_.Function(declared.result,
                                            canonical_parameters,
                                            declared.variadic);
+  vector<AstId> canonical_defaults = default_arguments;
+  if (is_member)
+    canonical_defaults.insert(canonical_defaults.begin(), 0);
 
   // 13.1/3.3.10: a prior declaration of the name in this scope with the
   // same canonical signature declares the same function.
@@ -1527,6 +1564,12 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
       entity.c_linkage = entity.c_linkage || c_linkage_depth_ != 0;
       entity.noexcept_qualifier = entity.noexcept_qualifier ||
           noexcept_qualifier;
+      if (entity.default_arguments.size() < canonical_parameters.size())
+        entity.default_arguments.resize(canonical_parameters.size(), 0);
+      for (std::size_t i = 0; i < canonical_defaults.size() &&
+           i < entity.default_arguments.size(); ++i)
+        if (canonical_defaults[i] != 0)
+          entity.default_arguments[i] = canonical_defaults[i];
       binding = model_.AddBinding(scope, name, BINDING_FUNCTION,
                                   declared_type);
       model_.BindingAt(binding).function = prior.function;
@@ -1552,6 +1595,7 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     entity.member_const = member_const;
   }
   model_.FunctionAt(function).noexcept_qualifier = noexcept_qualifier;
+  model_.FunctionAt(function).default_arguments = canonical_defaults;
   binding = model_.AddBinding(scope, name, BINDING_FUNCTION, declared_type);
   model_.BindingAt(binding).function = function;
   model_.BindingAt(binding).internal_linkage = internal_linkage;

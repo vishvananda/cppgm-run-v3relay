@@ -16,7 +16,7 @@ namespace
 bool IsConstObject(const TypeTable& types, TypeId type)
 {
   return type != 0 && types.Kind(type) == TYPE_CV &&
-      (types.At(type).is_const || types.At(type).is_volatile);
+      types.At(type).is_const;
 }
 
 bool IsScopedEnum(const TypeTable& types, TypeId type)
@@ -773,11 +773,14 @@ SemaId ExpressionAnalyzer::AnalyzeAssignment(AstId expression, ScopeId scope)
     throw std::runtime_error("invalid assignment expression");
   const ETokenType op = Operator(expression);
   const SemaId left = Analyze(Child(expression, 0), scope);
-  const SemaId right = Analyze(Child(expression, 1), scope);
   const Info lhs = NodeInfo(left);
-  const Info rhs = NodeInfo(right);
   const TypeId lhs_value = types_.Kind(lhs.type) == TYPE_REFERENCE ?
       types_.Referent(lhs.type) : lhs.type;
+  const AstId right_ast = Child(expression, 1);
+  const SemaId right = arena_.At(right_ast).kind == AST_BRACED_INIT_LIST ?
+      AnalyzeBraced(right_ast, scope, lhs_value) :
+      Analyze(right_ast, scope);
+  const Info rhs = NodeInfo(right);
   if (!IsModifiableLvalue(left))
     throw std::runtime_error("assignment requires a modifiable lvalue");
   if (op == OP_ASS)
@@ -944,6 +947,22 @@ bool ExpressionAnalyzer::IsFundamentalCastCallee(AstId callee) const
        token.IsSimple(KW_DECLTYPE));
 }
 
+void ExpressionAnalyzer::AppendDefaultArguments(
+    FunctionEntityId function, TypeId function_type, std::size_t supplied,
+    vector<SemaId>& arguments)
+{
+  const FunctionEntity& entity = model_.FunctionAt(function);
+  const TypeNode& callable = types_.At(types_.Unqualified(function_type));
+  for (size_t i = supplied; i < callable.parameters.size(); ++i)
+  {
+    if (i >= entity.default_arguments.size() ||
+        entity.default_arguments[i] == 0)
+      throw std::runtime_error("missing default argument");
+    arguments.push_back(AnalyzeInitializer(
+        entity.default_arguments[i], entity.scope, callable.parameters[i]));
+  }
+}
+
 SemaId ExpressionAnalyzer::AnalyzeCast(AstId expression, ScopeId scope)
 {
   if (arena_.At(expression).children.size() != 2)
@@ -1060,9 +1079,16 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
     }
     const SemaId operand = Analyze(args[0], scope);
     const Info source = NodeInfo(operand);
-    if (!Classify(types_, source.type, source.category,
-                  IsNullPointerConstant(operand),
-                  source.is_function_lvalue, target).Viable())
+    const bool implicit_viable = Classify(
+        types_, source.type, source.category,
+        IsNullPointerConstant(operand), source.is_function_lvalue,
+        target).Viable();
+    // Functional casts are explicit conversions.  In particular, a scoped
+    // enumeration may be converted to its arithmetic destination here even
+    // though the same source-to-int path is not an implicit conversion.
+    const bool explicit_enum = IsScopedEnum(types_, source.type) &&
+        types_.IsArithmetic(target);
+    if (!implicit_viable && !explicit_enum)
       throw std::runtime_error("functional cast is not viable");
     const SemaId result = MakeExpression(SEMA_CAST, expression, target,
                                          VC_PRVALUE, scope);
@@ -1184,12 +1210,23 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
   }
 
   const TypeNode& callable = types_.At(types_.Unqualified(function_type));
-  if ((!callable.variadic && callable.parameters.size() != args.size()) ||
-      (callable.variadic && args.size() < callable.parameters.size()))
+  if (function != 0)
+  {
+    const FunctionEntity& entity = model_.FunctionAt(function);
+    std::size_t required = callable.parameters.size();
+    while (required > 0 && required <= entity.default_arguments.size() &&
+           entity.default_arguments[required - 1] != 0)
+      --required;
+    if (args.size() < required ||
+        (!callable.variadic && args.size() > callable.parameters.size()))
+      throw std::runtime_error("wrong number of call arguments");
+  }
+  else if ((!callable.variadic && callable.parameters.size() != args.size()) ||
+           (callable.variadic && args.size() < callable.parameters.size()))
     throw std::runtime_error("wrong number of call arguments");
 
   vector<SemaId> converted_arguments;
-  converted_arguments.reserve(analyzed_arguments.size());
+  converted_arguments.reserve(callable.parameters.size());
   for (size_t i = 0; i < analyzed_arguments.size(); ++i)
   {
     SemaId argument = analyzed_arguments[i];
@@ -1197,6 +1234,9 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
       argument = Initialize(argument, callable.parameters[i]);
     converted_arguments.push_back(argument);
   }
+  if (function != 0)
+    AppendDefaultArguments(function, function_type, analyzed_arguments.size(),
+                           converted_arguments);
 
   const TypeId result_type = callable.result;
   ValueCategory result_category = VC_PRVALUE;
@@ -1228,13 +1268,22 @@ SemaId ExpressionAnalyzer::AnalyzeBraced(AstId expression, ScopeId scope,
   if (target == 0)
     throw std::runtime_error("braced initializer requires an array target");
   if (types_.Kind(target) != TYPE_ARRAY) {
-    if (children.empty())
-      return MakeExpression(SEMA_BRACED_INIT_LIST, expression, target,
-                            VC_PRVALUE, scope);
+    if (children.empty() || children.size() == 1)
+    {
+      const SemaId result = MakeExpression(SEMA_BRACED_INIT_LIST, expression,
+                                           target, VC_PRVALUE, scope);
+      if (children.size() == 1)
+      {
+        const SemaId child = Analyze(children[0], scope);
+        Initialize(child, target);
+        Append(result, child);
+      }
+      return result;
+    }
     throw std::runtime_error("braced initializer target is not an array");
   }
   const TypeId element = types_.At(target).base;
-  if (children.size() != types_.At(target).array_bound)
+  if (children.size() > types_.At(target).array_bound)
     throw std::runtime_error("initializer list has the wrong bound");
   const SemaId result = MakeExpression(SEMA_BRACED_INIT_LIST, expression,
                                        target, VC_LVALUE, scope);

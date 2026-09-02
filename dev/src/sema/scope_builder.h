@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -56,6 +57,7 @@ private:
   {
     std::string name;
     TypeId type;
+    AstId default_initializer;
   };
 
   struct StatementContext
@@ -199,7 +201,9 @@ private:
                                    BindingId& binding,
                                    bool member_const = false,
                                    bool internal_linkage = false,
-                                   bool noexcept_qualifier = false);
+                                   bool noexcept_qualifier = false,
+                                   const std::vector<AstId>& default_arguments =
+                                       std::vector<AstId>());
   SemaId MakeDetachedSemantic(SemaKind kind, ScopeId scope, TypeId type,
                               BindingId binding, FunctionEntityId function);
   TypeId SubstituteTemplateType(TypeId type, const TemplateBindings& values);
@@ -210,6 +214,12 @@ private:
                              FunctionEntityId& function, BindingId& binding);
   bool HasIncompleteArray(AstId declarator) const;
   std::size_t InitializerBound(AstId initializer) const;
+
+  // Labels and gotos are function-local semantic facts.  Names are recorded
+  // while the body is built so forward gotos can be resolved after the full
+  // body has been visited.
+  std::set<std::string> labels_;
+  std::vector<std::string> gotos_;
 
   const std::vector<Pa6Token>& tokens_;
   const AstArena& arena_;

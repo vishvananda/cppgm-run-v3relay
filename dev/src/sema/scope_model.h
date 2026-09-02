@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "parser/ast_model.h"
 #include "sema/qualified_name.h"
 #include "sema/type_table.h"
 
@@ -146,6 +147,10 @@ struct FunctionEntity
   bool internal_linkage;
   bool c_linkage;
   bool noexcept_qualifier;
+  // One entry per canonical parameter; a zero entry means that parameter
+  // has no default initializer.  The AST initializer remains the canonical
+  // source fact and is materialized at each call site by expression sema.
+  std::vector<AstId> default_arguments;
   bool defined;
 
   FunctionEntity();

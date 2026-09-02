@@ -252,9 +252,18 @@ void ScopeBuilder::BuildForStatement(AstId node,
     MapSemanticScope(for_scope, init_semantic);
     const vector<AstId>& children = arena_.At(init).children;
     if (!children.empty())
-      BuildStatement(children[0], StatementContext(
-          for_scope, context.function, context.loop_depth,
-          context.switch_depth, init_semantic));
+    {
+      const AstId initializer = children[0];
+      if (IsDeclarationKind(arena_.At(initializer).kind))
+        BuildStatement(initializer, StatementContext(
+            for_scope, context.function, context.loop_depth,
+            context.switch_depth, init_semantic));
+      else
+      {
+        const SemaId expression = expression_.Analyze(initializer, for_scope);
+        tree_->Append(init_semantic, expression);
+      }
+    }
   }
   const AstId condition = FindChild(node, AST_CONDITION);
   if (condition != 0)
@@ -482,6 +491,33 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
       MakeSemantic(SEMA_CONTINUE_STATEMENT, context.scope,
                    context.semantic_parent);
     return;
+  case AST_LABELED_STATEMENT:
+  {
+    const AstNode& label = arena_.At(node);
+    const std::string name = label.text;
+    if (name.empty() || label.children.size() != 1)
+      throw std::runtime_error("invalid labeled statement");
+    if (!labels_.insert(name).second)
+      throw std::runtime_error("duplicate label");
+    const SemaId statement = MakeSemantic(
+        SEMA_LABELED_STATEMENT, context.scope, context.semantic_parent,
+        0, 0, 0, VC_PRVALUE, KW_AUTO, label.first, label.last);
+    BuildStatement(label.children[0], StatementContext(
+        context.scope, context.function, context.loop_depth,
+        context.switch_depth, statement));
+    return;
+  }
+  case AST_GOTO_STATEMENT:
+  {
+    const AstNode& jump = arena_.At(node);
+    const std::string name = jump.text;
+    if (name.empty() || !jump.children.empty())
+      throw std::runtime_error("invalid goto statement");
+    gotos_.push_back(name);
+    MakeSemantic(SEMA_GOTO_STATEMENT, context.scope, context.semantic_parent,
+                 0, 0, 0, VC_PRVALUE, KW_AUTO, jump.first, jump.last);
+    return;
+  }
   default:
     throw std::runtime_error("unsupported statement in semantic analysis");
   }

@@ -62,7 +62,11 @@ AstId Pa10Parser::parse_assignment_expression_rule()
 		is_assignment_operator(token(pos_).simple_type))
 	{
 		const size_t op_at = pos_++;
-		AstId right = parse_assignment_expression();
+		// An assignment's right operand is an initializer-clause, so a braced
+		// scalar/array list must remain part of the assignment AST instead of
+		// being rejected by the expression grammar.
+		AstId right = is_simple(OP_LBRACE) ? parse_braced_init_list() :
+			parse_assignment_expression();
 		if (right == 0)
 		{
 			restore(saved);

@@ -89,6 +89,7 @@ private:
   std::string NewTemp();
   std::string NewGeneratedSlot(const std::string& stem,
                                const lowir_model::LowType& type);
+  std::string LabelFor(SemaId node);
   void Emit(const lowir_model::Instruction& instruction);
   bool Terminated() const;
   void EmitJump(const std::string& label);
@@ -163,6 +164,7 @@ private:
   std::map<FunctionEntityId, std::string> function_names_;
   std::map<FunctionEntityId, std::string> object_names_;
   std::map<BindingId, std::string> slots_;
+  std::map<std::string, std::string> labels_;
   std::map<SemaId, std::string> condition_labels_;
   std::set<FunctionEntityId> definitions_;
   std::set<FunctionEntityId> declarations_;

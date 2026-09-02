@@ -84,7 +84,13 @@ bool Lowerer::DefinitelyTerminates(SemaId node) const
   case SEMA_RETURN_STATEMENT:
   case SEMA_BREAK_STATEMENT:
   case SEMA_CONTINUE_STATEMENT:
+  case SEMA_GOTO_STATEMENT:
     return true;
+  case SEMA_LABELED_STATEMENT:
+    {
+      const std::vector<SemaId> children = Children(node);
+      return children.size() == 1 && DefinitelyTerminates(children[0]);
+    }
   case SEMA_THEN:
   case SEMA_ELSE:
   case SEMA_COMPOUND_STATEMENT:
@@ -375,7 +381,7 @@ bool Lowerer::LowerFor(SemaId node)
   const std::string body_label = NewBlockLabel("for_body");
   const std::string iteration_label = NewBlockLabel("for_iter");
   const std::string end_label = NewBlockLabel("for_end");
-  LowerSequence(children[0]);
+  (void)LowerStatement(children[0]);
   EmitJump(condition_label);
   AddBlock(condition_label);
   SetCurrent(condition_label);
@@ -457,9 +463,10 @@ bool Lowerer::LowerSwitch(SemaId node)
         tree_.At(body_children[i]).kind == SEMA_DEFAULT_STATEMENT)
       collect(body_children[i]);
   if (default_node == 0) {
-    default_node = 0;
-    // A no-default switch still needs a destination for unmatched values.
-    labels[0] = NewBlockLabel("switch_default");
+    // With no default arm, an unmatched selector leaves the switch directly
+    // at its join point.  Reusing the join label also keeps the block graph
+    // bounded by the source arms rather than manufacturing an empty arm.
+    labels[0] = end_label;
   }
   bool switch_terminates = default_node != 0 &&
       !HasSwitchBreak(body, tree_) && DefinitelyTerminates(default_node);
@@ -533,11 +540,6 @@ bool Lowerer::LowerSwitch(SemaId node)
   active_switch_labels_ = previous_switch_labels;
   if (switch_terminates && previous_switch_labels == 0)
     return true;
-  if (default_node == 0) {
-    AddBlock(labels[0]);
-    SetCurrent(labels[0]);
-    EmitJump(end_label);
-  }
   AddBlock(end_label);
   SetCurrent(end_label);
   return false;
@@ -552,8 +554,17 @@ bool Lowerer::LowerStatement(SemaId node)
   case SEMA_COMPOUND_STATEMENT:
   case SEMA_THEN:
   case SEMA_ELSE:
-  case SEMA_FOR_INIT_STATEMENT:
     return LowerSequence(node);
+  case SEMA_FOR_INIT_STATEMENT: {
+    const std::vector<SemaId> children = Children(node);
+    if (children.size() != 1)
+      Unsupported("for-init statement shape");
+    if (tree_.At(children[0]).kind == SEMA_SIMPLE_DECLARATION)
+      LowerVariableDeclaration(children[0]);
+    else
+      LowerDiscard(children[0]);
+    return false;
+  }
   case SEMA_ITERATION: {
     const std::vector<SemaId> children = Children(node);
     if (children.size() == 1 &&
@@ -601,6 +612,21 @@ bool Lowerer::LowerStatement(SemaId node)
     if (CurrentContinue().empty()) Unsupported("continue outside a loop");
     EmitJump(CurrentContinue());
     return true;
+  case SEMA_LABELED_STATEMENT:
+  {
+    const std::vector<SemaId> children = Children(node);
+    if (children.size() != 1)
+      Unsupported("labeled statement shape");
+    const std::string label = LabelFor(node);
+    if (!Terminated())
+      EmitJump(label);
+    AddBlock(label);
+    SetCurrent(label);
+    return LowerStatement(children[0]);
+  }
+  case SEMA_GOTO_STATEMENT:
+    EmitJump(LabelFor(node));
+    return true;
   case SEMA_CASE_STATEMENT:
   case SEMA_DEFAULT_STATEMENT: {
     if (active_switch_labels_ == 0)
@@ -627,8 +653,14 @@ bool Lowerer::LowerSequence(SemaId node)
 {
   bool terminated = false;
   const std::vector<SemaId> children = Children(node);
-  for (std::size_t i = 0; i < children.size() && !terminated; ++i)
+  for (std::size_t i = 0; i < children.size(); ++i)
+  {
+    // A goto terminates the current block, but a later source label starts a
+    // new reachable block and must still be lowered for that edge.
+    if (terminated && tree_.At(children[i]).kind != SEMA_LABELED_STATEMENT)
+      continue;
     terminated = LowerStatement(children[i]);
+  }
   return terminated;
 }
 

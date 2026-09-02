@@ -344,7 +344,7 @@ re-parsed.  No static mutable state (batch runner).
 | --- | --- | --- |
 | plan | this commit | stage design, failure map, conventions |
 | CP1 serializer, driver mode, symbols, scalar procedural lowering | this checkpoint | 39 CP1 fixtures pass; pa15 42/109 (67 failures); through-pa14 1030/1030; file audit passed with 2 pre-existing header warnings |
-| CP2 (active) PA12 semantic boundary: parser gaps, default arguments, goto/labels, array/typedef/cast/comma/volatile/return rules, scoped-enum rejection | pending | target 48/109; all 109 inputs accepted or rejected as the refs require |
+| CP2 PA12 semantic boundary: parser gaps, default arguments, goto/labels, array/typedef/cast/comma/volatile/return rules, scoped-enum rejection | this checkpoint | focused CP2 check 9/9; pa15 48/109 (61 failures, down from 67); through-pa14 1030/1030; file audit passed with 2 pre-existing header warnings |
 | CP3 memory objects: references, pointers, arrays, string literals, indirect calls, refarg temporaries | pending | target 82/109 |
 | CP4 globals, constant initializers, structured data, declarations, `@__cppgm_init` | pending | target 109/109; through-pa15 clean |
 | CP5 architecture audit and cleanup (one naming authority, one conversion table, perf probe evidence in `audit.md`) | pending | 109/109; through-pa15 clean |
@@ -504,22 +504,38 @@ content assumed); whether static functions outside `extern "C"` mangle
 with `L` (the PA14 encoder cannot, so they do not); switch on `char`/enum
 prints case values as plain integers (assumed from the `switch` grammar).
 
-## Active Checkpoint: CP2 — semantic boundary and control-flow handoff
+## Completed Checkpoint: CP2 — semantic boundary and control-flow handoff
 
-Goal: move the PA12-owned parser and semantic facts needed by the next
-LowIR families across the boundary without changing earlier assignment
-fixtures.  Focus first on default arguments, braced scalar/array
-initialization, comma value categories, function typedef/reference casts,
-array/function decay, volatile lvalues, goto/labels, and the scoped-enum
-conversion rejection; keep lowering unsupported memory/global constructs
-explicit and bounded.
+Delivered: moved default arguments into canonical function entities and
+materialized them through the semantic tree; accepted braced scalar
+assignment, expression for-initializers, volatile assignments, operator
+delete parameter storage, and scalar scoped-enum initialization; rejected
+implicit scoped-enum-to-int conversion; and lowered function-local labels
+and gotos through one bounded source-label-to-LowIR-block map.  The switch
+join path now sends no-default selectors directly to its end block.
+Evidence: the nine named CP2 fixtures pass their focused check, pa15 is
+48/109 (61 failures, down from the turn-start 67), through-pa14 is
+1030/1030, and the file audit passes with only the two existing header
+division warnings.
 
-Implementation packet: start with the failing fixtures named in the CP2
-row above and trace each fact through `dev/src/parser/ast_parser*.cpp`,
-`dev/src/sema/expr_sema.cpp`, `dev/src/sema/stmt_builder.cpp`,
-`dev/src/sema/scope_builder.cpp`, and the corresponding `lowir_expr.cpp` /
-`lowir_program.cpp` consumer.  Preserve the canonical semantic tree as
-the owner of conversions and default arguments.  Use focused `check`
-targets for each repaired boundary, then the pa15 stage gate and
-through-pa14 gate; the next checkpoint is complete only when it increases
-the accepted fixture count without weakening coverage.
+Implementation packet: start with the CP3 fixtures in the failure map:
+references, pointer/array decay, array storage and subscripting, string
+literals, indirect calls, and reference-argument temporaries.  Trace them
+through `dev/src/sema/expr_sema.cpp`, `dev/src/sema/conversions.cpp`,
+`dev/src/lower/lowir_expr.cpp`, `dev/src/lower/lowir_program.cpp`, and
+`dev/src/lower/lowir_function.cpp`; keep storage ownership canonical and
+leave globals for CP4.
+
+## Active Checkpoint: CP3 — memory objects and indirect calls
+
+Goal: carry PA12 reference, pointer, array, string-literal, and callable
+facts into bounded LowIR storage and call lowering without regressing the
+CP1/CP2 scalar and control-flow paths.  Focus on local object slots,
+address/reference binding, array decay/subscripts, indirect calls, and
+reference-argument temporaries; keep global data and initialization in CP4.
+
+Implementation packet: begin with the CP3 fixtures named in the failure
+map, then use focused `check` targets before the pa15 and through-pa14
+gates.  Preserve one conversion/decay decision in semantic analysis and
+one storage/name authority in LowIR; measure only the CP3 probe when a
+new object or call path is performance-sensitive.  Target 82/109.

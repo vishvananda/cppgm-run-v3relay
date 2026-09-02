@@ -80,6 +80,12 @@ bool SameUnqualified(const TypeTable& types, TypeId left, TypeId right)
   return types.Unqualified(left) == types.Unqualified(right);
 }
 
+bool IsScopedEnum(const TypeTable& types, TypeId type)
+{
+  type = types.Unqualified(type);
+  return types.Kind(type) == TYPE_ENUM && types.At(type).scoped;
+}
+
 bool PointerToVoidCompatible(const TypeTable& types, TypeId source,
                              TypeId target, bool& added)
 {
@@ -211,7 +217,12 @@ ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
 
   const bool target_enum =
       types.Kind(types.Unqualified(target)) == TYPE_ENUM;
-  if (types.IsArithmetic(source_value) && types.IsArithmetic(target))
+  // A scoped enumeration is arithmetic for its own operators, but it does
+  // not participate in the implicit integral conversions of an unscoped
+  // enumeration.  Identity above still permits E -> E.
+  if (!IsScopedEnum(types, source_value) &&
+      !IsScopedEnum(types, target) &&
+      types.IsArithmetic(source_value) && types.IsArithmetic(target))
   {
     if (types.IsIntegral(source_value) && types.IsIntegral(target))
     {
@@ -245,7 +256,7 @@ ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
         CONV_INTEGRAL_CONVERSION;
     return result;
   }
-  if (types.IsScalar(source_value) &&
+  if (!IsScopedEnum(types, source_value) && types.IsScalar(source_value) &&
       types.Kind(types.Unqualified(target)) == TYPE_FUNDAMENTAL &&
       types.At(types.Unqualified(target)).fundamental == FT_BOOL)
   {

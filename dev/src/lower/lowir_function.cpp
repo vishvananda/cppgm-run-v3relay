@@ -107,6 +107,24 @@ std::string Lowerer::NewGeneratedSlot(const std::string& stem,
   }
 }
 
+std::string Lowerer::LabelFor(SemaId node)
+{
+  if (node == 0 || tree_.At(node).first >= tree_.At(node).last ||
+      tree_.At(node).first >= tokens_.size())
+  {
+    Unsupported("label without a source name");
+    return std::string();
+  }
+  const std::string name = tokens_[tree_.At(node).first].spelling;
+  std::map<std::string, std::string>::const_iterator found =
+      labels_.find(name);
+  if (found != labels_.end())
+    return found->second;
+  const std::string generated = NewBlockLabel("goto");
+  labels_[name] = generated;
+  return generated;
+}
+
 void Lowerer::Emit(const lowir_model::Instruction& instruction)
 {
   lowir_model::Block* block = CurrentBlock();
@@ -261,6 +279,7 @@ lowir_model::Function Lowerer::BuildFunction(SemaId node)
   function_ = lowir_model::Function();
   slots_.clear();
   controls_.clear();
+  labels_.clear();
   temp_counter_ = 0;
   label_counter_ = 0;
   generated_slot_counter_ = 0;

@@ -79,6 +79,9 @@ private:
   bool IsTypeName(AstId expression, ScopeId scope, TypeId& type) const;
   bool IsFundamentalCastCallee(AstId callee) const;
   bool IsModifiableLvalue(SemaId node) const;
+  void AppendDefaultArguments(FunctionEntityId function, TypeId function_type,
+                              std::size_t supplied,
+                              std::vector<SemaId>& arguments);
   bool RetargetFunctionName(SemaId expression, TypeId target);
   bool RetargetFunctionAddress(SemaId expression, TypeId target);
   bool TemplateArgumentTypes(const QualifiedName& name, ScopeId scope,

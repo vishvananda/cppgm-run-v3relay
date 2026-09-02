@@ -395,6 +395,11 @@ void ScopeBuilder::BuildParameters(AstId clause, ScopeId lookup_scope,
     ParameterInfo info;
     info.type = BuildDeclaratorType(declarator, base, lookup_scope, true);
     info.name = IdentifierName(FindIdentifier(declarator));
+    info.default_initializer = 0;
+    const AstId default_argument =
+        FindChild(child, AST_DEFAULT_ARGUMENT);
+    if (default_argument != 0)
+      info.default_initializer = FindChild(default_argument, AST_INITIALIZER);
     parameters.push_back(info);
   }
   // 8.3.5p4: a lone unnamed `void` parameter is an empty parameter list.

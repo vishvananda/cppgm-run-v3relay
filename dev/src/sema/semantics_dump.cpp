@@ -75,6 +75,8 @@ const char* KindName(SemaKind kind)
   case SEMA_SIZEOF: return "sizeof-expression";
   case SEMA_BRACED_INIT_LIST: return "braced-init-list";
   case SEMA_CONSTRUCTOR_ACTION: return "constructor-action";
+  case SEMA_LABELED_STATEMENT: return "labeled-statement";
+  case SEMA_GOTO_STATEMENT: return "goto-statement";
   }
   return "unknown";
 }
@@ -231,6 +233,14 @@ void PrintNode(std::ostream& out, const SemaTree& tree, const SemaModel& model,
     {
       out << ' ';
       PrintFunctionName(out, model, node.function);
+    }
+    break;
+  case SEMA_LABELED_STATEMENT:
+  case SEMA_GOTO_STATEMENT:
+    if (node.HasSpan())
+    {
+      out << ' ';
+      PrintSpan(out, node, tokens);
     }
     break;
   default:

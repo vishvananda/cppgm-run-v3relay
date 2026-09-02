@@ -126,8 +126,13 @@ FunctionEntityId SelectBestOverload(
     if (types.Kind(types.Unqualified(function_type)) != TYPE_FUNCTION)
       continue;
     const TypeNode& function = types.At(types.Unqualified(function_type));
-    if ((!function.variadic && function.parameters.size() != arguments.size()) ||
-        (function.variadic && arguments.size() < function.parameters.size()))
+    const FunctionEntity& entity = model.FunctionAt(entities[i]);
+    std::size_t required = function.parameters.size();
+    while (required > 0 && required <= entity.default_arguments.size() &&
+           entity.default_arguments[required - 1] != 0)
+      --required;
+    if (arguments.size() < required ||
+        (!function.variadic && arguments.size() > function.parameters.size()))
       continue;
 
     Candidate candidate;
