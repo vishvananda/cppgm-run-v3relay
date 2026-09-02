@@ -373,26 +373,6 @@ SemaId ExpressionAnalyzer::AnalyzeName(AstId expression, ScopeId scope)
   vector<BindingId> candidates;
   LookupNameBindings(name, scope, candidates);
   if (candidates.empty())
-  {
-    ScopeId context_scope = scope;
-    ClassEntityId context_class = 0;
-    while (context_scope != model_.GlobalScope())
-    {
-      const Scope& owner = model_.ScopeAt(context_scope);
-      if (owner.kind == SCOPE_CLASS && owner.class_entity != 0)
-      {
-        context_class = owner.class_entity;
-        break;
-      }
-      context_scope = owner.parent;
-    }
-    if (context_class != 0 && !name.Qualified())
-    {
-      model_.LookupMember(context_class, name.Last(), LOOKUP_ANY, candidates);
-      FilterAccessibleBindings(scope, candidates);
-    }
-  }
-  if (candidates.empty())
     throw std::runtime_error("unknown name in expression");
 
   // 7.3.4p6: the level names one entity or an overload set; non-function
@@ -792,7 +772,8 @@ SemaId ExpressionAnalyzer::BuildResolvedCall(
   vector<SemaId> converted;
   converted.reserve(callable.parameters.size());
   if (member_object)
-    converted.push_back(Initialize(implicit_object, callable.parameters[0]));
+    converted.push_back(BindImplicitObject(implicit_object,
+                                           callable.parameters[0]));
   for (size_t i = 0; i < arguments.size(); ++i)
   {
     const size_t parameter = i + required_start;
@@ -2034,7 +2015,7 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
       model_.FunctionAt(function).is_member &&
       !model_.FunctionAt(function).static_member;
   if (selected_implicit_object)
-    converted_arguments.push_back(Initialize(
+    converted_arguments.push_back(BindImplicitObject(
         implicit_object, callable.parameters[0]));
   for (size_t i = 0; i < analyzed_arguments.size(); ++i)
   {
@@ -2496,6 +2477,19 @@ bool ExpressionAnalyzer::IsZeroLiteral(SemaId semantic) const
 bool ExpressionAnalyzer::IsNullPointerConstant(SemaId semantic) const
 {
   return NodeInfo(semantic).is_null_literal || IsZeroLiteral(semantic);
+}
+
+// The implicit object argument reaches the member's class as part of the
+// member access itself: 11.2p5 checks the member in the naming class, so a
+// member re-exposed by a using-declaration is callable through a private
+// base.  Only the conversion's viability is checked here.
+SemaId ExpressionAnalyzer::BindImplicitObject(SemaId object, TypeId parameter)
+{
+  const Info source = NodeInfo(object);
+  if (!Classify(model_, types_, source.type, source.category, false,
+                source.is_function_lvalue, parameter).Viable())
+    throw std::runtime_error("implicit object argument does not convert");
+  return object;
 }
 
 SemaId ExpressionAnalyzer::Initialize(SemaId expression, TypeId target,

@@ -1,5 +1,186 @@
 # PA16 Checkpoint Review — cppgm++ --emit-lowir with the basic object model
 
+## Review 2 (2026-09-02): CP4b.1–CP6
+
+Scope: the four implementation checkpoints since review 1 (`25437f10b`
+placement new, `5f224e380` copy-list and access, `041f12f07` static member
+storage, `32ff02d5d` static and TLS storage), read in full against the
+README boundary, the plan's ownership and performance rules, and the
+fixtures they cite.  Method: the review-1 executable was rebuilt in a
+worktree and its pa16 failing set diffed against the turn-start set rather
+than compared by count; representative facts were traced from their owner
+to the emitted text (a placement-new allocation and its synthesized
+aggregate constructor, a protected member reached from a friend, a
+using-declaration through a private base, a static member read, write and
+address, a thread-local class member's wrapper and guarded initializer, a
+constant static member folded without storage); the plan's probes and a
+new protected-access probe were timed on the turn-start and review builds.
+
+### Findings and changes
+
+1. **CP4b.2 regressed a review-1 fixture (material, fixed).**  The count
+   went 86 → 63 failures across the four checkpoints, but
+   `300-private-base-using-method-call` passed at review 1 and failed at
+   the turn start with "inaccessible base-class conversion": `d.f()` with
+   `class Derived : private Base { public: using Base::f; }` converted the
+   implicit object argument through `Initialize`, whose new base-path
+   access check rejected the private base.  11.2p5 checks the member in
+   the naming class, and the using-declaration makes `f` a public member of
+   `Derived`; the object's conversion to the member's class is part of that
+   access, not a separate one.  `BindImplicitObject` now binds the implicit
+   object argument at both member-call sites (`BuildResolvedCall`,
+   `AnalyzeCall`), checking only that the conversion is viable.  User
+   expressions still go through `Initialize` and its check.
+2. **Protected access scanned every class in the program (fixed).**
+   `ContextCanAccess` implemented the friend-of-derived rule as a loop over
+   `classes_` (all of them) with `IsDerivedFrom` and a linear `std::find`
+   through each candidate's friend list, on every protected member use:
+   protected uses × classes.  The friend relation was also stored on the
+   granting class, the wrong side for a query that starts from the context.
+   `ClassEntity::friend_of` and `FunctionEntity::friend_of` now hold the
+   classes whose friend declarations name the entity (one owner,
+   `ScopeBuilder::RecordFriend`); the check walks the context's enclosing
+   classes and its function and asks each granting class whether it is the
+   owner or, for protected access, derived from it.  Cost is bounded by
+   the friend declarations naming the context.  `IsNestedClassOf`,
+   `IsFriendClass` and `IsFriendFunction` are gone; nesting is covered
+   because `ContextClasses` already lists every enclosing class.  The
+   probe (N classes, N friend functions of a derived class each reading a
+   protected base member) shows the old scan was cheap in practice: 8000
+   0.70 s on both builds, 16000 1.48 s before and 1.44 s after; it is gone
+   rather than deferred.
+3. **Unqualified lookup did not search base classes; a fallback did
+   (ownership, fixed).**  `WalkUnqualified` looked at a class scope's direct
+   bindings only, so CP4b.2 bolted a fallback onto `AnalyzeName`: when the
+   whole walk found nothing, search the innermost class's member graph.  A
+   name that exists both in a base and in an enclosing namespace therefore
+   resolved to the namespace (`200-inherited-member-call-hides-outer-type`:
+   `f()` in `D::g` picked `enum class f` over `B::f`), and types were never
+   covered.  The walk now owns 3.4.1p8: at a class level it calls
+   `CollectClassMember` (own scope, then bases, with hiding) for both the
+   value and the type walks.  A constructor binding found by a type lookup
+   stands for the injected-class-name through `InjectedClassName`, which
+   replaces the innermost-class special case in `LookupTypeName` and also
+   covers a class named inside its own member bodies and a base named in a
+   derived class.  The `AnalyzeName` fallback is removed.  This fixed the
+   regression's neighbours as well: `200-inherited-base-typedefs-in-
+   derived-members`, `200-out-of-line-member-inherited-typedef-body` and
+   `300-using-base-same-signature-derived-preferred`, three of CP7's
+   planned fixtures.
+4. **Declaration-only constants were dropped after the fact through a
+   shared name set (fixed).**  CP6 collected every declaration-only global
+   into `declare global` lines up front, recorded uses in a
+   `ProgramLowering::referenced_globals_` string set from a `const`
+   `GlobalFor`, kept an unread `mutable GlobalSymbol::referenced` beside
+   it, and ran `DropUnreferencedConstantDeclarations` over the program's
+   declaration list to delete the unused constants again.  Declaration-only
+   objects are now declared where declaration-only functions are:
+   `BuildDeclarations`, after the unit's bodies have run, using the
+   per-unit `GlobalSymbol::referenced` that a non-const `GlobalFor` sets.
+   A constant static member with an in-class initializer is declared only
+   when odr-used; a thread-local one is always declared so its wrapper's
+   `tls_for` target exists.  `BuildGlobalDeclaration` and `GlobalMetadata`
+   own the declaration and metadata shape.  Output on the suite is
+   unchanged.
+5. **Dead state (fixed).**  `ScopeBuilder::current_class_` was saved, set
+   and restored around every class body and never read.  The class-element
+   aggregate path of `BuildGlobalArrayDefinition` wrote
+   `DynamicInitializer::byte_offset` beside the `aggregate_path` that
+   `BuildGlobalInitializers` actually consumes.
+6. **Verified and kept.**  Placement new (`AnalyzeNew`, `LowerNew`): the
+   size operand is a synthesized `int` literal converted by the selected
+   `operator new` parameter, placement arguments join the allocation
+   overload set, a class object is constructed at the returned pointer, and
+   a braced initializer of an aggregate becomes a synthesized constructor
+   whose body stores each parameter to its field; the fixture pins exactly
+   that constructor (`_ZN5tableC1Ej`), so the entity is the oracle's shape
+   and not an invention.  `EnsureAggregateConstructor` reuses an existing
+   synthesized constructor of the same type.  Copy-list initialization:
+   explicit constructors are excluded only for copy forms, narrowing is
+   diagnosed on floating→integral, wider→narrower floating, and
+   non-constant or out-of-range integral→floating conversions; both are
+   pinned by `-bad` fixtures.  Static members: the out-of-class definition
+   recovers `Binding::static_member` and `thread_local_storage` from the
+   class declaration by name and compatible type, the in-class declaration
+   is the canonical global symbol, and `LowerLValue` / `GlobalAddress` read
+   it through `GlobalFor`.  Thread-local storage: the wrapper declaration,
+   guard object and guarded initializer are emitted once per TLS object
+   with a definition; the `tls_for` target, the missing type on a
+   thread-local class declaration and the `local_static_ctor_*` labels are
+   the fixtures' spellings.
+7. **Kept deliberately, recorded here.**  `TypeScopeForDeclaration` looks
+   the decl-specifier of a qualified out-of-class member definition up in
+   the member's class scope so a private nested type passes the access
+   check; `BuildFunctionDefinition` has done the same for return types
+   since CP1.  The standard looks the specifier up in the enclosing scope
+   and only checks access as the member (11p7), so an unqualified class
+   member name in that position is over-accepted; no fixture pins the
+   rejection.  The qualifier is resolved twice per declaration (once for
+   the type scope, once per declarator).  `TryBuildRuntimeClassAggregate`
+   applies its "zero object plus a store per leaf" rule to class static
+   arrays only; the only fixture with a dynamic aggregate leaf is a static
+   member, so the namespace-scope branch that mixes constant items with
+   startup stores stays as the pre-existing PA15 rule until a fixture
+   decides.  `BuildVariable` recognises copy-list-initialization by the
+   `=` token after the declarator because the parser does not keep the
+   `=` in `AST_INITIALIZER`.
+
+### Ownership after review
+
+| fact | owner | consumers |
+| --- | --- | --- |
+| unqualified name in a member: class, bases, then enclosing scopes (3.4.1p8) | `SemaModel::WalkUnqualified` via `CollectClassMember` | `LookupSet`, `LookupUnqualified`, `LookupTypeName`, `LookupCallSet` |
+| injected-class-name seen through a constructor binding | `SemaModel::InjectedClassName` | the type walk |
+| friendship | `ClassEntity::friend_of`, `FunctionEntity::friend_of` (`ScopeBuilder::RecordFriend`) | `ContextCanAccess` |
+| member and base accessibility | `SemaModel::IsAccessible`, `IsBaseAccessible` | name lookup filters, casts, `Initialize`, `LookupType`, using-declarations |
+| implicit object argument binding | `ExpressionAnalyzer::BindImplicitObject` | `BuildResolvedCall`, `AnalyzeCall` |
+| explicit constructors, copy-list exclusion, narrowing | `FunctionEntity::explicit_constructor`, `ResolveConstructor(copy_initialization)`, `IsNarrowingListInitialization` | `BuildVariable`, `BuildConstructorTemporary`, aggregate clauses |
+| placement allocation and construction | `AnalyzeNew` → `SEMA_NEW_EXPRESSION`; `EnsureAggregateConstructor` | `LowerNew` |
+| static member storage and TLS bits | `Binding::static_member`, `thread_local_storage` (class declaration; definition recovers them) | `CollectSymbols` → `GlobalSymbol` |
+| declaration-only object symbols | `Lowerer::BuildDeclarations` after uses (`GlobalSymbol::referenced`) | serializer |
+| TLS wrapper, guard, guarded initializer | `AddThreadLocalWrapperDeclaration`, `AddThreadLocalInitializer`, `BuildThreadLocalInitializers` | — |
+
+### Validation
+
+- `make test-pa16`: 185/243 (58 failures; 63 at the turn start, 86 at
+  review 1).  The turn-start failing set is a strict superset of the
+  current one; the review-1 regression passes; no fixture that passed at
+  review 1 or at the turn start fails.
+- `make test-report-through-pa15`: 1139/1139; `make test-report-through-
+  pa16`: 1324/1382 with every failure in pa16.
+- `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src`: passes
+  with five nonfatal warnings (four header-weight, one nesting depth in
+  `BuildGlobalDefinitions`).
+- Remaining failures by first error: 23 LowIR shape mismatches (bit-field
+  reads and increments, alignas layouts, ADL source point, nested aggregate
+  data, callable field, synthesized array lifecycle, nullptr_t operator,
+  value-initialized functional cast), 7 parse gaps (qualified class heads
+  and constructors, `alignas` positions, pseudo-destructor and explicit
+  destructor calls), 4 scalar conversions, 3 `unknown name` in the
+  metadata-emission trio, 3 `no viable constructor`, 3 initializer
+  conversions, 2 trailing return types, 2 `sizeof` of an incomplete type,
+  4 unknown type names (qualified injected-class-name, decltype of a
+  nested type, local-class inherited call, static using-declaration), and
+  singletons (out-of-class private nested return type, ADL suppression,
+  aliased base mem-initializer, derived pointer comparison, under-aligned
+  `-bad`, parenthesized member call, function reference return).
+
+### Performance evidence
+
+Review build, wall seconds and peak RSS; the plan's probes and the
+protected-access probe (`prot N`: N classes, N friend functions of a
+derived class each reading a protected base member).
+
+| probe | N | N×2 |
+| --- | --- | --- |
+| wide (fields + methods) 2000 | 0.06 s / 17.7 MB | 0.13 s / 31.1 MB |
+| deep (inheritance) 300 | 0.00 s / 6.2 MB | 0.01 s / 6.8 MB |
+| exits (locals with destructors + returns) 400 | 0.02 s / 9.8 MB | 0.04 s / 15.1 MB |
+| prot 8000 | 0.70 s / 140.3 MB | 1.44 s / 274.0 MB |
+
+Every probe doubles in time and memory per doubling; the turn-start build
+measured prot 8000/16000 at 0.70/1.48 s.
+
 ## CP6 (2026-09-02): canonical thread-local and static storage
 
 The semantic `Binding::thread_local_storage` bit is now the canonical storage
@@ -235,4 +416,9 @@ cheap comparisons (~0.05 s); it is gone rather than deferred.
 | CP2 constructors, destructors, lifetime | `30d1737df` | 97/243 |
 | CP3 operator overloading and ADL | `e74637d5b` | 142/243 |
 | CP4a aggregates and bit-fields | `14487c1aa` | 149/243; regressed 8 CP3 fixtures while fixing 15 |
-| review 1 (this section) | review commit | 157/243; through-pa15 1139/1139; findings 1–9 |
+| review 1 | `925a9d275` | 157/243; through-pa15 1139/1139; findings 1–9 |
+| CP4b.1 placement new | `25437f10b` | 159/243 |
+| CP4b.2 copy-list and access | `5f224e380` | 169/243; regressed `300-private-base-using-method-call` while fixing 11 |
+| CP5 static-member identity | `041f12f07` | 175/243 |
+| CP6 thread-local and static storage | `32ff02d5d` | 180/243 |
+| review 2 (this section) | review commit | 185/243; through-pa15 1139/1139; findings 1–7 |

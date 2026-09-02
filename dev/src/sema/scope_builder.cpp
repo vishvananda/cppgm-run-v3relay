@@ -474,12 +474,8 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     if (is_friend && has_friend_owner &&
         types_.Kind(types_.Unqualified(base)) == TYPE_CLASS)
     {
-      const ClassEntityId friend_class = static_cast<ClassEntityId>(
-          types_.At(types_.Unqualified(base)).entity);
-      std::vector<ClassEntityId>& friends = model_.ClassAt(
-          friend_owner).friend_classes;
-      if (std::find(friends.begin(), friends.end(), friend_class) == friends.end())
-        friends.push_back(friend_class);
+      RecordFriend(friend_owner, model_.ClassAt(static_cast<ClassEntityId>(
+          types_.At(types_.Unqualified(base)).entity)).friend_of);
     }
     if (EmitsSemantics() && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
       MakeSemantic(SEMA_SIMPLE_DECLARATION, scope,
@@ -553,10 +549,7 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
           SequenceHasKeyword(specifiers, KW_EXPLICIT));
       if (is_friend && has_friend_owner)
       {
-        std::vector<FunctionEntityId>& friends = model_.ClassAt(
-            friend_owner).friend_functions;
-        if (std::find(friends.begin(), friends.end(), function) == friends.end())
-          friends.push_back(function);
+        RecordFriend(friend_owner, model_.FunctionAt(function).friend_of);
         if (!had_visible_declaration)
         {
           model_.BindingAt(binding).hidden_friend = true;
@@ -809,10 +802,7 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
        (scope == target_scope || SequenceHasKeyword(specifiers, KW_INLINE)));
   if (is_friend && has_friend_owner)
   {
-    std::vector<FunctionEntityId>& friends = model_.ClassAt(
-        friend_owner).friend_functions;
-    if (std::find(friends.begin(), friends.end(), function) == friends.end())
-      friends.push_back(function);
+    RecordFriend(friend_owner, model_.FunctionAt(function).friend_of);
     bool had_visible_declaration = false;
     std::vector<BindingId> visible;
     model_.DirectBindings(target_scope, name, LOOKUP_FUNCTIONS, visible);
@@ -1523,10 +1513,8 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
   }
 
   const AccessKind saved_access = member_access_;
-  const ClassEntityId saved_class = current_class_;
   const std::size_t first_pending = deferred_member_bodies_.size();
   member_access_ = key == TK_CLASS ? ACCESS_PRIVATE : ACCESS_PUBLIC;
-  current_class_ = entity;
   for (std::size_t i = 0; i < value.children.size(); ++i)
   {
     const AstKind kind = arena_.At(value.children[i]).kind;
@@ -1549,7 +1537,6 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
       BuildNode(value.children[i], class_scope);
   }
   member_access_ = saved_access;
-  current_class_ = saved_class;
   CompleteClassLayout(entity);
   CompleteClassMembers(entity, first_pending);
   if (injected_union)

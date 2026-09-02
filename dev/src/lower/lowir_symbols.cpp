@@ -218,14 +218,15 @@ BindingId Lowerer::CanonicalBinding(BindingId id) const
   return first != 0 ? first : id;
 }
 
-const Lowerer::GlobalSymbol* Lowerer::GlobalFor(BindingId id) const
+// Every use of an object symbol passes through here, so a declaration-only
+// constant learns whether the unit ever needs its storage.
+const Lowerer::GlobalSymbol* Lowerer::GlobalFor(BindingId id)
 {
-  const std::map<BindingId, GlobalSymbol>::const_iterator found =
+  const std::map<BindingId, GlobalSymbol>::iterator found =
       globals_.find(CanonicalBinding(id));
   if (found == globals_.end())
     return 0;
   found->second.referenced = true;
-  shared_.referenced_globals_.insert(found->second.name);
   return &found->second;
 }
 
@@ -589,7 +590,6 @@ void Lowerer::BuildGlobalArrayDefinition(
           DynamicInitializer dynamic;
           dynamic.expression = values[value_index];
           dynamic.symbol = symbol.name;
-          dynamic.byte_offset = index * element_size + field.offset;
           dynamic.type = value_type;
           dynamic.aggregate_type = binding.type;
           dynamic.aggregate_path.push_back(index);
@@ -922,40 +922,53 @@ bool Lowerer::FoldConstructorAction(
   return true;
 }
 
+lowir_model::SymbolMetadata Lowerer::GlobalMetadata(
+    const GlobalSymbol& symbol) const
+{
+  lowir_model::SymbolMetadata metadata;
+  metadata.binding = symbol.internal_linkage ? lowir_model::SBM_INTERNAL :
+      lowir_model::SBM_STRONG;
+  metadata.linkage = symbol.c_linkage ? lowir_model::LLM_C :
+      lowir_model::LLM_DEFAULT;
+  metadata.object_symbol = symbol.object;
+  return metadata;
+}
+
+lowir_model::GlobalDeclaration Lowerer::BuildGlobalDeclaration(
+    const GlobalSymbol& symbol) const
+{
+  const TypeId declared = types_.Unqualified(
+      model_.BindingAt(symbol.binding).type);
+  lowir_model::GlobalDeclaration declaration;
+  declaration.name = symbol.name;
+  declaration.storage = symbol.thread_local_storage ?
+      lowir_model::GSM_THREAD_LOCAL : lowir_model::GSM_DEFAULT;
+  // An array of unknown bound has no LowIR storage type, and a thread-local
+  // class object is reached only through its wrapper.
+  declaration.has_type = (!symbol.thread_local_storage ||
+                          types_.Kind(declared) != TYPE_CLASS) &&
+      (types_.Kind(declared) != TYPE_ARRAY ||
+       types_.At(declared).array_bound != 0);
+  if (declaration.has_type)
+    declaration.type = LowTypeOf(model_.BindingAt(symbol.binding).type);
+  declaration.metadata = GlobalMetadata(symbol);
+  return declaration;
+}
+
+// Definitions and thread-local wrappers are emitted here; a symbol the unit
+// only declares is declared with the functions, once its uses are known.
 void Lowerer::BuildGlobalDefinitions()
 {
   typedef lowir_model::GlobalDefinition::DataItem DataItem;
   for (std::size_t i = 0; i < global_order_.size(); ++i) {
     const GlobalSymbol& symbol = globals_[global_order_[i]];
-    const Binding& canonical_binding = model_.BindingAt(symbol.binding);
-    lowir_model::SymbolMetadata metadata;
-    metadata.binding = symbol.internal_linkage ? lowir_model::SBM_INTERNAL :
-        lowir_model::SBM_STRONG;
-    metadata.linkage = symbol.c_linkage ? lowir_model::LLM_C :
-        lowir_model::LLM_DEFAULT;
-    metadata.object_symbol = symbol.object;
     if (symbol.thread_local_storage)
       AddThreadLocalWrapperDeclaration(
           symbol.name, ThreadLocalWrapperObjectName(symbol),
           symbol.internal_linkage);
-
-    if (symbol.definition == 0) {
-      const TypeId declared = types_.Unqualified(canonical_binding.type);
-      lowir_model::GlobalDeclaration declaration;
-      declaration.name = symbol.name;
-      declaration.storage = symbol.thread_local_storage ?
-          lowir_model::GSM_THREAD_LOCAL : lowir_model::GSM_DEFAULT;
-      // An array of unknown bound has no LowIR storage type.
-      declaration.has_type = (!symbol.thread_local_storage ||
-                              types_.Kind(declared) != TYPE_CLASS) &&
-          (types_.Kind(declared) != TYPE_ARRAY ||
-           types_.At(declared).array_bound != 0);
-      if (declaration.has_type)
-        declaration.type = LowTypeOf(canonical_binding.type);
-      declaration.metadata = metadata;
-      program_.global_declarations.push_back(declaration);
+    if (symbol.definition == 0)
       continue;
-    }
+    const lowir_model::SymbolMetadata metadata = GlobalMetadata(symbol);
 
     const SemaNode& variable = tree_.At(symbol.definition);
     const Binding& binding = model_.BindingAt(variable.binding);
@@ -1092,30 +1105,6 @@ void Lowerer::BuildThreadLocalInitializers()
     EmitReturn(0);
     program_.functions.push_back(std::move(function_));
   }
-}
-
-void Lowerer::DropUnreferencedConstantDeclarations()
-{
-  std::set<std::string> removable;
-  for (std::size_t i = 0; i < global_order_.size(); ++i) {
-    const GlobalSymbol& symbol = globals_[global_order_[i]];
-    if (symbol.definition == 0 && !symbol.thread_local_storage &&
-        model_.BindingAt(symbol.binding).has_const_value &&
-        shared_.referenced_globals_.count(symbol.name) == 0)
-      removable.insert(symbol.name);
-  }
-  if (removable.empty())
-    return;
-  std::size_t kept = 0;
-  for (std::size_t i = 0; i < program_.global_declarations.size(); ++i) {
-    if (removable.count(program_.global_declarations[i].name) != 0)
-      continue;
-    if (kept != i)
-      program_.global_declarations[kept] =
-          std::move(program_.global_declarations[i]);
-    ++kept;
-  }
-  program_.global_declarations.resize(kept);
 }
 
 bool Lowerer::TryBuildRuntimeClassAggregate(
@@ -1304,8 +1293,20 @@ void Lowerer::BuildGlobalFinalizers()
   SuspendFiniFunction();
 }
 
+// A declaration-only object is declared unless it is a constant the unit
+// only folded: a static member with an in-class initializer needs storage
+// only where it is odr-used, and its thread-local wrapper keeps its target.
 void Lowerer::BuildDeclarations()
 {
+  for (std::size_t i = 0; i < global_order_.size(); ++i) {
+    const GlobalSymbol& symbol = globals_[global_order_[i]];
+    if (symbol.definition != 0)
+      continue;
+    if (!symbol.referenced && !symbol.thread_local_storage &&
+        model_.BindingAt(symbol.binding).has_const_value)
+      continue;
+    program_.global_declarations.push_back(BuildGlobalDeclaration(symbol));
+  }
   for (std::size_t i = 0; i < function_order_.size(); ++i) {
     const FunctionSymbol& symbol = functions_[function_order_[i]];
     if (symbol.definition != 0)

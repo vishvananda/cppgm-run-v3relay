@@ -150,6 +150,7 @@ private:
                                const std::vector<SemaId>& arguments);
   TypeId CommonConditionalType(SemaId left, SemaId right) const;
   bool CanConvert(SemaId expression, TypeId target) const;
+  SemaId BindImplicitObject(SemaId object, TypeId parameter);
   bool IsNarrowingListInitialization(SemaId expression,
                                      TypeId target) const;
   void CheckBaseConversionAccess(TypeId source, TypeId target,

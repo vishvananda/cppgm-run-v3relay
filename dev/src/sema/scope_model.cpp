@@ -304,18 +304,44 @@ ScopeId SemaModel::WalkUnqualified(ScopeId scope, const std::string& name,
     const Scope& owner = scopes_[current];
     pending.insert(pending.end(), owner.using_directives.begin(),
                    owner.using_directives.end());
-    if (hide_types)
+    if (owner.kind == SCOPE_CLASS && owner.class_entity != 0)
     {
-      const BindingId direct = DirectBinding(current, name, LOOKUP_ANY);
-      if (direct != 0 && bindings_[direct].kind != BINDING_NAMESPACE)
+      // 3.4.1p8: a name used in a member of class X is looked up in X and
+      // its bases before any enclosing scope is considered.
+      std::vector<ClassEntityId> visited_classes;
+      if (hide_types)
       {
-        if (!Matches(bindings_[direct], filter))
-          return kNoScope;
-        result.push_back(direct);
-        return current;
+        std::vector<BindingId> members;
+        CollectClassMember(owner.class_entity, name, LOOKUP_ANY,
+                           visited_classes, members);
+        if (!members.empty())
+        {
+          const BindingId direct = InjectedClassName(members.back(), name);
+          if (!Matches(bindings_[direct], filter))
+            return kNoScope;
+          result.push_back(direct);
+          return current;
+        }
       }
+      else
+        CollectClassMember(owner.class_entity, name, filter, visited_classes,
+                           result);
     }
-    DirectBindings(current, name, filter, result);
+    else
+    {
+      if (hide_types)
+      {
+        const BindingId direct = DirectBinding(current, name, LOOKUP_ANY);
+        if (direct != 0 && bindings_[direct].kind != BINDING_NAMESPACE)
+        {
+          if (!Matches(bindings_[direct], filter))
+            return kNoScope;
+          result.push_back(direct);
+          return current;
+        }
+      }
+      DirectBindings(current, name, filter, result);
+    }
     if (owner.kind == SCOPE_NAMESPACE)
     {
       // 7.3.1p8, 7.3.4p2: members of inline namespaces and of the namespaces
@@ -352,28 +378,31 @@ BindingId SemaModel::LookupUnqualified(ScopeId scope, const std::string& name,
   return level == kNoScope ? 0 : Latest(found, level);
 }
 
+// A class scope binds its constructors under the class's own name and holds
+// no type binding for itself, so a constructor found by a type lookup stands
+// for the injected-class-name (9p2): the class binding in its declaring
+// scope.  Any other binding is returned unchanged.
+BindingId SemaModel::InjectedClassName(BindingId binding,
+                                       const std::string& name) const
+{
+  const Binding& value = bindings_[binding];
+  if (value.kind != BINDING_FUNCTION || value.function == 0 ||
+      value.function >= functions_.size())
+    return binding;
+  const FunctionEntity& function = functions_[value.function];
+  if (function.special_member != SPECIAL_MEMBER_CONSTRUCTOR ||
+      function.member_class == 0 || function.member_class >= classes_.size())
+    return binding;
+  const ScopeId class_scope = classes_[function.member_class].class_scope;
+  if (class_scope == 0 || class_scope >= scopes_.size())
+    return binding;
+  const BindingId type = DirectBinding(scopes_[class_scope].parent, name,
+                                       LOOKUP_TYPES);
+  return type != 0 ? type : binding;
+}
+
 BindingId SemaModel::LookupTypeName(ScopeId scope, const std::string& name) const
 {
-  // The injected-class-name is a type even though a constructor of the same
-  // spelling is declared in the class scope.  Ordinary type lookup must
-  // therefore skip that constructor and recover the class binding from its
-  // declaring scope (`struct Base { Base& f(); };`).
-  ScopeId current = scope;
-  while (current < scopes_.size() &&
-         scopes_[current].kind == SCOPE_TEMPLATE_PARAMETERS)
-    current = scopes_[current].parent;
-  if (current < scopes_.size() && scopes_[current].kind == SCOPE_CLASS &&
-      scopes_[current].class_entity != 0)
-  {
-    const ClassEntity& owner = classes_[scopes_[current].class_entity];
-    const TypeNode& class_type = types_.At(types_.Unqualified(owner.type));
-    std::string injected_name = scopes_[current].name;
-    const std::size_t separator = injected_name.rfind("::");
-    if (separator != std::string::npos)
-      injected_name = injected_name.substr(separator + 2);
-    if (class_type.kind == TYPE_CLASS && injected_name == name)
-      return LookupTypeName(scopes_[current].parent, name);
-  }
   std::vector<BindingId> found;
   const ScopeId level = WalkUnqualified(scope, name, LOOKUP_TYPES, true,
                                         found);
@@ -503,48 +532,15 @@ void SemaModel::ContextClasses(
   }
 }
 
-bool SemaModel::IsNestedClassOf(ClassEntityId nested,
-                                ClassEntityId enclosing) const
+// 11.3: a friend of the owner shares the owner's access; 11.2p5 further
+// lets a friend or member of a class derived from the owner use the
+// owner's protected members.
+bool SemaModel::FriendGrantsAccess(ClassEntityId granting,
+                                   ClassEntityId owner,
+                                   AccessKind access) const
 {
-  if (nested == 0 || enclosing == 0 || nested >= classes_.size() ||
-      enclosing >= classes_.size())
-    return false;
-  if (nested == enclosing)
-    return true;
-  ScopeId scope = classes_[nested].class_scope;
-  while (scope < scopes_.size())
-  {
-    if (scope == GlobalScope())
-      break;
-    scope = scopes_[scope].parent;
-    if (scope < scopes_.size() && scopes_[scope].kind == SCOPE_CLASS &&
-        scopes_[scope].class_entity == enclosing)
-      return true;
-  }
-  return false;
-}
-
-bool SemaModel::IsFriendClass(ClassEntityId owner,
-                              ClassEntityId context) const
-{
-  if (owner == 0 || context == 0 || owner >= classes_.size() ||
-      context >= classes_.size())
-    return false;
-  const std::vector<ClassEntityId>& friends = classes_[owner].friend_classes;
-  for (std::size_t i = 0; i < friends.size(); ++i)
-    if (IsNestedClassOf(context, friends[i]))
-      return true;
-  return false;
-}
-
-bool SemaModel::IsFriendFunction(ClassEntityId owner,
-                                  FunctionEntityId context) const
-{
-  if (owner == 0 || context == 0 || owner >= classes_.size())
-    return false;
-  const std::vector<FunctionEntityId>& friends =
-      classes_[owner].friend_functions;
-  return std::find(friends.begin(), friends.end(), context) != friends.end();
+  return granting == owner ||
+      (access == ACCESS_PROTECTED && IsDerivedFrom(granting, owner));
 }
 
 bool SemaModel::ContextCanAccess(ClassEntityId owner, AccessKind access,
@@ -552,36 +548,32 @@ bool SemaModel::ContextCanAccess(ClassEntityId owner, AccessKind access,
 {
   if (owner == 0 || owner >= classes_.size())
     return false;
+  // Every class enclosing the context is a candidate: a nested class is a
+  // member of its enclosing class (11.7), and a friend declaration naming
+  // an enclosing class covers the code nested inside it (11.3p2).
   std::vector<ClassEntityId> classes;
   ContextClasses(context, classes);
-  const FunctionEntityId function = ContextFunction(context);
   for (std::size_t i = 0; i < classes.size(); ++i)
   {
     const ClassEntityId candidate = classes[i];
-    if (candidate == owner || IsNestedClassOf(candidate, owner) ||
-        IsFriendClass(owner, candidate) ||
+    if (candidate == owner ||
         (access == ACCESS_PROTECTED && IsDerivedFrom(candidate, owner)))
       return true;
-  }
-  if (IsFriendFunction(owner, function))
-    return true;
-
-  // A friend of an intermediate derived class can use a protected member
-  // inherited through that class.  It does not gain access to the base's
-  // private members, so this relation is deliberately restricted to
-  // protected access.
-  if (access == ACCESS_PROTECTED)
-    for (ClassEntityId candidate = 1; candidate < classes_.size(); ++candidate)
-    {
-      if (candidate != owner && !IsDerivedFrom(candidate, owner))
-        continue;
-      bool friend_class = false;
-      for (std::size_t i = 0; i < classes.size(); ++i)
-        if (IsFriendClass(candidate, classes[i]))
-          friend_class = true;
-      if (friend_class || IsFriendFunction(candidate, function))
+    const std::vector<ClassEntityId>& granting =
+        classes_[candidate].friend_of;
+    for (std::size_t j = 0; j < granting.size(); ++j)
+      if (FriendGrantsAccess(granting[j], owner, access))
         return true;
-    }
+  }
+  const FunctionEntityId function = ContextFunction(context);
+  if (function != 0 && function < functions_.size())
+  {
+    const std::vector<ClassEntityId>& granting =
+        functions_[function].friend_of;
+    for (std::size_t j = 0; j < granting.size(); ++j)
+      if (FriendGrantsAccess(granting[j], owner, access))
+        return true;
+  }
   return false;
 }
 

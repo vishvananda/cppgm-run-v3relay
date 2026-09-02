@@ -98,6 +98,18 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    needs (12.6.2p8, 12.4p8), so lowering never asks for an entity sema did
    not create.  `ResolveConstructor` is the one public constructor
    selection and takes its candidates from the class scope's name index.
+   Review 2 moved two more facts to their owners: `SemaModel::
+   WalkUnqualified` searches a class level through `CollectClassMember`
+   (own scope, then bases, 3.4.1p8) for value and type lookups alike, and
+   `InjectedClassName` turns a constructor binding met by a type lookup
+   into the class binding of its declaring scope (no innermost-class
+   special case, no expression-level fallback).  Friendship lives on the
+   befriended entity (`ClassEntity::friend_of`, `FunctionEntity::
+   friend_of`, recorded by `ScopeBuilder::RecordFriend`) so
+   `ContextCanAccess` asks only the classes that name the context; the
+   implicit object argument of a member call is bound by
+   `BindImplicitObject`, which checks viability but not the base path,
+   because 11.2p5 checks the member in its naming class.
 
 3. Expression semantics (`dev/src/sema/expr_sema.cpp`, `overload.cpp`).
    `this` (keyword literal → prvalue `cv X*`), unqualified names inside
@@ -171,7 +183,12 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    array at namespace scope is a constructor action: `FoldConstructorAction`
    folds it into data when the constructor's body is empty and each
    mem-initializer stores one parameter or constant (the fixture shape),
-   otherwise `@__cppgm_init` constructs the element in place.
+   otherwise `@__cppgm_init` constructs the element in place.  A symbol the
+   unit only declares is declared in `BuildDeclarations` after every body
+   has run, like a declaration-only function: `GlobalSymbol::referenced`
+   is set by `GlobalFor`, and a constant static member with an in-class
+   initializer that was only folded gets no `declare global`, while a
+   thread-local one always does so its wrapper's `tls_for` target exists.
 
 ## Failure map at CP1 (218 failing, 25 passing; 19 fixtures expect EXIT_FAILURE)
 
@@ -239,6 +256,7 @@ comes from the intended check.
 | CP4b.2 copy/list diagnostics and access completion (completed) | explicit-constructor rejection, narrowing, anonymous storage, and the remaining private/protected/incomplete-reference paths | 169/243 pa16 tests pass (74 failures, down from 84); through-pa15 remains 1139/1139; file audit passes |
 | CP5 audit and cleanup (completed) | static-member declaration identity, qualified/inherited lookup, global lvalue/address lowering, aggregate startup stores, and audit cleanup | 175/243 pa16 tests pass (68 failures, down from 74); packet 5/5; through-pa15 1139/1139; through-pa16 1314/1382; file audit passes with four pre-existing warnings |
 | CP6 thread-local and static storage (completed) | canonical `Binding`/`GlobalSymbol` storage facts, TLS ABI wrapper and guarded initializer family, qualified private nested-type context, and use-sensitive constant declaration elision | 180/243 pa16 tests pass (63 failures, down from 68); packet 5/5; through-pa15 1139/1139; through-pa16 1319/1382; file audit passes with five warnings; specified scaling probe completed |
+| review 2 (completed; `audit.md`) | CP4b.2 regression restored (using-declaration through a private base); unqualified lookup owns the base-chain search; friendship indexed by the befriended entity, bounded protected access; declaration-only globals emitted on demand; dead state removed | 185/243 (58 failures); no fixture that passed at review 1 or at the turn start fails; through-pa15 1139/1139; through-pa16 1324/1382; file audit passes with five warnings; probes linear |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -294,6 +312,17 @@ passes with four warnings (the duplicate-block warning is resolved), and the
 plan's probes plus `many 8000/16000` (0.35/0.71 s) and `chain 300/600`
 (0.04/0.08 s) double per doubling.  Deliberate leftovers are listed in
 `audit.md` finding 9.
+
+Review 2 evidence (2026-09-02, `audit.md`): diffing the turn-start failing
+set against a rebuilt review-1 executable showed one regression hidden by
+the count (`300-private-base-using-method-call`); it passes again through
+`BindImplicitObject`.  The unqualified scope walk now searches bases, which
+also fixed `200-inherited-member-call-hides-outer-type` and three CP7
+fixtures.  `make test-pa16` is 185/243 (58 failures), `make
+test-report-through-pa15` 1139/1139, `make test-report-through-pa16`
+1324/1382, the file audit passes with five warnings, and the plan's probes
+plus `prot 8000/16000` (0.70/1.44 s) double per doubling.  Deliberate
+leftovers are listed in `audit.md` review 2 finding 7.
 
 ## Completed Checkpoint: CP1 — class model, layout, members, methods
 
@@ -578,11 +607,17 @@ through one scope-aware semantic path, preserving the through-pa16 gate.
 - Own the remaining qualified/deferred member type failures in `dev/src/sema`
   through declaration-scope resolution and completed-class context; do not
   edit fixtures or `.ref` files.
-- Start with `200-inherited-base-typedefs-in-derived-members`,
-  `200-out-of-line-member-inherited-typedef-body`,
-  `300-member-function-trailing-return`,
-  `300-out-of-class-private-nested-return-type`, and
-  `spec/100-decltype-qualified-nested-type-local`.
+- Start with `300-member-function-trailing-return` and
+  `300-out-of-class-member-trailing-return` (trailing return types reach
+  `BuildTypeSequence` as an unsupported specifier),
+  `300-out-of-class-private-nested-return-type` (a nested type used as a
+  reference-bound local in an out-of-class body),
+  `200-inherited-injected-class-name-qualified-type` (`Derived::Base`),
+  `spec/100-decltype-qualified-nested-type-local`,
+  `200-local-class-direct-init-inherited-member-call`, and
+  `300-using-base-static-same-signature-derived-preferred`.
+  `200-inherited-base-typedefs-in-derived-members` and
+  `200-out-of-line-member-inherited-typedef-body` pass since review 2.
 - Trace the type and scope facts from parser declarator through semantic
   binding and deferred body analysis, then require a focused comparison,
   `make test-pa16`, the through-pa16 report, and the pa16 file audit.

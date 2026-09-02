@@ -47,7 +47,6 @@ private:
   unsigned init_temp_counter_;
   unsigned init_label_counter_;
   unsigned init_slot_counter_;
-  std::set<std::string> referenced_globals_;
   lowir_model::Function fini_function_;
   bool has_fini_;
   bool needs_init_function_;
@@ -130,7 +129,7 @@ private:
     bool internal_linkage;
     bool c_linkage;
     bool thread_local_storage;
-    mutable bool referenced;
+    bool referenced;    // named by a load, a store, or an address
 
     GlobalSymbol()
         : binding(0), definition(0), internal_linkage(false),
@@ -203,7 +202,10 @@ private:
   const std::string& FunctionSymbolName(FunctionEntityId id);
   const std::string& FunctionBaseSymbolName(FunctionEntityId id);
   BindingId CanonicalBinding(BindingId id) const;
-  const GlobalSymbol* GlobalFor(BindingId id) const;
+  const GlobalSymbol* GlobalFor(BindingId id);
+  lowir_model::SymbolMetadata GlobalMetadata(const GlobalSymbol& symbol) const;
+  lowir_model::GlobalDeclaration BuildGlobalDeclaration(
+      const GlobalSymbol& symbol) const;
   void BuildGlobalDefinitions();
   void AddThreadLocalWrapperDeclaration(const std::string& target,
                                         const std::string& object,
@@ -212,7 +214,6 @@ private:
                                  SemaId expression, TypeId type,
                                  bool constructor_action);
   void BuildThreadLocalInitializers();
-  void DropUnreferencedConstantDeclarations();
   void BuildGlobalArrayDefinition(
       const GlobalSymbol& symbol, const Binding& binding,
       const std::vector<SemaId>& initializer,

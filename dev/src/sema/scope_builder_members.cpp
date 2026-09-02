@@ -1,5 +1,6 @@
 #include "sema/scope_builder.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 // Namespace redeclarations and out-of-class member definitions share the
@@ -89,4 +90,14 @@ ScopeId ScopeBuilder::TypeScopeForDeclaration(ScopeId scope, AstId list) const
   const QualifiedName name = NodeName(identifier);
   return name.Qualified() ? ResolveQualifierScope(scope, name.Prefix()) :
       scope;
+}
+
+// 11.3: a friend declaration in `granting` names the entity that owns
+// `friend_of`.  A class may repeat the declaration; the relation is one entry.
+void ScopeBuilder::RecordFriend(ClassEntityId granting,
+                                std::vector<ClassEntityId>& friend_of)
+{
+  if (std::find(friend_of.begin(), friend_of.end(), granting) ==
+      friend_of.end())
+    friend_of.push_back(granting);
 }

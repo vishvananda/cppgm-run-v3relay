@@ -196,10 +196,11 @@ struct ClassEntity
   // ADL, even though their bindings live in that class's enclosing
   // namespace.  This is the canonical hidden-friend association set.
   std::vector<BindingId> hidden_friends;
-  // Access-control relations are stored on the class that grants access;
-  // friend declarations themselves may be declared in a different scope.
-  std::vector<ClassEntityId> friend_classes;
-  std::vector<FunctionEntityId> friend_functions;
+  // 11.3: the classes whose friend declarations name this class.  Access
+  // checks start from the context that asks for access, so the relation is
+  // kept on the befriended entity and bounded by its own friend
+  // declarations rather than by the program's class count.
+  std::vector<ClassEntityId> friend_of;
   bool layout_complete;
   // Lifetime facts are fixed with the layout: whether default construction
   // and destruction of a complete object have any runtime effect, counting
@@ -252,6 +253,8 @@ struct FunctionEntity
   bool static_member;
   bool in_class_definition;
   bool synthesized;
+  // 11.3: the classes whose friend declarations name this function.
+  std::vector<ClassEntityId> friend_of;
   // One entry per canonical parameter; a zero entry means that parameter
   // has no default initializer.  The AST initializer remains the canonical
   // source fact and is materialized at each call site by expression sema.
@@ -416,13 +419,14 @@ private:
       ScopeId scope, const std::string& name, unsigned filter,
       std::vector<ScopeId>& visited,
       std::vector<BindingId>& result) const;
+  BindingId InjectedClassName(BindingId binding,
+                              const std::string& name) const;
   ClassEntityId DeclaringClass(BindingId binding) const;
   FunctionEntityId ContextFunction(ScopeId scope) const;
   void ContextClasses(ScopeId scope,
                       std::vector<ClassEntityId>& result) const;
-  bool IsNestedClassOf(ClassEntityId nested, ClassEntityId enclosing) const;
-  bool IsFriendClass(ClassEntityId owner, ClassEntityId context) const;
-  bool IsFriendFunction(ClassEntityId owner, FunctionEntityId context) const;
+  bool FriendGrantsAccess(ClassEntityId granting, ClassEntityId owner,
+                          AccessKind access) const;
   bool ContextCanAccess(ClassEntityId owner, AccessKind access,
                         ScopeId context) const;
   bool IsBaseEdgeAccessible(ClassEntityId owner, AccessKind access,

@@ -289,6 +289,8 @@ private:
   bool HasStaticMemberFunction(ScopeId scope, const std::string& name,
                                TypeId member_type) const;
   ScopeId TypeScopeForDeclaration(ScopeId scope, AstId list) const;
+  static void RecordFriend(ClassEntityId granting,
+                           std::vector<ClassEntityId>& friend_of);
 
   const std::vector<Pa6Token>& tokens_;
   const AstArena& arena_;
@@ -303,7 +305,6 @@ private:
   unsigned unnamed_local_class_counter_;
   unsigned c_linkage_depth_;
   AccessKind member_access_;
-  ClassEntityId current_class_;
   bool suppress_semantics_;
   unsigned jump_sequence_;
   std::vector<SemaId> deferred_semantics_;

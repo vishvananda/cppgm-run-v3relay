@@ -14,7 +14,7 @@ ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens,
       expression_(tokens, arena, model, scratch_tree_, *this),
       semantic_root_(0), unnamed_local_enum_counter_(0),
       unnamed_local_class_counter_(0), c_linkage_depth_(0),
-      member_access_(ACCESS_PUBLIC), current_class_(0),
+      member_access_(ACCESS_PUBLIC),
       suppress_semantics_(false), jump_sequence_(0)
 {
 }
@@ -27,7 +27,7 @@ ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens,
       expression_(tokens, arena, model, tree, *this),
       semantic_root_(0), unnamed_local_enum_counter_(0),
       unnamed_local_class_counter_(0), c_linkage_depth_(0),
-      member_access_(ACCESS_PUBLIC), current_class_(0),
+      member_access_(ACCESS_PUBLIC),
       suppress_semantics_(false), jump_sequence_(0)
 {
 }
