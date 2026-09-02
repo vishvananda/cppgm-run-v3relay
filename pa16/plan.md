@@ -238,6 +238,7 @@ comes from the intended check.
 | CP4b.1 placement-new semantic/lowering (completed) | placement-new allocation overloads, placement arguments, class construction at the returned address, and aggregate-brace constructor calls | 159/243 (84 failures, down from 86); through-pa15 1139/1139; file audit passes |
 | CP4b.2 copy/list diagnostics and access completion (completed) | explicit-constructor rejection, narrowing, anonymous storage, and the remaining private/protected/incomplete-reference paths | 169/243 pa16 tests pass (74 failures, down from 84); through-pa15 remains 1139/1139; file audit passes |
 | CP5 audit and cleanup (completed) | static-member declaration identity, qualified/inherited lookup, global lvalue/address lowering, aggregate startup stores, and audit cleanup | 175/243 pa16 tests pass (68 failures, down from 74); packet 5/5; through-pa15 1139/1139; through-pa16 1314/1382; file audit passes with four pre-existing warnings |
+| CP6 thread-local and static storage (completed) | canonical `Binding`/`GlobalSymbol` storage facts, TLS ABI wrapper and guarded initializer family, qualified private nested-type context, and use-sensitive constant declaration elision | 180/243 pa16 tests pass (63 failures, down from 68); packet 5/5; through-pa15 1139/1139; through-pa16 1319/1382; file audit passes with five warnings; specified scaling probe completed |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -567,24 +568,21 @@ failures.  The pa16 file audit passes with four pre-existing header warnings.
 The architecture findings and remaining failure ownership are recorded in
 `audit.md`.
 
-## Active Checkpoint: CP6 — thread-local and remaining static storage
+## Active Checkpoint: CP7 — qualified and deferred member type contexts
 
-Goal: complete the remaining static-member lvalue/address cases and the
-thread-local symbol family through one canonical storage model, preserving
-the through-pa16 gate.
+Goal: resolve the remaining out-of-class and deferred member type contexts
+through one scope-aware semantic path, preserving the through-pa16 gate.
 
 ### Implementation Packet
 
-- Own the remaining static/TLS failures in `dev/src/sema` and `dev/src/lower`
-  through `Binding`/`GlobalSymbol` storage facts and bounded symbol-family
-  construction; do not edit fixtures or `.ref` files.
-- Start with `100-static-member-object-access`,
-  `200-static-thread-local-member`,
-  `200-static-thread-local-member-object-call`,
-  `300-static-member-definition-private-nested-type`, and
-  `300-thread-local-synthetic-symbol-family-isolation`.
-- Re-run the focused failure-set comparison after each loop, then require
-  `make test-pa16`, `make test-report-through-pa16`, the pa16 file audit, and
-  the packet probe.
-- Record the storage ownership and final evidence in `audit.md` before
-  declaring the checkpoint complete.
+- Own the remaining qualified/deferred member type failures in `dev/src/sema`
+  through declaration-scope resolution and completed-class context; do not
+  edit fixtures or `.ref` files.
+- Start with `200-inherited-base-typedefs-in-derived-members`,
+  `200-out-of-line-member-inherited-typedef-body`,
+  `300-member-function-trailing-return`,
+  `300-out-of-class-private-nested-return-type`, and
+  `spec/100-decltype-qualified-nested-type-local`.
+- Trace the type and scope facts from parser declarator through semantic
+  binding and deferred body analysis, then require a focused comparison,
+  `make test-pa16`, the through-pa16 report, and the pa16 file audit.

@@ -163,8 +163,10 @@ void Lowerer::Run()
       }
     }
   }
+  BuildThreadLocalInitializers();
   BuildGlobalInitializers();
   BuildGlobalFinalizers();
+  DropUnreferencedConstantDeclarations();
   BuildDeclarations();
 }
 

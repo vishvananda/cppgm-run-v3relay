@@ -47,6 +47,7 @@ private:
   unsigned init_temp_counter_;
   unsigned init_label_counter_;
   unsigned init_slot_counter_;
+  std::set<std::string> referenced_globals_;
   lowir_model::Function fini_function_;
   bool has_fini_;
   bool needs_init_function_;
@@ -128,10 +129,31 @@ private:
     SemaId definition;  // defining variable node; 0 when only declared
     bool internal_linkage;
     bool c_linkage;
+    bool thread_local_storage;
+    mutable bool referenced;
 
     GlobalSymbol()
         : binding(0), definition(0), internal_linkage(false),
-          c_linkage(false) {}
+          c_linkage(false), thread_local_storage(false), referenced(false) {}
+  };
+
+  struct ThreadLocalInitializer
+  {
+    std::string function;
+    std::string symbol;
+    std::string guard;
+    SemaId expression;
+    TypeId type;
+    bool constructor_action;
+
+    ThreadLocalInitializer(const std::string& function = std::string(),
+                           const std::string& symbol = std::string(),
+                           const std::string& guard = std::string(),
+                           SemaId expression = 0, TypeId type = 0,
+                           bool constructor_action = false)
+        : function(function), symbol(symbol), guard(guard),
+          expression(expression), type(type),
+          constructor_action(constructor_action) {}
   };
 
   // A store the startup initializer performs because the initializer is
@@ -177,11 +199,24 @@ private:
   std::vector<std::string> NamespacePieces(ScopeId scope) const;
   std::string FunctionObjectName(FunctionEntityId id) const;
   std::string GlobalObjectName(const GlobalSymbol& symbol) const;
+  std::string ThreadLocalWrapperObjectName(const GlobalSymbol& symbol) const;
   const std::string& FunctionSymbolName(FunctionEntityId id);
   const std::string& FunctionBaseSymbolName(FunctionEntityId id);
   BindingId CanonicalBinding(BindingId id) const;
   const GlobalSymbol* GlobalFor(BindingId id) const;
   void BuildGlobalDefinitions();
+  void AddThreadLocalWrapperDeclaration(const std::string& target,
+                                        const std::string& object,
+                                        bool internal_linkage);
+  void AddThreadLocalInitializer(const GlobalSymbol& symbol,
+                                 SemaId expression, TypeId type,
+                                 bool constructor_action);
+  void BuildThreadLocalInitializers();
+  void DropUnreferencedConstantDeclarations();
+  void BuildGlobalArrayDefinition(
+      const GlobalSymbol& symbol, const Binding& binding,
+      const std::vector<SemaId>& initializer,
+      lowir_model::GlobalDefinition& global);
   bool TryBuildRuntimeClassAggregate(
       const GlobalSymbol& symbol, const Binding& binding, TypeId element,
       const std::vector<SemaId>& elements,
@@ -416,6 +451,7 @@ private:
   std::map<BindingId, GlobalSymbol> globals_;
   std::vector<BindingId> global_order_;
   std::vector<DynamicInitializer> dynamic_initializers_;
+  std::vector<ThreadLocalInitializer> thread_local_initializers_;
   std::map<SemaId, std::string> string_symbols_;
 
   // Function-level state.

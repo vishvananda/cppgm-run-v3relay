@@ -36,10 +36,15 @@ const char* role_name(SymbolRole role)
 }
 
 void append_symbol_metadata(std::ostringstream& out,
-                            const SymbolMetadata& metadata)
+                            const SymbolMetadata& metadata,
+                            GlobalStorageMode storage = GSM_DEFAULT)
 {
   bool first = true;
   std::ostringstream body;
+  if (storage == GSM_THREAD_LOCAL) {
+    body << "storage=thread_local";
+    first = false;
+  }
   if (metadata.role != SR_NONE) { body << (first ? "" : ", ") << "role=" << role_name(metadata.role); first = false; }
   if (metadata.linkage != LLM_DEFAULT) { body << (first ? "" : ", ") << "linkage=" << (metadata.linkage == LLM_C ? "c" : "cpp"); first = false; }
   if (metadata.binding != SBM_DEFAULT) {
@@ -271,7 +276,7 @@ std::string global_declaration_text(const GlobalDeclaration& declaration)
   out << "declare global " << declaration.name;
   if (declaration.has_type)
     out << " : " << declaration.type.text;
-  append_symbol_metadata(out, declaration.metadata);
+  append_symbol_metadata(out, declaration.metadata, declaration.storage);
   return out.str();
 }
 
@@ -283,7 +288,9 @@ std::string global_definition_text(const GlobalDefinition& global)
     out << " readonly";
   if (!global.structured) {
     out << " : " << global.type.text;
-    append_symbol_metadata(out, global.metadata);
+    append_symbol_metadata(out, global.metadata,
+                           global.storage == GSM_THREAD_LOCAL ?
+                               GSM_THREAD_LOCAL : GSM_DEFAULT);
     out << " = ";
     if (global.init_kind == GlobalDefinition::INIT_ZERO)
       out << "zero";
@@ -298,7 +305,9 @@ std::string global_definition_text(const GlobalDefinition& global)
       out << operand(global.init_operand);
     return out.str();
   }
-  append_symbol_metadata(out, global.metadata);
+  append_symbol_metadata(out, global.metadata,
+                         global.storage == GSM_THREAD_LOCAL ?
+                             GSM_THREAD_LOCAL : GSM_DEFAULT);
   out << " = {\n";
   for (std::size_t i = 0; i < global.data_items.size(); ++i) {
     const GlobalDefinition::DataItem& item = global.data_items[i];

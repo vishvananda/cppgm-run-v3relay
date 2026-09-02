@@ -98,6 +98,7 @@ struct Binding
   BindingId object_binding; // injected member: implicit anonymous-union object
   bool internal_linkage;
   bool c_linkage;
+  bool thread_local_storage;
   bool extern_declaration;
   bool hidden_friend;
   bool noexcept_qualifier;

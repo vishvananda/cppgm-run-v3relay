@@ -19,6 +19,10 @@ void ScopeBuilder::LinkRedeclaration(BindingId binding, ScopeId scope,
       continue;
     if (!CompatibleRedeclaration(prior.type, type))
       throw std::runtime_error("object redeclared with a different type");
+    if (prior.thread_local_storage !=
+        model_.BindingAt(binding).thread_local_storage)
+      throw std::runtime_error(
+          "thread_local does not agree across redeclarations");
     model_.BindingAt(binding).redeclared_binding =
         prior.redeclared_binding != 0 ? prior.redeclared_binding : priors[i];
     return;
@@ -74,4 +78,15 @@ bool ScopeBuilder::HasStaticMemberFunction(
       return true;
   }
   return false;
+}
+
+ScopeId ScopeBuilder::TypeScopeForDeclaration(ScopeId scope, AstId list) const
+{
+  if (list == 0 || arena_.At(list).children.empty())
+    return scope;
+  const AstId first = arena_.At(list).children[0];
+  const AstId identifier = FindIdentifier(FindChild(first, AST_DECLARATOR));
+  const QualifiedName name = NodeName(identifier);
+  return name.Qualified() ? ResolveQualifierScope(scope, name.Prefix()) :
+      scope;
 }

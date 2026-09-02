@@ -288,6 +288,7 @@ private:
                                      TypeId type) const;
   bool HasStaticMemberFunction(ScopeId scope, const std::string& name,
                                TypeId member_type) const;
+  ScopeId TypeScopeForDeclaration(ScopeId scope, AstId list) const;
 
   const std::vector<Pa6Token>& tokens_;
   const AstArena& arena_;

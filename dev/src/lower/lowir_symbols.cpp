@@ -122,6 +122,8 @@ void Lowerer::CollectSymbols(SemaId node)
       symbol.internal_linkage = symbol.internal_linkage ||
           binding.internal_linkage;
       symbol.c_linkage = symbol.c_linkage || binding.c_linkage;
+      symbol.thread_local_storage = symbol.thread_local_storage ||
+          binding.thread_local_storage;
       if (!binding.extern_declaration && symbol.definition == 0)
         symbol.definition = node;
     }
@@ -220,7 +222,11 @@ const Lowerer::GlobalSymbol* Lowerer::GlobalFor(BindingId id) const
 {
   const std::map<BindingId, GlobalSymbol>::const_iterator found =
       globals_.find(CanonicalBinding(id));
-  return found == globals_.end() ? 0 : &found->second;
+  if (found == globals_.end())
+    return 0;
+  found->second.referenced = true;
+  shared_.referenced_globals_.insert(found->second.name);
+  return &found->second;
 }
 
 // LowIR names are assigned in first-declaration order: functions, then
@@ -463,6 +469,213 @@ std::string Lowerer::GlobalObjectName(const GlobalSymbol& symbol) const
   const std::vector<abi_mangle::AbiFunctionRecord> records;
   const abi_mangle::AbiDefinitionTable definitions;
   return abi_mangle::mangle_target(target, records, definitions);
+}
+
+std::string Lowerer::ThreadLocalWrapperObjectName(
+    const GlobalSymbol& symbol) const
+{
+  const Binding& binding = model_.BindingAt(symbol.binding);
+  if (symbol.internal_linkage || binding.c_linkage)
+    return std::string();
+  abi_mangle::AbiTargetRecord target;
+  target.kind = abi_mangle::ABI_TARGET_FACT_THREAD_LOCAL_WRAPPER;
+  target.qualified_name =
+      Join(NamespacePieces(binding.scope), "::", binding.name);
+  const std::vector<abi_mangle::AbiFunctionRecord> records;
+  const abi_mangle::AbiDefinitionTable definitions;
+  return abi_mangle::mangle_target(target, records, definitions);
+}
+
+void Lowerer::AddThreadLocalWrapperDeclaration(
+    const std::string& target, const std::string& object,
+    bool internal_linkage)
+{
+  if (target.empty() || target[0] != '@')
+    Unsupported("a thread-local wrapper without a target symbol");
+  const std::string base = "@__cppgm_tls_wrapper__" + target.substr(1);
+  const std::string name = TopLevelName(base, object);
+  lowir_model::FunctionDeclaration declaration;
+  declaration.name = name;
+  declaration.return_type = PtrType();
+  declaration.metadata.binding = internal_linkage ?
+      lowir_model::SBM_INTERNAL : lowir_model::SBM_STRONG;
+  if (!object.empty())
+    declaration.metadata.object_symbol = object;
+  declaration.metadata.tls_for_symbol = target;
+  program_.function_declarations.push_back(declaration);
+}
+
+void Lowerer::AddThreadLocalInitializer(const GlobalSymbol& symbol,
+                                        SemaId expression, TypeId type,
+                                        bool constructor_action)
+{
+  if (expression == 0)
+    Unsupported("a thread-local initializer without an expression");
+  const std::string suffix = symbol.name.substr(1);
+  const std::string guard = TopLevelName(
+      "@__cppgm_tls_guard__" + suffix, std::string());
+  const std::string function = TopLevelName(
+      "@__cppgm_tls_init__" + suffix, std::string());
+  AddThreadLocalWrapperDeclaration(guard, std::string(), true);
+
+  lowir_model::GlobalDefinition guard_global;
+  guard_global.name = guard;
+  guard_global.type = I64Type();
+  guard_global.storage = lowir_model::GSM_THREAD_LOCAL;
+  guard_global.init_kind = lowir_model::GlobalDefinition::INIT_ZERO;
+  guard_global.metadata.binding = lowir_model::SBM_INTERNAL;
+  program_.globals.push_back(guard_global);
+  thread_local_initializers_.push_back(ThreadLocalInitializer(
+      function, symbol.name, guard, expression, type, constructor_action));
+}
+
+void Lowerer::BuildGlobalArrayDefinition(
+    const GlobalSymbol& symbol, const Binding& binding,
+    const std::vector<SemaId>& initializer,
+    lowir_model::GlobalDefinition& global)
+{
+  typedef lowir_model::GlobalDefinition::DataItem DataItem;
+  global.structured = true;
+  const TypeId object_type = types_.Unqualified(binding.type);
+  const TypeId element = types_.At(object_type).base;
+  const std::size_t element_size = types_.SizeOf(element);
+  const std::size_t bound = types_.At(object_type).array_bound;
+  std::vector<SemaId> elements;
+  if (!initializer.empty() &&
+      tree_.At(initializer[0]).kind == SEMA_BRACED_INIT_LIST)
+    elements = Children(initializer[0]);
+
+  if (TryBuildRuntimeClassAggregate(symbol, binding, element, elements,
+                                    global))
+    return;
+  // Consecutive zero elements, whether written, missing, or awaiting a
+  // startup store, merge into one zero run.
+  std::size_t pending_zero = 0;
+  for (std::size_t index = 0; index < elements.size() && index < bound;
+       ++index) {
+    const TypeId element_unqualified = types_.Unqualified(element);
+    if (types_.Kind(element_unqualified) == TYPE_CLASS &&
+        tree_.At(elements[index]).kind == SEMA_BRACED_INIT_LIST) {
+      if (pending_zero != 0) {
+        DataItem zero;
+        zero.kind = DataItem::ITEM_ZERO;
+        zero.zero_bytes = pending_zero;
+        global.data_items.push_back(zero);
+        pending_zero = 0;
+      }
+      const ClassEntity& class_entity = model_.ClassAt(
+          types_.At(element_unqualified).entity);
+      const std::vector<SemaId> values = Children(elements[index]);
+      std::size_t value_index = 0;
+      std::size_t cursor = 0;
+      for (std::size_t field_index = 0;
+           field_index < class_entity.fields.size(); ++field_index) {
+        const ClassField& field = class_entity.fields[field_index];
+        if (field.static_member || field.binding == 0)
+          continue;
+        if (field.offset > cursor) {
+          DataItem zero;
+          zero.kind = DataItem::ITEM_ZERO;
+          zero.zero_bytes = field.offset - cursor;
+          global.data_items.push_back(zero);
+        }
+        const TypeId value_type = field.type;
+        DataItem field_item;
+        if (value_index < values.size() &&
+            ConstantGlobalItem(values[value_index], value_type,
+                               field_item)) {
+          global.data_items.push_back(field_item);
+        } else if (value_index < values.size()) {
+          DynamicInitializer dynamic;
+          dynamic.expression = values[value_index];
+          dynamic.symbol = symbol.name;
+          dynamic.byte_offset = index * element_size + field.offset;
+          dynamic.type = value_type;
+          dynamic.aggregate_type = binding.type;
+          dynamic.aggregate_path.push_back(index);
+          dynamic.aggregate_path.push_back(field_index);
+          dynamic.aggregate_subobject = true;
+          dynamic_initializers_.push_back(dynamic);
+          DataItem zero;
+          zero.kind = DataItem::ITEM_ZERO;
+          zero.zero_bytes = types_.SizeOf(value_type);
+          global.data_items.push_back(zero);
+        } else {
+          DataItem zero;
+          zero.kind = DataItem::ITEM_ZERO;
+          zero.zero_bytes = types_.SizeOf(value_type);
+          global.data_items.push_back(zero);
+        }
+        ++value_index;
+        cursor = field.offset + types_.SizeOf(value_type);
+      }
+      if (cursor < element_size) {
+        DataItem zero;
+        zero.kind = DataItem::ITEM_ZERO;
+        zero.zero_bytes = element_size - cursor;
+        global.data_items.push_back(zero);
+      }
+      continue;
+    }
+    if (types_.Kind(element_unqualified) == TYPE_CLASS &&
+        tree_.At(elements[index]).kind == SEMA_CONSTRUCTOR_ACTION) {
+      std::vector<DataItem> folded;
+      if (FoldConstructorAction(elements[index], element_unqualified,
+                                folded)) {
+        if (pending_zero != 0) {
+          DataItem zero;
+          zero.kind = DataItem::ITEM_ZERO;
+          zero.zero_bytes = pending_zero;
+          global.data_items.push_back(zero);
+          pending_zero = 0;
+        }
+        global.data_items.insert(global.data_items.end(),
+                                 folded.begin(), folded.end());
+        continue;
+      }
+      DynamicInitializer dynamic;
+      dynamic.expression = elements[index];
+      dynamic.symbol = symbol.name;
+      dynamic.byte_offset = index * element_size;
+      dynamic.element_index = index;
+      dynamic.type = element;
+      dynamic.constructor_action = true;
+      dynamic_initializers_.push_back(dynamic);
+      pending_zero += element_size;
+      continue;
+    }
+    DataItem item;
+    if (!ConstantGlobalItem(elements[index], element, item)) {
+      DynamicInitializer dynamic;
+      dynamic.expression = elements[index];
+      dynamic.symbol = symbol.name;
+      dynamic.byte_offset = index * element_size;
+      dynamic.type = element;
+      dynamic_initializers_.push_back(dynamic);
+      pending_zero += element_size;
+      continue;
+    }
+    if (item.kind == DataItem::ITEM_ZERO) {
+      pending_zero += element_size;
+      continue;
+    }
+    if (pending_zero != 0) {
+      DataItem zero;
+      zero.kind = DataItem::ITEM_ZERO;
+      zero.zero_bytes = pending_zero;
+      global.data_items.push_back(zero);
+      pending_zero = 0;
+    }
+    global.data_items.push_back(item);
+  }
+  if (bound > elements.size())
+    pending_zero += (bound - elements.size()) * element_size;
+  if (pending_zero != 0 || global.data_items.empty()) {
+    DataItem zero;
+    zero.kind = DataItem::ITEM_ZERO;
+    zero.zero_bytes = pending_zero;
+    global.data_items.push_back(zero);
+  }
 }
 
 // Every reference to a function symbol passes through here, so a function
@@ -714,23 +927,31 @@ void Lowerer::BuildGlobalDefinitions()
   typedef lowir_model::GlobalDefinition::DataItem DataItem;
   for (std::size_t i = 0; i < global_order_.size(); ++i) {
     const GlobalSymbol& symbol = globals_[global_order_[i]];
+    const Binding& canonical_binding = model_.BindingAt(symbol.binding);
     lowir_model::SymbolMetadata metadata;
     metadata.binding = symbol.internal_linkage ? lowir_model::SBM_INTERNAL :
         lowir_model::SBM_STRONG;
     metadata.linkage = symbol.c_linkage ? lowir_model::LLM_C :
         lowir_model::LLM_DEFAULT;
     metadata.object_symbol = symbol.object;
+    if (symbol.thread_local_storage)
+      AddThreadLocalWrapperDeclaration(
+          symbol.name, ThreadLocalWrapperObjectName(symbol),
+          symbol.internal_linkage);
 
     if (symbol.definition == 0) {
-      const Binding& binding = model_.BindingAt(symbol.binding);
-      const TypeId declared = types_.Unqualified(binding.type);
+      const TypeId declared = types_.Unqualified(canonical_binding.type);
       lowir_model::GlobalDeclaration declaration;
       declaration.name = symbol.name;
+      declaration.storage = symbol.thread_local_storage ?
+          lowir_model::GSM_THREAD_LOCAL : lowir_model::GSM_DEFAULT;
       // An array of unknown bound has no LowIR storage type.
-      declaration.has_type = types_.Kind(declared) != TYPE_ARRAY ||
-          types_.At(declared).array_bound != 0;
+      declaration.has_type = (!symbol.thread_local_storage ||
+                              types_.Kind(declared) != TYPE_CLASS) &&
+          (types_.Kind(declared) != TYPE_ARRAY ||
+           types_.At(declared).array_bound != 0);
       if (declaration.has_type)
-        declaration.type = LowTypeOf(binding.type);
+        declaration.type = LowTypeOf(canonical_binding.type);
       declaration.metadata = metadata;
       program_.global_declarations.push_back(declaration);
       continue;
@@ -742,151 +963,12 @@ void Lowerer::BuildGlobalDefinitions()
     const std::vector<SemaId> initializer = Children(symbol.definition);
     lowir_model::GlobalDefinition global;
     global.name = symbol.name;
+    global.storage = symbol.thread_local_storage ?
+        lowir_model::GSM_THREAD_LOCAL : lowir_model::GSM_DEFAULT;
     global.metadata = metadata;
 
     if (types_.Kind(object_type) == TYPE_ARRAY) {
-      global.structured = true;
-      const TypeId element = types_.At(object_type).base;
-      const std::size_t element_size = types_.SizeOf(element);
-      const std::size_t bound = types_.At(object_type).array_bound;
-      std::vector<SemaId> elements;
-      if (!initializer.empty() &&
-          tree_.At(initializer[0]).kind == SEMA_BRACED_INIT_LIST)
-        elements = Children(initializer[0]);
-
-      if (TryBuildRuntimeClassAggregate(symbol, binding, element, elements,
-                                        global)) {
-        program_.globals.push_back(global);
-        continue;
-      }
-      // Consecutive zero elements, whether written, missing, or awaiting a
-      // startup store, merge into one zero run.
-      std::size_t pending_zero = 0;
-      for (std::size_t index = 0; index < elements.size() && index < bound;
-           ++index) {
-        const TypeId element_unqualified = types_.Unqualified(element);
-        if (types_.Kind(element_unqualified) == TYPE_CLASS &&
-            tree_.At(elements[index]).kind == SEMA_BRACED_INIT_LIST) {
-          if (pending_zero != 0) {
-            DataItem zero;
-            zero.kind = DataItem::ITEM_ZERO;
-            zero.zero_bytes = pending_zero;
-            global.data_items.push_back(zero);
-            pending_zero = 0;
-          }
-          const ClassEntity& class_entity = model_.ClassAt(
-              types_.At(element_unqualified).entity);
-          const std::vector<SemaId> values = Children(elements[index]);
-          std::size_t value_index = 0;
-          std::size_t cursor = 0;
-          for (std::size_t field_index = 0;
-               field_index < class_entity.fields.size(); ++field_index) {
-            const ClassField& field = class_entity.fields[field_index];
-            if (field.static_member || field.binding == 0)
-              continue;
-            if (field.offset > cursor) {
-              DataItem zero;
-              zero.kind = DataItem::ITEM_ZERO;
-              zero.zero_bytes = field.offset - cursor;
-              global.data_items.push_back(zero);
-            }
-            const TypeId value_type = field.type;
-            DataItem field_item;
-            if (value_index < values.size() &&
-                ConstantGlobalItem(values[value_index], value_type,
-                                   field_item)) {
-              global.data_items.push_back(field_item);
-            } else if (value_index < values.size()) {
-              DynamicInitializer dynamic;
-              dynamic.expression = values[value_index];
-              dynamic.symbol = symbol.name;
-              dynamic.byte_offset = index * element_size + field.offset;
-              dynamic.type = value_type;
-              dynamic.aggregate_type = binding.type;
-              dynamic.aggregate_path.push_back(index);
-              dynamic.aggregate_path.push_back(field_index);
-              dynamic.aggregate_subobject = true;
-              dynamic_initializers_.push_back(dynamic);
-              DataItem zero;
-              zero.kind = DataItem::ITEM_ZERO;
-              zero.zero_bytes = types_.SizeOf(value_type);
-              global.data_items.push_back(zero);
-            } else {
-              DataItem zero;
-              zero.kind = DataItem::ITEM_ZERO;
-              zero.zero_bytes = types_.SizeOf(value_type);
-              global.data_items.push_back(zero);
-            }
-            ++value_index;
-            cursor = field.offset + types_.SizeOf(value_type);
-          }
-          if (cursor < element_size) {
-            DataItem zero;
-            zero.kind = DataItem::ITEM_ZERO;
-            zero.zero_bytes = element_size - cursor;
-            global.data_items.push_back(zero);
-          }
-          continue;
-        }
-        if (types_.Kind(element_unqualified) == TYPE_CLASS &&
-            tree_.At(elements[index]).kind == SEMA_CONSTRUCTOR_ACTION) {
-          std::vector<DataItem> folded;
-          if (FoldConstructorAction(elements[index], element_unqualified,
-                                    folded)) {
-            if (pending_zero != 0) {
-              DataItem zero;
-              zero.kind = DataItem::ITEM_ZERO;
-              zero.zero_bytes = pending_zero;
-              global.data_items.push_back(zero);
-              pending_zero = 0;
-            }
-            global.data_items.insert(global.data_items.end(),
-                                     folded.begin(), folded.end());
-            continue;
-          }
-          DynamicInitializer dynamic;
-          dynamic.expression = elements[index];
-          dynamic.symbol = symbol.name;
-          dynamic.byte_offset = index * element_size;
-          dynamic.element_index = index;
-          dynamic.type = element;
-          dynamic.constructor_action = true;
-          dynamic_initializers_.push_back(dynamic);
-          pending_zero += element_size;
-          continue;
-        }
-        DataItem item;
-        if (!ConstantGlobalItem(elements[index], element, item)) {
-          DynamicInitializer dynamic;
-          dynamic.expression = elements[index];
-          dynamic.symbol = symbol.name;
-          dynamic.byte_offset = index * element_size;
-          dynamic.type = element;
-          dynamic_initializers_.push_back(dynamic);
-          pending_zero += element_size;
-          continue;
-        }
-        if (item.kind == DataItem::ITEM_ZERO) {
-          pending_zero += element_size;
-          continue;
-        }
-        if (pending_zero != 0) {
-          DataItem zero;
-          zero.kind = DataItem::ITEM_ZERO;
-          zero.zero_bytes = pending_zero;
-          global.data_items.push_back(zero);
-          pending_zero = 0;
-        }
-        global.data_items.push_back(item);
-      }
-      if (bound > elements.size())
-        pending_zero += (bound - elements.size()) * element_size;
-      if (pending_zero != 0 || global.data_items.empty()) {
-        DataItem zero;
-        zero.kind = DataItem::ITEM_ZERO;
-        zero.zero_bytes = pending_zero;
-        global.data_items.push_back(zero);
-      }
+      BuildGlobalArrayDefinition(symbol, binding, initializer, global);
       program_.globals.push_back(global);
       continue;
     }
@@ -906,17 +988,25 @@ void Lowerer::BuildGlobalDefinitions()
             tree_.At(action_children[0]).kind == SEMA_CALL) {
           const FunctionEntityId constructor =
               tree_.At(action_children[0]).function;
-          if (constructor != 0)
-            shared_.needs_init_function_ = true;
-          if (constructor != 0 &&
-              !model_.ClassAt(model_.FunctionAt(constructor).member_class)
-                  .trivial_default_constructor) {
-            DynamicInitializer dynamic;
-            dynamic.expression = action_children[0];
-            dynamic.symbol = symbol.name;
-            dynamic.type = binding.type;
-            dynamic.constructor_action = true;
-            dynamic_initializers_.push_back(dynamic);
+          if (constructor != 0) {
+            const bool trivial =
+                model_.ClassAt(model_.FunctionAt(constructor).member_class)
+                    .trivial_default_constructor;
+            if (symbol.thread_local_storage) {
+              if (!trivial)
+                AddThreadLocalInitializer(symbol, initializer[0],
+                                          binding.type, true);
+            } else {
+              shared_.needs_init_function_ = true;
+              if (!trivial) {
+                DynamicInitializer dynamic;
+                dynamic.expression = action_children[0];
+                dynamic.symbol = symbol.name;
+                dynamic.type = binding.type;
+                dynamic.constructor_action = true;
+                dynamic_initializers_.push_back(dynamic);
+              }
+            }
           }
         }
       }
@@ -926,14 +1016,11 @@ void Lowerer::BuildGlobalDefinitions()
     global.type = LowTypeOf(binding.type);
     global.init_kind = lowir_model::GlobalDefinition::INIT_ZERO;
     DataItem item;
+    bool dynamic = false;
     if (initializer.empty()) {
       // zero-initialized
     } else if (!ConstantGlobalItem(initializer[0], binding.type, item)) {
-      DynamicInitializer dynamic;
-      dynamic.expression = initializer[0];
-      dynamic.symbol = symbol.name;
-      dynamic.type = binding.type;
-      dynamic_initializers_.push_back(dynamic);
+      dynamic = true;
     } else if (item.kind == DataItem::ITEM_ADDR) {
       global.init_kind = lowir_model::GlobalDefinition::INIT_ADDR;
       global.init_operand = GlobalOperand(item.symbol);
@@ -943,7 +1030,92 @@ void Lowerer::BuildGlobalDefinitions()
       global.init_operand = item.literal_operand;
     }
     program_.globals.push_back(global);
+    if (dynamic) {
+      if (symbol.thread_local_storage)
+        AddThreadLocalInitializer(symbol, initializer[0], binding.type, false);
+      else {
+        DynamicInitializer initializer_record;
+        initializer_record.expression = initializer[0];
+        initializer_record.symbol = symbol.name;
+        initializer_record.type = binding.type;
+        dynamic_initializers_.push_back(initializer_record);
+      }
+    }
   }
+}
+
+void Lowerer::BuildThreadLocalInitializers()
+{
+  for (std::size_t i = 0; i < thread_local_initializers_.size(); ++i) {
+    const ThreadLocalInitializer& initializer = thread_local_initializers_[i];
+    ResetFunction(initializer.function, VoidType());
+    function_.metadata.binding = lowir_model::SBM_INTERNAL;
+    StartBlock("^entry");
+
+    const std::string run = NewBlockLabel("local_static_ctor_run");
+    const std::string done = NewBlockLabel("local_static_ctor_done");
+    lowir_model::Instruction guard;
+    guard.kind = lowir_model::Instruction::IK_LOAD;
+    guard.dest = NewTemp();
+    guard.type = I64Type();
+    guard.first = GlobalOperand(initializer.guard);
+    Emit(guard);
+
+    lowir_model::Instruction initialized;
+    initialized.kind = lowir_model::Instruction::IK_CMP;
+    initialized.dest = NewTemp();
+    initialized.op = "ne";
+    initialized.type = I64Type();
+    initialized.first = TempOperand(guard.dest);
+    initialized.second = Immediate(0);
+    Emit(initialized);
+    EmitBranch(TempOperand(initialized.dest), done, run);
+
+    StartBlock(run);
+    if (initializer.constructor_action) {
+      const std::vector<SemaId> action_children =
+          Children(initializer.expression);
+      if (action_children.size() != 1 ||
+          tree_.At(action_children[0]).kind != SEMA_CALL)
+        Unsupported("a thread-local constructor action");
+      (void)LowerRValue(action_children[0], types_.Fundamental(FT_VOID));
+    } else {
+      const Value value = LowerRValue(initializer.expression,
+                                      initializer.type);
+      EmitStore(LowTypeOf(initializer.type), value.operand,
+                GlobalOperand(initializer.symbol));
+    }
+    EmitStore(I64Type(), Immediate(1), GlobalOperand(initializer.guard));
+    EmitJump(done);
+
+    StartBlock(done);
+    EmitReturn(0);
+    program_.functions.push_back(std::move(function_));
+  }
+}
+
+void Lowerer::DropUnreferencedConstantDeclarations()
+{
+  std::set<std::string> removable;
+  for (std::size_t i = 0; i < global_order_.size(); ++i) {
+    const GlobalSymbol& symbol = globals_[global_order_[i]];
+    if (symbol.definition == 0 && !symbol.thread_local_storage &&
+        model_.BindingAt(symbol.binding).has_const_value &&
+        shared_.referenced_globals_.count(symbol.name) == 0)
+      removable.insert(symbol.name);
+  }
+  if (removable.empty())
+    return;
+  std::size_t kept = 0;
+  for (std::size_t i = 0; i < program_.global_declarations.size(); ++i) {
+    if (removable.count(program_.global_declarations[i].name) != 0)
+      continue;
+    if (kept != i)
+      program_.global_declarations[kept] =
+          std::move(program_.global_declarations[i]);
+    ++kept;
+  }
+  program_.global_declarations.resize(kept);
 }
 
 bool Lowerer::TryBuildRuntimeClassAggregate(

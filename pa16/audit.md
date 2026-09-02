@@ -1,5 +1,39 @@
 # PA16 Checkpoint Review — cppgm++ --emit-lowir with the basic object model
 
+## CP6 (2026-09-02): canonical thread-local and static storage
+
+The semantic `Binding::thread_local_storage` bit is now the canonical storage
+fact for a static data member.  It is captured on both class-scope and
+qualified out-of-class declarations, carried through redeclaration matching,
+and transferred into `GlobalSymbol`.  The lowerer therefore emits one
+consistent `storage=thread_local` global family, including the ABI object
+wrapper, guard wrapper, guarded initializer function, and `tls_for` metadata.
+TLS class construction and scalar initialization remain demand-driven and
+bounded by the collected global symbols; ordinary globals keep the existing
+program startup path.
+
+The same ownership path also removes declaration-only constant static
+objects only after lowering has recorded an actual `GlobalFor` use, which
+keeps `100-static-member-object-access` as a local constant while preserving
+address and lvalue users.  Qualified member declarations build their type in
+the resolved class scope, so private nested types remain valid in permitted
+out-of-class definitions.  LowIR serialization now preserves TLS storage
+metadata on declarations and definitions.  No fixtures or reference files
+were changed.
+
+Evidence (2026-09-02): the five packet fixtures
+`100-static-member-object-access`, `200-static-thread-local-member`,
+`200-static-thread-local-member-object-call`,
+`300-static-member-definition-private-nested-type`, and
+`300-thread-local-synthetic-symbol-family-isolation` pass 5/5.  The final
+`make test-pa16` result is 180/243 (63 failures, down from 68) with unchanged
+coverage; `make test-report-through-pa15` is 1139/1139, and
+`make test-report-through-pa16` is 1319/1382.  The pa16 file audit passes with
+five nonfatal warnings.  The specified probe measured wide 0.06s/18348KB
+and doubled 0.13s/29668KB; deep 0.00s/6372KB and doubled 0.01s/6924KB (the
+baseline timing is below wall-clock resolution); exits 0.02s/10196KB and
+doubled 0.04s/15528KB.
+
 ## CP5 (2026-09-02): static-member identity and aggregate startup stores
 
 The implementation now keeps the static/non-static distinction on the

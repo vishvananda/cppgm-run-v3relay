@@ -462,7 +462,10 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     generated << "__local_type" << ++unnamed_local_class_counter_;
     anonymous_name = generated.str();
   }
-  const TypeId base = BuildSpecifierType(specifiers, scope, anonymous_name);
+  // A qualified out-of-class member definition is checked in the member's
+  // class context, including access to a private nested type.
+  const TypeId base = BuildSpecifierType(
+      specifiers, TypeScopeForDeclaration(scope, list), anonymous_name);
   const bool is_friend = SequenceHasKeyword(specifiers, KW_FRIEND);
   ClassEntityId friend_owner = 0;
   const bool has_friend_owner = model_.ClassForScope(scope, friend_owner);
@@ -517,6 +520,8 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     const bool is_member = model_.ClassForScope(target_scope, member_class);
     bool static_member = is_member &&
         SequenceHasKeyword(specifiers, KW_STATIC);
+    bool thread_local_storage =
+        SequenceHasKeyword(specifiers, KW_THREAD_LOCAL);
     // 7.1.5p9: a constexpr object is const.
     if (is_constexpr && !is_typedef && !is_function)
       type = types_.Cv(type, true);
@@ -583,8 +588,12 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
       redeclared_static_member = FindStaticMemberVariable(
           target_scope, name, type);
       static_member = redeclared_static_member != 0;
+      if (redeclared_static_member != 0)
+        thread_local_storage = thread_local_storage ||
+            model_.BindingAt(redeclared_static_member).thread_local_storage;
     }
     model_.BindingAt(binding).static_member = static_member;
+    model_.BindingAt(binding).thread_local_storage = thread_local_storage;
     if (redeclared_static_member != 0)
       model_.BindingAt(binding).redeclared_binding = redeclared_static_member;
     TypeId linkage_type = type;
@@ -1555,6 +1564,7 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
       injected.access = member.access;
       injected.declaring_class = member.declaring_class;
       injected.static_member = member.static_member;
+      injected.thread_local_storage = member.thread_local_storage;
       injected.field_index = member.field_index;
       injected.has_const_value = member.has_const_value;
       injected.const_value = member.const_value;
