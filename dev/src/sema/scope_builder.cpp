@@ -621,6 +621,7 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
         ClassField field(binding, type);
         field.access = member_access_;
         field.initializer = initializer;
+        field.requested_alignment = AlignmentSpecifiers(node, scope);
         model_.BindingAt(binding).field_index =
             model_.ClassAt(member_class).fields.size();
         model_.ClassAt(member_class).fields.push_back(field);
@@ -708,7 +709,12 @@ void ScopeBuilder::BuildVariable(BindingId binding, AstId initializer,
     const bool copy_list_initialization = value_kind == AST_BRACED_INIT_LIST &&
         after_declarator < tokens_.size() &&
         tokens_[after_declarator].IsSimple(OP_ASS);
-    if (!class_entity.aggregate && !class_entity.constructors.empty())
+    // A class functional cast (`T(args)`) is an expression-shaped
+    // constructor action.  Let expression analysis own that form; the
+    // declaration-specific path below is for direct/list initialization,
+    // whose AST children are already the constructor arguments.
+    if (value_kind != AST_CALL_EXPRESSION &&
+        !class_entity.aggregate && !class_entity.constructors.empty())
     {
       std::vector<AstId> arguments = arena_.At(value).children;
       bool copy_initialization = false;
@@ -1119,11 +1125,27 @@ void ScopeBuilder::BuildMemberInitializers(AstId initializer,
     }
     if (field_binding == 0)
     {
+      // A mem-initializer-id names the direct base class, but its spelling
+      // may be a typedef (12.6.2).  Resolve that spelling through the type
+      // lookup path and compare the canonical class entity, rather than
+      // comparing it with the base scope's printed name.
+      TypeId nominated_type = 0;
+      try
+      {
+        nominated_type = types_.Unqualified(LookupType(owner.class_scope,
+                                                        name));
+      }
+      catch (const std::runtime_error&)
+      {
+        nominated_type = 0;
+      }
       for (std::size_t base = 0; base < owner.bases.size(); ++base)
       {
         const ClassEntity& base_entity =
             model_.ClassAt(owner.bases[base].entity);
-        if (model_.ScopeAt(base_entity.class_scope).name == name.Last())
+        if (nominated_type != 0 &&
+            types_.Kind(nominated_type) == TYPE_CLASS &&
+            types_.At(nominated_type).entity == owner.bases[base].entity)
         {
           target_type = base_entity.type;
           break;
@@ -1268,6 +1290,48 @@ long long ScopeBuilder::ConstantValue(AstId expression, ScopeId scope)
   return value;
 }
 
+std::size_t ScopeBuilder::AlignmentSpecifiers(AstId node, ScopeId scope)
+{
+  if (node == 0)
+    return 0;
+  std::size_t requested = 0;
+  const vector<AstId>& children = arena_.At(node).children;
+  for (std::size_t i = 0; i < children.size(); ++i)
+  {
+    const AstId specifier = children[i];
+    if (arena_.At(specifier).kind != AST_ALIGNMENT_SPECIFIER)
+      continue;
+    const vector<AstId>& arguments = arena_.At(specifier).children;
+    if (arguments.size() != 1)
+      throw std::runtime_error("alignas has no single argument");
+    const AstId argument = arguments[0];
+    std::size_t alignment = 0;
+    if (arena_.At(argument).kind == AST_TYPE_ID)
+    {
+      alignment = types_.AlignOf(BuildTypeId(argument, scope));
+    }
+    else
+    {
+      const long long value = ConstantValue(argument, scope);
+      if (value < 0 || static_cast<unsigned long long>(value) >
+          static_cast<unsigned long long>(
+              std::numeric_limits<std::size_t>::max()))
+        throw std::runtime_error("alignas value is outside the target range");
+      alignment = static_cast<std::size_t>(value);
+    }
+    // alignas(0) is explicitly ignored.  Nonzero alignments accepted by the
+    // x86-64 object model are powers of two, so reject an invalid request at
+    // the declaration boundary instead of manufacturing an unrepresentable
+    // layout later.
+    if (alignment == 0)
+      continue;
+    if ((alignment & (alignment - 1)) != 0)
+      throw std::runtime_error("alignas value is not a valid alignment");
+    requested = std::max(requested, alignment);
+  }
+  return requested;
+}
+
 void ScopeBuilder::BuildStaticAssert(AstId node, ScopeId scope)
 {
   const AstNode& value = arena_.At(node);
@@ -1356,8 +1420,11 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
 
   const AstId class_key = FindChild(node, AST_CLASS_KEY);
   if (class_key != 0 && arena_.At(class_key).first < tokens_.size())
-    model_.ClassAt(entity).requested_alignment =
+    model_.ClassAt(entity).pack_alignment =
         tokens_[arena_.At(class_key).first].pack_alignment;
+  model_.ClassAt(entity).requested_alignment = std::max(
+      model_.ClassAt(entity).requested_alignment,
+      AlignmentSpecifiers(node, class_scope));
 
   // Resolve direct bases while the completed class name is already visible
   // to its own member scope.  The entity stores base ids, not copied types,
@@ -1414,7 +1481,8 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
       }
       continue;
     }
-    if (kind != AST_CLASS_KEY && kind != AST_BASE_CLAUSE)
+    if (kind != AST_CLASS_KEY && kind != AST_BASE_CLAUSE &&
+        kind != AST_ALIGNMENT_SPECIFIER)
       BuildNode(value.children[i], class_scope);
   }
   member_access_ = saved_access;
@@ -1492,7 +1560,7 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
   std::size_t offset = 0;
   std::size_t alignment = 1;
   std::size_t size = 0;
-  const std::size_t pack_alignment = value.requested_alignment;
+  const std::size_t pack_alignment = value.pack_alignment;
   for (std::size_t i = 0; i < value.bases.size(); ++i)
   {
     const ClassBase& base = value.bases[i];
@@ -1530,9 +1598,14 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
     if (field.static_member)
       continue;
     const std::size_t natural_field_alignment = types_.AlignOf(field.type);
+    if (field.requested_alignment != 0 &&
+        field.requested_alignment < natural_field_alignment)
+      throw std::runtime_error("member alignas weakens natural alignment");
+    const std::size_t requested_field_alignment = std::max(
+        natural_field_alignment, field.requested_alignment);
     const std::size_t field_alignment = pack_alignment == 0 ?
-        natural_field_alignment :
-        std::min(natural_field_alignment, pack_alignment);
+        requested_field_alignment :
+        std::min(requested_field_alignment, pack_alignment);
     const std::size_t field_size = types_.SizeOf(field.type);
     alignment = std::max(alignment, field_alignment);
     if (field.bit_width != 0 || field.binding == 0)
@@ -1613,6 +1686,10 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
   // size is a multiple of its alignment.
   if (size == 0)
     size = 1;
+  if (value.requested_alignment != 0 &&
+      value.requested_alignment < alignment)
+    throw std::runtime_error("class alignas weakens natural alignment");
+  alignment = std::max(alignment, value.requested_alignment);
   size = AlignUp(size, alignment);
   value.size = size;
   value.alignment = alignment;
@@ -1677,12 +1754,19 @@ TypeId ScopeBuilder::BuildClassForward(AstId node, ScopeId scope)
   const QualifiedName name = NodeName(node);
   if (name.Empty())
     throw std::runtime_error("unnamed class forward declaration");
+  const std::size_t requested_alignment =
+      AlignmentSpecifiers(node, scope);
   if (name.Qualified())
   {
     // A qualified redeclaration must find its class and declares nothing new.
     const BindingId found = model_.LookupQualified(scope, name, LOOKUP_TYPES);
     if (found == 0 || types_.Kind(model_.BindingAt(found).type) != TYPE_CLASS)
       throw std::runtime_error("qualified class declaration names no class");
+    const TypeId found_type = model_.BindingAt(found).type;
+    ClassEntity& found_entity = model_.ClassAt(static_cast<ClassEntityId>(
+        types_.At(types_.Unqualified(found_type)).entity));
+    found_entity.requested_alignment = std::max(
+        found_entity.requested_alignment, requested_alignment);
     return model_.BindingAt(found).type;
   }
   const TypeKeyword key = ClassKey(node);
@@ -1702,6 +1786,12 @@ TypeId ScopeBuilder::BuildClassForward(AstId node, ScopeId scope)
     entity = model_.CreateClass(key == TK_UNION);
   const TypeId type = types_.Class(entity, key, name.Last());
   model_.ClassAt(entity).type = type;
+  model_.ClassAt(entity).requested_alignment = std::max(
+      model_.ClassAt(entity).requested_alignment, requested_alignment);
+  const AstId class_key = FindChild(node, AST_CLASS_KEY);
+  if (class_key != 0 && arena_.At(class_key).first < tokens_.size())
+    model_.ClassAt(entity).pack_alignment =
+        tokens_[arena_.At(class_key).first].pack_alignment;
   model_.AddBinding(scope, name.Last(), BINDING_TYPE, type);
   return type;
 }

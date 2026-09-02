@@ -43,7 +43,7 @@ Scope::Scope()
 
 ClassEntity::ClassEntity()
     : class_scope(0), type(0), default_constructor(0),
-      size(0), alignment(1), requested_alignment(0),
+      size(0), alignment(1), requested_alignment(0), pack_alignment(0),
       destructor(0), inheriting_constructor_base(0), layout_complete(false),
       trivial_default_constructor(true), trivial_destructor(true),
       aggregate(true), is_union(false), defined(false)

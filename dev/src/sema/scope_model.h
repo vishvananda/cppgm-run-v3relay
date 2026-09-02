@@ -135,13 +135,15 @@ struct ClassField
   std::size_t offset;
   std::size_t bit_offset;
   unsigned bit_width;
+  std::size_t requested_alignment;
   AccessKind access;
   AstId initializer;
   bool static_member;
 
   ClassField(BindingId binding = 0, TypeId type = 0)
       : binding(binding), type(type), offset(0), bit_offset(0),
-        bit_width(0), access(ACCESS_PUBLIC), initializer(0),
+        bit_width(0), requested_alignment(0), access(ACCESS_PUBLIC),
+        initializer(0),
         static_member(false) {}
 };
 
@@ -189,7 +191,10 @@ struct ClassEntity
   std::vector<ClassField> fields;
   std::size_t size;
   std::size_t alignment;
+  // Alignment explicitly requested by alignas; zero means no request.
   std::size_t requested_alignment;
+  // The active #pragma pack limit at the class definition.
+  std::size_t pack_alignment;
   FunctionEntityId destructor;
   ClassEntityId inheriting_constructor_base;
   // Friend declarations are owned by their innermost enclosing class for

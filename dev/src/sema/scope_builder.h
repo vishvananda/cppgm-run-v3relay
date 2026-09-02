@@ -210,6 +210,9 @@ private:
   TypeId LookupType(ScopeId scope, const QualifiedName& name) const;
   // 5.19 integral constant value; the analysis nodes are released.
   long long ConstantValue(AstId expression, ScopeId scope);
+  // The declaration's alignas clauses are canonicalized to one required
+  // alignment before layout consumes them.  A zero result means no clause.
+  std::size_t AlignmentSpecifiers(AstId node, ScopeId scope);
   // A const integral or enumeration object records a constant initializer
   // value on its binding (5.19p2).
   bool RecordsConstantValue(TypeId type) const;

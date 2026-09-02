@@ -96,6 +96,7 @@ const char* const Names[AST_KIND_COUNT] =
 	"message",
 	"placement",
 	"target",
+	"alignment-specifier",
 	"class-specifier",
 	"class-key",
 	"class-forward-declaration",
@@ -206,6 +207,11 @@ void PrintAst(std::ostream& out, const AstArena& arena, AstId root,
 	if (root == 0)
 		return;
 	const AstNode& node = arena.At(root);
+	// Alignment specifiers are retained as semantic metadata on their owning
+	// declaration, but PA10's checked AST contract intentionally omits
+	// declaration attributes from the tree dump.
+	if (node.kind == AST_ALIGNMENT_SPECIFIER)
+		return;
 	for (unsigned i = 0; i < depth; ++i)
 		out << "  ";
 	out << AstKindName(node.kind);

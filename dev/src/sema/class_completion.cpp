@@ -47,6 +47,7 @@ void ScopeBuilder::BuildBitFieldDeclaration(AstId node, ScopeId scope)
   field.type = declared_type;
   field.access = member_access_;
   field.bit_width = static_cast<unsigned>(width);
+  field.requested_alignment = AlignmentSpecifiers(node, scope);
   field.initializer = 0;
   field.static_member = false;
   field.binding = 0;

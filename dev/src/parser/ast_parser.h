@@ -77,6 +77,7 @@ private:
 	AstId parse_using_directive();
 	AstId parse_using_declaration();
 	AstId parse_class_specifier();
+	AstId parse_alignment_specifier();
 	AstId parse_base_clause();
 	AstId parse_member_declaration(const std::string& class_name);
 	AstId parse_special_member_declaration(const std::string& class_name);

@@ -1263,8 +1263,15 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
       break;
     }
   const Binding& member = model_.BindingAt(binding);
-  TypeId type = member.type;
-  if (!member.static_member && (object_const || object_volatile))
+  const bool reference_member = !member.static_member &&
+      types_.Kind(types_.Unqualified(member.type)) == TYPE_REFERENCE;
+  // A reference data member expression denotes its referent as an lvalue;
+  // the reference wrapper is storage metadata consumed by LowerLValue.  In
+  // particular, cv on the containing object does not qualify the referred
+  // object a reference member names.
+  TypeId type = reference_member ? types_.Referent(member.type) : member.type;
+  if (!member.static_member && !reference_member &&
+      (object_const || object_volatile))
     type = types_.Cv(type, object_const, object_volatile);
   const SemaId result = MakeExpression(SEMA_MEMBER, expression, type,
                                        VC_LVALUE, scope, op);

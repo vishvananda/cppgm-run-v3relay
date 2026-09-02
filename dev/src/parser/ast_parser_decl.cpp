@@ -448,6 +448,41 @@ AstId Pa10Parser::parse_base_clause()
 	return result;
 }
 
+AstId Pa10Parser::parse_alignment_specifier()
+{
+	const Mark saved = mark();
+	if (!consume_simple(KW_ALIGNAS) || !enter_bracket(OP_LPAREN))
+		return 0;
+	const Mark inside = mark();
+	AstId argument = parse_type_id();
+	if (argument != 0)
+	{
+		consume_simple(OP_DOTS);
+		if (leave_bracket(OP_RPAREN))
+		{
+			const AstId result = make_span(AST_ALIGNMENT_SPECIFIER,
+				saved.position, pos_, Join(saved.position, pos_));
+			add(result, argument);
+			return result;
+		}
+	}
+	restore(inside);
+	argument = parse_assignment_expression();
+	if (argument != 0)
+	{
+		consume_simple(OP_DOTS);
+		if (leave_bracket(OP_RPAREN))
+		{
+			const AstId result = make_span(AST_ALIGNMENT_SPECIFIER,
+				saved.position, pos_, Join(saved.position, pos_));
+			add(result, argument);
+			return result;
+		}
+	}
+	restore(saved);
+	return 0;
+}
+
 AstId Pa10Parser::parse_class_specifier()
 {
 	const Mark saved = mark();
@@ -456,11 +491,26 @@ AstId Pa10Parser::parse_class_specifier()
 		!is_simple(KW_UNION))
 		return 0;
 	++pos_;
-	(void)consume_attribute_specifiers();
+	vector<AstId> alignments;
+	while (true)
+	{
+		const AstId alignment = parse_alignment_specifier();
+		if (alignment != 0)
+		{
+			alignments.push_back(alignment);
+			continue;
+		}
+		if (consume_attribute_specifiers())
+			continue;
+		break;
+	}
 	const size_t name_start = pos_;
-	if (is_kind(PA6_IDENTIFIER_TOKEN) &&
-		(!is_simple(OP_LT, pos_ + 1) || parse_simple_template_id() == 0))
-		++pos_;
+	const bool unnamed = is_simple(OP_LBRACE) || is_simple(OP_COLON);
+	if (!unnamed && parse_qualified_name() == 0)
+	{
+		restore(saved);
+		return 0;
+	}
 	const size_t name_end = pos_;
 	AstId bases = 0;
 	if (is_simple(OP_COLON))
@@ -482,6 +532,8 @@ AstId Pa10Parser::parse_class_specifier()
 		const AstId result = make_join(AST_CLASS_FORWARD_DECLARATION,
 			name_start, name_end);
 		add(result, make_token(AST_CLASS_KEY, key_at));
+		for (size_t i = 0; i < alignments.size(); ++i)
+			add(result, alignments[i]);
 		scopes_.Bind(declared_identifier(result), BIND_TYPE);
 		return result;
 	}
@@ -493,6 +545,8 @@ AstId Pa10Parser::parse_class_specifier()
 	enter_bracket(OP_LBRACE);
 	scopes_.Push();
 	add(result, make_token(AST_CLASS_KEY, key_at));
+	for (size_t i = 0; i < alignments.size(); ++i)
+		add(result, alignments[i]);
 	add(result, bases);
 	while (!is_simple(OP_RBRACE))
 	{

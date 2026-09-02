@@ -658,6 +658,19 @@ AstId Pa10Parser::parse_empty_declaration()
 AstId Pa10Parser::parse_specified_declaration(bool member_context)
 {
 	const Mark saved = mark();
+	vector<AstId> alignments;
+	while (true)
+	{
+		const AstId alignment = parse_alignment_specifier();
+		if (alignment != 0)
+		{
+			alignments.push_back(alignment);
+			continue;
+		}
+		if (consume_attribute_specifiers())
+			continue;
+		break;
+	}
 	const AstId specifiers = parse_decl_specifier_seq();
 	if (specifiers == 0)
 		return 0;
@@ -673,6 +686,8 @@ AstId Pa10Parser::parse_specified_declaration(bool member_context)
 				kind == AST_CLASS_FORWARD_DECLARATION ||
 				kind == AST_ENUM_SPECIFIER || kind == AST_ENUM_DECLARATION)
 			{
+				for (size_t i = 0; i < alignments.size(); ++i)
+					add(children[0], alignments[i]);
 				// An unnamed specifier has no name span; record the extent of
 				// the declaration it forms so sema can give the type an identity.
 				const AstNode& specifier = arena_.At(children[0]);
@@ -684,6 +699,8 @@ AstId Pa10Parser::parse_specified_declaration(bool member_context)
 		}
 		const AstId result = make(AST_SIMPLE_DECLARATION);
 		add(result, specifiers);
+		for (size_t i = 0; i < alignments.size(); ++i)
+			add(result, alignments[i]);
 		return result;
 	}
 	AstId declarator = 0;
@@ -697,16 +714,34 @@ AstId Pa10Parser::parse_specified_declaration(bool member_context)
 		}
 	}
 	if (member_context && is_simple(OP_COLON))
-		return finish_bit_field_declaration(saved, specifiers, declarator);
+	{
+		const AstId result = finish_bit_field_declaration(saved, specifiers,
+			declarator);
+		if (result == 0)
+			return 0;
+		for (size_t i = 0; i < alignments.size(); ++i)
+			add(result, alignments[i]);
+		return result;
+	}
 	if (declarator != 0 && is_simple(OP_LBRACE) &&
 		node_has_kind(declarator, AST_PARAMETER_CLAUSE))
 	{
 		const AstId definition =
 			finish_function_definition(specifiers, declarator);
 		if (definition != 0)
+		{
+			for (size_t i = 0; i < alignments.size(); ++i)
+				add(definition, alignments[i]);
 			return definition;
+		}
 	}
-	return finish_simple_declaration(saved, specifiers, declarator);
+	const AstId result = finish_simple_declaration(saved, specifiers,
+		declarator);
+	if (result == 0)
+		return 0;
+	for (size_t i = 0; i < alignments.size(); ++i)
+		add(result, alignments[i]);
+	return result;
 }
 
 AstId Pa10Parser::finish_function_definition(AstId specifiers,

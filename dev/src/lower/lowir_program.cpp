@@ -426,7 +426,16 @@ void Lowerer::LowerVariable(SemaId variable_node)
         RegisterLiveObject(variable.binding, declared);
         return;
       }
-      (void)LowerCall(action_children[0], 0);
+      // A declaration-owned constructor action already carries the
+      // synthesized destination argument.  An expression-owned functional
+      // cast has no implicit object in its semantic call: its destination is
+      // chosen only when the target variable's storage is known, so inject
+      // it through the aggregate constructor argument path.
+      if (tree_.At(initializer[0]).binding != 0)
+        (void)LowerCall(action_children[0], 0);
+      else
+        LowerAggregateConstructor(initializer[0], declared,
+                                  AddressValue(object).operand);
       RegisterLiveObject(variable.binding, declared);
       return;
     }
@@ -750,23 +759,44 @@ void Lowerer::LowerAggregateObjectInitializer(
       ++value_index;
       continue;
     }
-    const lowir_model::Operand destination = AggregateDestination(
-        object, field_path);
-    Value initialized_value;
-    if (value_index < values.size())
-      initialized_value = LowerRValue(values[value_index], field.type);
-    else {
-      initialized_value.type = field.type;
-      initialized_value.operand = ZeroOperand(field.type);
-    }
     const bool bit_field = field.bit_width != 0;
     const bool preserve = bit_field && BitFieldUnitInitialized(field);
-    if (bit_field) {
-      StoreBitField(field, destination, initialized_value.type,
-                    initialized_value.operand, preserve, field.type);
+    if (bit_field && !preserve) {
+      // Encoding a fresh allocation unit has no destination dependency, so
+      // evaluate it before projecting the member address.  This preserves
+      // initializer-before-store ordering and keeps the bit-field write
+      // independent of an extra address read.
+      Value initialized_value;
+      if (value_index < values.size())
+        initialized_value = LowerRValue(values[value_index], field.type);
+      else {
+        initialized_value.type = field.type;
+        initialized_value.operand = ZeroOperand(field.type);
+      }
+      const lowir_model::Operand encoded = EncodeBitField(
+          field, initialized_value.type, initialized_value.operand,
+          field.type);
+      const lowir_model::Operand destination = AggregateDestination(
+          object, field_path);
+      EmitStore(LowTypeOf(field.type), encoded, destination);
       MarkBitFieldUnitInitialized(field);
-    } else
-      EmitStore(LowTypeOf(field.type), initialized_value.operand, destination);
+    } else {
+      const lowir_model::Operand destination = AggregateDestination(
+          object, field_path);
+      Value initialized_value;
+      if (value_index < values.size())
+        initialized_value = LowerRValue(values[value_index], field.type);
+      else {
+        initialized_value.type = field.type;
+        initialized_value.operand = ZeroOperand(field.type);
+      }
+      if (bit_field) {
+        StoreBitField(field, destination, initialized_value.type,
+                      initialized_value.operand, preserve, field.type);
+        MarkBitFieldUnitInitialized(field);
+      } else
+        EmitStore(LowTypeOf(field.type), initialized_value.operand, destination);
+    }
     if (value_index < values.size())
       ++value_index;
   }
@@ -1252,8 +1282,15 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
     }
     if (arguments.size() != 1)
       Unsupported("a scalar mem-initializer with the wrong arity");
-    lowered_arguments.push_back(
-        LowerRValue(arguments[0], initializer.type).operand);
+    const ClassField* target_field = initializer.binding == 0 ? 0 :
+        model_.FieldFor(initializer.binding);
+    if (target_field != 0 &&
+        types_.Kind(types_.Unqualified(target_field->type)) == TYPE_REFERENCE)
+      lowered_arguments.push_back(LowerReferenceArgument(
+          arguments[0], target_field->type).operand);
+    else
+      lowered_arguments.push_back(
+          LowerRValue(arguments[0], initializer.type).operand);
   };
   if (!is_base)
     lower_arguments();

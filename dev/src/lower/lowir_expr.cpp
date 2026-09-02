@@ -1742,6 +1742,13 @@ void Lowerer::LowerDiscard(SemaId node)
     return;
   if (tree_.At(node).kind == SEMA_CALL)
     (void)LowerCall(node, 0);
+  else if (tree_.At(node).category == VC_LVALUE &&
+           types_.Kind(types_.Unqualified(ReferentType(
+               tree_.At(node).type))) == TYPE_CLASS)
+    // A discarded class glvalue is evaluated for its designation; loading
+    // the opaque class value would invent a scalar read and loses the
+    // object's canonical address.
+    (void)AddressValue(LowerLValue(node));
   else
     (void)LowerRValue(node, 0);
 }
