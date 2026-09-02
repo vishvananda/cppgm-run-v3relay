@@ -501,6 +501,7 @@ int run_emit_lowir_mode(const vector<string> & args)
   }
 
   lowir_model::Program program;
+  lowir_lowering::ProgramLowering lowering(program);
   const PreprocBuildInfo build_info = PreprocHostBuildInfo();
   for(size_t i = 0; i < invocation.inputs.size(); ++i) {
     ostringstream discarded_preproc_output;
@@ -518,21 +519,9 @@ int run_emit_lowir_mode(const vector<string> & args)
     SemaTree tree;
     ScopeBuilder builder(collector.tokens, arena, model, tree);
     builder.Build(root);
-    const lowir_model::Program unit = lowir_lowering::LowerTranslationUnit(
-        collector.tokens, arena, root, model, tree);
-    program.global_declarations.insert(program.global_declarations.end(),
-        unit.global_declarations.begin(), unit.global_declarations.end());
-    program.globals.insert(program.globals.end(), unit.globals.begin(),
-                           unit.globals.end());
-    program.function_declarations.insert(program.function_declarations.end(),
-        unit.function_declarations.begin(), unit.function_declarations.end());
-    program.functions.insert(program.functions.end(), unit.functions.begin(),
-                             unit.functions.end());
-    program.object_aliases.insert(program.object_aliases.end(),
-        unit.object_aliases.begin(), unit.object_aliases.end());
-    program.exported_symbols.insert(program.exported_symbols.end(),
-        unit.exported_symbols.begin(), unit.exported_symbols.end());
+    lowering.AddUnit(collector.tokens, model, tree);
   }
+  lowering.Finish();
   out << lowir_model::serialize_lowir_program(program);
   return EXIT_SUCCESS;
 }

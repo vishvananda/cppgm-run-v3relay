@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstddef>
-#include <set>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -131,7 +131,7 @@ private:
                        TypeId type);
   std::string AnonymousTypeName(AstId node, const char* kind) const;
   bool HasConstFunctionQualifier(AstId declarator) const;
-  bool HasNoexceptQualifier(AstId declarator) const;
+  bool IsNoThrowDeclarator(AstId declarator, ScopeId scope);
   FunctionEntityId EnsureDefaultConstructor(TypeId type);
   void AddConstructorAction(SemaId variable, ScopeId scope, TypeId type,
                             BindingId binding, AstId declarator);
@@ -215,11 +215,40 @@ private:
   bool HasIncompleteArray(AstId declarator) const;
   std::size_t InitializerBound(AstId initializer) const;
 
-  // Labels and gotos are function-local semantic facts.  Names are recorded
-  // while the body is built so forward gotos can be resolved after the full
-  // body has been visited.
-  std::set<std::string> labels_;
-  std::vector<std::string> gotos_;
+  // Function-local jump facts (6.1, 6.7p3).  Each label receives a
+  // per-function ordinal that is published on its labeled-statement node and
+  // on every goto that names it, so later phases never resolve a label
+  // spelling again.  Every jump destination is checked against the
+  // initialized automatic objects whose scope it would enter: case labels
+  // when they are built, gotos once the body is complete.  Positions are one
+  // monotonic per-function sequence.
+  struct LabelRecord
+  {
+    unsigned ordinal;
+    unsigned sequence;
+    ScopeId scope;
+  };
+  struct GotoRecord
+  {
+    SemaId node;
+    std::string name;
+    unsigned sequence;
+  };
+  struct SwitchEntry
+  {
+    unsigned sequence;
+    ScopeId scope; // the scope containing the switch statement
+  };
+  std::map<std::string, LabelRecord> labels_;
+  std::vector<GotoRecord> gotos_;
+  std::map<ScopeId, std::vector<unsigned> > initialized_locals_;
+  std::vector<SwitchEntry> switch_entries_;
+  void RecordInitializedLocal(ScopeId scope);
+  void CheckJumpTarget(unsigned source_sequence, ScopeId source_scope,
+                       unsigned target_sequence, ScopeId target_scope) const;
+  void LinkRedeclaration(BindingId binding, ScopeId scope,
+                         const std::string& name, TypeId type);
+  bool CompatibleRedeclaration(TypeId prior, TypeId current) const;
 
   const std::vector<Pa6Token>& tokens_;
   const AstArena& arena_;
@@ -234,6 +263,7 @@ private:
   unsigned unnamed_local_class_counter_;
   unsigned c_linkage_depth_;
   bool suppress_semantics_;
+  unsigned jump_sequence_;
   std::vector<SemaId> deferred_semantics_;
   struct DeferredTemplateInstance
   {

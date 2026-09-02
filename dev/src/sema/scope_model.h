@@ -71,6 +71,10 @@ struct Binding
   bool c_linkage;
   bool extern_declaration;
   bool noexcept_qualifier;
+  // BINDING_VARIABLE at namespace scope: the first binding of the same
+  // object when this declaration redeclares it (3.3.10); 0 when this is the
+  // first declaration.  Consumers that need one symbol per object key on it.
+  BindingId redeclared_binding;
   bool has_const_value;
   long long const_value;
 

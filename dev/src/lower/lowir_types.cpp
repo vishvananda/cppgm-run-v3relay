@@ -1,16 +1,47 @@
+// Type classification, LowIR type rendering, and the PA14 ABI type adapter.
 #include "lower/lowir_lowering.h"
 
-#include <sstream>
 #include <stdexcept>
 
 namespace lowir_lowering {
 
 namespace {
 
-lowir_model::LowType MakeLowType(const char* text)
+lowir_model::LowType MakeLowType(const std::string& text)
 {
   lowir_model::LowType result;
   result.text = text;
+  return result;
+}
+
+lowir_model::Operand NamedOperand(lowir_model::Operand::Kind kind,
+                                  const std::string& text)
+{
+  lowir_model::Operand result;
+  result.kind = kind;
+  result.text = text;
+  return result;
+}
+
+LowInfo KindInfo(LowInfo::Kind kind)
+{
+  LowInfo result;
+  result.kind = kind;
+  return result;
+}
+
+LowInfo IntegerInfo(unsigned bits, bool is_unsigned)
+{
+  LowInfo result = KindInfo(LowInfo::LK_INTEGER);
+  result.bits = bits;
+  result.is_unsigned = is_unsigned;
+  return result;
+}
+
+LowInfo FloatInfo(unsigned bits)
+{
+  LowInfo result = KindInfo(LowInfo::LK_FLOAT);
+  result.bits = bits;
   return result;
 }
 
@@ -24,90 +55,222 @@ abi_mangle::AbiType Builtin(abi_mangle::AbiBuiltinType type)
 
 }  // namespace
 
-lowir_model::LowType Lowerer::LowTypeOf(TypeId type) const
+bool SameStorage(const LowInfo& left, const LowInfo& right)
 {
-  if (type == 0)
-    throw std::logic_error("unsupported in CP1: invalid type");
-  const TypeKind kind = types_.Kind(type);
-  if (kind == TYPE_CV)
-    return LowTypeOf(types_.At(type).base);
-  if (kind == TYPE_REFERENCE || kind == TYPE_POINTER ||
-      kind == TYPE_MEMBER_POINTER)
-    return MakeLowType("ptr");
-  if (kind == TYPE_ARRAY) {
-    std::ostringstream out;
-    out << "obj<" << types_.SizeOf(type) << "x" << types_.AlignOf(type)
-        << ">";
-    lowir_model::LowType result;
-    result.text = out.str();
-    return result;
+  if (left.kind != right.kind)
+    return false;
+  switch (left.kind) {
+  case LowInfo::LK_INTEGER:
+    return left.bits == right.bits &&
+        (left.bits == 64 || left.is_unsigned == right.is_unsigned);
+  case LowInfo::LK_FLOAT:
+    return left.bits == right.bits;
+  case LowInfo::LK_OBJECT:
+    return left.bytes == right.bytes && left.alignment == right.alignment;
+  default:
+    return true;
   }
-  if (kind == TYPE_ENUM)
-    return LowTypeOf(types_.At(type).base);
-  if (kind != TYPE_FUNDAMENTAL)
-    throw std::logic_error("unsupported in CP1: non-scalar object type");
-  switch (types_.At(type).fundamental) {
-  case FT_VOID: return MakeLowType("void");
-  case FT_BOOL: return MakeLowType("u8");
-  case FT_SIGNED_CHAR: case FT_CHAR: return MakeLowType("i8");
-  case FT_UNSIGNED_CHAR: return MakeLowType("u8");
-  case FT_SHORT_INT: return MakeLowType("i16");
-  case FT_UNSIGNED_SHORT_INT: return MakeLowType("u16");
-  case FT_INT: return MakeLowType("i32");
-  case FT_UNSIGNED_INT: return MakeLowType("u32");
-  case FT_LONG_INT: case FT_LONG_LONG_INT: return MakeLowType("i64");
-  case FT_UNSIGNED_LONG_INT: case FT_UNSIGNED_LONG_LONG_INT:
-    return MakeLowType("i64");
-  case FT_WCHAR_T: return MakeLowType("i32");
-  case FT_CHAR16_T: return MakeLowType("u16");
-  case FT_CHAR32_T: return MakeLowType("u32");
-  case FT_FLOAT: return MakeLowType("f32");
-  case FT_DOUBLE: return MakeLowType("f64");
-  case FT_LONG_DOUBLE: return MakeLowType("f80");
-  case FT_NULLPTR_T: return MakeLowType("ptr");
-  }
-  throw std::logic_error("unsupported in CP1: fundamental type");
 }
 
-lowir_model::LowType Lowerer::LowTypeOfUnqualified(TypeId type) const
+lowir_model::LowType RenderLowType(const LowInfo& info)
 {
-  return LowTypeOf(types_.Unqualified(type));
+  switch (info.kind) {
+  case LowInfo::LK_VOID:
+    return MakeLowType("void");
+  case LowInfo::LK_INTEGER:
+    return MakeLowType((info.is_unsigned && info.bits < 64 ? "u" : "i") +
+                       std::to_string(info.bits));
+  case LowInfo::LK_FLOAT:
+    return MakeLowType("f" + std::to_string(info.bits));
+  case LowInfo::LK_POINTER:
+    return MakeLowType("ptr");
+  case LowInfo::LK_OBJECT:
+    return MakeLowType("obj<" + std::to_string(info.bytes) + "x" +
+                       std::to_string(info.alignment) + ">");
+  }
+  return lowir_model::LowType();
+}
+
+lowir_model::LowType PtrType() { return MakeLowType("ptr"); }
+lowir_model::LowType I64Type() { return MakeLowType("i64"); }
+lowir_model::LowType I8Type() { return MakeLowType("i8"); }
+lowir_model::LowType VoidType() { return MakeLowType("void"); }
+
+lowir_model::Operand TempOperand(const std::string& name)
+{
+  return NamedOperand(lowir_model::Operand::OP_TEMP, name);
+}
+
+lowir_model::Operand SlotOperand(const std::string& name)
+{
+  return NamedOperand(lowir_model::Operand::OP_SLOT, name);
+}
+
+lowir_model::Operand GlobalOperand(const std::string& name)
+{
+  return NamedOperand(lowir_model::Operand::OP_GLOBAL, name);
+}
+
+lowir_model::Operand LabelOperand(const std::string& name)
+{
+  return NamedOperand(lowir_model::Operand::OP_LABEL, name);
+}
+
+lowir_model::Operand Immediate(long long value)
+{
+  lowir_model::Operand result;
+  result.kind = lowir_model::Operand::OP_INTEGER;
+  result.int_value = value;
+  result.text = std::to_string(value);
+  return result;
+}
+
+// The null pointer is the one immediate LowIR spells as a word.
+lowir_model::Operand NullptrImmediate()
+{
+  lowir_model::Operand result = Immediate(0);
+  result.text = "nullptr";
+  return result;
+}
+
+lowir_model::Operand FloatImmediate(const std::string& spelling,
+                                    long double value,
+                                    const lowir_model::LowType& type)
+{
+  lowir_model::Operand result;
+  result.kind = lowir_model::Operand::OP_FLOAT;
+  result.text = spelling;
+  result.float_value = value;
+  result.literal_type = type;
+  return result;
+}
+
+bool IsLogicalOperator(ETokenType op)
+{
+  return op == OP_LAND || op == OP_LOR;
+}
+
+bool IsScalarBinaryOperator(ETokenType op)
+{
+  switch (op) {
+  case OP_PLUS: case OP_MINUS: case OP_STAR: case OP_DIV: case OP_MOD:
+  case OP_AMP: case OP_BOR: case OP_XOR: case OP_LSHIFT: case OP_RSHIFT:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool IsKnownIntegralLiteral(const SemaNode& node, const TypeTable& types)
+{
+  if (node.kind != SEMA_LITERAL || !node.has_value)
+    return false;
+  const TypeId type = types.Unqualified(node.type);
+  return types.Kind(type) == TYPE_FUNDAMENTAL &&
+      !IsFloatingType(types, type);
+}
+
+bool IsFloatingType(const TypeTable& types, TypeId type)
+{
+  type = types.Unqualified(type);
+  if (types.Kind(type) != TYPE_FUNDAMENTAL)
+    return false;
+  const EFundamentalType fundamental = types.At(type).fundamental;
+  return fundamental == FT_FLOAT || fundamental == FT_DOUBLE ||
+      fundamental == FT_LONG_DOUBLE;
+}
+
+bool IsVoidType(const TypeTable& types, TypeId type)
+{
+  type = types.Unqualified(type);
+  return types.Kind(type) == TYPE_FUNDAMENTAL &&
+      types.At(type).fundamental == FT_VOID;
+}
+
+bool IsBoolType(const TypeTable& types, TypeId type)
+{
+  type = types.Unqualified(type);
+  return types.Kind(type) == TYPE_FUNDAMENTAL &&
+      types.At(type).fundamental == FT_BOOL;
+}
+
+LowInfo Lowerer::LowInfoOf(TypeId type) const
+{
+  if (type == 0)
+    Unsupported("an invalid type");
+  const TypeNode& node = types_.At(type);
+  switch (node.kind) {
+  case TYPE_CV:
+  case TYPE_ENUM: // the underlying type owns the storage
+    return LowInfoOf(node.base);
+  case TYPE_REFERENCE:
+  case TYPE_POINTER:
+  case TYPE_MEMBER_POINTER:
+    return KindInfo(LowInfo::LK_POINTER);
+  case TYPE_ARRAY: {
+    LowInfo result = KindInfo(LowInfo::LK_OBJECT);
+    result.bytes = types_.SizeOf(type);
+    result.alignment = types_.AlignOf(type);
+    return result;
+  }
+  case TYPE_FUNDAMENTAL:
+    switch (node.fundamental) {
+    case FT_VOID: return KindInfo(LowInfo::LK_VOID);
+    case FT_BOOL: return IntegerInfo(8, true);
+    case FT_CHAR: case FT_SIGNED_CHAR: return IntegerInfo(8, false);
+    case FT_UNSIGNED_CHAR: return IntegerInfo(8, true);
+    case FT_SHORT_INT: return IntegerInfo(16, false);
+    case FT_UNSIGNED_SHORT_INT: case FT_CHAR16_T: return IntegerInfo(16, true);
+    case FT_INT: case FT_WCHAR_T: return IntegerInfo(32, false);
+    case FT_UNSIGNED_INT: case FT_CHAR32_T: return IntegerInfo(32, true);
+    case FT_LONG_INT: case FT_LONG_LONG_INT: return IntegerInfo(64, false);
+    case FT_UNSIGNED_LONG_INT: case FT_UNSIGNED_LONG_LONG_INT:
+      return IntegerInfo(64, true);
+    case FT_FLOAT: return FloatInfo(32);
+    case FT_DOUBLE: return FloatInfo(64);
+    case FT_LONG_DOUBLE: return FloatInfo(80);
+    case FT_NULLPTR_T: return KindInfo(LowInfo::LK_POINTER);
+    }
+    break;
+  default:
+    break;
+  }
+  Unsupported("a non-scalar object type");
+  return LowInfo();
+}
+
+lowir_model::LowType Lowerer::LowTypeOf(TypeId type) const
+{
+  return RenderLowType(LowInfoOf(type));
 }
 
 bool Lowerer::IsUnsigned(TypeId type) const
 {
-  type = types_.Unqualified(type);
-  if (types_.Kind(type) == TYPE_ENUM)
-    return IsUnsigned(types_.At(type).base);
-  return types_.Kind(type) == TYPE_FUNDAMENTAL &&
-      FundamentalIsUnsigned(types_.At(type).fundamental);
+  return LowInfoOf(type).is_unsigned;
 }
 
 unsigned Lowerer::TypeBits(TypeId type) const
 {
-  const lowir_model::LowTypeInfo info =
-      lowir_model::describe_low_type(LowTypeOf(type));
-  return info.integer() ? info.bits : 0;
+  const LowInfo info = LowInfoOf(type);
+  return info.Integer() ? info.bits : 0;
 }
 
-bool Lowerer::IsScalar(TypeId type) const
-{
-  return types_.IsScalar(type) || types_.Kind(types_.Unqualified(type)) ==
-      TYPE_ENUM;
-}
+namespace {
 
-std::string Lowerer::NamedType(TypeId type) const
+std::string NamedType(const TypeTable& types, TypeId type)
 {
-  const TypeNode& node = types_.At(types_.Unqualified(type));
+  const TypeNode& node = types.At(types.Unqualified(type));
   if (node.name.empty())
     return "<anonymous>";
   return node.name;
 }
 
+}  // namespace
+
 abi_mangle::AbiType Lowerer::AbiTypeOf(TypeId type) const
 {
   if (type == 0)
-    throw std::logic_error("unsupported in CP1: invalid ABI type");
+    Unsupported("an invalid ABI type");
   const TypeNode& node = types_.At(type);
   if (node.kind == TYPE_CV) {
     abi_mangle::AbiType result = AbiTypeOf(node.base);
@@ -129,7 +292,8 @@ abi_mangle::AbiType Lowerer::AbiTypeOf(TypeId type) const
     case FT_LONG_INT: return Builtin(abi_mangle::ABI_BUILTIN_LONG);
     case FT_UNSIGNED_LONG_INT: return Builtin(abi_mangle::ABI_BUILTIN_ULONG);
     case FT_LONG_LONG_INT: return Builtin(abi_mangle::ABI_BUILTIN_LONGLONG);
-    case FT_UNSIGNED_LONG_LONG_INT: return Builtin(abi_mangle::ABI_BUILTIN_ULONGLONG);
+    case FT_UNSIGNED_LONG_LONG_INT:
+      return Builtin(abi_mangle::ABI_BUILTIN_ULONGLONG);
     case FT_WCHAR_T: return Builtin(abi_mangle::ABI_BUILTIN_WCHAR);
     case FT_CHAR16_T: return Builtin(abi_mangle::ABI_BUILTIN_CHAR16);
     case FT_CHAR32_T: return Builtin(abi_mangle::ABI_BUILTIN_CHAR32);
@@ -147,7 +311,8 @@ abi_mangle::AbiType Lowerer::AbiTypeOf(TypeId type) const
   }
   if (node.kind == TYPE_REFERENCE) {
     abi_mangle::AbiType result;
-    result.kind = node.lvalue_reference ? abi_mangle::ABI_TYPE_LVALUE_REFERENCE :
+    result.kind = node.lvalue_reference ?
+        abi_mangle::ABI_TYPE_LVALUE_REFERENCE :
         abi_mangle::ABI_TYPE_RVALUE_REFERENCE;
     result.types.push_back(AbiTypeOf(node.base));
     return result;
@@ -172,10 +337,11 @@ abi_mangle::AbiType Lowerer::AbiTypeOf(TypeId type) const
   if (node.kind == TYPE_ENUM || node.kind == TYPE_CLASS) {
     abi_mangle::AbiType result;
     result.kind = abi_mangle::ABI_TYPE_NAMED;
-    result.name = NamedType(type);
+    result.name = NamedType(types_, type);
     return result;
   }
-  throw std::logic_error("unsupported in CP1: ABI type");
+  Unsupported("an ABI type");
+  return abi_mangle::AbiType();
 }
 
 }  // namespace lowir_lowering

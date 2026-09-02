@@ -29,7 +29,7 @@ FRONTEND_OBJ_BASENAMES_cppgm++ := preproc_host parser/ast_parser parser/ast_pars
 	sema/type_table sema/qualified_name sema/scope_model \
 	sema/sema_tree sema/conversions sema/overload sema/expr_sema sema/scope_builder \
 	sema/type_builder sema/stmt_builder sema/semantics_dump sema/types_dump \
-	lowir_parse lowir_serialize lower/lowir_types lower/lowir_symbols lower/lowir_function \
+	lowir_serialize lower/lowir_types lower/lowir_symbols lower/lowir_function \
 	lower/lowir_expr lower/lowir_program abi_mangle_encode abi_mangle_types \
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer posttoken_stream \
 	posttoken_tables unicode

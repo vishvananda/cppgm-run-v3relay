@@ -8,15 +8,6 @@ namespace lowir_model {
 
 namespace {
 
-void add_item(std::ostringstream& out, bool& first, const std::string& text,
-              bool blank_before)
-{
-  if (!first)
-    out << (blank_before ? "\n" : "");
-  out << text;
-  first = false;
-}
-
 std::string operand(const Operand& value)
 {
   if (value.kind == Operand::OP_INTEGER && value.text == "nullptr")
@@ -319,23 +310,32 @@ std::string global_definition_text(const GlobalDefinition& global)
 
 }  // namespace
 
+// Canonical top-level layout (lowir.md, Program Structure): declarations,
+// then global definitions, then functions, with one blank line between the
+// groups that are present and none inside a group.
 std::string serialize_lowir_program(const Program& program)
 {
-  std::ostringstream out;
-  bool first = true;
+  std::string declarations;
   for (std::size_t i = 0; i < program.global_declarations.size(); ++i)
-    add_item(out, first, global_declaration_text(program.global_declarations[i]), false);
+    declarations += global_declaration_text(program.global_declarations[i]) + "\n";
   for (std::size_t i = 0; i < program.function_declarations.size(); ++i)
-    add_item(out, first, declaration_text(program.function_declarations[i]),
-             !first);
+    declarations += declaration_text(program.function_declarations[i]) + "\n";
+  std::string globals;
   for (std::size_t i = 0; i < program.globals.size(); ++i)
-    add_item(out, first, global_definition_text(program.globals[i]), true);
+    globals += global_definition_text(program.globals[i]) + "\n";
+  std::string functions;
   for (std::size_t i = 0; i < program.functions.size(); ++i)
-    add_item(out, first, function_text(program.functions[i]),
-             i == 0 && (!program.function_declarations.empty() ||
-                        !program.globals.empty() ||
-                        !program.global_declarations.empty()));
-  return out.str();
+    functions += function_text(program.functions[i]);
+  const std::string* groups[] = { &declarations, &globals, &functions };
+  std::string out;
+  for (std::size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); ++i) {
+    if (groups[i]->empty())
+      continue;
+    if (!out.empty())
+      out += "\n";
+    out += *groups[i];
+  }
+  return out;
 }
 
 }  // namespace lowir_model

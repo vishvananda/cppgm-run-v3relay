@@ -89,6 +89,7 @@ void ScopeBuilder::BuildConditionDeclaration(AstId node,
   ResolveDeclarationScope(context.scope, FindIdentifier(declarator), name);
   const BindingId binding = model_.AddBinding(context.scope, name,
                                               BINDING_VARIABLE, type);
+  RecordInitializedLocal(context.scope);
   SemaId condition = 0;
   if (tree_ != 0)
     condition = MakeSemantic(SEMA_CONDITION_DECLARATION, context.scope,
@@ -318,24 +319,29 @@ void ScopeBuilder::BuildSwitchStatement(AstId node,
     condition_node = MakeSemantic(SEMA_CONDITION, context.scope, statement);
   BuildCondition(condition, context, condition_node, true);
   const AstId body = FindChild(node, AST_COMPOUND_STATEMENT);
+  // The dispatch jumps from this point into the body, so every case label is
+  // a jump target measured from here (6.7p3).
+  SwitchEntry entry;
+  entry.sequence = ++jump_sequence_;
+  entry.scope = context.scope;
+  switch_entries_.push_back(entry);
   if (body != 0)
     BuildCompound(body, context.scope, context.function, context.loop_depth,
                   context.switch_depth + 1, statement);
+  switch_entries_.pop_back();
 }
 
 void ScopeBuilder::BuildCaseStatement(AstId node,
                                       const StatementContext& context)
 {
-  if (context.switch_depth == 0)
+  if (context.switch_depth == 0 || switch_entries_.empty())
     throw std::runtime_error("case outside switch");
   const vector<AstId>& children = arena_.At(node).children;
   if (children.size() < 2)
     throw std::runtime_error("invalid case statement");
-  // A case label is a control-flow entry point.  A declaration immediately
-  // following it would put an automatic object in scope without running its
-  // initializer; require an explicit compound scope for that declaration.
-  if (IsDeclarationKind(arena_.At(children[1]).kind))
-    throw std::runtime_error("case label bypasses initialization");
+  CheckJumpTarget(switch_entries_.back().sequence,
+                  switch_entries_.back().scope, ++jump_sequence_,
+                  context.scope);
   SemaId statement = 0;
   if (tree_ != 0)
     statement = MakeSemantic(SEMA_CASE_STATEMENT, context.scope,
@@ -354,8 +360,11 @@ void ScopeBuilder::BuildCaseStatement(AstId node,
 void ScopeBuilder::BuildDefaultStatement(AstId node,
                                          const StatementContext& context)
 {
-  if (context.switch_depth == 0)
+  if (context.switch_depth == 0 || switch_entries_.empty())
     throw std::runtime_error("default outside switch");
+  CheckJumpTarget(switch_entries_.back().sequence,
+                  switch_entries_.back().scope, ++jump_sequence_,
+                  context.scope);
   if (tree_ != 0)
   {
     const SemaId statement = MakeSemantic(SEMA_DEFAULT_STATEMENT,
@@ -502,11 +511,20 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
     const std::string name = label.text;
     if (name.empty() || label.children.size() != 1)
       throw std::runtime_error("invalid labeled statement");
-    if (!labels_.insert(name).second)
+    if (labels_.find(name) != labels_.end())
       throw std::runtime_error("duplicate label");
+    LabelRecord& record = labels_[name];
+    record.ordinal = static_cast<unsigned>(labels_.size());
+    record.sequence = ++jump_sequence_;
+    record.scope = context.scope;
     const SemaId statement = MakeSemantic(
         SEMA_LABELED_STATEMENT, context.scope, context.semantic_parent,
         0, 0, 0, VC_PRVALUE, KW_AUTO, label.first, label.last);
+    if (statement != 0)
+    {
+      tree_->At(statement).has_value = true;
+      tree_->At(statement).value = record.ordinal;
+    }
     BuildStatement(label.children[0], StatementContext(
         context.scope, context.function, context.loop_depth,
         context.switch_depth, statement));
@@ -518,9 +536,13 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
     const std::string name = jump.text;
     if (name.empty() || !jump.children.empty())
       throw std::runtime_error("invalid goto statement");
-    gotos_.push_back(name);
-    MakeSemantic(SEMA_GOTO_STATEMENT, context.scope, context.semantic_parent,
-                 0, 0, 0, VC_PRVALUE, KW_AUTO, jump.first, jump.last);
+    GotoRecord record;
+    record.node = MakeSemantic(SEMA_GOTO_STATEMENT, context.scope,
+                               context.semantic_parent, 0, 0, 0, VC_PRVALUE,
+                               KW_AUTO, jump.first, jump.last);
+    record.name = name;
+    record.sequence = ++jump_sequence_;
+    gotos_.push_back(record);
     return;
   }
   default:

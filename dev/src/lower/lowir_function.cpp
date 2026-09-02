@@ -1,30 +1,18 @@
+// Per-function state: blocks, temporaries, slots, terminators, and the
+// function definition builder.
 #include "lower/lowir_lowering.h"
 
-#include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace lowir_lowering {
 
-namespace {
-
-lowir_model::Operand NamedOperand(lowir_model::Operand::Kind kind,
-                                  const std::string& text)
-{
-  lowir_model::Operand result;
-  result.kind = kind;
-  result.text = text;
-  return result;
-}
-
-}  // namespace
-
-Lowerer::Lowerer(const std::vector<Pa6Token>& tokens, const AstArena& arena,
-                 const SemaModel& model, const SemaTree& tree)
-    : tokens_(tokens), arena_(arena), model_(model), tree_(tree),
-      types_(model.Types()), active_switch_labels_(0), temp_counter_(0),
-      label_counter_(0), generated_slot_counter_(0),
-      string_literal_counter_(0),
-      function_return_type_id_(0)
+Lowerer::Lowerer(ProgramLowering& shared, const std::vector<Pa6Token>& tokens,
+                 SemaModel& model, const SemaTree& tree)
+    : shared_(shared), tokens_(tokens), model_(model), tree_(tree),
+      types_(model.Types()), program_(shared.program_), current_block_(0),
+      active_switch_labels_(0), temp_counter_(0), label_counter_(0),
+      generated_slot_counter_(0), function_return_type_id_(0)
 {
 }
 
@@ -39,41 +27,74 @@ std::vector<SemaId> Lowerer::Children(SemaId node) const
   return result;
 }
 
-const lowir_model::Block* Lowerer::CurrentBlock() const
+void Lowerer::ResetFunction(const std::string& name,
+                            const lowir_model::LowType& return_type)
 {
-  for (std::size_t i = 0; i < function_.blocks.size(); ++i)
-    if (function_.blocks[i].label == current_label_)
-      return &function_.blocks[i];
-  return 0;
+  function_ = lowir_model::Function();
+  function_.name = name;
+  function_.return_type = return_type;
+  current_block_ = 0;
+  block_labels_.clear();
+  slot_names_.clear();
+  slots_.clear();
+  goto_labels_.clear();
+  condition_labels_.clear();
+  controls_.clear();
+  temp_counter_ = 0;
+  label_counter_ = 0;
+  generated_slot_counter_ = 0;
+  function_return_type_id_ = 0;
 }
 
-lowir_model::Block* Lowerer::CurrentBlock()
+// The startup initializer is one program-wide function: each unit resumes
+// it with the counters the previous unit left, appends its stores, and hands
+// it back.
+void Lowerer::ResumeInitFunction()
 {
+  ResetFunction("@__cppgm_init", VoidType());
+  if (!shared_.has_init_) {
+    function_.metadata.role = lowir_model::SR_INIT;
+    function_.metadata.binding = lowir_model::SBM_INTERNAL;
+    StartBlock("^entry");
+    return;
+  }
+  function_ = std::move(shared_.init_function_);
+  temp_counter_ = shared_.init_temp_counter_;
+  label_counter_ = shared_.init_label_counter_;
+  generated_slot_counter_ = shared_.init_slot_counter_;
+  for (std::size_t i = 0; i < function_.slots.size(); ++i)
+    slot_names_.insert(function_.slots[i].first);
   for (std::size_t i = 0; i < function_.blocks.size(); ++i)
-    if (function_.blocks[i].label == current_label_)
-      return &function_.blocks[i];
-  return 0;
+    block_labels_.insert(function_.blocks[i].label);
+  current_block_ = function_.blocks.size() - 1;
 }
 
-void Lowerer::AddBlock(const std::string& label)
+void Lowerer::SuspendInitFunction()
 {
-  for (std::size_t i = 0; i < function_.blocks.size(); ++i)
-    if (function_.blocks[i].label == label)
-      return;
+  shared_.init_function_ = std::move(function_);
+  shared_.has_init_ = true;
+  shared_.init_temp_counter_ = temp_counter_;
+  shared_.init_label_counter_ = label_counter_;
+  shared_.init_slot_counter_ = generated_slot_counter_;
+}
+
+lowir_model::Block& Lowerer::CurrentBlock()
+{
+  if (current_block_ >= function_.blocks.size())
+    throw std::logic_error("internal LowIR error: no current block");
+  return function_.blocks[current_block_];
+}
+
+// Blocks appear in the order they are started; every label is started once.
+void Lowerer::StartBlock(const std::string& label)
+{
+  if (!block_labels_.insert(label).second)
+    throw std::logic_error("internal LowIR error: block started twice: " +
+                           label);
   lowir_model::Block block;
   block.label = label;
   function_.blocks.push_back(block);
-}
-
-void Lowerer::AddBlockIfMissing(const std::string& label)
-{
-  AddBlock(label);
-}
-
-void Lowerer::SetCurrent(const std::string& label)
-{
-  AddBlockIfMissing(label);
-  current_label_ = label;
+  current_block_ = function_.blocks.size() - 1;
 }
 
 std::string Lowerer::NewBlockLabel(const std::string& stem)
@@ -86,60 +107,55 @@ std::string Lowerer::NewTemp()
   return "%t" + std::to_string(++temp_counter_);
 }
 
+void Lowerer::AddSlot(const std::string& name,
+                      const lowir_model::LowType& type)
+{
+  function_.slots.push_back(std::make_pair(name, type));
+  slot_names_.insert(name);
+}
+
+// Generated slots share one per-function counter and skip every number
+// whose name a source declaration already owns.
 std::string Lowerer::NewGeneratedSlot(const std::string& stem,
                                       const lowir_model::LowType& type)
 {
-  const std::string base = "$" + stem;
-  std::string candidate = base;
-  const std::size_t marker = stem.rfind("__");
-  const std::string prefix = marker == std::string::npos ? stem :
-      stem.substr(0, marker);
   while (true) {
-    bool used = false;
-    for (std::size_t i = 0; i < function_.slots.size(); ++i)
-      if (function_.slots[i].first == candidate)
-        used = true;
-    if (!used) {
-      function_.slots.push_back(std::make_pair(candidate, type));
+    const std::string candidate =
+        "$" + stem + "__" + std::to_string(++generated_slot_counter_);
+    if (slot_names_.count(candidate) == 0) {
+      AddSlot(candidate, type);
       return candidate;
     }
-    candidate = "$" + prefix + "__" +
-        std::to_string(++generated_slot_counter_);
   }
 }
 
-std::string Lowerer::LabelFor(SemaId node)
+// Labels carry the per-function ordinal the semantic layer assigned; the
+// block is named on the first mention, by a goto or by the label itself.
+std::string Lowerer::GotoLabel(const SemaNode& node)
 {
-  if (node == 0 || tree_.At(node).first >= tree_.At(node).last ||
-      tree_.At(node).first >= tokens_.size())
-  {
-    Unsupported("label without a source name");
-    return std::string();
-  }
-  const std::string name = tokens_[tree_.At(node).first].spelling;
-  std::map<std::string, std::string>::const_iterator found =
-      labels_.find(name);
-  if (found != labels_.end())
-    return found->second;
-  const std::string generated = NewBlockLabel("goto");
-  labels_[name] = generated;
-  return generated;
+  if (!node.has_value || node.value <= 0)
+    Unsupported("a label without a semantic ordinal");
+  const std::size_t ordinal = static_cast<std::size_t>(node.value);
+  if (goto_labels_.size() <= ordinal)
+    goto_labels_.resize(ordinal + 1);
+  if (goto_labels_[ordinal].empty())
+    goto_labels_[ordinal] = NewBlockLabel("goto");
+  return goto_labels_[ordinal];
 }
 
 void Lowerer::Emit(const lowir_model::Instruction& instruction)
 {
-  lowir_model::Block* block = CurrentBlock();
-  if (block == 0)
-    throw std::logic_error("internal LowIR error: no current block");
-  block->instructions.push_back(instruction);
+  CurrentBlock().instructions.push_back(instruction);
 }
 
 bool Lowerer::Terminated() const
 {
-  const lowir_model::Block* block = CurrentBlock();
-  if (block == 0 || block->instructions.empty())
+  if (current_block_ >= function_.blocks.size())
     return false;
-  const lowir_model::Instruction::Kind kind = block->instructions.back().kind;
+  const lowir_model::Block& block = function_.blocks[current_block_];
+  if (block.instructions.empty())
+    return false;
+  const lowir_model::Instruction::Kind kind = block.instructions.back().kind;
   return kind == lowir_model::Instruction::IK_RETURN ||
       kind == lowir_model::Instruction::IK_JUMP ||
       kind == lowir_model::Instruction::IK_BRANCH ||
@@ -152,7 +168,7 @@ void Lowerer::EmitJump(const std::string& label)
     return;
   lowir_model::Instruction instruction;
   instruction.kind = lowir_model::Instruction::IK_JUMP;
-  instruction.first = NamedOperand(lowir_model::Operand::OP_LABEL, label);
+  instruction.first = LabelOperand(label);
   Emit(instruction);
 }
 
@@ -163,9 +179,21 @@ void Lowerer::EmitBranch(const lowir_model::Operand& condition,
   lowir_model::Instruction instruction;
   instruction.kind = lowir_model::Instruction::IK_BRANCH;
   instruction.first = condition;
-  instruction.second = NamedOperand(lowir_model::Operand::OP_LABEL, true_label);
-  instruction.third = NamedOperand(lowir_model::Operand::OP_LABEL, false_label);
+  instruction.second = LabelOperand(true_label);
+  instruction.third = LabelOperand(false_label);
   Emit(instruction);
+}
+
+void Lowerer::EmitStore(const lowir_model::LowType& type,
+                        const lowir_model::Operand& value,
+                        const lowir_model::Operand& destination)
+{
+  lowir_model::Instruction store;
+  store.kind = lowir_model::Instruction::IK_STORE;
+  store.type = type;
+  store.first = value;
+  store.second = destination;
+  Emit(store);
 }
 
 void Lowerer::EmitReturn(const Value* value)
@@ -198,6 +226,9 @@ void Lowerer::CollectParameters(SemaId function_node,
       parameters.push_back(child);
 }
 
+// Source slots are declared in encounter order over the whole body, nested
+// blocks included, so the frame layout is fixed before any statement is
+// lowered.
 void Lowerer::CollectSlots(SemaId node, std::set<BindingId>& seen)
 {
   if (node == 0)
@@ -214,81 +245,62 @@ void Lowerer::CollectSlots(SemaId node, std::set<BindingId>& seen)
     CollectSlots(child, seen);
 }
 
-std::string Lowerer::SlotFor(BindingId binding) const
+const std::string& Lowerer::SlotFor(BindingId binding) const
 {
   const std::map<BindingId, std::string>::const_iterator found =
       slots_.find(binding);
   if (found == slots_.end())
-    throw std::logic_error("unsupported in CP1: object has no storage slot");
+    Unsupported("an object without a storage slot");
   return found->second;
 }
 
 void Lowerer::AddSourceSlot(BindingId binding)
 {
+  if (slots_.find(binding) != slots_.end())
+    return;
   const Binding& value = model_.BindingAt(binding);
-  std::string name = value.name.empty() ?
-      "$__local" + std::to_string(++generated_slot_counter_) : "$" + value.name;
-  std::string base = name;
-  unsigned suffix = 1;
-  while (slots_.find(binding) == slots_.end()) {
-    bool collision = false;
-    for (std::size_t i = 0; i < function_.slots.size(); ++i)
-      if (function_.slots[i].first == name)
-        collision = true;
-    if (!collision) {
-      function_.slots.push_back(std::make_pair(name, LowTypeOf(value.type)));
-      slots_[binding] = name;
-      return;
-    }
-    name = base + "__shadow" + std::to_string(++suffix);
-  }
+  const std::string base = value.name.empty() ?
+      "$__local" + std::to_string(++generated_slot_counter_) :
+      "$" + value.name;
+  std::string name = base;
+  for (unsigned suffix = 2; slot_names_.count(name) != 0; ++suffix)
+    name = base + "__shadow" + std::to_string(suffix);
+  AddSlot(name, LowTypeOf(value.type));
+  slots_[binding] = name;
 }
 
 void Lowerer::AddParameterSlots(SemaId function_node)
 {
-  const FunctionEntity& entity = model_.FunctionAt(tree_.At(function_node).function);
+  const FunctionEntity& entity =
+      model_.FunctionAt(tree_.At(function_node).function);
   const TypeNode& type = types_.At(types_.Unqualified(entity.type));
-  function_return_type_id_ = type.result;
   std::vector<SemaId> parameters;
   CollectParameters(function_node, parameters);
   for (std::size_t i = 0; i < type.parameters.size(); ++i) {
-    std::string name = "$__param" + std::to_string(i);
+    std::string base = "$__param" + std::to_string(i);
     BindingId binding = 0;
     if (i < parameters.size()) {
       binding = tree_.At(parameters[i]).binding;
       if (binding != 0 && !model_.BindingAt(binding).name.empty())
-        name = "$" + model_.BindingAt(binding).name;
+        base = "$" + model_.BindingAt(binding).name;
     }
-    std::string base = name;
-    unsigned suffix = 1;
-    while (true) {
-      bool collision = false;
-      for (std::size_t j = 0; j < function_.slots.size(); ++j)
-        if (function_.slots[j].first == name)
-          collision = true;
-      if (!collision) break;
-      name = base + "__" + std::to_string(++suffix);
-    }
-    function_.slots.push_back(std::make_pair(name, LowTypeOf(type.parameters[i])));
+    std::string name = base;
+    for (unsigned suffix = 2; slot_names_.count(name) != 0; ++suffix)
+      name = base + "__" + std::to_string(suffix);
+    AddSlot(name, LowTypeOf(type.parameters[i]));
     if (binding != 0)
       slots_[binding] = name;
   }
 }
 
-lowir_model::Function Lowerer::BuildFunction(SemaId node)
+lowir_model::Function Lowerer::BuildFunction(const FunctionSymbol& symbol)
 {
-  function_ = lowir_model::Function();
-  slots_.clear();
-  controls_.clear();
-  labels_.clear();
-  temp_counter_ = 0;
-  label_counter_ = 0;
-  generated_slot_counter_ = 0;
+  const SemaId node = symbol.definition;
   const FunctionEntityId id = tree_.At(node).function;
   const FunctionEntity& entity = model_.FunctionAt(id);
-  function_.name = function_names_[id];
   const TypeNode& type = types_.At(types_.Unqualified(entity.type));
-  function_.return_type = LowTypeOf(type.result);
+  ResetFunction(symbol.name, LowTypeOf(type.result));
+  function_return_type_id_ = type.result;
   function_.boundary.arity = type.variadic ? lowir_model::CAM_VARIADIC :
       lowir_model::CAM_FIXED;
   function_.metadata.binding = entity.internal_linkage ?
@@ -297,11 +309,13 @@ lowir_model::Function Lowerer::BuildFunction(SemaId node)
       lowir_model::LLM_DEFAULT;
   if (entity.noexcept_qualifier)
     function_.boundary.unwind = lowir_model::CUM_NO;
-  if (entity.name == "main" && entity.scope == model_.GlobalScope()) {
+  const bool is_main = entity.name == "main" &&
+      entity.scope == model_.GlobalScope();
+  if (is_main) {
     function_.metadata.role = lowir_model::SR_ENTRY;
     function_.metadata.keep_internal_alias = true;
   } else if (!entity.c_linkage) {
-    function_.metadata.object_symbol = object_names_[id];
+    function_.metadata.object_symbol = symbol.object;
   }
 
   std::vector<SemaId> parameters;
@@ -313,27 +327,24 @@ lowir_model::Function Lowerer::BuildFunction(SemaId node)
       const BindingId binding = tree_.At(parameters[i]).binding;
       if (binding != 0 && !model_.BindingAt(binding).name.empty())
         parameter.name = "%" + model_.BindingAt(binding).name;
-      if (types_.Kind(types_.Unqualified(type.parameters[i])) == TYPE_REFERENCE)
+      if (types_.Kind(types_.Unqualified(type.parameters[i])) ==
+          TYPE_REFERENCE)
         parameter.metadata.passing = lowir_model::PPM_REFERENCE;
     }
     parameter.type = LowTypeOf(type.parameters[i]);
     function_.params.push_back(parameter);
   }
 
-  // Parameter names share the textual namespace used by generated
-  // temporaries.  Reserve names such as %t1 before body lowering so a source
-  // parameter cannot collide with a compiler-created value.
+  // Parameter names share the textual namespace of generated temporaries.
+  // Reserve every %tN a parameter spells before the body allocates any.
   for (std::size_t i = 0; i < function_.params.size(); ++i) {
     const std::string& name = function_.params[i].name;
     if (name.size() <= 2 || name.compare(0, 2, "%t") != 0)
       continue;
     unsigned value = 0;
     bool digits = true;
-    for (std::size_t j = 2; j < name.size(); ++j) {
-      if (name[j] < '0' || name[j] > '9') {
-        digits = false;
-        break;
-      }
+    for (std::size_t j = 2; j < name.size() && digits; ++j) {
+      digits = name[j] >= '0' && name[j] <= '9';
       value = value * 10 + static_cast<unsigned>(name[j] - '0');
     }
     if (digits && value > temp_counter_)
@@ -343,38 +354,27 @@ lowir_model::Function Lowerer::BuildFunction(SemaId node)
   AddParameterSlots(node);
   const SemaId body = FunctionBody(node);
   if (body == 0)
-    Unsupported("function without a body");
+    Unsupported("a function without a body");
   std::set<BindingId> source_slots;
   CollectSlots(body, source_slots);
-  AddBlock("^entry");
-  current_label_ = "^entry";
-  for (std::size_t i = 0; i < function_.params.size(); ++i) {
-    lowir_model::Instruction store;
-    store.kind = lowir_model::Instruction::IK_STORE;
-    store.type = function_.params[i].type;
-    store.first = NamedOperand(lowir_model::Operand::OP_TEMP,
-                               function_.params[i].name);
-    store.second = NamedOperand(lowir_model::Operand::OP_SLOT,
-                                function_.slots[i].first);
-    Emit(store);
-  }
+  StartBlock("^entry");
+  for (std::size_t i = 0; i < function_.params.size(); ++i)
+    EmitStore(function_.params[i].type, TempOperand(function_.params[i].name),
+              SlotOperand(function_.slots[i].first));
   LowerSequence(body);
   if (!Terminated()) {
-    if (function_.return_type.text == "void")
+    // 6.6.3p2/3.6.1p5: main returns 0 when it falls off the end.  Any other
+    // value-returning function that can fall off the end gets the same
+    // zero terminator: the block is well-formed and reaching it is the
+    // program's undefined behaviour, not a compile-time error.
+    if (IsVoidType(types_, type.result)) {
       EmitReturn(0);
-    else if (entity.name == "main" && entity.scope == model_.GlobalScope()) {
-      lowir_model::Instruction result;
-      result.kind = lowir_model::Instruction::IK_RETURN;
-      result.type = function_.return_type;
-      result.first.kind = lowir_model::Operand::OP_INTEGER;
-      result.first.text = "0";
-      result.first.int_value = 0;
-      Emit(result);
+    } else {
+      const Value zero = ZeroValue(type.result);
+      EmitReturn(&zero);
     }
-    else
-      Unsupported("falling off a non-void function");
   }
-  return function_;
+  return std::move(function_);
 }
 
 void Lowerer::PushControl(const std::string& break_label,
@@ -401,8 +401,8 @@ std::string Lowerer::CurrentBreak() const
 
 std::string Lowerer::CurrentContinue() const
 {
-  for (std::vector<ControlTarget>::const_reverse_iterator i = controls_.rbegin();
-       i != controls_.rend(); ++i)
+  for (std::vector<ControlTarget>::const_reverse_iterator i =
+           controls_.rbegin(); i != controls_.rend(); ++i)
     if (!i->continue_label.empty())
       return i->continue_label;
   return std::string();
@@ -410,7 +410,7 @@ std::string Lowerer::CurrentContinue() const
 
 void Lowerer::Unsupported(const std::string& feature) const
 {
-  throw std::logic_error("unsupported in CP1: " + feature);
+  throw std::logic_error("LowIR lowering does not support " + feature);
 }
 
 }  // namespace lowir_lowering

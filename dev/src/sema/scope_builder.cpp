@@ -1,6 +1,7 @@
 // Declaration collection and scope ownership for the semantic model.
 #include "sema/scope_builder.h"
 
+#include <algorithm>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -352,7 +353,7 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
           target_scope, name, type, false, binding,
           HasConstFunctionQualifier(declarator),
           SequenceHasKeyword(specifiers, KW_STATIC),
-          HasNoexceptQualifier(declarator), default_arguments);
+          IsNoThrowDeclarator(declarator, target_scope), default_arguments);
       ClassEntityId member_class = 0;
       const bool is_member = model_.ClassForScope(target_scope, member_class);
       if (EmitsSemantics() && !is_member)
@@ -379,6 +380,15 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     model_.BindingAt(binding).c_linkage = c_linkage_depth_ != 0;
     model_.BindingAt(binding).extern_declaration =
         initializer == 0 && SequenceHasKeyword(specifiers, KW_EXTERN);
+    if (kind == BINDING_VARIABLE)
+    {
+      if (model_.ScopeAt(target_scope).kind == SCOPE_NAMESPACE)
+        LinkRedeclaration(binding, target_scope, name, type);
+      else if (initializer != 0 &&
+               model_.ScopeAt(target_scope).kind == SCOPE_BLOCK &&
+               !SequenceHasKeyword(specifiers, KW_STATIC))
+        RecordInitializedLocal(target_scope);
+    }
     SemaId variable = 0;
     if (EmitsSemantics() && model_.ScopeAt(target_scope).kind != SCOPE_CLASS)
       variable = MakeSemantic(is_typedef ? SEMA_TYPE_ALIAS : SEMA_VARIABLE,
@@ -474,7 +484,7 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
       target_scope, name, type, true, binding,
       HasConstFunctionQualifier(declarator),
       SequenceHasKeyword(specifiers, KW_STATIC),
-      HasNoexceptQualifier(declarator), default_arguments);
+      IsNoThrowDeclarator(declarator, target_scope), default_arguments);
   ClassEntityId member_class = 0;
   const bool is_member = model_.ClassForScope(target_scope, member_class);
   SemaId function_node = 0;
@@ -535,12 +545,27 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   }
   labels_.clear();
   gotos_.clear();
+  initialized_locals_.clear();
+  jump_sequence_ = 0;
   (void)BuildCompound(body, function_scope, function, 0, 0, function_node);
   for (std::size_t i = 0; i < gotos_.size(); ++i)
-    if (labels_.find(gotos_[i]) == labels_.end())
+  {
+    const std::map<std::string, LabelRecord>::const_iterator label =
+        labels_.find(gotos_[i].name);
+    if (label == labels_.end())
       throw std::runtime_error("goto target does not name a label");
+    if (gotos_[i].node != 0)
+    {
+      tree_->At(gotos_[i].node).has_value = true;
+      tree_->At(gotos_[i].node).value = label->second.ordinal;
+    }
+    CheckJumpTarget(gotos_[i].sequence, tree_ != 0 && gotos_[i].node != 0 ?
+                        tree_->At(gotos_[i].node).scope : function_scope,
+                    label->second.sequence, label->second.scope);
+  }
   labels_.clear();
   gotos_.clear();
+  initialized_locals_.clear();
 }
 
 long long ScopeBuilder::ConstantValue(AstId expression, ScopeId scope)
@@ -1122,7 +1147,11 @@ bool ScopeBuilder::HasConstFunctionQualifier(AstId declarator) const
   return false;
 }
 
-bool ScopeBuilder::HasNoexceptQualifier(AstId declarator) const
+// 15.4: `noexcept`, `noexcept(constant)` with a true constant, and the empty
+// dynamic specification `throw()` promise not to throw.  The parser joins
+// each specification into one function-qualifier node whose first token
+// names the form; a noexcept operand is that node's only child.
+bool ScopeBuilder::IsNoThrowDeclarator(AstId declarator, ScopeId scope)
 {
   if (declarator == 0)
     return false;
@@ -1130,17 +1159,97 @@ bool ScopeBuilder::HasNoexceptQualifier(AstId declarator) const
   bool have_parameters = false;
   for (std::size_t i = 0; i < node.children.size(); ++i)
   {
-    const AstId child = node.children[i];
-    const AstNode& value = arena_.At(child);
+    const AstNode& value = arena_.At(node.children[i]);
     if (value.kind == AST_PARAMETER_CLAUSE)
+    {
       have_parameters = true;
-    else if (have_parameters &&
-             (value.kind == AST_NOEXCEPT_SPECIFICATION ||
-              (value.kind == AST_FUNCTION_QUALIFIER &&
-               value.text.find("noexcept") != string::npos)))
-      return true;
+      continue;
+    }
+    if (!have_parameters || value.kind != AST_FUNCTION_QUALIFIER ||
+        value.first >= value.last || value.first >= tokens_.size())
+      continue;
+    const Pa6Token& keyword = tokens_[value.first];
+    if (keyword.IsSimple(KW_NOEXCEPT))
+      return value.children.empty() || value.children[0] == 0 ||
+          ConstantValue(value.children[0], scope) != 0;
+    if (keyword.IsSimple(KW_THROW))
+      return value.last - value.first == 3; // `throw ( )`
   }
   return false;
+}
+
+// 3.3.10/3.5: a namespace-scope object declared again in the same scope is
+// the same entity.  The later binding records the first one so a consumer
+// that needs one symbol per object has it without repeating the lookup.
+void ScopeBuilder::LinkRedeclaration(BindingId binding, ScopeId scope,
+                                     const string& name, TypeId type)
+{
+  vector<BindingId> priors;
+  model_.DirectBindings(scope, name, LOOKUP_VALUES, priors);
+  for (std::size_t i = 0; i < priors.size(); ++i)
+  {
+    if (priors[i] == binding)
+      continue;
+    const Binding& prior = model_.BindingAt(priors[i]);
+    if (prior.kind != BINDING_VARIABLE)
+      continue;
+    if (!CompatibleRedeclaration(prior.type, type))
+      throw std::runtime_error("object redeclared with a different type");
+    model_.BindingAt(binding).redeclared_binding =
+        prior.redeclared_binding != 0 ? prior.redeclared_binding : priors[i];
+    return;
+  }
+}
+
+bool ScopeBuilder::CompatibleRedeclaration(TypeId prior, TypeId current) const
+{
+  if (prior == current)
+    return true;
+  // 8.3.4p3: an array of unknown bound is completed by a later declaration.
+  if (types_.Kind(prior) != TYPE_ARRAY || types_.Kind(current) != TYPE_ARRAY)
+    return false;
+  const TypeNode& first = types_.At(prior);
+  const TypeNode& second = types_.At(current);
+  return first.base == second.base &&
+      (first.array_bound == 0 || second.array_bound == 0 ||
+       first.array_bound == second.array_bound);
+}
+
+void ScopeBuilder::RecordInitializedLocal(ScopeId scope)
+{
+  initialized_locals_[scope].push_back(++jump_sequence_);
+}
+
+// 6.7p3: a jump may not enter the scope of an automatic object that has an
+// initializer while bypassing that initializer.  Walking outward from the
+// target, every block scope that does not contain the source is entered, so
+// an initialized object declared in it before the target is bypassed; once
+// the walk reaches a scope that contains the source, only objects declared
+// between a forward source and the target are bypassed.
+void ScopeBuilder::CheckJumpTarget(unsigned source_sequence,
+                                   ScopeId source_scope,
+                                   unsigned target_sequence,
+                                   ScopeId target_scope) const
+{
+  for (ScopeId scope = target_scope;
+       scope != 0 && model_.ScopeAt(scope).kind == SCOPE_BLOCK;
+       scope = model_.ScopeAt(scope).parent)
+  {
+    const std::map<ScopeId, std::vector<unsigned> >::const_iterator locals =
+        initialized_locals_.find(scope);
+    if (locals == initialized_locals_.end())
+      continue;
+    unsigned lower = 0;
+    for (ScopeId probe = source_scope; probe != 0 && lower == 0;
+         probe = model_.ScopeAt(probe).parent)
+      if (probe == scope)
+        lower = source_sequence;
+    const std::vector<unsigned>& sequences = locals->second;
+    const std::vector<unsigned>::const_iterator first =
+        std::upper_bound(sequences.begin(), sequences.end(), lower);
+    if (first != sequences.end() && *first < target_sequence)
+      throw std::runtime_error("jump bypasses variable initialization");
+  }
 }
 
 FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
