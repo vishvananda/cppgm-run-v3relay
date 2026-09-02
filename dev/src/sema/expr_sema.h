@@ -66,6 +66,12 @@ private:
   };
 
   SemaId AnalyzeNode(AstId expression, ScopeId scope);
+  SemaId AnalyzeAmbiguousParameter(AstId parameter, ScopeId scope,
+                                   bool unevaluated = false);
+  SemaId AnalyzeAmbiguousTypeId(AstId type_id, ScopeId scope);
+  SemaId AnalyzeNamedCall(AstId source, const QualifiedName& name,
+                          ScopeId scope,
+                          const std::vector<SemaId>& arguments);
   SemaId AnalyzeLiteral(AstId expression, ScopeId scope);
   SemaId AnalyzeName(AstId expression, ScopeId scope);
   SemaId AnalyzeUnary(AstId expression, ScopeId scope);

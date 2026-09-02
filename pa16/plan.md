@@ -257,6 +257,7 @@ comes from the intended check.
 | CP5 audit and cleanup (completed) | static-member declaration identity, qualified/inherited lookup, global lvalue/address lowering, aggregate startup stores, and audit cleanup | 175/243 pa16 tests pass (68 failures, down from 74); packet 5/5; through-pa15 1139/1139; through-pa16 1314/1382; file audit passes with four pre-existing warnings |
 | CP6 thread-local and static storage (completed) | canonical `Binding`/`GlobalSymbol` storage facts, TLS ABI wrapper and guarded initializer family, qualified private nested-type context, and use-sensitive constant declaration elision | 180/243 pa16 tests pass (63 failures, down from 68); packet 5/5; through-pa15 1139/1139; through-pa16 1319/1382; file audit passes with five warnings; specified scaling probe completed |
 | review 2 (completed; `audit.md`) | CP4b.2 regression restored (using-declaration through a private base); unqualified lookup owns the base-chain search; friendship indexed by the befriended entity, bounded protected access; declaration-only globals emitted on demand; dead state removed | 185/243 (58 failures); no fixture that passed at review 1 or at the turn start fails; through-pa15 1139/1139; through-pa16 1324/1382; file audit passes with five warnings; probes linear |
+| CP7 qualified and deferred member type contexts (completed) | declaration-scope trailing-return construction, injected-class-name and `decltype` qualified lookup, bounded ambiguous direct-initializer classification, deferred local reference binding, and derived-over-base same-signature member lookup | 192/243 pa16 tests pass (51 failures, down from 58); packet 7/7; through-pa15 1139/1139; through-pa16 1331/1382; file audit passes with five warnings |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -597,27 +598,43 @@ failures.  The pa16 file audit passes with four pre-existing header warnings.
 The architecture findings and remaining failure ownership are recorded in
 `audit.md`.
 
-## Active Checkpoint: CP7 — qualified and deferred member type contexts
+CP7 evidence (2026-09-02): type construction now carries the resolved
+declaration scope through trailing return types, injected class names, and
+`decltype`-qualified nested names.  The semantic path also bounds parser
+ambiguity to the direct-initializer and `sizeof` type-id shapes it can prove,
+then reuses normal overload selection and constructor/lifetime actions; class
+member collection filters inherited same-signature candidates after direct
+derived lookup.  The seven packet fixtures pass 7/7.  The final
+`make test-pa16` run reports 192/243 (51 failures, down from 58) with unchanged
+coverage; `make test-report-through-pa15` is 1139/1139,
+`make test-report-through-pa16` is 1331/1382, and the pa16 file audit passes
+with five nonfatal warnings.  No fixtures or reference files changed.
 
-Goal: resolve the remaining out-of-class and deferred member type contexts
-through one scope-aware semantic path, preserving the through-pa16 gate.
+## Completed Checkpoint: CP7 — qualified and deferred member type contexts
+
+Delivered: resolved the packet's remaining out-of-class and deferred member
+type contexts through one scope-aware semantic path while preserving the
+through-pa16 gate.
+
+## Active Checkpoint: CP8 — enclosing-scope destruction and incomplete types
+
+Goal: make completed-class and enclosing-namespace type ownership consistent
+for deferred constructors, explicit/pseudo-destructor calls, and incomplete
+object/reference contexts.
 
 ### Implementation Packet
 
-- Own the remaining qualified/deferred member type failures in `dev/src/sema`
-  through declaration-scope resolution and completed-class context; do not
-  edit fixtures or `.ref` files.
-- Start with `300-member-function-trailing-return` and
-  `300-out-of-class-member-trailing-return` (trailing return types reach
-  `BuildTypeSequence` as an unsupported specifier),
-  `300-out-of-class-private-nested-return-type` (a nested type used as a
-  reference-bound local in an out-of-class body),
-  `200-inherited-injected-class-name-qualified-type` (`Derived::Base`),
-  `spec/100-decltype-qualified-nested-type-local`,
-  `200-local-class-direct-init-inherited-member-call`, and
-  `300-using-base-static-same-signature-derived-preferred`.
-  `200-inherited-base-typedefs-in-derived-members` and
-  `200-out-of-line-member-inherited-typedef-body` pass since review 2.
-- Trace the type and scope facts from parser declarator through semantic
-  binding and deferred body analysis, then require a focused comparison,
-  `make test-pa16`, the through-pa16 report, and the pa16 file audit.
+- Own the next semantic boundary in `dev/src/sema` (and its direct lowering
+  consumer only if the semantic result is already correct); do not edit
+  fixtures or `.ref` files.
+- Start with `200-nested-out-of-class-constructor-enclosing-type`,
+  `300-const-pointer-explicit-destructor-call`,
+  `300-explicit-destructor-call-enclosing-namespace-type`,
+  `300-scalar-pseudo-destructor-call`,
+  `100-global-reference-incomplete-referent`, and
+  `100-incomplete-class-return-function-address`.
+- Trace the canonical type/completeness and destruction-target facts from
+  deferred body analysis through semantic cleanup/lowering; keep ordinary
+  class completion and overload paths unchanged.  Require a focused
+  comparison, `make test-pa16`, the through-pa16 report, and the pa16 file
+  audit before closing the checkpoint.

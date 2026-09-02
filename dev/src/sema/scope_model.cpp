@@ -3,6 +3,25 @@
 #include <algorithm>
 #include <stdexcept>
 
+namespace
+{
+
+bool SameMemberParameterList(const TypeTable& types,
+                             const FunctionEntity& left,
+                             const FunctionEntity& right)
+{
+  if (left.member_type == 0 || right.member_type == 0)
+    return false;
+  const TypeNode& left_type = types.At(types.Unqualified(left.member_type));
+  const TypeNode& right_type = types.At(types.Unqualified(right.member_type));
+  return left_type.variadic == right_type.variadic &&
+      left_type.parameters == right_type.parameters &&
+      left.member_const == right.member_const &&
+      left.member_volatile == right.member_volatile;
+}
+
+} // namespace
+
 Binding::Binding()
     : kind(BINDING_VARIABLE), type(0), scope(0), declaring_class(0),
       namespace_scope(0),
@@ -641,6 +660,64 @@ void SemaModel::CollectClassMember(
   const std::size_t before = result.size();
   if (value.class_scope != 0)
     DirectBindings(value.class_scope, name, filter, result);
+  // 9p2: the injected-class-name is a member of its class scope even though
+  // the canonical type binding lives in the enclosing scope.  Materialize
+  // that existing binding during lookup so a derived qualifier can find an
+  // inherited `Base` in `Derived::Base` without copying type ownership.
+  if (result.size() == before && (filter & LOOKUP_TYPES) != 0 &&
+      value.class_scope != 0 &&
+      scopes_[value.class_scope].name == name)
+  {
+    const BindingId injected = DirectBinding(
+        scopes_[value.class_scope].parent, name, LOOKUP_TYPES);
+    if (injected != 0)
+      result.push_back(injected);
+  }
+  if (result.size() != before)
+  {
+    // A using-declaration re-exposes base overloads in the derived scope.
+    // A declaration in that same scope with an identical member parameter
+    // list hides the re-exposed base declaration, while distinct base
+    // overloads remain candidates.
+    std::vector<BindingId> local_functions;
+    for (std::size_t i = before; i < result.size(); ++i)
+    {
+      const Binding& binding = bindings_[result[i]];
+      if (binding.kind == BINDING_FUNCTION && binding.function != 0 &&
+          functions_[binding.function].member_class == entity)
+        local_functions.push_back(result[i]);
+    }
+    if (!local_functions.empty())
+    {
+      std::vector<BindingId> kept;
+      kept.reserve(result.size() - before);
+      for (std::size_t i = before; i < result.size(); ++i)
+      {
+        const Binding& binding = bindings_[result[i]];
+        bool hidden = false;
+        if (binding.kind == BINDING_FUNCTION && binding.function != 0 &&
+            functions_[binding.function].member_class != entity)
+        {
+          const FunctionEntity& candidate = functions_[binding.function];
+          for (std::size_t local = 0; local < local_functions.size(); ++local)
+          {
+            const FunctionEntity& declared = functions_[
+                bindings_[local_functions[local]].function];
+            if (SameMemberParameterList(types_, candidate, declared))
+            {
+              hidden = true;
+              break;
+            }
+          }
+        }
+        if (!hidden)
+          kept.push_back(result[i]);
+      }
+      result.resize(before);
+      result.insert(result.end(), kept.begin(), kept.end());
+    }
+    return;
+  }
   // A declaration in the derived class hides every base declaration of the
   // same name, including declarations that are not viable overloads.
   if (result.size() != before)

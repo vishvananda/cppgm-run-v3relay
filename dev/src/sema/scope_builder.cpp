@@ -508,7 +508,13 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
         SequenceHasKeyword(specifiers, KW_EXTERN) ?
             std::numeric_limits<std::size_t>::max() :
             (HasIncompleteArray(declarator) ? InitializerBound(initializer) : 0);
-    TypeId type = BuildDeclaratorType(
+    vector<AstId> ambiguous_arguments;
+    const bool ambiguous_direct_initializer =
+        !is_typedef && initializer == 0 &&
+        types_.Kind(types_.Unqualified(base)) == TYPE_CLASS &&
+        FindAmbiguousDirectInitializer(declarator, target_scope,
+                                        ambiguous_arguments);
+    TypeId type = ambiguous_direct_initializer ? base : BuildDeclaratorType(
         declarator, base, is_friend ? scope : target_scope, false,
         incomplete_bound);
     const bool is_function = types_.Kind(type) == TYPE_FUNCTION;
@@ -633,6 +639,10 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
           target_scope, declaration_node != 0 ? declaration_node :
               (semantic_parent != 0 ? semantic_parent :
                   SemanticParent(target_scope)), type, binding);
+    if (BuildAmbiguousDirectInitializer(
+            ambiguous_direct_initializer ? type : 0, binding, variable,
+            target_scope, static_member, ambiguous_arguments))
+      continue;
     if (!is_typedef)
       BuildVariable(binding, initializer, declarator, target_scope,
                     in_class_static_declaration ? 0 : variable, is_constexpr);

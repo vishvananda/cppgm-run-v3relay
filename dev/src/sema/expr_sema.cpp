@@ -215,6 +215,8 @@ SemaId ExpressionAnalyzer::AnalyzeNode(AstId expression, ScopeId scope)
   case AST_KEYWORD_LITERAL: return AnalyzeLiteral(expression, scope);
   case AST_ID_EXPRESSION: case AST_IDENTIFIER:
     return AnalyzeName(expression, scope);
+  case AST_PARAMETER_DECLARATION:
+    return AnalyzeAmbiguousParameter(expression, scope);
   case AST_UNARY_EXPRESSION: return AnalyzeUnary(expression, scope);
   case AST_POSTFIX_EXPRESSION: return AnalyzePostfix(expression, scope);
   case AST_MEMBER_EXPRESSION: return AnalyzeMember(expression, scope);
@@ -231,6 +233,145 @@ SemaId ExpressionAnalyzer::AnalyzeNode(AstId expression, ScopeId scope)
   default:
     throw std::runtime_error("unsupported expression in semantic analysis");
   }
+}
+
+// Declaration parsing has priority over expression parsing at several
+// grammar boundaries.  Once semantic lookup has established that a
+// parameter-shaped node is actually a zero-argument expression, analyze it
+// through the same constructor or overload path as an ordinary call.
+SemaId ExpressionAnalyzer::AnalyzeAmbiguousParameter(AstId parameter,
+                                                     ScopeId scope,
+                                                     bool unevaluated)
+{
+  const AstId specifiers = FindChild(parameter, AST_DECL_SPECIFIER_SEQ);
+  const AstId declarator = FindChild(parameter, AST_DECLARATOR);
+  if (specifiers == 0 || declarator == 0 ||
+      arena_.At(declarator).children.size() != 1)
+    throw std::runtime_error("invalid ambiguous expression parameter");
+  const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
+  if (clause == 0 || !arena_.At(clause).children.empty())
+    throw std::runtime_error("ambiguous expression parameter is not a call");
+
+  TypeId type = 0;
+  try
+  {
+    type = builder_.TypeOfSpecifierSequence(specifiers, scope);
+  }
+  catch (const std::runtime_error&)
+  {
+    type = 0;
+  }
+  if (type != 0)
+  {
+    if (unevaluated &&
+        types_.Kind(types_.Unqualified(type)) == TYPE_CLASS)
+      return MakeExpression(SEMA_ID_EXPRESSION, parameter, type,
+                            VC_PRVALUE, scope);
+    return AnalyzeFunctionalCast(parameter, type, scope, vector<AstId>());
+  }
+
+  const vector<AstId>& specifier_nodes = arena_.At(specifiers).children;
+  if (specifier_nodes.size() != 1)
+    throw std::runtime_error("ambiguous expression has no callable name");
+  const QualifiedName name = ReadQualifiedName(
+      tokens_, arena_.At(specifier_nodes[0]).first,
+      arena_.At(specifier_nodes[0]).last, true);
+  return AnalyzeNamedCall(parameter, name, scope, vector<SemaId>());
+}
+
+SemaId ExpressionAnalyzer::AnalyzeAmbiguousTypeId(AstId type_id,
+                                                  ScopeId scope)
+{
+  const vector<AstId>& children = arena_.At(type_id).children;
+  if (children.size() != 2 || children[0] == 0 || children[1] == 0)
+    throw std::runtime_error("invalid ambiguous type-id expression");
+  const vector<AstId>& specifier_nodes =
+      arena_.At(children[0]).children;
+  if (specifier_nodes.size() != 1 ||
+      arena_.At(specifier_nodes[0]).kind != AST_TYPE_NAME)
+    throw std::runtime_error("ambiguous type-id has no callable name");
+  const QualifiedName name = ReadQualifiedName(
+      tokens_, arena_.At(specifier_nodes[0]).first,
+      arena_.At(specifier_nodes[0]).last, true);
+  const AstId clause = FindChild(children[1], AST_PARAMETER_CLAUSE);
+  if (clause == 0)
+    throw std::runtime_error("ambiguous type-id has no argument list");
+  vector<SemaId> arguments;
+  const vector<AstId>& argument_nodes = arena_.At(clause).children;
+  for (size_t i = 0; i < argument_nodes.size(); ++i)
+    arguments.push_back(AnalyzeAmbiguousParameter(argument_nodes[i], scope,
+                                                  true));
+  return AnalyzeNamedCall(type_id, name, scope, arguments);
+}
+
+SemaId ExpressionAnalyzer::AnalyzeNamedCall(
+    AstId source, const QualifiedName& name, ScopeId scope,
+    const vector<SemaId>& arguments)
+{
+  vector<BindingId> bindings;
+  LookupNameBindings(name, scope, bindings);
+  if (!name.Qualified())
+  {
+    vector<TypeId> argument_types;
+    for (size_t i = 0; i < arguments.size(); ++i)
+      argument_types.push_back(NodeInfo(arguments[i]).type);
+    vector<BindingId> call_bindings;
+    model_.LookupCallSet(scope, name.Last(), argument_types, call_bindings);
+    FilterAccessibleBindings(scope, call_bindings);
+    bindings.swap(call_bindings);
+  }
+  if (bindings.empty())
+    throw std::runtime_error("unknown callable name in expression");
+
+  SemaId implicit_object = 0;
+  bool has_implicit_object = false;
+  for (size_t i = 0; i < bindings.size(); ++i)
+  {
+    const Binding& binding = model_.BindingAt(bindings[i]);
+    if (binding.kind != BINDING_FUNCTION || binding.function == 0)
+      continue;
+    const FunctionEntity& function = model_.FunctionAt(binding.function);
+    if (!function.is_member || function.static_member)
+      continue;
+    const BindingId this_binding = model_.LookupUnqualified(
+        scope, "this", LOOKUP_VALUES);
+    if (this_binding == 0)
+      continue;
+    implicit_object = MakeExpression(
+        SEMA_ID_EXPRESSION, 0,
+        model_.BindingAt(this_binding).type, VC_PRVALUE, scope, KW_THIS);
+    tree_.At(implicit_object).binding = this_binding;
+    has_implicit_object = true;
+    break;
+  }
+
+  vector<OverloadArgument> overload_arguments;
+  if (has_implicit_object)
+  {
+    const Info object = NodeInfo(implicit_object);
+    overload_arguments.push_back(OverloadArgument(
+        object.type, object.category, IsNullPointerConstant(implicit_object),
+        object.is_function_lvalue, true));
+  }
+  for (size_t i = 0; i < arguments.size(); ++i)
+  {
+    const Info info = NodeInfo(arguments[i]);
+    OverloadArgument argument(info.type, info.category,
+                              IsNullPointerConstant(arguments[i]),
+                              info.is_function_lvalue);
+    const SemaNode& semantic = tree_.At(arguments[i]);
+    if (semantic.kind == SEMA_ID_EXPRESSION && semantic.function != 0)
+      FunctionCandidates(ReadQualifiedName(tokens_, semantic.first,
+                                           semantic.last, true),
+                         semantic.scope, argument.function_candidates);
+    overload_arguments.push_back(argument);
+  }
+  const FunctionEntityId function = SelectBestOverload(
+      model_, types_, bindings, overload_arguments, has_implicit_object);
+  if (function == 0)
+    throw std::runtime_error("no unique viable callable overload");
+  return BuildResolvedCall(source, scope, function, implicit_object,
+                           arguments);
 }
 
 void ExpressionAnalyzer::FoldLiteral(SemaId node, AstId expression)
@@ -1686,7 +1827,23 @@ SemaId ExpressionAnalyzer::AnalyzeSizeof(AstId expression, ScopeId scope)
   const AstId operand = Child(expression, 0);
   TypeId type = 0;
   if (arena_.At(operand).kind == AST_TYPE_ID)
-    type = builder_.TypeOfTypeId(operand, scope);
+  {
+    try
+    {
+      type = builder_.TypeOfTypeId(operand, scope);
+    }
+    catch (const std::runtime_error&)
+    {
+      // `sizeof(derived::select(index()))` is parsed as a type-id because
+      // the parser cannot use semantic overload lookup at that point.  The
+      // type-name is a callable member set, so resolve the expression-shaped
+      // form and retain only its result type in this unevaluated context.
+      const std::size_t mark = tree_.Mark();
+      const SemaId analyzed = AnalyzeAmbiguousTypeId(operand, scope);
+      type = tree_.At(analyzed).type;
+      tree_.Truncate(mark);
+    }
+  }
   else if (!IsTypeName(operand, scope, type))
     type = tree_.At(Analyze(operand, scope)).type;
   // 5.3.3p6, 5.3.6p3: std::size_t, which is unsigned long on this target.

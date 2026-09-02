@@ -37,6 +37,11 @@ TypeId ScopeBuilder::TypeOfTypeId(AstId type_id, ScopeId scope)
   return BuildTypeId(type_id, scope);
 }
 
+TypeId ScopeBuilder::TypeOfSpecifierSequence(AstId sequence, ScopeId scope)
+{
+  return BuildSpecifierType(sequence, scope);
+}
+
 TypeId ScopeBuilder::TypeOfDecltype(AstId expression, ScopeId scope)
 {
   return BuildDecltype(expression, scope);
@@ -74,6 +79,7 @@ TypeId ScopeBuilder::BuildTypeSequence(AstId sequence, ScopeId lookup_scope,
   TypeId result = 0;
   bool is_const = false;
   bool is_volatile = false;
+  bool is_auto = false;
   for (std::size_t i = 0; i < value.children.size(); ++i)
   {
     const AstId child = value.children[i];
@@ -90,11 +96,40 @@ TypeId ScopeBuilder::BuildTypeSequence(AstId sequence, ScopeId lookup_scope,
         is_const = true;
       else if (token == KW_VOLATILE)
         is_volatile = true;
+      else if (token == KW_AUTO)
+        is_auto = true;
       else if (IsFundamentalTypeKeyword(token))
         fundamental.push_back(token);
       else if (!IsIgnoredSpecifier(token))
         throw std::runtime_error("unsupported declaration specifier");
       continue;
+    }
+    // The AST parser stores `decltype(e)::name` as the decltype specifier
+    // followed by a separate `::name` type-name node.  The leading `::` is
+    // the separator from the decltype operand, not global namespace
+    // qualification.  Resolve the suffix in the operand's class scope while
+    // retaining the original declaration scope for access checking.
+    if (result != 0 && (node.kind == AST_DECL_SPECIFIER ||
+                        node.kind == AST_TYPE_NAME))
+    {
+      const QualifiedName suffix = NodeName(child);
+      if (suffix.global)
+      {
+        ScopeId type_scope = 0;
+        if (!model_.ScopeOfType(result, type_scope))
+          throw std::runtime_error("decltype qualifier is not a class type");
+        QualifiedName member = suffix;
+        member.global = false;
+        const BindingId binding = member.Qualified() ?
+            model_.LookupQualified(type_scope, member, LOOKUP_TYPES) :
+            model_.LookupTypeName(type_scope, member.Last());
+        if (binding == 0 || model_.BindingAt(binding).type == 0)
+          throw std::runtime_error("unknown type name: " + member.Last());
+        if (!model_.IsAccessible(binding, lookup_scope))
+          throw std::runtime_error("inaccessible type name: " + member.Last());
+        result = model_.BindingAt(binding).type;
+        continue;
+      }
     }
     const TypeId child_type = BuildTypeNode(child, lookup_scope, in_declaration,
                                             anonymous_name);
@@ -102,10 +137,16 @@ TypeId ScopeBuilder::BuildTypeSequence(AstId sequence, ScopeId lookup_scope,
       throw std::runtime_error("multiple type specifiers");
     result = child_type;
   }
-  if (result != 0 && !fundamental.empty())
+  if (result != 0 && (!fundamental.empty() || is_auto))
     throw std::runtime_error("multiple type specifiers");
   if (result == 0 && !fundamental.empty())
     result = types_.FundamentalFromKeywords(fundamental);
+  // `auto` is a placeholder until BuildDeclaratorType consumes the
+  // declarator's trailing-return-type.  Keeping the placeholder as the null
+  // type avoids inventing a non-canonical type-table entry for an unresolved
+  // deduction; a declarator without a trailing return is rejected there.
+  if (result == 0 && is_auto)
+    return 0;
   if (result == 0)
     throw std::runtime_error("declaration has no type");
   return types_.Cv(result, is_const, is_volatile);
@@ -292,6 +333,7 @@ TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
   vector<AstId> member_prefix;
   vector<AstId> suffix;
   AstId nested = 0;
+  AstId trailing_return = 0;
   bool seen_direct = false;
   for (std::size_t i = 0; i < node.children.size(); ++i)
   {
@@ -317,10 +359,28 @@ TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
     }
     else if (!seen_direct && kind == AST_CV_QUALIFIER)
       prefix.push_back(child);
+    else if (kind == AST_TRAILING_RETURN_TYPE)
+    {
+      if (trailing_return != 0)
+        throw std::runtime_error("multiple trailing return types");
+      trailing_return = child;
+    }
     else if (kind != AST_PARAMETER_PACK)
       suffix.push_back(child);
   }
-  const TypeId declared = ApplySuffix(ApplyPrefix(base, prefix), suffix,
+  TypeId declarator_base = base;
+  if (trailing_return != 0)
+  {
+    if (base != 0)
+      throw std::runtime_error("trailing return type requires auto");
+    const AstNode& trailing = arena_.At(trailing_return);
+    if (trailing.children.size() != 1)
+      throw std::runtime_error("invalid trailing return type");
+    declarator_base = BuildTypeId(trailing.children[0], lookup_scope);
+  }
+  if (declarator_base == 0)
+    throw std::runtime_error("auto declaration has no trailing return type");
+  const TypeId declared = ApplySuffix(ApplyPrefix(declarator_base, prefix), suffix,
                                       lookup_scope, parameter_context,
                                       deduced_bound);
   TypeId result = declared;

@@ -37,6 +37,7 @@ public:
 
   // Type construction and template entities for the expression analyzer.
   TypeId TypeOfTypeId(AstId type_id, ScopeId scope);
+  TypeId TypeOfSpecifierSequence(AstId sequence, ScopeId scope);
   TypeId TypeOfDecltype(AstId expression, ScopeId scope);
   TypeId TypeForName(const QualifiedName& name, ScopeId scope) const;
   // Template entities are owned by the scope builder until a use supplies
@@ -100,6 +101,11 @@ private:
   void BuildBitFieldDeclaration(AstId node, ScopeId scope);
   void BuildVariable(BindingId binding, AstId initializer, AstId declarator,
                      ScopeId scope, SemaId variable, bool is_constexpr);
+  bool FindAmbiguousDirectInitializer(
+      AstId declarator, ScopeId scope, std::vector<AstId>& arguments) const;
+  bool BuildAmbiguousDirectInitializer(
+      TypeId type, BindingId binding, SemaId variable, ScopeId scope,
+      bool static_member, const std::vector<AstId>& arguments);
   void BuildFunctionDefinition(AstId node, ScopeId scope);
   void BuildSpecialMember(AstId node, ScopeId scope);
   // 9.2p2 complete-class contexts, run once when the class body closes over
@@ -119,6 +125,8 @@ private:
                         unsigned switch_depth = 0,
                         SemaId semantic_parent = 0);
   void BuildStatement(AstId node, const StatementContext& context);
+  bool TryBuildAmbiguousReferenceDeclaration(
+      AstId node, const StatementContext& context);
   void BuildDeclarationsOnly(AstId node, ScopeId scope);
   void BuildBranch(AstId node, const StatementContext& context,
                    SemaId semantic_parent);

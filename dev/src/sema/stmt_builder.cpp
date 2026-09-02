@@ -397,6 +397,66 @@ void ScopeBuilder::BuildDeclarationsOnly(AstId node, ScopeId scope)
   }
 }
 
+// A function body is parsed before semantic inheritance is known.  If a
+// nested type is not visible to the parser's declaration disambiguator,
+// `Result & resolved = resolve(value)` arrives as an assignment expression
+// instead of an AST_SIMPLE_DECLARATION.  Reclassify the unambiguous
+// type-and-reference shape in the completed member context, then feed its
+// initializer through the ordinary declaration/lifetime path.
+bool ScopeBuilder::TryBuildAmbiguousReferenceDeclaration(
+    AstId node, const StatementContext& context)
+{
+  if (node != 0 && arena_.At(node).kind == AST_EXPRESSION_STATEMENT)
+  {
+    if (arena_.At(node).children.size() != 1)
+      return false;
+    node = arena_.At(node).children[0];
+  }
+  if (!EmitsSemantics() || node == 0 ||
+      arena_.At(node).kind != AST_ASSIGNMENT_EXPRESSION ||
+      arena_.At(node).children.size() != 2)
+    return false;
+  const AstId left = arena_.At(node).children[0];
+  const AstId initializer = arena_.At(node).children[1];
+  if (arena_.At(left).kind != AST_BINARY_EXPRESSION ||
+      arena_.At(left).children.size() != 2)
+    return false;
+  const AstId type_expression = arena_.At(left).children[0];
+  const AstId identifier = arena_.At(left).children[1];
+  if ((arena_.At(type_expression).kind != AST_ID_EXPRESSION &&
+       arena_.At(type_expression).kind != AST_IDENTIFIER) ||
+      (arena_.At(identifier).kind != AST_ID_EXPRESSION &&
+       arena_.At(identifier).kind != AST_IDENTIFIER) ||
+      arena_.At(type_expression).last >= tokens_.size() ||
+      !tokens_[arena_.At(type_expression).last].IsSimple(OP_AMP))
+    return false;
+
+  TypeId referent = 0;
+  try
+  {
+    referent = LookupType(context.scope, ReadQualifiedName(
+        tokens_, arena_.At(type_expression).first,
+        arena_.At(type_expression).last));
+  }
+  catch (const std::runtime_error&)
+  {
+    return false;
+  }
+  const std::string name = IdentifierName(identifier);
+  if (name.empty())
+    return false;
+  const TypeId type = types_.Reference(referent, true);
+  const BindingId binding = model_.AddBinding(
+      context.scope, name, BINDING_VARIABLE, type);
+  const SemaId declaration = MakeSemantic(
+      SEMA_SIMPLE_DECLARATION, context.scope, context.semantic_parent);
+  const SemaId variable = MakeSemantic(
+      SEMA_VARIABLE, context.scope, declaration, type, binding);
+  RecordInitializedLocal(context.scope);
+  BuildVariable(binding, initializer, 0, context.scope, variable, false);
+  return true;
+}
+
 void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
 {
   if (node == 0)
@@ -414,6 +474,8 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
     BuildNode(node, context.scope, context.semantic_parent);
     return;
   }
+  if (TryBuildAmbiguousReferenceDeclaration(node, context))
+    return;
   switch (kind)
   {
   case AST_COMPOUND_STATEMENT:
