@@ -64,6 +64,8 @@ private:
                                   std::size_t depth);
   std::string mangle_expression_impl(const AbiDependentExpression & expression,
                                      std::size_t depth);
+  std::string mangle_expression_ref(const std::string & ref,
+                                    std::size_t depth);
   std::string mangle_entity_impl(const AbiEntityFact & entity,
                                  std::size_t depth);
   std::string mangle_internal_name(const std::string & qualified_name);

@@ -290,8 +290,11 @@ static tables built at runtime per call, no per-case reparsing.
   test-report-through-pa13` remains clean at 919/919 and the pa14 file audit
   passes with the same three non-fatal warnings.  The remaining failures are
   the planned CP4 dependent-expression boundary.
-- CP4 — dependent expressions, decltype, type traits, entity-reference
-  expressions, `member-template-entity`: 111/111, through-pa14 clean.
+- CP4 (complete) — dependent expressions, decltype, type traits,
+  entity-reference expressions, and `member-template-entity`: the 18 packet
+  fixtures pass and the stage is 111/111 (failures 15 → 0).  The required
+  `make test-report-through-pa13` gate is clean at 919/919 and the pa14 file
+  audit passes with the same three non-fatal warnings.
 - CP5 — architecture audit and cleanup: one key authority, one function
   emitter, serializer round-trip check, perf probe evidence in `audit.md`.
 
@@ -416,11 +419,13 @@ non-local 200-level functions/operators/thunks, the CP2 300-level cases, and
 the four listed 600-level cases. Preserve the CP1 pass set and ensure every
 later fixture still parses before its unsupported encoder boundary.
 
-## Active Checkpoint: CP4 — Dependent expressions and member-template entities
+## Completed Checkpoint: CP4 — Dependent expressions and member-template entities
 
-Goal: lower dependent expressions, decltype types, and member-template entity
-arguments through the existing type/argument substitution state while
-preserving the 96/111 CP3 result and all earlier PAs.
+Goal and evidence: lower dependent expressions, decltype types, and
+member-template entity arguments through the existing type/argument
+substitution state.  All 111 pa14 fixtures pass, including the 18-fixture CP4
+packet, while the 96 previously passing cases remain green; all earlier PAs
+remain clean.
 
 ### Implementation Packet
 
@@ -439,3 +444,24 @@ Fixture group: the 18 CP4 cases in the failure map—13 `500-*` expression
 fixtures, `400-dependent-alias-type-id`, and the four `300-*` internal/entity
 and member-template fixtures.  Keep all 96 currently passing cases green and
 finish with `make test-pa14` at 111/111.
+
+## Active Checkpoint: CP5 — Architecture audit and cleanup
+
+Goal: preserve the 111/111 behavior while auditing structural ownership,
+serializer round-trips, substitution-key authority, and representative
+performance evidence for the complete pa14 encoder.
+
+### Implementation Packet
+
+Files/symbols:
+
+- `dev/src/abi_mangle.h`, `dev/src/abi_mangle_encoder.h`, and the three
+  abimangle implementation units: audit ownership and keep one substitution
+  and function-emission path.
+- `dev/src/abi_fact_parse.cpp`: verify typed reader/serializer round-trips
+  without reintroducing text-level lowering.
+- `scripts/cppgm_file_audit.pl` and the pa14 test harness: record the full
+  stage, prior-through, audit, and performance evidence in `audit.md`.
+
+Fixture group: all 111 pa14 fixtures, with no reduction in coverage and no
+regression in prior PAs.
