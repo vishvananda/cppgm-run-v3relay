@@ -1,6 +1,7 @@
 // Student-facing scaffold for the PA13 `lowir2cy86` binary.
 
 #include "exceptions.h"
+#include "lowir_cy86_codegen.h"
 #include "lowir_model.h"
 #include "lowir_validate.h"
 #include "tool_help_text.h"
@@ -66,11 +67,13 @@ void parse_output_invocation(const vector<string> & args,
   srcfiles.assign(args.begin() + 2, args.end());
 }
 
-void validate_lowir_inputs(const vector<string> & srcfiles)
+lowir_model::LowirProgram parse_and_validate(const vector<string> & srcfiles,
+                                             LowirProgramFacts & facts)
 {
   const lowir_model::LowirProgram program =
     lowir_model::parse_lowir_program_files(srcfiles);
-  (void)ValidateLowirProgram(program);
+  facts = ValidateLowirProgram(program);
+  return program;
 }
 
 int run_lowir2cy86_mode(const vector<string> & args)
@@ -88,10 +91,18 @@ int run_lowir2cy86_mode(const vector<string> & args)
   vector<string> srcfiles;
   parse_output_invocation(args, outfile, srcfiles);
 
-  (void) outfile;
-  validate_lowir_inputs(srcfiles);
-
-  throw NotImplementedException();
+  LowirProgramFacts facts;
+  const lowir_model::LowirProgram program = parse_and_validate(srcfiles, facts);
+  const string output = EmitCy86Program(program, facts);
+  ofstream destination(outfile.c_str(), ios::out | ios::binary | ios::trunc);
+  if(!destination) {
+    throw runtime_error("unable to open output file '" + outfile + "'");
+  }
+  destination << output;
+  if(!destination) {
+    throw runtime_error("unable to write output file '" + outfile + "'");
+  }
+  return EXIT_SUCCESS;
 }
 
 }  // namespace

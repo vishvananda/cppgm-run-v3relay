@@ -281,50 +281,51 @@ function translates in well under a second and scales linearly.
   intentional translation-boundary status), through-pa12 823/823, and the
   pa13 file audit passes. The final 100k/200k probe scales 0.35s/0.72s and
   85MB/153MB RSS.
-- CP2 (active) — CY86 codegen core: frame layout, prologue/epilogue, `start`
-  with init/fini, integer/pointer/f32/f64 instruction families,
+- CP2 (completed) — CY86 codegen core: frame layout, prologue/epilogue,
+  `start` with init/fini, integer/pointer/f32/f64 instruction families,
   index/copyobj/zeroinit, direct/indirect/stack-arg calls, terminators,
-  atomics, scalar and structured globals: target ≥ 82/96.
+  atomics, scalar and structured globals. Evidence: 86/96 pa13 fixtures,
+  823/823 through-pa12, and the pa13 file audit pass; the ten remaining
+  failures are the planned f80/object/EH boundary.
 - CP3 — wide values and EH: f80 staging and conversions, `f80`/`obj`
   parameters and returns through hidden pointers, EH handler stack and
   runtime support emission: 96/96, through-pa13 clean.
 - CP4 — architecture audit and cleanup (one operand-loading authority, one
   width table, one label counter, linear passes, audit warnings), `audit.md`.
 
-## Active Checkpoint: CP2 — CY86 codegen core
+## Active Checkpoint: CP3 — wide values and EH
 
-Goal: emit deterministic CY86 for the scalar, pointer, control-flow, call,
-atomic, and global forms covered by the 53 non-wide success fixtures, while
-preserving CP1 parsing and validation. Progress proof: those fixtures move
-from EXIT_NOT_IMPLEMENTED to byte-exact EXIT_SUCCESS without changing the 29
-malformed-fixture failures or earlier-PA results.
+Goal: extend deterministic CY86 emission to f80 staging, object/f80 ABI
+boundaries, and exception-handler runtime support while preserving the 86
+passing pa13 fixtures and all earlier PAs. Progress proof: the ten remaining
+pa13 success fixtures become byte-exact EXIT_SUCCESS with no malformed-fixture
+regressions.
 
 ### Implementation Packet
 
 Files/symbols:
 
-- `dev/src/lowir_cy86_codegen.h/.cpp`: add `EmitCy86Program` and a
-  per-function `FrameLayout`/value map with one-pass frame construction;
-  keep every emission family under the 240-line audit limit.
-- `dev/lowir2cy86.cpp`: retain help, batch mode, and `-o` parsing, then write
-  `EmitCy86Program(program, facts)` to the requested file; report an
-  unwritable output as failure.
-- `dev/frontend_source_sets.mk`: add `lowir_cy86_codegen` to the lowir2cy86
-  source set; reuse `lowir_parse` and `lowir_validate` unchanged.
+- `dev/src/lowir_cy86_codegen.h/.cpp`: extend the existing `FrameLayout`,
+  value map, scratch staging, wide calls/returns, global encoding, and EH
+  handler emission; keep every emission family under the 240-line audit limit.
+- `dev/lowir2cy86.cpp`: preserve the validated parse → emit → output path and
+  the existing help, batch, and `-o` envelope.
+- `dev/frontend_source_sets.mk`: retain `lowir_cy86_codegen` in the
+  lowir2cy86 source set; keep parser and validator unchanged.
 
-Fixture groups: the 53 scalar/pointer/control/call/atomic/global successes
-listed in the Failure Map, including `f32`/`f64`, object storage, metadata,
-switch, and direct/indirect calls. Keep the 29 malformed fixtures and the 14
-wide/EH successes as the regression boundary for CP3.
+Fixture groups: `100-small-direct-object-argument`,
+`200-direct-object-return-boundary-smoke`, `200-f80-{direct-call,global,
+unary-binary-cmp}`, `200-{float-width-conversions,integral-float-conversions}`,
+and `100-eh-{cleanup-resume,end-normal,same-function-catch}`. Keep the 86
+passing fixtures and 29 malformed fixtures as the regression boundary.
 
-Required implementation facts: names and CY86 layout are fixture-pinned in
-Stage Design; use `start`, source-order functions, EH-free globals, one
-program-wide synthetic-label counter, and width-aware loads/stores. Validate
-before emission, use hash maps for top-level and per-function lookup, and
-build output once. Resolve any unpinned shape by the LowIR contract and
-nearby fixtures, not by test-specific branches.
+Required implementation facts: preserve the existing names and layout, use
+one program-wide synthetic-label counter, 16-byte f80/object staging and
+hidden result pointers, and the EH globals/handler stack specified in Stage
+Design. Validate before emission, use hash maps for top-level and per-function
+lookup, and build output once. Resolve unpinned shapes by the LowIR contract
+and nearby fixtures, not by test-specific branches.
 
-Commands: focused `make -C pa13 check TEST=tests/spec/100-ret0.t` plus one
-representative call/control case; broad `make test-report-through-pa12`,
-`make test-pa13`, and
+Commands: focused wide/object and EH checks; broad
+`make test-report-through-pa12`, `make test-pa13`, and
 `perl scripts/cppgm_file_audit.pl --stage pa13 --paths dev/src`.
