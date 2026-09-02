@@ -13,37 +13,6 @@
 using namespace std;
 
 namespace abi_mangle {
-
-AbiFactRecord parse_fact_record_words(const vector<string> & words)
-{
-  (void)words;
-  throw NotImplementedException();
-}
-
-AbiFactFile parse_fact_text(const string & text)
-{
-  (void)text;
-  throw NotImplementedException();
-}
-
-string serialize_fact_file(const AbiFactFile & file)
-{
-  (void)file;
-  throw NotImplementedException();
-}
-
-string mangle_fact_file(const AbiFactFile & file)
-{
-  (void)file;
-  throw NotImplementedException();
-}
-
-string mangle_fact_files(const vector<string> & input_paths)
-{
-  (void)input_paths;
-  throw NotImplementedException();
-}
-
 }  // namespace abi_mangle
 
 namespace {

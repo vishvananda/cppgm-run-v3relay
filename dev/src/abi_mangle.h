@@ -3,6 +3,8 @@
 // ABI fact model for the PA14 standalone abimangle tool.
 
 #include <cstddef>
+#include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -193,6 +195,7 @@ struct AbiType
   bool rvalue_ref = false;
   bool substitutable = false;
   bool standard_substitution_includes_arguments = false;
+  bool tagged = false;
   std::vector<AbiType> types;
   std::vector<std::string> argument_refs;
   std::vector<std::string> namespace_qualifiers;
@@ -208,6 +211,7 @@ struct AbiTemplateArgument
   std::string name;
   std::string substitution;
   std::string entity_ref;
+  std::string expression_ref;
   std::string symbol;
   long long value = 0;
   std::size_t index = 0;
@@ -342,8 +346,31 @@ struct AbiFactFile
   std::vector<AbiFactCase> cases;
 };
 
+struct AbiDefinitionTable
+{
+  std::map<std::string, AbiDefinitionRecord> definitions;
+
+  void add(const AbiDefinitionRecord & definition)
+  {
+    if(!definitions.insert(std::make_pair(definition.id, definition)).second) {
+      throw std::logic_error("duplicate ABI definition '" + definition.id + "'");
+    }
+  }
+
+  const AbiDefinitionRecord * find(const std::string & id) const
+  {
+    const std::map<std::string, AbiDefinitionRecord>::const_iterator it =
+      definitions.find(id);
+    return it == definitions.end() ? 0 : &it->second;
+  }
+};
+
 AbiFactRecord parse_fact_record_words(const std::vector<std::string> & words);
+AbiFactFile parse_fact_text(const std::string & text);
 std::string serialize_fact_file(const AbiFactFile & file);
+std::string mangle_fact_case(const AbiFactCase & fact_case);
+std::string mangle_target(const AbiTargetRecord & target,
+                          const AbiDefinitionTable & definitions);
 std::string mangle_fact_files(const std::vector<std::string> & input_paths);
 
 }  // namespace abi_mangle

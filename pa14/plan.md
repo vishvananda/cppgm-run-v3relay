@@ -269,10 +269,14 @@ static tables built at runtime per call, no per-case reparsing.
 
 ## Checkpoint Ledger
 
-- CP1 (active) — fact reader for the full vocabulary, typed definition
+- CP1 (complete) — fact reader for the full vocabulary, typed definition
   table, substitution table, type/name/template-argument encoder,
-  non-function targets and variables: 35/111 (failures 109 → 76), through-
-  pa13 clean, file audit passing.
+  non-function targets and variables: all 35 CP1 fixture files pass exactly
+  (33 newly green plus the 2 real negative reader rejections); stage total is
+  37/111 because two adjacent simple type cases also pass (failures 109 →
+  74).  `make test-report-through-pa13` is clean at 919/919, the pa14 file
+  audit passes, and the 10k/20k probe scales 2.85s → 5.60s at ~48 MB RSS;
+  the 5k pointer chain completes in 0.12s without stack overflow.
 - CP2 — `FunctionShape` lowering and emission for compact, `path` and
   `encoding` forms; terminals, qualifiers, tags, template prefixes/args,
   results, thunks, `c-function`, function entities: ≥ 83/111.
@@ -283,7 +287,7 @@ static tables built at runtime per call, no per-case reparsing.
 - CP5 — architecture audit and cleanup: one key authority, one function
   emitter, serializer round-trip check, perf probe evidence in `audit.md`.
 
-## Active Checkpoint: CP1 — reader, model, substitution table, types and names
+## Completed Checkpoint: CP1 — reader, model, substitution table, types and names
 
 Goal: every fixture parses into typed records (the two negatives fail from
 real duplicate-id and negative-index rejection inside the reader), the
@@ -378,3 +382,28 @@ implement the obvious Itanium spelling or reject, never guess silently;
 `path` in `function path …` is an optional keyword with no separate
 semantics; `Tn` and the `member-template-entity` slot order are
 fixture-pinned quirks to keep even where they diverge from GCC/Clang.
+
+## Active Checkpoint: CP2 — FunctionShape lowering and emission
+
+Goal: lower compact, `path`, and `encoding` function targets through one
+structured emitter, including terminals, qualifiers, tags, template prefixes
+and arguments, results, C-linkage functions, function entities, and thunks;
+preserve the CP1 reader/model and reach at least 83/111 while all earlier PAs
+remain clean.
+
+### Implementation Packet
+
+Files/symbols:
+
+- `dev/src/abi_mangle.h` and `dev/src/abi_mangle_encoder.h`: extend the typed
+  function shape and shared lowering state without adding a second emitter.
+- `dev/src/abi_mangle_encode.cpp`: lower compact/path/encoding forms and emit
+  terminals, qualifiers, ABI tags, function-template components, results,
+  C-linkage names, function entities, and thunk call offsets.
+- `dev/src/abi_mangle_types.cpp`: keep type/argument candidates and the shared
+  substitution table in the same emission order.
+
+Fixture group: the 48 CP2 cases in the failure map—100-level function forms,
+non-local 200-level functions/operators/thunks, the CP2 300-level cases, and
+the four listed 600-level cases. Preserve the CP1 pass set and ensure every
+later fixture still parses before its unsupported encoder boundary.
