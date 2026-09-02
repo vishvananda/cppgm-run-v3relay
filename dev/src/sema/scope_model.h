@@ -69,6 +69,7 @@ struct Binding
   BindingId object_binding; // injected member: implicit anonymous-union object
   bool internal_linkage;
   bool c_linkage;
+  bool extern_declaration;
   bool noexcept_qualifier;
   bool has_const_value;
   long long const_value;

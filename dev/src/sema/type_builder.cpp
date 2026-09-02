@@ -1,6 +1,7 @@
 // Specifier- and declarator-derived type construction for the ScopeBuilder.
 #include "sema/scope_builder.h"
 
+#include <limits>
 #include <stdexcept>
 
 using std::string;
@@ -246,6 +247,11 @@ TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
           // function type is formed.  An omitted bound therefore never needs
           // to become a synthetic array type in the canonical type table.
           result = types_.Pointer(result);
+          continue;
+        }
+        if (deduced_bound == std::numeric_limits<std::size_t>::max())
+        {
+          result = types_.IncompleteArray(result);
           continue;
         }
         if (deduced_bound == 0)

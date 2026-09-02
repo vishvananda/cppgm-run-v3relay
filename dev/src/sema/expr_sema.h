@@ -63,6 +63,9 @@ private:
   SemaId AnalyzeCast(AstId expression, ScopeId scope);
   SemaId AnalyzeSizeof(AstId expression, ScopeId scope);
   SemaId AnalyzeCall(AstId expression, ScopeId scope);
+  SemaId AnalyzeFunctionalCast(AstId expression, TypeId target,
+                               ScopeId scope,
+                               const std::vector<AstId>& arguments);
   SemaId AnalyzeBraced(AstId expression, ScopeId scope, TypeId target);
 
   Info NodeInfo(SemaId node) const;

@@ -23,6 +23,7 @@ Lowerer::Lowerer(const std::vector<Pa6Token>& tokens, const AstArena& arena,
     : tokens_(tokens), arena_(arena), model_(model), tree_(tree),
       types_(model.Types()), active_switch_labels_(0), temp_counter_(0),
       label_counter_(0), generated_slot_counter_(0),
+      string_literal_counter_(0),
       function_return_type_id_(0)
 {
 }
@@ -319,6 +320,26 @@ lowir_model::Function Lowerer::BuildFunction(SemaId node)
     function_.params.push_back(parameter);
   }
 
+  // Parameter names share the textual namespace used by generated
+  // temporaries.  Reserve names such as %t1 before body lowering so a source
+  // parameter cannot collide with a compiler-created value.
+  for (std::size_t i = 0; i < function_.params.size(); ++i) {
+    const std::string& name = function_.params[i].name;
+    if (name.size() <= 2 || name.compare(0, 2, "%t") != 0)
+      continue;
+    unsigned value = 0;
+    bool digits = true;
+    for (std::size_t j = 2; j < name.size(); ++j) {
+      if (name[j] < '0' || name[j] > '9') {
+        digits = false;
+        break;
+      }
+      value = value * 10 + static_cast<unsigned>(name[j] - '0');
+    }
+    if (digits && value > temp_counter_)
+      temp_counter_ = value;
+  }
+
   AddParameterSlots(node);
   const SemaId body = FunctionBody(node);
   if (body == 0)
@@ -341,6 +362,15 @@ lowir_model::Function Lowerer::BuildFunction(SemaId node)
   if (!Terminated()) {
     if (function_.return_type.text == "void")
       EmitReturn(0);
+    else if (entity.name == "main" && entity.scope == model_.GlobalScope()) {
+      lowir_model::Instruction result;
+      result.kind = lowir_model::Instruction::IK_RETURN;
+      result.type = function_.return_type;
+      result.first.kind = lowir_model::Operand::OP_INTEGER;
+      result.first.text = "0";
+      result.first.int_value = 0;
+      Emit(result);
+    }
     else
       Unsupported("falling off a non-void function");
   }

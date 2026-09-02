@@ -48,6 +48,7 @@ struct Pa6Token
 	EFundamentalType lit_type;
 	std::size_t lit_count;
 	unsigned long long lit_value;
+	std::vector<unsigned char> lit_bytes;
 
 	Pa6Token(Pa6TokenKind kind, const std::string& spelling,
 		ETokenType simple_type = KW_AUTO);

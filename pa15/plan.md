@@ -345,8 +345,7 @@ re-parsed.  No static mutable state (batch runner).
 | plan | this commit | stage design, failure map, conventions |
 | CP1 serializer, driver mode, symbols, scalar procedural lowering | this checkpoint | 39 CP1 fixtures pass; pa15 42/109 (67 failures); through-pa14 1030/1030; file audit passed with 2 pre-existing header warnings |
 | CP2 PA12 semantic boundary: parser gaps, default arguments, goto/labels, array/typedef/cast/comma/volatile/return rules, scoped-enum rejection | this checkpoint | focused CP2 check 9/9; pa15 48/109 (61 failures, down from 67); through-pa14 1030/1030; file audit passed with 2 pre-existing header warnings |
-| CP3 memory objects: references, pointers, arrays, string literals, indirect calls, refarg temporaries | pending | target 82/109 |
-| CP4 globals, constant initializers, structured data, declarations, `@__cppgm_init` | pending | target 109/109; through-pa15 clean |
+| CP3/CP4 memory objects, calls, globals, constant data, and initialization | this checkpoint | focused packet and adjacent memory/call/reference checks pass; pa15 109/109 (61 turn-start failures removed); through-pa14 1030/1030; 10k/20k probe 3.33s/779MB and 6.64s/1.55GB; 3000-term plus 1000-nested stress passes at 8MB stack; file audit passed with 2 pre-existing header warnings |
 | CP5 architecture audit and cleanup (one naming authority, one conversion table, perf probe evidence in `audit.md`) | pending | 109/109; through-pa15 clean |
 
 ## Completed Checkpoint: CP1 — serializer, driver mode, symbols, scalar lowering
@@ -518,24 +517,29 @@ Evidence: the nine named CP2 fixtures pass their focused check, pa15 is
 1030/1030, and the file audit passes with only the two existing header
 division warnings.
 
-Implementation packet: start with the CP3 fixtures in the failure map:
-references, pointer/array decay, array storage and subscripting, string
-literals, indirect calls, and reference-argument temporaries.  Trace them
-through `dev/src/sema/expr_sema.cpp`, `dev/src/sema/conversions.cpp`,
-`dev/src/lower/lowir_expr.cpp`, `dev/src/lower/lowir_program.cpp`, and
-`dev/src/lower/lowir_function.cpp`; keep storage ownership canonical and
-leave globals for CP4.
+## Completed Checkpoint: CP3/CP4 — memory objects, calls, globals, and initialization
 
-## Active Checkpoint: CP3 — memory objects and indirect calls
+Delivered: carried references, pointers, arrays, string literals, indirect
+calls, and reference-argument temporaries into bounded LowIR storage; added
+global declarations and definitions, C/internal linkage naming, structured
+constant data, pointer initializers, and the ordered `@__cppgm_init` runtime
+initializer path.  The same lowering ownership now handles conditional
+lvalues, array/function decay, pointer arithmetic, assignment ordering, and
+fall-through `main` returns.  Eager scalar binary chains reduce along an
+iterative left spine so deep valid expressions do not consume the call stack.
 
-Goal: carry PA12 reference, pointer, array, string-literal, and callable
-facts into bounded LowIR storage and call lowering without regressing the
-CP1/CP2 scalar and control-flow paths.  Focus on local object slots,
-address/reference binding, array decay/subscripts, indirect calls, and
-reference-argument temporaries; keep global data and initialization in CP4.
+Evidence: the focused packet and adjacent memory/call/reference checks pass,
+pa15 is 109/109, through-pa14 is 1030/1030, the 10k/20k probe scales at approximately 2x in
+time and memory, the 3000-term plus 1000-nested stress input passes under an
+8MB stack, and the file audit passes with only the two pre-existing
+header-division warnings.
 
-Implementation packet: begin with the CP3 fixtures named in the failure
-map, then use focused `check` targets before the pa15 and through-pa14
-gates.  Preserve one conversion/decay decision in semantic analysis and
-one storage/name authority in LowIR; measure only the CP3 probe when a
-new object or call path is performance-sensitive.  Target 82/109.
+## Active Checkpoint: CP5 — architecture audit and cleanup
+
+Goal: audit the completed LowIR path for one naming authority, one conversion
+table, bounded traversal/storage, and stable serializer ownership without
+changing the passing semantics.
+
+Implementation packet: inspect the current symbol, conversion, and
+serialization paths; document the representative 10k/20k scaling probe in
+`audit.md`; run the file audit and all required gates after any cleanup.

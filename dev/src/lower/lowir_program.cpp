@@ -258,37 +258,108 @@ bool Lowerer::LowerConditionDeclaration(SemaId node,
 
 void Lowerer::LowerVariableDeclaration(SemaId node)
 {
-  if (tree_.At(node).kind == SEMA_VARIABLE) {
-    const SemaNode& variable = tree_.At(node);
-    const std::vector<SemaId> initializer = Children(node);
+  const auto lower_one = [this](SemaId variable_node) {
+    const SemaNode& variable = tree_.At(variable_node);
+    const std::vector<SemaId> initializer = Children(variable_node);
     if (initializer.empty())
       return;
-    Value value = LowerRValue(initializer[0], variable.type);
-    lowir_model::Instruction store;
-    store.kind = lowir_model::Instruction::IK_STORE;
-    store.type = LowTypeOf(variable.type);
-    store.first = value.operand;
-    store.second.kind = lowir_model::Operand::OP_SLOT;
-    store.second.text = SlotFor(variable.binding);
-    Emit(store);
+    const TypeId declared = variable.type;
+    const TypeId unqualified = types_.Unqualified(declared);
+    if (types_.Kind(unqualified) == TYPE_REFERENCE) {
+      const TypeId referent = types_.Referent(unqualified);
+      Value address;
+      const SemaId source = initializer[0];
+      const SemaKind source_kind = tree_.At(source).kind;
+      if (tree_.At(source).category == VC_LVALUE ||
+          tree_.At(source).category == VC_XVALUE ||
+          source_kind == SEMA_CALL || source_kind == SEMA_BINARY) {
+        address = AddressValue(LowerLValue(source));
+      } else {
+        Value materialized = LowerRValue(source, referent);
+        const std::string slot = NewGeneratedSlot(
+            "refarg__" + std::to_string(++generated_slot_counter_),
+            LowTypeOf(referent));
+        lowir_model::Instruction store;
+        store.kind = lowir_model::Instruction::IK_STORE;
+        store.type = LowTypeOf(referent);
+        store.first = materialized.operand;
+        store.second = NamedOperand(lowir_model::Operand::OP_SLOT, slot);
+        Emit(store);
+        address.type = referent;
+        address.operand = NamedOperand(lowir_model::Operand::OP_SLOT, slot);
+        address = AddressValue(address);
+      }
+      lowir_model::Instruction store;
+      store.kind = lowir_model::Instruction::IK_STORE;
+      store.type.text = "ptr";
+      store.first = address.operand;
+      store.second = NamedOperand(lowir_model::Operand::OP_SLOT,
+                                  SlotFor(variable.binding));
+      Emit(store);
+      return;
+    }
+    if (types_.Kind(unqualified) == TYPE_ARRAY &&
+        tree_.At(initializer[0]).kind == SEMA_BRACED_INIT_LIST) {
+      const TypeId element = types_.At(unqualified).base;
+      const std::size_t bound = types_.At(unqualified).array_bound;
+      Value array;
+      array.type = declared;
+      array.lvalue = true;
+      array.operand = NamedOperand(lowir_model::Operand::OP_SLOT,
+                                   SlotFor(variable.binding));
+      Value address = AddressValue(array);
+      const std::vector<SemaId> elements = Children(initializer[0]);
+      for (std::size_t i = 0; i < bound; ++i) {
+        lowir_model::Operand destination = address.operand;
+        if (i != 0) {
+          lowir_model::Instruction projection;
+          projection.kind = lowir_model::Instruction::IK_INDEX;
+          projection.dest = NewTemp();
+          projection.type.text = "i8";
+          projection.first = address.operand;
+          projection.second = IntegerOperand(static_cast<long long>(
+              i * types_.SizeOf(element)));
+          Emit(projection);
+          destination = NamedOperand(lowir_model::Operand::OP_TEMP,
+                                     projection.dest);
+        }
+        Value value;
+        if (i < elements.size())
+          value = LowerRValue(elements[i], element);
+        else {
+          value.type = element;
+          value.operand = ZeroOperand(element);
+        }
+        lowir_model::Instruction store;
+        store.kind = lowir_model::Instruction::IK_STORE;
+        store.type = LowTypeOf(element);
+        store.first = value.operand;
+        store.second = destination;
+        Emit(store);
+      }
+      return;
+    }
+    if (tree_.At(variable_node).kind == SEMA_VARIABLE) {
+      Value value = LowerRValue(initializer[0], variable.type);
+      lowir_model::Instruction store;
+      store.kind = lowir_model::Instruction::IK_STORE;
+      store.type = LowTypeOf(variable.type);
+      store.first = value.operand;
+      store.second.kind = lowir_model::Operand::OP_SLOT;
+      store.second.text = SlotFor(variable.binding);
+      Emit(store);
+      return;
+    }
+  };
+  if (tree_.At(node).kind == SEMA_VARIABLE) {
+    lower_one(node);
     return;
   }
   const std::vector<SemaId> children = Children(node);
   for (std::size_t i = 0; i < children.size(); ++i) {
     if (tree_.At(children[i]).kind != SEMA_VARIABLE)
       continue;
-    const SemaNode& variable = tree_.At(children[i]);
-    const std::vector<SemaId> initializer = Children(children[i]);
-    if (initializer.empty())
-      continue;
-    Value value = LowerRValue(initializer[0], variable.type);
-    lowir_model::Instruction store;
-    store.kind = lowir_model::Instruction::IK_STORE;
-    store.type = LowTypeOf(variable.type);
-    store.first = value.operand;
-    store.second.kind = lowir_model::Operand::OP_SLOT;
-    store.second.text = SlotFor(variable.binding);
-    Emit(store);
+    lower_one(children[i]);
   }
 }
 
@@ -557,6 +628,8 @@ bool Lowerer::LowerStatement(SemaId node)
     return LowerSequence(node);
   case SEMA_FOR_INIT_STATEMENT: {
     const std::vector<SemaId> children = Children(node);
+    if (children.empty())
+      return false;
     if (children.size() != 1)
       Unsupported("for-init statement shape");
     if (tree_.At(children[0]).kind == SEMA_SIMPLE_DECLARATION)
@@ -587,6 +660,22 @@ bool Lowerer::LowerStatement(SemaId node)
     if (children.empty()) {
       EmitReturn(0);
     } else {
+      if (types_.Kind(function_return_type_id_) == TYPE_REFERENCE) {
+        const SemaNode& expression = tree_.At(children[0]);
+        Value result;
+        if (expression.kind == SEMA_BINARY && expression.op == OP_COMMA)
+          result = LowerLValue(children[0]);
+        else if (expression.kind == SEMA_CALL)
+          result = LowerCall(children[0], 0);
+        else
+          result = LowerLValue(children[0]);
+        if (result.operand.kind == lowir_model::Operand::OP_SLOT ||
+            result.operand.kind == lowir_model::Operand::OP_GLOBAL)
+          result = AddressValue(result);
+        result.type = function_return_type_id_;
+        EmitReturn(&result);
+        return true;
+      }
       Value result = LowerRValue(children[0]);
       const bool unsigned_widening_literal =
           IsUnsigned(function_return_type_id_) &&
@@ -679,12 +768,17 @@ lowir_model::Program Lowerer::Run(AstId root)
   std::set<FunctionEntityId> seen;
   CollectFunctions(tree_.Root(), uses, seen);
   BuildFunctionNames(uses);
+  std::vector<SemaId> global_variables;
+  CollectGlobalVariables(tree_.Root(), global_variables);
+  BuildGlobalNames(global_variables);
+  BuildGlobalDefinitions(global_variables);
   std::vector<lowir_model::Function> functions;
   for (std::size_t i = 0; i < uses.size(); ++i) {
     if (!uses[i].definition)
       continue;
     functions.push_back(BuildFunction(uses[i].node));
   }
+  BuildGlobalInitializers(global_variables, functions);
   BuildDeclarations(uses);
   program_.functions.swap(functions);
   return program_;

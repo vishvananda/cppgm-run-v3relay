@@ -334,7 +334,10 @@ AstId Pa10Parser::parse_cast_expression()
 		const AstId result = make_token(AST_CAST_EXPRESSION, op_at);
 		add(result, type);
 		add(result, expression);
-		return result;
+		// A cast-expression is also a postfix-expression when its result is
+		// callable.  Keep the suffix attached here so
+		// `static_cast<R (&)()>(f)()` is parsed as one expression.
+		return parse_postfix_suffixes(result);
 	}
 	if (is_simple(OP_LPAREN))
 	{
@@ -371,7 +374,7 @@ AstId Pa10Parser::parse_cast_expression()
 						saved.position, saved.position + 1, "OP_LPAREN:");
 					add(result, type);
 					add(result, expression);
-					return result;
+					return parse_postfix_suffixes(result);
 				}
 			}
 			restore(saved);

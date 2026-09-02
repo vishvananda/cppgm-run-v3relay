@@ -19,6 +19,8 @@ void add_item(std::ostringstream& out, bool& first, const std::string& text,
 
 std::string operand(const Operand& value)
 {
+  if (value.kind == Operand::OP_INTEGER && value.text == "nullptr")
+    return "nullptr";
   if (value.kind == Operand::OP_INTEGER)
     return std::to_string(value.int_value);
   if (value.kind == Operand::OP_FLOAT) {
@@ -270,6 +272,51 @@ std::string global_declaration_text(const GlobalDeclaration& declaration)
   return out.str();
 }
 
+std::string global_definition_text(const GlobalDefinition& global)
+{
+  std::ostringstream out;
+  out << "global " << global.name;
+  if (global.storage == GSM_READONLY)
+    out << " readonly";
+  if (!global.structured) {
+    out << " : " << global.type.text;
+    append_symbol_metadata(out, global.metadata);
+    out << " = ";
+    if (global.init_kind == GlobalDefinition::INIT_ZERO)
+      out << "zero";
+    else if (global.init_kind == GlobalDefinition::INIT_ADDR) {
+      out << "addr " << operand(global.init_operand);
+      if (global.addr_addend > 0)
+        out << " + " << global.addr_addend;
+      else if (global.addr_addend < 0)
+        out << " - " << -global.addr_addend;
+    }
+    else
+      out << operand(global.init_operand);
+    return out.str();
+  }
+  append_symbol_metadata(out, global.metadata);
+  out << " = {\n";
+  for (std::size_t i = 0; i < global.data_items.size(); ++i) {
+    const GlobalDefinition::DataItem& item = global.data_items[i];
+    out << "  ";
+    if (item.kind == GlobalDefinition::DataItem::ITEM_ZERO) {
+      out << "zero " << item.zero_bytes;
+    } else if (item.kind == GlobalDefinition::DataItem::ITEM_ADDR) {
+      out << item.type.text << " addr " << item.symbol;
+      if (item.addr_addend > 0)
+        out << "+" << item.addr_addend;
+      else if (item.addr_addend < 0)
+        out << item.addr_addend;
+    } else {
+      out << item.type.text << " " << operand(item.literal_operand);
+    }
+    out << "\n";
+  }
+  out << "}";
+  return out.str();
+}
+
 }  // namespace
 
 std::string serialize_lowir_program(const Program& program)
@@ -278,11 +325,11 @@ std::string serialize_lowir_program(const Program& program)
   bool first = true;
   for (std::size_t i = 0; i < program.global_declarations.size(); ++i)
     add_item(out, first, global_declaration_text(program.global_declarations[i]), false);
-  for (std::size_t i = 0; i < program.globals.size(); ++i)
-    throw std::logic_error("LowIR serializer global definitions are not implemented in CP1");
   for (std::size_t i = 0; i < program.function_declarations.size(); ++i)
     add_item(out, first, declaration_text(program.function_declarations[i]),
-             !program.globals.empty());
+             !first);
+  for (std::size_t i = 0; i < program.globals.size(); ++i)
+    add_item(out, first, global_definition_text(program.globals[i]), true);
   for (std::size_t i = 0; i < program.functions.size(); ++i)
     add_item(out, first, function_text(program.functions[i]),
              i == 0 && (!program.function_declarations.empty() ||

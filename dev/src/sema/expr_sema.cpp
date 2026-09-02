@@ -586,6 +586,14 @@ SemaId ExpressionAnalyzer::AnalyzeUnary(AstId expression, ScopeId scope)
     result_type = types_.Fundamental(FT_BOOL);
     break;
   case OP_PLUS: case OP_MINUS: case OP_COMPL:
+    if (op == OP_PLUS &&
+        types_.Kind(types_.Unqualified(value_type)) == TYPE_ARRAY)
+    {
+      // Unary plus is an lvalue-to-rvalue context.  Arrays first undergo the
+      // standard array-to-pointer conversion, preserving the element cv.
+      result_type = types_.Decay(value_type);
+      break;
+    }
     if (!types_.IsArithmetic(value_type) ||
         (op == OP_COMPL && !types_.IsIntegral(value_type)))
       throw std::runtime_error("unary arithmetic operator has invalid operand");
@@ -759,8 +767,10 @@ SemaId ExpressionAnalyzer::AnalyzeBinary(AstId expression, ScopeId scope)
   default:
     throw std::runtime_error("unsupported binary operator");
   }
+  const ValueCategory result_category = op == OP_COMMA ? rhs.category :
+      VC_PRVALUE;
   const SemaId result = MakeExpression(SEMA_BINARY, expression, result_type,
-                                       VC_PRVALUE, scope, op);
+                                       result_category, scope, op);
   Append(result, left);
   Append(result, right);
   FoldBinary(result, op, left, right);
@@ -818,25 +828,29 @@ TypeId ExpressionAnalyzer::CommonConditionalType(SemaId left,
 {
   const Info lhs = NodeInfo(left);
   const Info rhs = NodeInfo(right);
-  if (lhs.type == rhs.type)
-    return lhs.type;
-  if (types_.IsArithmetic(lhs.type) && types_.IsArithmetic(rhs.type))
-    return types_.UsualArithmetic(lhs.type, rhs.type);
-  if (types_.IsPointer(lhs.type) && types_.IsPointer(rhs.type))
+  TypeTable& mutable_types = const_cast<TypeTable&>(types_);
+  const TypeId left_type = mutable_types.Decay(lhs.type);
+  const TypeId right_type = mutable_types.Decay(rhs.type);
+  if (left_type == right_type)
+    return left_type;
+  if (types_.IsArithmetic(left_type) && types_.IsArithmetic(right_type))
+    return mutable_types.UsualArithmetic(left_type, right_type);
+  if (types_.IsPointer(left_type) && types_.IsPointer(right_type))
   {
     bool ok = false;
-    const TypeId composite = types_.CompositePointer(lhs.type, rhs.type, ok);
+    const TypeId composite = mutable_types.CompositePointer(
+        left_type, right_type, ok);
     if (ok)
       return composite;
   }
-  if (types_.IsPointer(lhs.type) && IsNullPointerConstant(right))
-    return lhs.type;
-  if (types_.IsPointer(rhs.type) && IsNullPointerConstant(left))
-    return rhs.type;
-  if (CanConvert(left, rhs.type))
-    return rhs.type;
-  if (CanConvert(right, lhs.type))
-    return lhs.type;
+  if (types_.IsPointer(left_type) && IsNullPointerConstant(right))
+    return left_type;
+  if (types_.IsPointer(right_type) && IsNullPointerConstant(left))
+    return right_type;
+  if (CanConvert(left, right_type))
+    return right_type;
+  if (CanConvert(right, left_type))
+    return left_type;
   return 0;
 }
 
@@ -1064,38 +1078,7 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
 
   const vector<AstId>& args = arena_.At(arguments).children;
   if (functional_cast)
-  {
-    if (args.size() > 1)
-      throw std::runtime_error("functional cast has too many arguments");
-    if (args.empty())
-    {
-      // 5.2.3p2: value-initialization of a scalar is a zero of that type.
-      const SemaId result = MakeExpression(SEMA_LITERAL, 0, target,
-                                           VC_PRVALUE, scope);
-      tree_.At(result).has_value = types_.IsIntegral(target) ||
-          types_.IsNullPointerType(target);
-      tree_.At(result).value = 0;
-      return result;
-    }
-    const SemaId operand = Analyze(args[0], scope);
-    const Info source = NodeInfo(operand);
-    const bool implicit_viable = Classify(
-        types_, source.type, source.category,
-        IsNullPointerConstant(operand), source.is_function_lvalue,
-        target).Viable();
-    // Functional casts are explicit conversions.  In particular, a scoped
-    // enumeration may be converted to its arithmetic destination here even
-    // though the same source-to-int path is not an implicit conversion.
-    const bool explicit_enum = IsScopedEnum(types_, source.type) &&
-        types_.IsArithmetic(target);
-    if (!implicit_viable && !explicit_enum)
-      throw std::runtime_error("functional cast is not viable");
-    const SemaId result = MakeExpression(SEMA_CAST, expression, target,
-                                         VC_PRVALUE, scope);
-    Append(result, operand);
-    FoldConversion(result, operand, target);
-    return result;
-  }
+    return AnalyzeFunctionalCast(expression, target, scope, args);
 
   const AstNode& callee_node = arena_.At(callee);
   const bool named_callee = callee_node.kind == AST_ID_EXPRESSION ||
@@ -1258,6 +1241,54 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
     Append(result, indirect_callee);
   for (size_t i = 0; i < converted_arguments.size(); ++i)
     Append(result, converted_arguments[i]);
+  return result;
+}
+
+SemaId ExpressionAnalyzer::AnalyzeFunctionalCast(
+    AstId expression, TypeId target, ScopeId scope,
+    const vector<AstId>& args)
+{
+  if (args.size() > 1)
+    throw std::runtime_error("functional cast has too many arguments");
+  if (args.empty())
+  {
+    // 5.2.3p2: value-initialization of a scalar is a zero of that type.
+    const SemaId result = MakeExpression(SEMA_LITERAL, 0, target,
+                                         VC_PRVALUE, scope);
+    tree_.At(result).has_value = types_.IsIntegral(target) ||
+        types_.IsNullPointerType(target);
+    tree_.At(result).value = 0;
+    return result;
+  }
+  const SemaId operand = Analyze(args[0], scope);
+  const Info source = NodeInfo(operand);
+  // A typedef naming a reference is still an explicit reference cast when
+  // written in functional notation (`R(x)`).  Keep the operand as the
+  // canonical storage expression, including an intentional qualification
+  // adjustment, just as AnalyzeCast does for `static_cast<T&>(x)`.
+  if (types_.Kind(target) == TYPE_REFERENCE &&
+      source.category == VC_LVALUE)
+  {
+    tree_.At(operand).type = target;
+    tree_.At(operand).category = types_.At(target).lvalue_reference ?
+        VC_LVALUE : VC_XVALUE;
+    return operand;
+  }
+  const bool implicit_viable = Classify(
+      types_, source.type, source.category,
+      IsNullPointerConstant(operand), source.is_function_lvalue,
+      target).Viable();
+  // Functional casts are explicit conversions.  In particular, a scoped
+  // enumeration may be converted to its arithmetic destination here even
+  // though the same source-to-int path is not an implicit conversion.
+  const bool explicit_enum = IsScopedEnum(types_, source.type) &&
+      types_.IsArithmetic(target);
+  if (!implicit_viable && !explicit_enum)
+    throw std::runtime_error("functional cast is not viable");
+  const SemaId result = MakeExpression(SEMA_CAST, expression, target,
+                                       VC_PRVALUE, scope);
+  Append(result, operand);
+  FoldConversion(result, operand, target);
   return result;
 }
 

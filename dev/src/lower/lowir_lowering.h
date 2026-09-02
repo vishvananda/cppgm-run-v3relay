@@ -10,6 +10,7 @@
 #include "lowir_model.h"
 #include "parser/ast_model.h"
 #include "parser/recog_token.h"
+#include "sema/overload.h"
 #include "sema/sema_tree.h"
 #include "sema/scope_model.h"
 
@@ -58,10 +59,22 @@ private:
   // Collection and symbols.
   void CollectFunctions(SemaId node, std::vector<FunctionUse>& result,
                         std::set<FunctionEntityId>& seen) const;
+  void CollectGlobalVariables(SemaId node,
+                              std::vector<SemaId>& result) const;
   void BuildFunctionNames(const std::vector<FunctionUse>& uses);
+  void BuildGlobalNames(const std::vector<SemaId>& variables);
+  void BuildGlobalDefinitions(const std::vector<SemaId>& variables);
+  void BuildGlobalInitializers(const std::vector<SemaId>& variables,
+                               std::vector<lowir_model::Function>& functions);
   std::string QualifiedFunctionName(FunctionEntityId id) const;
   std::string FunctionBaseName(FunctionEntityId id) const;
   std::string FunctionObjectName(FunctionEntityId id) const;
+  std::string QualifiedGlobalName(BindingId id) const;
+  std::string GlobalObjectName(BindingId id) const;
+  bool GlobalAddress(SemaId node, std::string& symbol,
+                     long long& addend);
+  lowir_model::GlobalDefinition::DataItem GlobalDataItem(
+      SemaId node, TypeId type);
   void BuildDeclarations(const std::vector<FunctionUse>& uses);
   lowir_model::Function BuildFunction(SemaId node);
   lowir_model::FunctionDeclaration BuildFunctionDeclaration(
@@ -112,14 +125,22 @@ private:
   Value LowerExpression(SemaId node, TypeId expected = 0);
   Value LowerRValue(SemaId node, TypeId expected = 0);
   Value LowerLValue(SemaId node);
-  Value LowerLiteral(const SemaNode& node, TypeId expected);
+  Value LowerLiteral(SemaId node, const SemaNode& value, TypeId expected);
+  Value LowerArrayDecay(SemaId node);
+  Value LowerSubscript(SemaId node, bool lvalue);
+  Value LowerConditionalLValue(SemaId node);
+  Value LowerReferenceArgument(SemaId node, TypeId parameter);
+  Value LoadValue(const Value& lvalue);
+  Value AddressValue(const Value& lvalue);
   Value Convert(Value value, TypeId target);
   Value ConvertExpression(Value value, TypeId target);
   Value LowerBinary(SemaId node, TypeId expected);
-  Value LowerAssignment(SemaId node);
+  Value LowerScalarBinary(SemaId node, Value left, TypeId expected);
+  Value LowerAssignment(SemaId node, Value* assigned_lvalue = 0);
   Value LowerConditional(SemaId node, TypeId expected);
   Value LowerCall(SemaId node, TypeId expected);
-  Value LowerUnary(SemaId node, bool postfix, TypeId expected);
+  Value LowerUnary(SemaId node, bool postfix, TypeId expected,
+                   bool as_lvalue = false);
   Value LowerLogicalValue(SemaId node);
   void LowerDiscard(SemaId node);
   lowir_model::Operand ZeroOperand(TypeId type) const;
@@ -128,6 +149,11 @@ private:
   std::string CompareName(ETokenType op, TypeId type) const;
   std::string ConversionName(TypeId from, TypeId to) const;
   Value MakeBoolValue(const lowir_model::Operand& operand);
+  TypeId ReferentType(TypeId type) const;
+  TypeId PointerElementType(TypeId type) const;
+  TypeId DefaultArgumentPromotion(TypeId type) const;
+  lowir_model::Operand ByteOffset(std::size_t bytes) const;
+  std::string RegisterStringLiteral(SemaId node, const SemaNode& value);
 
   // Conditions and statements.
   void LowerCondition(SemaId node, const std::string& true_label,
@@ -163,18 +189,21 @@ private:
   lowir_model::Program program_;
   std::map<FunctionEntityId, std::string> function_names_;
   std::map<FunctionEntityId, std::string> object_names_;
+  std::map<BindingId, std::string> global_names_;
   std::map<BindingId, std::string> slots_;
   std::map<std::string, std::string> labels_;
   std::map<SemaId, std::string> condition_labels_;
   std::set<FunctionEntityId> definitions_;
   std::set<FunctionEntityId> declarations_;
   std::set<FunctionEntityId> emitted_function_uses_;
+  std::map<SemaId, std::string> string_symbols_;
   const std::map<SemaId, std::string>* active_switch_labels_;
   std::vector<ControlTarget> controls_;
   std::string current_label_;
   unsigned temp_counter_;
   unsigned label_counter_;
   unsigned generated_slot_counter_;
+  unsigned string_literal_counter_;
   TypeId function_return_type_id_;
 };
 

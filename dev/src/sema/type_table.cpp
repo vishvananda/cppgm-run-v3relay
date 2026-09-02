@@ -250,6 +250,28 @@ TypeId TypeTable::Array(TypeId element, std::size_t bound)
   return arrays_[key] = Add(node);
 }
 
+TypeId TypeTable::IncompleteArray(TypeId element)
+{
+  if (element == 0)
+    throw std::runtime_error("array has no element type");
+  const TypeKind kind = Kind(element);
+  const TypeNode& unqualified = At(Unqualified(element));
+  if (kind == TYPE_FUNCTION || kind == TYPE_REFERENCE ||
+      (unqualified.kind == TYPE_FUNDAMENTAL &&
+       unqualified.fundamental == FT_VOID))
+    throw std::runtime_error("array element type is not an object type");
+  const std::pair<TypeId, std::size_t> key(element, 0);
+  const std::map<std::pair<TypeId, std::size_t>, TypeId>::const_iterator
+      found = arrays_.find(key);
+  if (found != arrays_.end())
+    return found->second;
+  TypeNode node;
+  node.kind = TYPE_ARRAY;
+  node.base = element;
+  node.array_bound = 0;
+  return arrays_[key] = Add(node);
+}
+
 TypeId TypeTable::Function(TypeId result, const std::vector<TypeId>& parameters,
                            bool variadic, bool function_const)
 {

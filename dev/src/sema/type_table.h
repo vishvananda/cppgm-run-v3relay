@@ -88,6 +88,7 @@ public:
   TypeId Pointer(TypeId base);
   TypeId Reference(TypeId base, bool lvalue = true);
   TypeId Array(TypeId element, std::size_t bound);
+  TypeId IncompleteArray(TypeId element);
   TypeId Function(TypeId result, const std::vector<TypeId>& parameters,
                   bool variadic = false, bool function_const = false);
   TypeId Class(EntityId entity, TypeKeyword key, const std::string& name);

@@ -101,11 +101,16 @@ void Pa6TokenCollector::emit_literal(const string& source,
 }
 
 void Pa6TokenCollector::emit_literal_array(const string& source,
-	size_t num_elements, EFundamentalType type, const void*, size_t)
+	size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
 {
 	Pa6Token token(PA6_LITERAL_TOKEN, source);
 	token.lit_type = type;
 	token.lit_count = num_elements;
+	if (data != 0 && nbytes != 0)
+	{
+		const unsigned char* bytes = static_cast<const unsigned char*>(data);
+		token.lit_bytes.assign(bytes, bytes + nbytes);
+	}
 	tokens.push_back(token);
 }
 

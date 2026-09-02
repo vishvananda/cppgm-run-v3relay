@@ -322,9 +322,14 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     const ScopeId target_scope = ResolveDeclarationScope(
         scope, FindIdentifier(declarator), name);
     const AstId initializer = FindChild(items[i], AST_INITIALIZER);
+    const std::size_t incomplete_bound =
+        HasIncompleteArray(declarator) && initializer == 0 &&
+        SequenceHasKeyword(specifiers, KW_EXTERN) ?
+            std::numeric_limits<std::size_t>::max() :
+            (HasIncompleteArray(declarator) ? InitializerBound(initializer) : 0);
     TypeId type = BuildDeclaratorType(
         declarator, base, target_scope, false,
-        HasIncompleteArray(declarator) ? InitializerBound(initializer) : 0);
+        incomplete_bound);
     const bool is_function = types_.Kind(type) == TYPE_FUNCTION;
     // 7.1.5p9: a constexpr object is const.
     if (is_constexpr && !is_typedef && !is_function)
@@ -332,7 +337,7 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     const BindingKind kind = is_typedef ? BINDING_TYPE_ALIAS :
         is_function ? BINDING_FUNCTION : BINDING_VARIABLE;
     BindingId binding = 0;
-    if (is_function)
+	    if (is_function && !is_typedef)
     {
       vector<ParameterInfo> parameters;
       bool variadic = false;
@@ -358,9 +363,22 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
       continue;
     }
     binding = model_.AddBinding(target_scope, name, kind, type);
+    TypeId linkage_type = type;
+    while (linkage_type != 0 &&
+           types_.Kind(types_.Unqualified(linkage_type)) == TYPE_ARRAY)
+      linkage_type = types_.At(types_.Unqualified(linkage_type)).base;
+    const bool namespace_const =
+        model_.ScopeAt(target_scope).kind == SCOPE_NAMESPACE &&
+        types_.Kind(linkage_type) == TYPE_CV &&
+        types_.At(linkage_type).is_const;
     model_.BindingAt(binding).internal_linkage =
-        SequenceHasKeyword(specifiers, KW_STATIC);
+        SequenceHasKeyword(specifiers, KW_STATIC) ||
+        (model_.ScopeAt(target_scope).kind == SCOPE_NAMESPACE &&
+         !SequenceHasKeyword(specifiers, KW_EXTERN) &&
+         namespace_const);
     model_.BindingAt(binding).c_linkage = c_linkage_depth_ != 0;
+    model_.BindingAt(binding).extern_declaration =
+        initializer == 0 && SequenceHasKeyword(specifiers, KW_EXTERN);
     SemaId variable = 0;
     if (EmitsSemantics() && model_.ScopeAt(target_scope).kind != SCOPE_CLASS)
       variable = MakeSemantic(is_typedef ? SEMA_TYPE_ALIAS : SEMA_VARIABLE,

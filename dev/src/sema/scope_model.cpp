@@ -6,7 +6,8 @@
 Binding::Binding()
     : kind(BINDING_VARIABLE), type(0), scope(0), namespace_scope(0),
       function(0), object_binding(0),
-      internal_linkage(false), c_linkage(false), noexcept_qualifier(false),
+      internal_linkage(false), c_linkage(false), extern_declaration(false),
+      noexcept_qualifier(false),
       has_const_value(false), const_value(0)
 {
 }

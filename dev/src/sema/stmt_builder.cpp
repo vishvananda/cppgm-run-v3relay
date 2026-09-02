@@ -331,6 +331,11 @@ void ScopeBuilder::BuildCaseStatement(AstId node,
   const vector<AstId>& children = arena_.At(node).children;
   if (children.size() < 2)
     throw std::runtime_error("invalid case statement");
+  // A case label is a control-flow entry point.  A declaration immediately
+  // following it would put an automatic object in scope without running its
+  // initializer; require an explicit compound scope for that declaration.
+  if (IsDeclarationKind(arena_.At(children[1]).kind))
+    throw std::runtime_error("case label bypasses initialization");
   SemaId statement = 0;
   if (tree_ != 0)
     statement = MakeSemantic(SEMA_CASE_STATEMENT, context.scope,
