@@ -1,59 +1,28 @@
+// Itanium <name>, function encodings, special names, and the target driver.
+
 #include "abi_mangle_encoder.h"
 
-#include <algorithm>
-#include <fstream>
-#include <iterator>
-#include <sstream>
 #include <stdexcept>
 
 namespace abi_mangle {
 namespace {
 
-std::string normalized_name(const std::string & name)
+std::string number_word(unsigned long long value)
 {
-  return name.compare(0, 2, "::") == 0 ? name.substr(2) : name;
+  return std::to_string(value);
 }
 
-std::vector<std::string> name_components(const std::string & name)
+std::string signed_number(long long value)
 {
-  const std::string normalized = normalized_name(name);
-  std::vector<std::string> components;
-  std::size_t start = 0;
-  while(start <= normalized.size()) {
-    const std::size_t separator = normalized.find("::", start);
-    if(separator == std::string::npos) {
-      if(start == normalized.size()) {
-        throw std::logic_error("ABI qualified name has an empty component");
-      }
-      components.push_back(normalized.substr(start));
-      break;
-    }
-    if(separator == start) {
-      throw std::logic_error("ABI qualified name has an empty component");
-    }
-    components.push_back(normalized.substr(start, separator - start));
-    start = separator + 2;
+  if(value >= 0) {
+    return number_word(static_cast<unsigned long long>(value));
   }
-  if(components.empty()) {
-    throw std::logic_error("ABI qualified name is empty");
-  }
-  return components;
-}
-
-std::string joined_components(const std::vector<std::string> & components,
-                              std::size_t last)
-{
-  std::string result;
-  for(std::size_t i = 0; i <= last; ++i) {
-    if(i != 0) result += "::";
-    result += components[i];
-  }
-  return result;
+  return "n" + number_word(0ULL - static_cast<unsigned long long>(value));
 }
 
 std::string source_name(const std::string & name)
 {
-  return std::to_string(name.size()) + name;
+  return number_word(name.size()) + name;
 }
 
 bool is_dash(const std::string & word)
@@ -61,64 +30,29 @@ bool is_dash(const std::string & word)
   return word.empty() || word == "-";
 }
 
-std::string signed_number(long long value)
+std::string strip_scope(const std::string & name)
 {
-  if(value >= 0) {
-    return std::to_string(static_cast<unsigned long long>(value));
-  }
-  const unsigned long long magnitude = 0ULL -
-    static_cast<unsigned long long>(value);
-  return "n" + std::to_string(magnitude);
+  return name.compare(0, 2, "::") == 0 ? name.substr(2) : name;
 }
 
-std::string operator_code(const std::string & name)
+std::string joined_components(const std::vector<std::string> & components,
+                              std::size_t count)
 {
-  if(name == "new") return "nw";
-  if(name == "new-array") return "na";
-  if(name == "delete") return "dl";
-  if(name == "delete-array") return "da";
-  if(name == "plus") return "pl";
-  if(name == "minus") return "mi";
-  if(name == "multiply") return "ml";
-  if(name == "divide") return "dv";
-  if(name == "modulo") return "rm";
-  if(name == "plus-assign") return "pL";
-  if(name == "minus-assign") return "mI";
-  if(name == "multiply-assign") return "mL";
-  if(name == "divide-assign") return "dV";
-  if(name == "modulo-assign") return "rM";
-  if(name == "equal") return "eq";
-  if(name == "not-equal") return "ne";
-  if(name == "less") return "lt";
-  if(name == "greater") return "gt";
-  if(name == "less-equal") return "le";
-  if(name == "greater-equal") return "ge";
-  if(name == "subscript") return "ix";
-  if(name == "call") return "cl";
-  if(name == "arrow") return "pt";
-  if(name == "arrow-star") return "pm";
-  if(name == "dereference") return "de";
-  if(name == "address-of") return "ad";
-  if(name == "increment") return "pp";
-  if(name == "decrement") return "mm";
-  if(name == "unary-plus") return "ps";
-  if(name == "unary-minus") return "ng";
-  if(name == "bit-and") return "an";
-  if(name == "bit-or") return "or";
-  if(name == "bit-xor") return "eo";
-  if(name == "complement") return "co";
-  if(name == "logical-not") return "nt";
-  if(name == "logical-and") return "aa";
-  if(name == "logical-or") return "oo";
-  if(name == "comma") return "cm";
-  if(name == "assign") return "aS";
-  if(name == "spaceship") return "ss";
-  if(name == "co-await") return "aw";
-  throw std::logic_error("unknown ABI operator terminal '" + name + "'");
+  std::string result;
+  for(std::size_t i = 0; i < count; ++i) {
+    if(i != 0) result += "::";
+    result += components[i];
+  }
+  return result;
+}
+
+bool is_standard(const std::vector<std::string> & components)
+{
+  return !components.empty() && components[0] == "std";
 }
 
 void append_qualifier_codes(const std::vector<AbiFunctionQualifier> & qualifiers,
-                            std::string * result)
+                            std::string * out)
 {
   bool has_volatile = false;
   bool has_const = false;
@@ -133,695 +67,215 @@ void append_qualifier_codes(const std::vector<AbiFunctionQualifier> & qualifiers
     has_rvalue_ref = has_rvalue_ref ||
       qualifiers[i] == ABI_FUNCTION_QUALIFIER_RVALUE_REFERENCE;
   }
-  if(has_volatile) *result += "V";
-  if(has_const) *result += "K";
-  if(has_lvalue_ref) *result += "R";
-  if(has_rvalue_ref) *result += "O";
+  if(has_volatile) *out += "V";
+  if(has_const) *out += "K";
+  if(has_lvalue_ref) *out += "R";
+  if(has_rvalue_ref) *out += "O";
 }
 
+// Local class discriminators count occurrences; the first is unnumbered.
 std::string local_discriminator_suffix(const std::string & discriminator)
 {
-  if(discriminator.empty() || discriminator == "-") {
+  if(is_dash(discriminator)) {
     return std::string();
   }
-  unsigned long long value = 0;
-  std::istringstream input(discriminator);
-  if(!(input >> value) || !input.eof()) {
-    throw std::logic_error("invalid ABI local discriminator '" +
-      discriminator + "'");
-  }
-  return value == 0 ? std::string() : "_" + std::to_string(value - 1);
+  const unsigned long long value = std::stoull(discriminator);
+  return value == 0 ? std::string() : "_" + number_word(value - 1);
 }
 
-AbiFunctionRecord owned_terminal_record(const std::string & terminal)
+}  // namespace
+
+std::vector<std::string> name_components(const std::string & name)
 {
-  AbiFunctionRecord record;
-  if(terminal == "operator-call" || terminal == "call") {
-    record.kind = ABI_FUNCTION_RECORD_OPERATOR_TERMINAL;
-    record.terminal = "call";
-  } else if(terminal.compare(0, 12, "constructor-") == 0 ||
-            terminal.compare(0, 10, "destructor-") == 0) {
-    record.kind = ABI_FUNCTION_RECORD_TERMINAL;
-    record.terminal = terminal;
-  } else {
-    record.kind = ABI_FUNCTION_RECORD_TERMINAL_SOURCE;
-    record.terminal = terminal;
+  const std::string normalized = strip_scope(name);
+  std::vector<std::string> components;
+  std::size_t start = 0;
+  while(true) {
+    const std::size_t separator = normalized.find("::", start);
+    const std::size_t end = separator == std::string::npos ? normalized.size() :
+      separator;
+    if(end == start) {
+      throw std::logic_error("ABI qualified name '" + name +
+        "' has an empty component");
+    }
+    components.push_back(normalized.substr(start, end - start));
+    if(separator == std::string::npos) {
+      return components;
+    }
+    start = separator + 2;
   }
-  return record;
 }
 
 bool needs_nested_name(const std::vector<std::string> & components)
 {
   if(components.size() == 1) return false;
-  return !(components.size() == 2 && components[0] == "std");
+  return !(components.size() == 2 && is_standard(components));
 }
 
-std::vector<std::string> split_fact_line(const std::string & line)
+// ---------------------------------------------------------------------------
+// Definition table
+
+void AbiDefinitionTable::add(const std::string & id, AbiDefinitionKind kind,
+                             const void * fact)
 {
-  std::istringstream input(line);
-  std::vector<std::string> words;
-  std::string word;
-  while(input >> word) {
-    words.push_back(word);
+  Entry entry;
+  entry.kind = kind;
+  entry.fact = fact;
+  if(!entries_.insert(std::make_pair(id, entry)).second) {
+    throw std::logic_error("duplicate ABI definition '" + id + "'");
   }
-  return words;
 }
 
-void append_stream_case(const AbiFactCase & fact_case, std::string * output,
-                        std::string * first_error)
+const void * AbiDefinitionTable::find(const std::string & id,
+                                      AbiDefinitionKind kind) const
 {
-  try {
-    *output += mangle_fact_case(fact_case);
-    *output += "\n";
-  } catch(const std::exception & error) {
-    if(first_error->empty()) {
-      *first_error = error.what();
+  const std::map<std::string, Entry>::const_iterator it = entries_.find(id);
+  if(it == entries_.end() || it->second.kind != kind) {
+    return 0;
+  }
+  return it->second.fact;
+}
+
+void AbiDefinitionTable::add_type(const std::string & id, const AbiType & type)
+{
+  add(id, ABI_DEFINITION_TYPE, &type);
+}
+
+void AbiDefinitionTable::add_argument(const std::string & id,
+                                      const AbiTemplateArgument & argument)
+{
+  add(id, ABI_DEFINITION_TEMPLATE_ARGUMENT, &argument);
+}
+
+void AbiDefinitionTable::add_expression(const std::string & id,
+                                        const AbiDependentExpression & expression)
+{
+  add(id, ABI_DEFINITION_EXPRESSION, &expression);
+}
+
+void AbiDefinitionTable::add_context(const std::string & id,
+                                     const AbiLocalContext & context)
+{
+  add(id, ABI_DEFINITION_CONTEXT, &context);
+}
+
+void AbiDefinitionTable::add_entity(const std::string & id,
+                                    const AbiEntityFact & entity)
+{
+  add(id, ABI_DEFINITION_ENTITY, &entity);
+}
+
+void AbiDefinitionTable::add_case(const AbiFactCase & fact_case)
+{
+  for(std::size_t i = 0; i < fact_case.types.size(); ++i) {
+    add_type(fact_case.types[i].id, fact_case.types[i].type);
+  }
+  for(std::size_t i = 0; i < fact_case.arguments.size(); ++i) {
+    add_argument(fact_case.arguments[i].id, fact_case.arguments[i].argument);
+  }
+  for(std::size_t i = 0; i < fact_case.expressions.size(); ++i) {
+    add_expression(fact_case.expressions[i].id,
+                   fact_case.expressions[i].expression);
+  }
+  for(std::size_t i = 0; i < fact_case.contexts.size(); ++i) {
+    add_context(fact_case.contexts[i].id, fact_case.contexts[i].context);
+  }
+  for(std::size_t i = 0; i < fact_case.entities.size(); ++i) {
+    add_entity(fact_case.entities[i].id, fact_case.entities[i].entity);
+  }
+}
+
+const AbiType * AbiDefinitionTable::find_type(const std::string & id) const
+{
+  return static_cast<const AbiType *>(find(id, ABI_DEFINITION_TYPE));
+}
+
+const AbiTemplateArgument * AbiDefinitionTable::find_argument(
+  const std::string & id) const
+{
+  return static_cast<const AbiTemplateArgument *>(
+    find(id, ABI_DEFINITION_TEMPLATE_ARGUMENT));
+}
+
+const AbiDependentExpression * AbiDefinitionTable::find_expression(
+  const std::string & id) const
+{
+  return static_cast<const AbiDependentExpression *>(
+    find(id, ABI_DEFINITION_EXPRESSION));
+}
+
+const AbiLocalContext * AbiDefinitionTable::find_context(
+  const std::string & id) const
+{
+  return static_cast<const AbiLocalContext *>(find(id, ABI_DEFINITION_CONTEXT));
+}
+
+const AbiEntityFact * AbiDefinitionTable::find_entity(const std::string & id) const
+{
+  return static_cast<const AbiEntityFact *>(find(id, ABI_DEFINITION_ENTITY));
+}
+
+// ---------------------------------------------------------------------------
+// <name> and <prefix>
+
+AbiKeyId Mangler::prefix_key(const std::vector<std::string> & components,
+                             std::size_t count)
+{
+  return name_key(joined_components(components, count), std::vector<std::string>());
+}
+
+// Emits the first `count` components of a qualified name as <prefix>es: the
+// longest already-registered prefix is substituted, every prefix emitted
+// after it is registered, and a leading std is spelled St and never
+// registered.
+void Mangler::append_prefixes(const std::vector<std::string> & components,
+                              std::size_t count, std::string * out)
+{
+  const bool standard = is_standard(components);
+  const std::size_t first = standard ? 1 : 0;
+  std::size_t start = first;
+  bool substituted = false;
+  for(std::size_t length = count; length > first; --length) {
+    std::string spelling;
+    if(substitutions_.lookup(prefix_key(components, length), &spelling)) {
+      *out += spelling;
+      start = length;
+      substituted = true;
+      break;
     }
   }
+  if(standard && !substituted && count > 0) {
+    *out += "St";
+  }
+  for(std::size_t length = start + 1; length <= count; ++length) {
+    *out += source_name(components[length - 1]);
+    substitutions_.add(prefix_key(components, length));
+  }
 }
 
-}  // namespace
-
-std::string Mangler::mangle_prefix_chain(
-  const std::string & qualified_name, bool register_last,
-  const std::vector<std::string> & abi_tags)
+// Body of a qualified name without the N...E wrapper.  `register_key` is the
+// component the complete name denotes (a class, template, or closure) and is
+// registered after the name is emitted; 0 for functions and variables.
+std::string Mangler::mangle_name_body(const std::string & qualified_name,
+                                      const std::vector<std::string> & tags,
+                                      AbiKeyId register_key, bool * nested)
 {
   const std::vector<std::string> components = name_components(qualified_name);
-  const bool standard = components[0] == "std";
-  const std::size_t first_prefix = standard ? 1 : 0;
   std::string result;
-  if(standard) {
-    result = "St";
-  }
-  std::size_t substitution_end = components.size();
-  std::string substitution;
-  if(components.size() > first_prefix + 1) {
-    for(std::size_t i = components.size() - 2; i >= first_prefix; --i) {
-      if(substitutions_.lookup(joined_components(components, i), &substitution)) {
-        substitution_end = i;
-        break;
-      }
-      if(i == first_prefix) break;
-    }
-  }
-  if(substitution_end != components.size()) {
-    result.clear();
-    result += substitution;
-  }
-  for(std::size_t i = first_prefix; i + 1 < components.size(); ++i) {
-    if(substitution_end != components.size() && i <= substitution_end) continue;
-    result += source_name(components[i]);
-    substitutions_.add(joined_components(components, i));
-  }
+  append_prefixes(components, components.size() - 1, &result);
   result += source_name(components.back());
-  if(!abi_tags.empty()) {
-    result += mangle_tag_list(abi_tags);
-  }
-  if(register_last) {
-    substitutions_.add(normalized_name(qualified_name));
-  }
+  result += mangle_tag_list(tags);
+  substitutions_.add(register_key);
+  *nested = needs_nested_name(components);
   return result;
 }
 
-std::string Mangler::mangle_qualified_name(
-  const std::string & qualified_name, bool register_last,
-  const std::vector<std::string> & abi_tags)
+std::string Mangler::mangle_qualified_name(const std::string & qualified_name)
 {
-  const std::vector<std::string> components = name_components(qualified_name);
-  const bool nested = needs_nested_name(components);
-  const std::string body = mangle_prefix_chain(qualified_name, register_last,
-                                               abi_tags);
+  bool nested = false;
+  const std::string body = mangle_name_body(qualified_name,
+    std::vector<std::string>(), 0, &nested);
   return nested ? "N" + body + "E" : body;
-}
-
-std::string Mangler::mangle_function_terminal(const AbiFunctionRecord & record)
-{
-  if(record.kind == ABI_FUNCTION_RECORD_TERMINAL_SOURCE) {
-    if(is_dash(record.terminal)) {
-      throw std::logic_error("empty function terminal source");
-    }
-    return source_name(record.terminal);
-  }
-  if(record.kind == ABI_FUNCTION_RECORD_CONVERSION_TERMINAL) {
-    return "cv" + mangle_type(record.type);
-  }
-  if(record.kind == ABI_FUNCTION_RECORD_OPERATOR_TERMINAL) {
-    if(record.terminal == "literal") {
-      return "li" + source_name(record.literal_suffix);
-    }
-    return operator_code(record.terminal);
-  }
-  if(record.kind == ABI_FUNCTION_RECORD_TERMINAL) {
-    if(record.terminal == "constructor-complete") return "C1";
-    if(record.terminal == "constructor-base") return "C2";
-    if(record.terminal == "destructor-deleting") return "D0";
-    if(record.terminal == "destructor-complete") return "D1";
-    if(record.terminal == "destructor-base") return "D2";
-    throw std::logic_error("unknown ABI function terminal '" +
-      record.terminal + "'");
-  }
-  throw std::logic_error("invalid ABI function terminal record");
-}
-
-std::string Mangler::mangle_function_name(
-  const std::vector<AbiFunctionRecord> & records,
-  std::vector<std::string> * template_arguments,
-  bool * has_template_encoding)
-{
-  struct NamePiece
-  {
-    const AbiFunctionRecord * record;
-    bool template_name;
-  };
-
-  std::vector<NamePiece> pieces;
-  const AbiFunctionRecord * terminal = 0;
-  std::vector<AbiFunctionQualifier> qualifiers;
-  std::vector<std::string> tags;
-  std::vector<std::string> template_prefixes;
-  const AbiFunctionRecord * local_context = 0;
-  const AbiFunctionRecord * lambda_context = 0;
-  const AbiFunctionRecord * namespace_lambda_context = 0;
-  bool standard = false;
-  std::string standard_substitution;
-  if(has_template_encoding) *has_template_encoding = false;
-
-  for(std::size_t i = 0; i < records.size(); ++i) {
-    const AbiFunctionRecord & record = records[i];
-    switch(record.kind) {
-    case ABI_FUNCTION_RECORD_NAME_SOURCE:
-      if(!is_dash(record.source_name)) {
-        NamePiece piece = {&record, false};
-        pieces.push_back(piece);
-      }
-      break;
-    case ABI_FUNCTION_RECORD_NAME_STD:
-      standard = true;
-      standard_substitution = record.standard_substitution;
-      break;
-    case ABI_FUNCTION_RECORD_NAME_TEMPLATE: {
-      NamePiece piece = {&record, true};
-      pieces.push_back(piece);
-      break;
-    }
-    case ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_ARGUMENT:
-      if(template_arguments) {
-        template_arguments->push_back(record.substitution);
-      }
-      if(has_template_encoding) *has_template_encoding = true;
-      break;
-    case ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_PREFIX:
-      if(!is_dash(record.substitution)) {
-        template_prefixes.push_back(record.substitution);
-      }
-      break;
-    case ABI_FUNCTION_RECORD_LOCAL_CONTEXT:
-      local_context = &record;
-      break;
-    case ABI_FUNCTION_RECORD_LAMBDA_CONTEXT:
-      lambda_context = &record;
-      break;
-    case ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT:
-      namespace_lambda_context = &record;
-      break;
-    case ABI_FUNCTION_RECORD_QUALIFIER:
-      qualifiers.insert(qualifiers.end(), record.qualifiers.begin(),
-                        record.qualifiers.end());
-      break;
-    case ABI_FUNCTION_RECORD_ABI_TAG:
-      tags.push_back(record.name);
-      break;
-    case ABI_FUNCTION_RECORD_TERMINAL_SOURCE:
-    case ABI_FUNCTION_RECORD_TERMINAL:
-    case ABI_FUNCTION_RECORD_OPERATOR_TERMINAL:
-    case ABI_FUNCTION_RECORD_CONVERSION_TERMINAL:
-      if(terminal) {
-        throw std::logic_error("multiple ABI function terminals");
-      }
-      terminal = &record;
-      break;
-    default:
-      break;
-    }
-  }
-
-  if(local_context || lambda_context || namespace_lambda_context) {
-    return mangle_context_function_name(records, template_arguments,
-                                        has_template_encoding);
-  }
-
-  // The source-level "operator" component and the dash component are
-  // placeholders when a terminal record supplies the ABI unqualified name.
-  if(terminal && !pieces.empty() && !pieces.back().template_name &&
-     (pieces.back().record->source_name == "operator" ||
-      is_dash(pieces.back().record->source_name))) {
-    pieces.pop_back();
-  }
-  if(pieces.empty() && !terminal) {
-    throw std::logic_error("ABI function has no name");
-  }
-
-  const std::size_t component_count = (standard ? 1 : 0) + pieces.size() +
-    (terminal ? 1 : 0);
-  const bool nested = component_count > 1 &&
-    !(standard && component_count == 2 && pieces.size() == 1 && !terminal);
-
-  std::string result;
-  if(nested) result += "N";
-  bool has_volatile = false;
-  bool has_const = false;
-  bool has_lvalue_ref = false;
-  bool has_rvalue_ref = false;
-  for(std::size_t i = 0; i < qualifiers.size(); ++i) {
-    has_volatile = has_volatile ||
-      qualifiers[i] == ABI_FUNCTION_QUALIFIER_VOLATILE;
-    has_const = has_const || qualifiers[i] == ABI_FUNCTION_QUALIFIER_CONST;
-    has_lvalue_ref = has_lvalue_ref ||
-      qualifiers[i] == ABI_FUNCTION_QUALIFIER_LVALUE_REFERENCE;
-    has_rvalue_ref = has_rvalue_ref ||
-      qualifiers[i] == ABI_FUNCTION_QUALIFIER_RVALUE_REFERENCE;
-  }
-  if(has_volatile) result += "V";
-  if(has_const) result += "K";
-  if(has_lvalue_ref) result += "R";
-  if(has_rvalue_ref) result += "O";
-  if(standard) {
-    result += standard_substitution.empty() ? "St" : standard_substitution;
-  }
-
-  const std::size_t final_piece = terminal ? pieces.size() :
-    pieces.size() - 1;
-  if(!terminal && pieces[final_piece].template_name && has_template_encoding) {
-    *has_template_encoding = true;
-  }
-  for(std::size_t i = 0; i < pieces.size(); ++i) {
-    if(!terminal && i == final_piece) break;
-    const AbiFunctionRecord & record = *pieces[i].record;
-    if(pieces[i].template_name) {
-      if(!is_dash(record.substitution)) substitutions_.add(record.substitution);
-      if(!is_dash(record.standard_substitution) &&
-         !record.standard_substitution.empty()) {
-        result += record.standard_substitution;
-        if(!record.standard_substitution_includes_arguments) {
-          result += mangle_template_args(record.argument_refs);
-        }
-      } else {
-        result += source_name(record.name);
-        result += mangle_template_args(record.argument_refs);
-      }
-      if(!is_dash(record.complete_substitution)) {
-        substitutions_.add(record.complete_substitution);
-      }
-    } else {
-      result += source_name(record.source_name);
-      if(!is_dash(record.substitution)) substitutions_.add(record.substitution);
-    }
-  }
-
-  if(terminal) {
-    result += mangle_function_terminal(*terminal);
-  } else {
-    const AbiFunctionRecord & record = *pieces[final_piece].record;
-    if(pieces[final_piece].template_name) {
-      if(!is_dash(record.standard_substitution) &&
-         !record.standard_substitution.empty()) {
-        result += record.standard_substitution;
-        if(!record.standard_substitution_includes_arguments) {
-          result += mangle_template_args(record.argument_refs);
-        }
-      } else {
-        result += source_name(record.name);
-        result += mangle_template_args(record.argument_refs);
-      }
-      if(!is_dash(record.complete_substitution)) {
-        substitutions_.add(record.complete_substitution);
-      }
-    } else {
-      result += source_name(record.source_name);
-      if(!is_dash(record.substitution)) substitutions_.add(record.substitution);
-    }
-  }
-  if(!tags.empty()) result += mangle_tag_list(tags);
-  for(std::size_t i = 0; i < template_prefixes.size(); ++i) {
-    substitutions_.add(template_prefixes[i]);
-  }
-  if(template_arguments && !template_arguments->empty()) {
-    result += mangle_template_args(*template_arguments);
-  }
-  if(nested) result += "E";
-  return result;
-}
-
-std::string Mangler::mangle_context(const std::string & ref)
-{
-  const AbiDefinitionRecord * record = definition(ref);
-  if(!record || record->kind != ABI_DEFINITION_CONTEXT) {
-    throw std::logic_error("unknown ABI context '" + ref + "'");
-  }
-  if(record->context.kind == ABI_CONTEXT_RAW) {
-    return record->context.fragment;
-  }
-  AbiFunctionShape shape;
-  shape.target = record->context.function;
-  const std::string encoding = mangle_function(shape);
-  if(encoding.compare(0, 2, "_Z") != 0) {
-    throw std::logic_error("ABI context function is not Itanium-mangled");
-  }
-  return "Z" + encoding.substr(2) + "E";
-}
-
-std::string Mangler::mangle_local_discriminator(
-  const std::string & discriminator) const
-{
-  return local_discriminator_suffix(discriminator);
-}
-
-std::string Mangler::mangle_context_function_name(
-  const std::vector<AbiFunctionRecord> & records,
-  std::vector<std::string> * template_arguments,
-  bool * has_template_encoding)
-{
-  const AbiFunctionRecord * context = 0;
-  const AbiFunctionRecord * terminal = 0;
-  std::vector<AbiFunctionQualifier> qualifiers;
-  std::vector<std::string> tags;
-  std::vector<std::string> template_prefixes;
-  enum ContextKind { CONTEXT_LOCAL, CONTEXT_LAMBDA, CONTEXT_NAMESPACE_LAMBDA };
-  ContextKind context_kind = CONTEXT_LOCAL;
-  std::size_t context_count = 0;
-  if(has_template_encoding) *has_template_encoding = false;
-
-  for(std::size_t i = 0; i < records.size(); ++i) {
-    const AbiFunctionRecord & record = records[i];
-    if(record.kind == ABI_FUNCTION_RECORD_LOCAL_CONTEXT ||
-       record.kind == ABI_FUNCTION_RECORD_LAMBDA_CONTEXT ||
-       record.kind == ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT) {
-      ++context_count;
-      context = &record;
-      context_kind = record.kind == ABI_FUNCTION_RECORD_LOCAL_CONTEXT ?
-        CONTEXT_LOCAL : record.kind == ABI_FUNCTION_RECORD_LAMBDA_CONTEXT ?
-        CONTEXT_LAMBDA : CONTEXT_NAMESPACE_LAMBDA;
-    } else if(record.kind == ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_ARGUMENT) {
-      if(template_arguments) template_arguments->push_back(record.substitution);
-      if(has_template_encoding) *has_template_encoding = true;
-    } else if(record.kind == ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_PREFIX) {
-      if(!is_dash(record.substitution)) template_prefixes.push_back(record.substitution);
-    } else if(record.kind == ABI_FUNCTION_RECORD_QUALIFIER) {
-      qualifiers.insert(qualifiers.end(), record.qualifiers.begin(),
-                        record.qualifiers.end());
-    } else if(record.kind == ABI_FUNCTION_RECORD_ABI_TAG) {
-      tags.push_back(record.name);
-    } else if(record.kind == ABI_FUNCTION_RECORD_TERMINAL_SOURCE ||
-              record.kind == ABI_FUNCTION_RECORD_TERMINAL ||
-              record.kind == ABI_FUNCTION_RECORD_OPERATOR_TERMINAL ||
-              record.kind == ABI_FUNCTION_RECORD_CONVERSION_TERMINAL) {
-      if(terminal) throw std::logic_error("multiple ABI function terminals");
-      terminal = &record;
-    }
-  }
-  if(context_count != 1 || !context) {
-    throw std::logic_error("ABI function needs exactly one local context");
-  }
-
-  std::string result;
-  if(context_kind == CONTEXT_NAMESPACE_LAMBDA) {
-    result = "N";
-    append_qualifier_codes(qualifiers, &result);
-    for(std::size_t i = 0; i < context->namespace_qualifiers.size(); ++i) {
-      result += source_name(context->namespace_qualifiers[i]);
-    }
-    result += source_name(context->source_name);
-  } else {
-    result = mangle_context(context->context_ref);
-    result += "N";
-    append_qualifier_codes(qualifiers, &result);
-    if(context_kind == CONTEXT_LOCAL) {
-      result += source_name(context->source_name);
-      result += local_discriminator_suffix(context->discriminator);
-    } else {
-      const std::string discriminator = context->discriminator.empty() ?
-        context->source_name : context->discriminator;
-      result += "Ul";
-      if(context->types.empty()) {
-        result += "v";
-      } else {
-        for(std::size_t i = 0; i < context->types.size(); ++i) {
-          result += mangle_type(context->types[i]);
-        }
-      }
-      result += "E" + discriminator + "_";
-    }
-  }
-  if(terminal) {
-    result += mangle_function_terminal(*terminal);
-  } else {
-    result += "cl";
-  }
-  if(!tags.empty()) result += mangle_tag_list(tags);
-  for(std::size_t i = 0; i < template_prefixes.size(); ++i) {
-    substitutions_.add(template_prefixes[i]);
-  }
-  if(template_arguments && !template_arguments->empty()) {
-    result += mangle_template_args(*template_arguments);
-  }
-  return result + "E";
-}
-
-std::string Mangler::mangle_path_name(
-  const AbiFunctionTarget & target,
-  const std::vector<AbiFunctionRecord> & records,
-  const std::vector<std::string> & template_arguments)
-{
-  const std::vector<std::string> components = name_components(
-    target.qualified_name);
-  const bool nested = needs_nested_name(components);
-  const bool standard = components[0] == "std";
-  const std::size_t first_prefix = standard ? 1 : 0;
-  const AbiFunctionRecord * terminal = 0;
-  std::vector<std::string> tags;
-  std::vector<AbiFunctionQualifier> qualifiers;
-  for(std::size_t i = 0; i < records.size(); ++i) {
-    const AbiFunctionRecord & record = records[i];
-    if(record.kind == ABI_FUNCTION_RECORD_ABI_TAG) {
-      tags.push_back(record.name);
-    } else if(record.kind == ABI_FUNCTION_RECORD_QUALIFIER) {
-      qualifiers.insert(qualifiers.end(), record.qualifiers.begin(),
-                        record.qualifiers.end());
-    } else if(record.kind == ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_PREFIX) {
-      if(!is_dash(record.substitution)) substitutions_.add(record.substitution);
-    } else if(record.kind == ABI_FUNCTION_RECORD_TERMINAL_SOURCE ||
-              record.kind == ABI_FUNCTION_RECORD_TERMINAL ||
-              record.kind == ABI_FUNCTION_RECORD_OPERATOR_TERMINAL ||
-              record.kind == ABI_FUNCTION_RECORD_CONVERSION_TERMINAL) {
-      if(terminal) {
-        throw std::logic_error("multiple ABI function terminals");
-      }
-      terminal = &record;
-    }
-  }
-
-  std::string prefix_result;
-  if(standard) prefix_result = "St";
-  std::size_t substitution_end = components.size();
-  std::string substitution;
-  if(components.size() > first_prefix + 1) {
-    for(std::size_t i = components.size() - 2; i >= first_prefix; --i) {
-      if(substitutions_.lookup(joined_components(components, i), &substitution)) {
-        substitution_end = i;
-        break;
-      }
-      if(i == first_prefix) break;
-    }
-  }
-  if(substitution_end != components.size()) {
-    prefix_result = substitution;
-  }
-  for(std::size_t i = first_prefix; i + 1 < components.size(); ++i) {
-    if(substitution_end != components.size() && i <= substitution_end) continue;
-    prefix_result += source_name(components[i]);
-    substitutions_.add(joined_components(components, i));
-  }
-
-  std::string result;
-  if(nested) result += "N";
-  bool has_volatile = false;
-  bool has_const = false;
-  bool has_lvalue_ref = false;
-  bool has_rvalue_ref = false;
-  for(std::size_t i = 0; i < qualifiers.size(); ++i) {
-    has_volatile = has_volatile ||
-      qualifiers[i] == ABI_FUNCTION_QUALIFIER_VOLATILE;
-    has_const = has_const || qualifiers[i] == ABI_FUNCTION_QUALIFIER_CONST;
-    has_lvalue_ref = has_lvalue_ref ||
-      qualifiers[i] == ABI_FUNCTION_QUALIFIER_LVALUE_REFERENCE;
-    has_rvalue_ref = has_rvalue_ref ||
-      qualifiers[i] == ABI_FUNCTION_QUALIFIER_RVALUE_REFERENCE;
-  }
-  if(has_volatile) result += "V";
-  if(has_const) result += "K";
-  if(has_lvalue_ref) result += "R";
-  if(has_rvalue_ref) result += "O";
-  result += prefix_result;
-  if(terminal) {
-    result += mangle_function_terminal(*terminal);
-  } else {
-    result += source_name(components.back());
-  }
-  if(!tags.empty()) result += mangle_tag_list(tags);
-  if(!template_arguments.empty()) {
-    result += mangle_template_args(template_arguments);
-    substitutions_.add(normalized_name(target.qualified_name));
-  }
-  if(nested) result += "E";
-  return result;
-}
-
-std::string Mangler::mangle_function_path(const AbiFunctionShape & shape)
-{
-  const AbiFunctionTarget & target = shape.target;
-  std::vector<std::string> template_arguments;
-  std::vector<AbiType> path_parameters;
-  bool path_variadic = false;
-  for(std::size_t i = 0; i < target.path_operands.size(); ++i) {
-    const AbiFunctionPathOperand & operand = target.path_operands[i];
-    if(operand.kind == ABI_FUNCTION_PATH_TEMPLATE_ARGUMENT) {
-      if(argument_definition(operand.argument_ref)) {
-        template_arguments.push_back(operand.argument_ref);
-      } else if(type_definition(operand.argument_ref)) {
-        AbiType type;
-        type.kind = ABI_TYPE_NAME_OR_REFERENCE;
-        type.name = operand.argument_ref;
-        path_parameters.push_back(type);
-      } else {
-        throw std::logic_error("unknown ABI path operand '" +
-          operand.argument_ref + "'");
-      }
-    } else if(operand.kind == ABI_FUNCTION_PATH_TYPE) {
-      path_parameters.push_back(operand.type);
-    } else if(operand.kind == ABI_FUNCTION_PATH_VARIADIC) {
-      path_variadic = true;
-    }
-  }
-
-  std::vector<AbiType> parameters;
-  std::vector<AbiType> results;
-  bool explicit_parameters = false;
-  bool variadic = path_variadic;
-  for(std::size_t i = 0; i < shape.records.size(); ++i) {
-    const AbiFunctionRecord & record = shape.records[i];
-    if(record.kind == ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_ARGUMENT) {
-      template_arguments.push_back(record.substitution);
-    } else if(record.kind == ABI_FUNCTION_RECORD_PARAMETER) {
-      explicit_parameters = true;
-      parameters.push_back(record.type);
-    } else if(record.kind == ABI_FUNCTION_RECORD_RESULT) {
-      results.push_back(record.type);
-    } else if(record.kind == ABI_FUNCTION_RECORD_VARIADIC) {
-      variadic = true;
-    }
-  }
-  if(!explicit_parameters) parameters = path_parameters;
-
-  std::string result = "_Z" + mangle_path_name(target, shape.records,
-                                                 template_arguments);
-  if(!template_arguments.empty()) {
-    for(std::size_t i = 0; i < results.size(); ++i) {
-      result += mangle_type(results[i]);
-    }
-  }
-  if(parameters.empty()) {
-    result += "v";
-  } else {
-    for(std::size_t i = 0; i < parameters.size(); ++i) {
-      result += mangle_type(parameters[i]);
-    }
-  }
-  if(variadic) result += "z";
-  return result;
-}
-
-std::string Mangler::mangle_function_encoding(const AbiFunctionShape & shape)
-{
-  std::vector<std::string> template_arguments;
-  bool has_template_encoding = false;
-  const std::string name = mangle_function_name(shape.records,
-                                                &template_arguments,
-                                                &has_template_encoding);
-  std::vector<AbiType> parameters;
-  std::vector<AbiType> results;
-  bool variadic = false;
-  for(std::size_t i = 0; i < shape.records.size(); ++i) {
-    const AbiFunctionRecord & record = shape.records[i];
-    if(record.kind == ABI_FUNCTION_RECORD_PARAMETER) {
-      parameters.push_back(record.type);
-    } else if(record.kind == ABI_FUNCTION_RECORD_RESULT) {
-      results.push_back(record.type);
-    } else if(record.kind == ABI_FUNCTION_RECORD_VARIADIC) {
-      variadic = true;
-    }
-  }
-  std::string result = "_Z" + name;
-  if(has_template_encoding) {
-    for(std::size_t i = 0; i < results.size(); ++i) {
-      result += mangle_type(results[i]);
-    }
-  }
-  if(parameters.empty()) {
-    result += "v";
-  } else {
-    for(std::size_t i = 0; i < parameters.size(); ++i) {
-      result += mangle_type(parameters[i]);
-    }
-  }
-  if(variadic) result += "z";
-  return result;
-}
-
-std::string Mangler::mangle_owned_function(const AbiFunctionShape & shape)
-{
-  AbiFunctionShape owned = shape;
-  owned.target.kind = ABI_FUNCTION_TARGET_ENCODING;
-  AbiFunctionRecord context;
-  if(shape.target.kind == ABI_FUNCTION_TARGET_LOCAL) {
-    context.kind = ABI_FUNCTION_RECORD_LOCAL_CONTEXT;
-    context.context_ref = shape.target.context_ref;
-    context.source_name = shape.target.source_name;
-    context.discriminator = shape.target.discriminator;
-  } else if(shape.target.kind == ABI_FUNCTION_TARGET_LAMBDA) {
-    context.kind = ABI_FUNCTION_RECORD_LAMBDA_CONTEXT;
-    context.context_ref = shape.target.context_ref;
-    context.discriminator = shape.target.discriminator;
-    context.types = shape.target.signature_parameter_types;
-  } else {
-    context.kind = ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT;
-    context.source_name = shape.target.source_name;
-    context.namespace_qualifiers = shape.target.namespace_qualifiers;
-  }
-  owned.records.insert(owned.records.begin(), context);
-  owned.records.insert(owned.records.begin() + 1,
-                       owned_terminal_record(shape.target.terminal));
-  return mangle_function_encoding(owned);
-}
-
-std::string Mangler::mangle_function(const AbiFunctionShape & shape)
-{
-  if(shape.target.kind == ABI_FUNCTION_TARGET_PATH) {
-    return mangle_function_path(shape);
-  }
-  if(shape.target.kind == ABI_FUNCTION_TARGET_ENCODING) {
-    return mangle_function_encoding(shape);
-  }
-  if(shape.target.kind == ABI_FUNCTION_TARGET_LOCAL ||
-     shape.target.kind == ABI_FUNCTION_TARGET_LAMBDA ||
-     shape.target.kind == ABI_FUNCTION_TARGET_NAMESPACE_LAMBDA) {
-    return mangle_owned_function(shape);
-  }
-  throw std::logic_error("unsupported function target");
-}
-
-std::string Mangler::mangle_call_offset(long long offset) const
-{
-  return "h" + signed_number(offset) + "_";
 }
 
 std::string Mangler::mangle_internal_name(const std::string & qualified_name)
@@ -831,156 +285,497 @@ std::string Mangler::mangle_internal_name(const std::string & qualified_name)
     return "L" + source_name(components[0]);
   }
   std::string result = "N";
-  for(std::size_t i = 0; i + 1 < components.size(); ++i) {
-    result += source_name(components[i]);
+  append_prefixes(components, components.size() - 1, &result);
+  return result + "L" + source_name(components.back()) + "E";
+}
+
+// ---------------------------------------------------------------------------
+// Functions
+
+void Mangler::lower_records(const std::vector<AbiFunctionRecord> & records,
+                            FunctionFacts * facts)
+{
+  for(std::size_t i = 0; i < records.size(); ++i) {
+    const AbiFunctionRecord & record = records[i];
+    switch(record.kind) {
+    case ABI_FUNCTION_RECORD_NAME_SOURCE: {
+      if(is_dash(record.source_name)) break;   // ctor/dtor placeholder
+      NamePiece piece;
+      piece.kind = NamePiece::SOURCE;
+      piece.spelling = &record.source_name;
+      piece.key = is_dash(record.substitution) ? 0 :
+        name_key(record.substitution, std::vector<std::string>());
+      facts->pieces.push_back(piece);
+      break;
+    }
+    case ABI_FUNCTION_RECORD_NAME_STD:
+      facts->standard = true;
+      facts->standard_substitution = record.standard_substitution.empty() ?
+        std::string("St") : record.standard_substitution;
+      break;
+    case ABI_FUNCTION_RECORD_NAME_TEMPLATE: {
+      NamePiece piece;
+      piece.kind = NamePiece::TEMPLATE;
+      piece.spelling = &record.name;
+      piece.key = is_dash(record.substitution) ? 0 :
+        name_key(record.substitution, std::vector<std::string>());
+      piece.complete_key = is_dash(record.complete_substitution) ? 0 :
+        name_key(record.complete_substitution, std::vector<std::string>());
+      piece.standard_substitution = is_dash(record.standard_substitution) ? 0 :
+        &record.standard_substitution;
+      piece.standard_substitution_includes_arguments =
+        record.standard_substitution_includes_arguments;
+      piece.argument_refs = &record.argument_refs;
+      facts->pieces.push_back(piece);
+      break;
+    }
+    case ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_ARGUMENT:
+      facts->template_arguments.push_back(record.argument_refs.at(0));
+      facts->template_encoding = true;
+      break;
+    case ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_PREFIX:
+      if(!is_dash(record.substitution)) {
+        facts->template_prefix_keys.push_back(
+          name_key(record.substitution, std::vector<std::string>()));
+      }
+      break;
+    case ABI_FUNCTION_RECORD_LOCAL_CONTEXT:
+    case ABI_FUNCTION_RECORD_LAMBDA_CONTEXT:
+    case ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT:
+      if(facts->context) {
+        throw std::logic_error("ABI function has more than one local context");
+      }
+      facts->context = &record;
+      break;
+    case ABI_FUNCTION_RECORD_TERMINAL:
+      if(facts->terminal) {
+        throw std::logic_error("multiple ABI function terminals");
+      }
+      facts->terminal = &record.terminal;
+      facts->conversion_type = &record.type;
+      break;
+    case ABI_FUNCTION_RECORD_VARIADIC:
+      facts->variadic = true;
+      break;
+    case ABI_FUNCTION_RECORD_ABI_TAG:
+      facts->tags.push_back(record.name);
+      break;
+    case ABI_FUNCTION_RECORD_QUALIFIER:
+      facts->qualifiers.insert(facts->qualifiers.end(),
+                               record.qualifiers.begin(), record.qualifiers.end());
+      break;
+    case ABI_FUNCTION_RECORD_PARAMETER:
+      facts->parameters.push_back(&record.type);
+      break;
+    case ABI_FUNCTION_RECORD_RESULT:
+      facts->results.push_back(&record.type);
+      break;
+    }
   }
-  result += "L" + source_name(components.back()) + "E";
+}
+
+// A compact `function [path] Q operands...` target: the qualified name
+// supplies the name pieces and the operands supply template arguments and,
+// unless param records follow, the parameter types.
+void Mangler::lower_path_target(const AbiFunctionTarget & target,
+                                const std::vector<AbiFunctionRecord> & records,
+                                FunctionFacts * facts,
+                                std::vector<std::string> * components)
+{
+  lower_records(records, facts);
+  std::vector<const AbiType *> path_parameters;
+  for(std::size_t i = 0; i < target.path_operands.size(); ++i) {
+    const AbiFunctionPathOperand & operand = target.path_operands[i];
+    if(operand.kind == ABI_FUNCTION_PATH_TEMPLATE_ARGUMENT) {
+      facts->template_arguments.push_back(operand.argument_ref);
+    } else if(operand.kind == ABI_FUNCTION_PATH_TYPE) {
+      path_parameters.push_back(&operand.type);
+    } else {
+      facts->variadic = true;
+    }
+  }
+  if(facts->parameters.empty()) {
+    facts->parameters = path_parameters;
+  }
+  facts->template_encoding = !facts->template_arguments.empty();
+
+  *components = name_components(target.qualified_name);
+  std::size_t first = 0;
+  if(is_standard(*components)) {
+    facts->standard = true;
+    facts->standard_substitution = "St";
+    first = 1;
+  }
+  // With a terminal the last component is its placeholder.
+  const std::size_t count = facts->terminal ? components->size() - 1 :
+    components->size();
+  for(std::size_t i = first; i < count; ++i) {
+    NamePiece piece;
+    piece.kind = NamePiece::SOURCE;
+    piece.spelling = &(*components)[i];
+    const bool last = i + 1 == components->size();
+    if(!last || facts->template_encoding) {
+      piece.key = prefix_key(*components, i + 1);
+    }
+    facts->pieces.push_back(piece);
+  }
+}
+
+std::string Mangler::mangle_function(const AbiFunctionTarget & target,
+                                     const std::vector<AbiFunctionRecord> & records)
+{
+  DepthScope scope(this);
+  FunctionFacts facts;
+  std::vector<std::string> components;
+  AbiFunctionRecord owned_context;
+  switch(target.kind) {
+  case ABI_FUNCTION_TARGET_PATH:
+    lower_path_target(target, records, &facts, &components);
+    break;
+  case ABI_FUNCTION_TARGET_ENCODING:
+    lower_records(records, &facts);
+    break;
+  case ABI_FUNCTION_TARGET_LOCAL:
+  case ABI_FUNCTION_TARGET_LAMBDA:
+  case ABI_FUNCTION_TARGET_NAMESPACE_LAMBDA:
+    owned_context.kind = target.kind == ABI_FUNCTION_TARGET_LOCAL ?
+      ABI_FUNCTION_RECORD_LOCAL_CONTEXT :
+      target.kind == ABI_FUNCTION_TARGET_LAMBDA ?
+      ABI_FUNCTION_RECORD_LAMBDA_CONTEXT :
+      ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT;
+    owned_context.context_ref = target.context_ref;
+    owned_context.source_name = target.source_name;
+    owned_context.discriminator = target.discriminator;
+    owned_context.types = target.signature_parameter_types;
+    owned_context.namespace_qualifiers = target.namespace_qualifiers;
+    lower_records(records, &facts);
+    if(facts.context || facts.terminal) {
+      throw std::logic_error("compact local function targets carry their own "
+        "context and terminal");
+    }
+    facts.context = &owned_context;
+    facts.terminal = &target.terminal;
+    break;
+  }
+  return mangle_function_facts(facts);
+}
+
+std::string Mangler::mangle_function_facts(const FunctionFacts & facts)
+{
+  std::string result = facts.context ? mangle_context_function_name(facts) :
+    mangle_function_name(facts);
+  // A function whose own name is a template-id, or that carries function
+  // template arguments, encodes its return type; constructors, destructors,
+  // and conversion functions never do.
+  const bool template_id = !facts.terminal && !facts.pieces.empty() &&
+    facts.pieces.back().kind == NamePiece::TEMPLATE;
+  const bool special = facts.terminal &&
+    (facts.terminal->kind == ABI_TERMINAL_SPECIAL ||
+     facts.terminal->kind == ABI_TERMINAL_CONVERSION);
+  if((facts.template_encoding || template_id) && !special) {
+    for(std::size_t i = 0; i < facts.results.size(); ++i) {
+      result += mangle_type(*facts.results[i]);
+    }
+  }
+  if(facts.parameters.empty()) {
+    result += "v";
+  }
+  for(std::size_t i = 0; i < facts.parameters.size(); ++i) {
+    result += mangle_type(*facts.parameters[i]);
+  }
+  if(facts.variadic) result += "z";
   return result;
 }
 
-std::string Mangler::mangle_special_target(const AbiTargetRecord & target)
+// A template piece registers its template name before the arguments; only a
+// prefix piece (a class template specialization) also registers the complete
+// specialization, since function template specializations are not
+// substitution candidates.
+void Mangler::append_name_piece(const NamePiece & piece, bool prefix,
+                                std::string * out)
 {
-  if(target.kind == ABI_TARGET_FACT_TYPEINFO) {
-    return "_ZTI" + mangle_type(target.type);
+  if(piece.kind == NamePiece::SOURCE) {
+    *out += source_name(*piece.spelling);
+    substitutions_.add(piece.key);
+    return;
   }
-  if(target.kind == ABI_TARGET_FACT_VTABLE) {
-    return "_ZTV" + mangle_type(target.type);
+  if(piece.standard_substitution) {
+    *out += *piece.standard_substitution;
+    substitutions_.add(piece.key);
+    if(!piece.standard_substitution_includes_arguments) {
+      *out += mangle_template_args(*piece.argument_refs);
+    }
+  } else {
+    std::string spelling;
+    if(substitutions_.lookup(piece.key, &spelling)) {
+      *out += spelling;
+    } else {
+      *out += source_name(*piece.spelling);
+      substitutions_.add(piece.key);
+    }
+    *out += mangle_template_args(*piece.argument_refs);
   }
-  if(target.kind == ABI_TARGET_FACT_VTT) {
-    return "_ZTT" + mangle_type(target.type);
+  if(prefix) {
+    substitutions_.add(piece.complete_key);
   }
-  if(target.kind == ABI_TARGET_FACT_CONSTRUCTION_VTABLE) {
-    return "_ZTC" + mangle_type(target.type) + std::to_string(target.base_offset) +
-      "_" + mangle_type(target.base_type);
-  }
-  if(target.kind == ABI_TARGET_FACT_THREAD_LOCAL_WRAPPER) {
-    return "_ZTW" + mangle_qualified_name(target.qualified_name, false);
-  }
-  if(target.kind == ABI_TARGET_FACT_VARIABLE) {
-    return "_Z" + mangle_qualified_name(target.qualified_name, false);
-  }
-  if(target.kind == ABI_TARGET_FACT_TYPE) {
-    return mangle_type(target.type);
-  }
-  throw std::logic_error("unsupported target");
 }
 
-std::string Mangler::mangle_target(const AbiTargetRecord & target)
+std::string Mangler::mangle_terminal(const FunctionFacts & facts, bool member)
 {
-  AbiFunctionShape shape;
-  if(target.kind == ABI_TARGET_FACT_FUNCTION ||
-     target.kind == ABI_TARGET_FACT_THUNK ||
-     target.kind == ABI_TARGET_FACT_VIRTUAL_BASE_THUNK) {
-    shape.target = target.function;
+  const AbiTerminal & terminal = *facts.terminal;
+  switch(terminal.kind) {
+  case ABI_TERMINAL_SOURCE:
+    if(is_dash(terminal.name)) {
+      throw std::logic_error("empty function terminal source");
+    }
+    return source_name(terminal.name);
+  case ABI_TERMINAL_SPECIAL:
+    return special_function_info(terminal.special_function).code;
+  case ABI_TERMINAL_OPERATOR: {
+    const AbiOperatorInfo & info = operator_info(terminal.operator_kind);
+    if(info.unary_code) {
+      const std::size_t operands = facts.parameters.size() + (member ? 1 : 0);
+      return operands == 1 ? info.unary_code : info.code;
+    }
+    return info.code;
   }
-  return mangle_target(target, shape);
+  case ABI_TERMINAL_LITERAL_OPERATOR:
+    return "li" + source_name(terminal.name);
+  case ABI_TERMINAL_CONVERSION:
+    return "cv" + mangle_type(*facts.conversion_type);
+  }
+  throw std::logic_error("invalid ABI function terminal");
+}
+
+// <nested-name> or <unscoped-name> of a function from its name pieces.
+std::string Mangler::mangle_function_name(const FunctionFacts & facts)
+{
+  std::vector<NamePiece> pieces = facts.pieces;
+  const AbiTerminal * terminal = facts.terminal;
+  // A source-level "operator" component is a placeholder when a terminal
+  // supplies the ABI unqualified name.
+  if(terminal && !pieces.empty() && pieces.back().kind == NamePiece::SOURCE &&
+     *pieces.back().spelling == "operator") {
+    pieces.pop_back();
+  }
+  if(pieces.empty() && !terminal) {
+    throw std::logic_error("ABI function has no name");
+  }
+  const std::size_t prefix_count = terminal ? pieces.size() : pieces.size() - 1;
+  const std::size_t component_count = (facts.standard ? 1 : 0) + pieces.size() +
+    (terminal ? 1 : 0);
+  const bool nested = component_count > 1 &&
+    !(facts.standard && !terminal && pieces.size() == 1 &&
+      facts.qualifiers.empty());
+
+  std::string result;
+  if(nested) result += "N";
+  append_qualifier_codes(facts.qualifiers, &result);
+  std::size_t start = 0;
+  bool substituted = false;
+  for(std::size_t length = prefix_count; length > 0; --length) {
+    const NamePiece & piece = pieces[length - 1];
+    const AbiKeyId key = piece.kind == NamePiece::TEMPLATE ? piece.complete_key :
+      piece.key;
+    std::string spelling;
+    if(substitutions_.lookup(key, &spelling)) {
+      result += spelling;
+      start = length;
+      substituted = true;
+      break;
+    }
+  }
+  if(facts.standard && !substituted) {
+    result += facts.standard_substitution;
+  }
+  for(std::size_t i = start; i < prefix_count; ++i) {
+    append_name_piece(pieces[i], true, &result);
+  }
+  if(terminal) {
+    result += mangle_terminal(facts, prefix_count > 0);
+  } else {
+    append_name_piece(pieces.back(), false, &result);
+  }
+  result += mangle_tag_list(facts.tags);
+  for(std::size_t i = 0; i < facts.template_prefix_keys.size(); ++i) {
+    substitutions_.add(facts.template_prefix_keys[i]);
+  }
+  if(!facts.template_arguments.empty()) {
+    result += mangle_template_args(facts.template_arguments);
+  }
+  if(nested) result += "E";
+  return result;
+}
+
+// <local-name> forms: a member of a local class, a closure call operator, or
+// a namespace-scope closure call operator.  The local class or closure type
+// is a <prefix> candidate keyed exactly as the corresponding type fact.
+std::string Mangler::mangle_context_function_name(const FunctionFacts & facts)
+{
+  const AbiFunctionRecord & context = *facts.context;
+  std::string result;
+  AbiKeyId owner_key = 0;
+  if(context.kind == ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT) {
+    result = "N";
+    append_qualifier_codes(facts.qualifiers, &result);
+    append_prefixes(context.namespace_qualifiers,
+                    context.namespace_qualifiers.size(), &result);
+    result += source_name(context.source_name);
+    owner_key = namespace_lambda_key(context.namespace_qualifiers,
+                                     context.source_name);
+  } else {
+    result = mangle_context(context.context_ref) + "N";
+    append_qualifier_codes(facts.qualifiers, &result);
+    if(context.kind == ABI_FUNCTION_RECORD_LOCAL_CONTEXT) {
+      result += source_name(context.source_name) +
+        local_discriminator_suffix(context.discriminator);
+      owner_key = local_type_key(context.context_ref, context.source_name,
+                                 context.discriminator);
+    } else {
+      result += "Ul";
+      if(context.types.empty()) result += "v";
+      for(std::size_t i = 0; i < context.types.size(); ++i) {
+        result += mangle_type(context.types[i]);
+      }
+      result += "E";
+      if(!is_dash(context.discriminator)) result += context.discriminator;
+      result += "_";
+      owner_key = lambda_closure_key(context.context_ref, context.discriminator,
+                                     context.types);
+    }
+  }
+  substitutions_.add(owner_key);
+  if(facts.terminal) {
+    result += mangle_terminal(facts, true);
+  } else {
+    result += "cl";
+  }
+  result += mangle_tag_list(facts.tags);
+  for(std::size_t i = 0; i < facts.template_prefix_keys.size(); ++i) {
+    substitutions_.add(facts.template_prefix_keys[i]);
+  }
+  if(!facts.template_arguments.empty()) {
+    result += mangle_template_args(facts.template_arguments);
+  }
+  return result + "E";
+}
+
+// Z <encoding> E of a local-name context, sharing this name's substitution
+// table; a raw context is an already-normalized fragment.
+std::string Mangler::mangle_context(const std::string & ref)
+{
+  DepthScope scope(this);
+  const AbiLocalContext & context = context_definition(ref);
+  if(context.kind == ABI_CONTEXT_RAW) {
+    return context.fragment;
+  }
+  return "Z" + mangle_function(context.function, std::vector<AbiFunctionRecord>()) +
+    "E";
+}
+
+// ---------------------------------------------------------------------------
+// Entities
+
+// Entity operands are encoded with a fresh substitution table: the fixtures
+// pin that nothing inside L_Z...E is visible to the enclosing name.
+std::string Mangler::mangle_entity_encoding(const AbiEntityFact & entity)
+{
+  DepthScope scope(this);
+  Mangler nested(definitions_, depth_);
+  return nested.mangle_entity_impl(entity);
+}
+
+std::string Mangler::mangle_entity_impl(const AbiEntityFact & entity)
+{
+  if(entity.kind == ABI_ENTITY_FACT_SYMBOL) {
+    return entity.qualified_name;
+  }
+  if(entity.kind == ABI_ENTITY_FACT_FUNCTION) {
+    return "_Z" + mangle_function(entity.function,
+                                  std::vector<AbiFunctionRecord>());
+  }
+  return "_Z" + (entity.internal_linkage ?
+    mangle_internal_name(entity.qualified_name) :
+    mangle_qualified_name(entity.qualified_name));
+}
+
+// ---------------------------------------------------------------------------
+// Targets
+
+std::string Mangler::mangle_special_target(const AbiTargetRecord & target)
+{
+  switch(target.kind) {
+  case ABI_TARGET_FACT_TYPE:
+    return mangle_type(target.type);
+  case ABI_TARGET_FACT_TYPEINFO:
+    return "_ZTI" + mangle_type(target.type);
+  case ABI_TARGET_FACT_VTABLE:
+    return "_ZTV" + mangle_type(target.type);
+  case ABI_TARGET_FACT_VTT:
+    return "_ZTT" + mangle_type(target.type);
+  case ABI_TARGET_FACT_CONSTRUCTION_VTABLE:
+    return "_ZTC" + mangle_type(target.type) + number_word(target.base_offset) +
+      "_" + mangle_type(target.base_type);
+  case ABI_TARGET_FACT_THREAD_LOCAL_WRAPPER:
+    return "_ZTW" + mangle_qualified_name(target.qualified_name);
+  case ABI_TARGET_FACT_VARIABLE:
+    return "_Z" + mangle_qualified_name(target.qualified_name);
+  default:
+    throw std::logic_error("unsupported ABI target");
+  }
+}
+
+// <special-name> thunks: Th <call-offset> and Tc <call-offset> <call-offset>,
+// where a call offset is h <fixed> _ or v <fixed> _ <vcall offset> _.
+std::string Mangler::mangle_thunk(const AbiTargetRecord & target,
+                                  const std::string & encoding) const
+{
+  if(target.kind == ABI_TARGET_FACT_VIRTUAL_BASE_THUNK) {
+    return "_ZTv" + signed_number(target.this_adjust) + "_" +
+      signed_number(target.vcall_offset) + "_" + encoding;
+  }
+  std::string result = target.has_result_adjust ? "_ZTc" : "_ZT";
+  result += "h" + signed_number(target.this_adjust) + "_";
+  if(target.has_result_adjust) {
+    if(target.result_adjust_virtual) {
+      result += "v" + signed_number(target.result_adjust) + "_" +
+        signed_number(target.result_vcall_offset) + "_";
+    } else {
+      result += "h" + signed_number(target.result_adjust) + "_";
+    }
+  }
+  return result + encoding;
 }
 
 std::string Mangler::mangle_target(const AbiTargetRecord & target,
-                                   const AbiFunctionShape & shape)
+                                   const std::vector<AbiFunctionRecord> & records)
 {
   if(target.kind == ABI_TARGET_FACT_FUNCTION) {
     if(target.c_linkage) return target.function.qualified_name;
-    return mangle_function(shape);
+    return "_Z" + mangle_function(target.function, records);
   }
   if(target.kind == ABI_TARGET_FACT_THUNK ||
      target.kind == ABI_TARGET_FACT_VIRTUAL_BASE_THUNK) {
-    const std::string base = mangle_function(shape);
-    if(base.compare(0, 2, "_Z") != 0) {
-      throw std::logic_error("thunk function is not Itanium-mangled");
-    }
-    const std::string encoding = base.substr(2);
-    if(target.kind == ABI_TARGET_FACT_VIRTUAL_BASE_THUNK) {
-      return "_ZTv0_" + signed_number(target.vcall_offset) + "_" + encoding;
-    }
-    std::string result = "_ZT";
-    if(target.has_result_adjust) {
-      result += "c";
-    }
-    result += mangle_call_offset(target.this_adjust);
-    if(target.has_result_adjust) {
-      if(target.result_adjust_virtual) {
-        result += "v0_" + signed_number(target.result_vcall_offset) + "_";
-      } else {
-        result += mangle_call_offset(target.result_adjust);
-      }
-    }
-    return result + encoding;
+    return mangle_thunk(target, mangle_function(target.function, records));
   }
   return mangle_special_target(target);
 }
 
-std::string mangle_fact_case(const AbiFactCase & fact_case)
+std::string mangle_target(const AbiTargetRecord & target,
+                          const std::vector<AbiFunctionRecord> & function_records,
+                          const AbiDefinitionTable & definitions)
 {
-  AbiDefinitionTable definitions;
-  const AbiTargetRecord * target = 0;
-  AbiFunctionShape shape;
-  for(std::size_t i = 0; i < fact_case.records.size(); ++i) {
-    const AbiFactRecord & record = fact_case.records[i];
-    if(record.kind == ABI_FACT_RECORD_DEFINITION) {
-      definitions.add(record.definition);
-    } else if(record.kind == ABI_FACT_RECORD_TARGET) {
-      if(target) {
-        throw std::logic_error("ABI case must contain exactly one target");
-      }
-      target = &record.target;
-    } else if(record.kind == ABI_FACT_RECORD_FUNCTION) {
-      shape.records.push_back(record.function);
-    }
-  }
-  if(!target) {
-    throw std::logic_error("ABI case must contain exactly one target");
-  }
-  shape.target = target->function;
-  return abi_mangle::Mangler(definitions).mangle_target(*target, shape);
+  return Mangler(definitions, 0).mangle_target(target, function_records);
 }
 
-std::string mangle_fact_files(const std::vector<std::string> & input_paths)
+std::string mangle_fact_case(const AbiFactCase & fact_case)
 {
-  std::string output;
-  std::string first_error;
-  for(std::size_t i = 0; i < input_paths.size(); ++i) {
-    std::ifstream input(input_paths[i].c_str());
-    if(!input) {
-      throw std::logic_error("unable to read ABI fact file '" + input_paths[i] +
-        "'");
-    }
-    AbiFactCase current;
-    bool active = false;
-    std::string line;
-    while(std::getline(input, line)) {
-      const std::vector<std::string> words = split_fact_line(line);
-      if(words.empty()) {
-        continue;
-      }
-      if(words[0] == "case") {
-        if(words.size() != 2) {
-          throw std::logic_error("malformed case header");
-        }
-        if(active) {
-          append_stream_case(current, &output, &first_error);
-        }
-        current = AbiFactCase();
-        current.label = words[1];
-        active = true;
-        continue;
-      }
-      if(!active) {
-        active = true;
-        current = AbiFactCase();
-      }
-      current.records.push_back(parse_fact_record_words(words));
-    }
-    if(active) {
-      append_stream_case(current, &output, &first_error);
-    } else {
-      throw std::logic_error("ABI fact file contains no cases");
-    }
+  if(!fact_case.has_target) {
+    throw std::logic_error("ABI case must contain exactly one target");
   }
-  if(!first_error.empty()) {
-    throw std::logic_error(first_error);
-  }
-  return output;
+  AbiDefinitionTable definitions;
+  definitions.add_case(fact_case);
+  return mangle_target(fact_case.target, fact_case.function_records, definitions);
 }
 
 }  // namespace abi_mangle

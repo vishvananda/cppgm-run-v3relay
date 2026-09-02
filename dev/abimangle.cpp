@@ -12,9 +12,6 @@
 
 using namespace std;
 
-namespace abi_mangle {
-}  // namespace abi_mangle
-
 namespace {
 
 struct AbimangleInvocation

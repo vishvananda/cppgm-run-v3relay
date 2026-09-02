@@ -1,27 +1,129 @@
+// Itanium <type>, <template-arg>, and <expression> encoding, the structural
+// key authority, and the fixed fact vocabularies.
+
 #include "abi_mangle_encoder.h"
 
 #include <algorithm>
-#include <limits>
-#include <sstream>
 #include <stdexcept>
 
 namespace abi_mangle {
+
+// ---------------------------------------------------------------------------
+// Vocabulary tables: one row per enum value, indexed by the reader (word ->
+// enum), the serializer (enum -> word), and the encoder (enum -> code).
+
 namespace {
 
-const std::size_t kMaximumDefinitionDepth = 65536;
+const AbiBuiltinTypeInfo kBuiltinTypes[ABI_BUILTIN_COUNT] = {
+  {"void", "v", 0, false},
+  {"bool", "b", 0, false},
+  {"char", "c", 8, false},
+  {"schar", "a", 8, false},
+  {"uchar", "h", 8, true},
+  {"short", "s", 16, false},
+  {"ushort", "t", 16, true},
+  {"int", "i", 32, false},
+  {"uint", "j", 32, true},
+  {"long", "l", 64, false},
+  {"ulong", "m", 64, true},
+  {"longlong", "x", 64, false},
+  {"ulonglong", "y", 64, true},
+  {"int128", "n", 128, false},
+  {"uint128", "o", 128, true},
+  {"float", "f", 0, false},
+  {"double", "d", 0, false},
+  {"longdouble", "e", 0, false},
+  {"float128", "g", 0, false},
+  {"wchar", "w", 32, false},
+  {"char16", "Ds", 16, true},
+  {"char32", "Di", 32, true},
+  {"nullptr", "Dn", 0, false},
+  {"auto", "Da", 0, false},
+  {"complex-float", "Cf", 0, false},
+  {"complex-double", "Cd", 0, false},
+  {"complex-longdouble", "Ce", 0, false},
+};
 
-void check_depth(std::size_t depth)
+const AbiSpecialFunctionInfo kSpecialFunctions[ABI_SPECIAL_FUNCTION_COUNT] = {
+  {"constructor-complete", "C1"},
+  {"constructor-base", "C2"},
+  {"constructor-allocating", "C3"},
+  {"destructor-deleting", "D0"},
+  {"destructor-complete", "D1"},
+  {"destructor-base", "D2"},
+};
+
+const AbiOperatorInfo kOperators[ABI_OPERATOR_COUNT] = {
+  {"new", "nw", 0},
+  {"new-array", "na", 0},
+  {"delete", "dl", 0},
+  {"delete-array", "da", 0},
+  {"plus", "pl", "ps"},
+  {"minus", "mi", "ng"},
+  {"address-of", "an", "ad"},
+  {"deref", "ml", "de"},
+  {"unary-plus", "ps", 0},
+  {"binary-plus", "pl", 0},
+  {"unary-minus", "ng", 0},
+  {"binary-minus", "mi", 0},
+  {"bit-and", "an", 0},
+  {"multiply", "ml", 0},
+  {"divide", "dv", 0},
+  {"remainder", "rm", 0},
+  {"bit-or", "or", 0},
+  {"bit-xor", "eo", 0},
+  {"assign", "aS", 0},
+  {"plus-assign", "pL", 0},
+  {"minus-assign", "mI", 0},
+  {"multiply-assign", "mL", 0},
+  {"divide-assign", "dV", 0},
+  {"remainder-assign", "rM", 0},
+  {"bit-and-assign", "aN", 0},
+  {"bit-or-assign", "oR", 0},
+  {"bit-xor-assign", "eO", 0},
+  {"shift-left", "ls", 0},
+  {"shift-right", "rs", 0},
+  {"shift-left-assign", "lS", 0},
+  {"shift-right-assign", "rS", 0},
+  {"equal", "eq", 0},
+  {"not-equal", "ne", 0},
+  {"less", "lt", 0},
+  {"greater", "gt", 0},
+  {"less-equal", "le", 0},
+  {"greater-equal", "ge", 0},
+  {"spaceship", "ss", 0},
+  {"logical-not", "nt", 0},
+  {"logical-and", "aa", 0},
+  {"logical-or", "oo", 0},
+  {"complement", "co", 0},
+  {"increment", "pp", 0},
+  {"decrement", "mm", 0},
+  {"comma", "cm", 0},
+  {"member-pointer", "pm", 0},
+  {"arrow", "pt", 0},
+  {"call", "cl", 0},
+  {"index", "ix", 0},
+  {"co-await", "aw", 0},
+};
+
+// Accepted alternate spellings of operator words.
+struct OperatorAlias
 {
-  if(depth > kMaximumDefinitionDepth) {
-    throw std::logic_error("ABI definition graph is too deep");
-  }
-}
+  const char * word;
+  AbiOperatorKind kind;
+};
+
+const OperatorAlias kOperatorAliases[] = {
+  {"dereference", ABI_OPERATOR_DEREF},
+  {"modulo", ABI_OPERATOR_REMAINDER},
+  {"modulo-assign", ABI_OPERATOR_REMAINDER_ASSIGN},
+  {"subscript", ABI_OPERATOR_INDEX},
+  {"arrow-star", ABI_OPERATOR_MEMBER_POINTER},
+};
 
 std::string number_word(unsigned long long value)
 {
-  std::ostringstream output;
-  output << value;
-  return output.str();
+  return std::to_string(value);
 }
 
 std::string signed_number_word(long long value)
@@ -29,9 +131,28 @@ std::string signed_number_word(long long value)
   if(value >= 0) {
     return number_word(static_cast<unsigned long long>(value));
   }
-  const unsigned long long magnitude = 0ULL -
-    static_cast<unsigned long long>(value);
-  return "n" + number_word(magnitude);
+  return "n" + number_word(0ULL - static_cast<unsigned long long>(value));
+}
+
+std::string id_word(AbiKeyId id)
+{
+  return number_word(static_cast<unsigned long long>(id));
+}
+
+std::string source_name(const std::string & name)
+{
+  return number_word(name.size()) + name;
+}
+
+std::string strip_scope(const std::string & name)
+{
+  return name.compare(0, 2, "::") == 0 ? name.substr(2) : name;
+}
+
+std::string template_param_spelling(std::size_t index)
+{
+  return index == 0 ? std::string("T_") :
+    "T" + number_word(static_cast<unsigned long long>(index - 1)) + "_";
 }
 
 std::string expression_operator_code(const std::string & operation)
@@ -46,1128 +167,1059 @@ std::string expression_operator_code(const std::string & operation)
   return operation;
 }
 
-std::string strip_scope(const std::string & name)
-{
-  return name.compare(0, 2, "::") == 0 ? name.substr(2) : name;
-}
-
-std::string base_key(const std::string & prefix, const std::string & value)
-{
-  return prefix + "(" + value + ")";
-}
-
-std::string source_name(const std::string & name)
-{
-  return std::to_string(name.size()) + name;
-}
-
-std::string tags_key(const std::vector<std::string> & tags)
+std::string canonical_tags(const std::vector<std::string> & tags)
 {
   std::vector<std::string> sorted = tags;
   std::sort(sorted.begin(), sorted.end());
   sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
   std::string key;
   for(std::size_t i = 0; i < sorted.size(); ++i) {
-    key += "B" + sorted[i];
+    key += "B" + source_name(sorted[i]);
   }
   return key;
 }
 
-bool lookup_substitution(SubstitutionTable * table, const std::string & key,
-                         std::string * result)
+// Decimal spelling of a 128-bit unsigned value.
+std::string wide_number_word(unsigned __int128 value)
 {
-  return !key.empty() && table->lookup(key, result);
-}
-
-std::string cv_key(const AbiType & type, const std::string & child)
-{
-  std::string key;
-  if(type.is_volatile) {
-    key += "V";
+  if(value == 0) {
+    return "0";
   }
-  if(type.is_const) {
-    key += "K";
+  std::string digits;
+  while(value != 0) {
+    digits.insert(digits.begin(), static_cast<char>('0' + value % 10));
+    value /= 10;
   }
-  return key.empty() ? child : key + "(" + child + ")";
+  return digits;
 }
 
 }  // namespace
 
-bool SubstitutionTable::lookup(const std::string & key,
-                               std::string * spelling) const
+const AbiBuiltinTypeInfo & builtin_type_info(AbiBuiltinType type)
 {
-  const std::map<std::string, std::size_t>::const_iterator it = indexes_.find(key);
-  if(it == indexes_.end()) {
+  return kBuiltinTypes[type];
+}
+
+bool lookup_builtin_type(const std::string & word, AbiBuiltinType * type)
+{
+  for(std::size_t i = 0; i < ABI_BUILTIN_COUNT; ++i) {
+    if(word == kBuiltinTypes[i].word) {
+      *type = static_cast<AbiBuiltinType>(i);
+      return true;
+    }
+  }
+  return false;
+}
+
+const AbiSpecialFunctionInfo & special_function_info(AbiSpecialFunctionKind kind)
+{
+  return kSpecialFunctions[kind];
+}
+
+bool lookup_special_function(const std::string & word,
+                             AbiSpecialFunctionKind * kind)
+{
+  for(std::size_t i = 0; i < ABI_SPECIAL_FUNCTION_COUNT; ++i) {
+    if(word == kSpecialFunctions[i].word) {
+      *kind = static_cast<AbiSpecialFunctionKind>(i);
+      return true;
+    }
+  }
+  return false;
+}
+
+const AbiOperatorInfo & operator_info(AbiOperatorKind kind)
+{
+  return kOperators[kind];
+}
+
+bool lookup_operator(const std::string & word, AbiOperatorKind * kind)
+{
+  for(std::size_t i = 0; i < ABI_OPERATOR_COUNT; ++i) {
+    if(word == kOperators[i].word) {
+      *kind = static_cast<AbiOperatorKind>(i);
+      return true;
+    }
+  }
+  const std::size_t aliases = sizeof(kOperatorAliases) / sizeof(kOperatorAliases[0]);
+  for(std::size_t i = 0; i < aliases; ++i) {
+    if(word == kOperatorAliases[i].word) {
+      *kind = kOperatorAliases[i].kind;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Encoder state
+
+AbiKeyId KeyInterner::intern(const std::string & spelling)
+{
+  const std::unordered_map<std::string, AbiKeyId>::const_iterator it =
+    ids_.find(spelling);
+  if(it != ids_.end()) {
+    return it->second;
+  }
+  const AbiKeyId id = ids_.size() + 1;
+  ids_.insert(std::make_pair(spelling, id));
+  return id;
+}
+
+bool SubstitutionTable::lookup(AbiKeyId key, std::string * spelling) const
+{
+  if(key == 0 || key >= slots_.size() || slots_[key] == 0) {
     return false;
   }
-  if(spelling) {
-    *spelling = sequence_id(it->second);
-  }
-  return true;
-}
-
-void SubstitutionTable::add(const std::string & key)
-{
-  if(key.empty() || indexes_.find(key) != indexes_.end()) {
-    return;
-  }
-  const std::size_t index = keys_.size();
-  keys_.push_back(key);
-  indexes_[key] = index;
-}
-
-std::string SubstitutionTable::sequence_id(std::size_t index) const
-{
+  std::size_t index = slots_[key] - 1;
   if(index == 0) {
-    return "S_";
+    *spelling = "S_";
+    return true;
   }
   --index;
-  std::string result;
+  std::string digits;
   do {
     const std::size_t digit = index % 36;
-    result.insert(result.begin(),
+    digits.insert(digits.begin(),
       static_cast<char>(digit < 10 ? '0' + digit : 'A' + digit - 10));
     index /= 36;
   } while(index != 0);
-  return "S" + result + "_";
+  *spelling = "S" + digits + "_";
+  return true;
 }
 
-Mangler::Mangler(const AbiDefinitionTable & definitions)
-  : definitions_(definitions)
+void SubstitutionTable::add(AbiKeyId key)
 {
-}
-
-const AbiDefinitionRecord * Mangler::definition(const std::string & id) const
-{
-  return definitions_.find(id);
-}
-
-const AbiType * Mangler::type_definition(const std::string & id) const
-{
-  const AbiDefinitionRecord * record = definition(id);
-  if(!record || record->kind != ABI_DEFINITION_TYPE) {
-    return 0;
+  if(key == 0) {
+    return;
   }
-  return &record->type;
-}
-
-const AbiTemplateArgument * Mangler::argument_definition(
-  const std::string & id) const
-{
-  const AbiDefinitionRecord * record = definition(id);
-  if(!record || record->kind != ABI_DEFINITION_TEMPLATE_ARGUMENT) {
-    return 0;
+  if(key >= slots_.size()) {
+    slots_.resize(key + 1, 0);
   }
-  return &record->template_argument;
-}
-
-const AbiDependentExpression * Mangler::expression_definition(
-  const std::string & id) const
-{
-  const AbiDefinitionRecord * record = definition(id);
-  if(!record || record->kind != ABI_DEFINITION_EXPRESSION) {
-    return 0;
+  if(slots_[key] == 0) {
+    slots_[key] = ++count_;
   }
-  return &record->expression;
 }
 
-const AbiEntityFact * Mangler::entity_definition(const std::string & id) const
+DepthScope::DepthScope(Mangler * mangler)
+  : mangler_(mangler)
 {
-  const AbiDefinitionRecord * record = definition(id);
-  if(!record || record->kind != ABI_DEFINITION_ENTITY) {
-    return 0;
+  if(++mangler_->depth_ > ABI_MAXIMUM_NESTING_DEPTH) {
+    --mangler_->depth_;
+    throw std::logic_error("ABI facts nest too deeply");
   }
-  return &record->entity;
 }
 
-std::string Mangler::builtin_code(const AbiType & type) const
+DepthScope::~DepthScope()
 {
-  const std::string & name = type.name;
-  if(name == "void") return "v";
-  if(name == "bool") return "b";
-  if(name == "char") return "c";
-  if(name == "schar") return "a";
-  if(name == "uchar") return "h";
-  if(name == "short") return "s";
-  if(name == "ushort") return "t";
-  if(name == "int") return "i";
-  if(name == "uint") return "j";
-  if(name == "long") return "l";
-  if(name == "ulong") return "m";
-  if(name == "longlong") return "x";
-  if(name == "ulonglong") return "y";
-  if(name == "int128") return "n";
-  if(name == "uint128") return "o";
-  if(name == "float") return "f";
-  if(name == "double") return "d";
-  if(name == "longdouble") return "e";
-  if(name == "float128") return "g";
-  if(name == "wchar") return "w";
-  if(name == "char16") return "Ds";
-  if(name == "char32") return "Di";
-  if(name == "nullptr") return "Dn";
-  if(name == "auto") return "Da";
-  if(name == "complex-float") return "Cf";
-  if(name == "complex-double") return "Cd";
-  if(name == "complex-longdouble") return "Ce";
-  throw std::logic_error("unknown ABI builtin type '" + name + "'");
+  --mangler_->depth_;
 }
 
-std::string Mangler::mangle_builtin(const AbiType & type) const
+Mangler::Mangler(const AbiDefinitionTable & definitions, std::size_t depth)
+  : definitions_(definitions), depth_(depth)
 {
-  return builtin_code(type);
 }
 
-std::string Mangler::type_name_key(const AbiType & type) const
+const AbiType & Mangler::type_definition(const std::string & ref) const
 {
-  return "name:" + strip_scope(type.name) + tags_key(type.abi_tags);
-}
-
-std::string Mangler::key_of_type(const AbiType & type)
-{
-  return key_of_type_impl(type, 0);
-}
-
-std::string Mangler::type_key_ref(const std::string & ref, std::size_t depth)
-{
-  const AbiType * type = type_definition(ref);
+  const AbiType * type = definitions_.find_type(ref);
   if(!type) {
-    AbiType named;
-    named.kind = ABI_TYPE_NAMED;
-    named.name = ref;
-    return key_of_type_impl(named, depth + 1);
+    throw std::logic_error("unknown ABI type definition '" + ref + "'");
   }
-  const std::map<std::string, std::string>::const_iterator cached =
-    type_key_cache_.find(ref);
-  if(cached != type_key_cache_.end()) {
-    return cached->second;
+  return *type;
+}
+
+const AbiTemplateArgument & Mangler::argument_definition(
+  const std::string & ref) const
+{
+  const AbiTemplateArgument * argument = definitions_.find_argument(ref);
+  if(!argument) {
+    throw std::logic_error("unknown ABI template argument '" + ref + "'");
   }
-  if(active_type_keys_.find(ref) != active_type_keys_.end()) {
-    throw std::logic_error("cyclic ABI type definition");
+  return *argument;
+}
+
+const AbiDependentExpression & Mangler::expression_definition(
+  const std::string & ref) const
+{
+  const AbiDependentExpression * expression = definitions_.find_expression(ref);
+  if(!expression) {
+    throw std::logic_error("unknown ABI expression '" + ref + "'");
   }
-  active_type_keys_[ref] = true;
+  return *expression;
+}
+
+const AbiEntityFact & Mangler::entity_definition(const std::string & ref) const
+{
+  const AbiEntityFact * entity = definitions_.find_entity(ref);
+  if(!entity) {
+    throw std::logic_error("unknown ABI entity '" + ref + "'");
+  }
+  return *entity;
+}
+
+const AbiLocalContext & Mangler::context_definition(const std::string & ref) const
+{
+  const AbiLocalContext * context = definitions_.find_context(ref);
+  if(!context) {
+    throw std::logic_error("unknown ABI context '" + ref + "'");
+  }
+  return *context;
+}
+
+// Follows definition aliases (a NAME_OR_REFERENCE naming a let-type) to the
+// node that carries structure, accumulating cv qualifiers.  The walk is
+// bounded by the number of definitions, so alias cycles are rejected without
+// recursion.
+ResolvedType Mangler::resolve_type(const AbiType & input) const
+{
+  ResolvedType resolved;
+  resolved.node = &input;
+  std::size_t hops = 0;
+  while(true) {
+    resolved.is_const = resolved.is_const || resolved.node->is_const;
+    resolved.is_volatile = resolved.is_volatile || resolved.node->is_volatile;
+    if(resolved.node->kind != ABI_TYPE_NAME_OR_REFERENCE) {
+      return resolved;
+    }
+    const AbiType * definition = definitions_.find_type(resolved.node->name);
+    if(!definition) {
+      return resolved;
+    }
+    if(!resolved.node->abi_tags.empty()) {
+      throw std::logic_error("ABI tags must be attached to a named or template "
+        "type, not to the definition '" + resolved.node->name + "'");
+    }
+    if(++hops > definitions_.size()) {
+      throw std::logic_error("cyclic ABI type definition '" +
+        resolved.node->name + "'");
+    }
+    resolved.node = definition;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Structural keys
+
+AbiKeyId Mangler::cached_key(const void * fact, bool * ready)
+{
+  std::unordered_map<const void *, KeyCacheEntry>::iterator it =
+    key_cache_.find(fact);
+  if(it == key_cache_.end()) {
+    KeyCacheEntry entry;
+    entry.in_progress = true;
+    key_cache_.insert(std::make_pair(fact, entry));
+    *ready = false;
+    return 0;
+  }
+  if(it->second.in_progress) {
+    throw std::logic_error("cyclic ABI definition");
+  }
+  *ready = true;
+  return it->second.key;
+}
+
+void Mangler::store_key(const void * fact, AbiKeyId key)
+{
+  KeyCacheEntry & entry = key_cache_[fact];
+  entry.key = key;
+  entry.in_progress = false;
+}
+
+void Mangler::release_key(const void * fact)
+{
+  key_cache_.erase(fact);
+}
+
+AbiKeyId Mangler::key_of_type(const AbiType & input, bool ignore_cv)
+{
+  const ResolvedType resolved = resolve_type(input);
+  const AbiKeyId base = key_of_node(*resolved.node);
+  if(ignore_cv || !(resolved.is_const || resolved.is_volatile)) {
+    return base;
+  }
+  std::string spelling;
+  if(resolved.is_volatile) spelling += "V";
+  if(resolved.is_const) spelling += "K";
+  return keys_.intern(spelling + "(" + id_word(base) + ")");
+}
+
+// Every node the encoder sees is owned by the case for the whole name, so
+// its key is memoized by address; the in-progress state rejects definition
+// cycles.
+AbiKeyId Mangler::key_of_node(const AbiType & node)
+{
+  bool ready = false;
+  const AbiKeyId cached = cached_key(&node, &ready);
+  if(ready) {
+    return cached;
+  }
   try {
-    const std::string key = key_of_type_impl(*type, depth + 1);
-    active_type_keys_.erase(ref);
-    type_key_cache_[ref] = key;
+    const AbiKeyId key = key_of_node_impl(node);
+    store_key(&node, key);
     return key;
   } catch(...) {
-    active_type_keys_.erase(ref);
+    release_key(&node);
     throw;
   }
 }
 
-std::string Mangler::key_of_type_impl(const AbiType & input,
-                                      std::size_t depth)
+// Key of a type node with its own cv qualifiers ignored (the caller layers
+// them).  Children are referenced by id, so the spelling is bounded by the
+// node's fan-out.
+AbiKeyId Mangler::key_of_node_impl(const AbiType & node)
 {
-  check_depth(depth);
-  if(input.is_const || input.is_volatile) {
-    AbiType base = input;
-    base.is_const = false;
-    base.is_volatile = false;
-    return cv_key(input, key_of_type_impl(base, depth + 1));
-  }
-  if(input.kind == ABI_TYPE_NAME_OR_REFERENCE) {
-    if(type_definition(input.name)) {
-      return type_key_ref(input.name, depth);
-    }
-    AbiType named = input;
-    named.kind = ABI_TYPE_NAMED;
-    return key_of_type_impl(named, depth + 1);
-  }
-  switch(input.kind) {
+  DepthScope scope(this);
+  switch(node.kind) {
   case ABI_TYPE_NAME_OR_REFERENCE:
-    throw std::logic_error("unresolved ABI type reference");
-  case ABI_TYPE_BUILTIN:
-    // Builtins are not substitution candidates, but they still need a
-    // distinct structural key when they occur inside a candidate.
-    return "builtin:" + builtin_code(input);
   case ABI_TYPE_NAMED:
-    return type_name_key(input);
+    return name_key(node.name, node.abi_tags);
+  case ABI_TYPE_BUILTIN:
+    return keys_.intern(std::string("b:") + builtin_type_info(node.builtin).code);
   case ABI_TYPE_TEMPLATE_PARAMETER:
-    return input.substitutable ? "Tsub(" + number_word(input.index) + ")" : "";
+    return keys_.intern("T" + number_word(node.index));
   case ABI_TYPE_POINTER:
-    return base_key("P", key_of_type_impl(input.types.at(0), depth + 1));
+    return keys_.intern("P(" + id_word(key_of_type(node.types.at(0), false)) + ")");
   case ABI_TYPE_LVALUE_REFERENCE:
-    return base_key("R", key_of_type_impl(input.types.at(0), depth + 1));
+    return keys_.intern("R(" + id_word(key_of_type(node.types.at(0), false)) + ")");
   case ABI_TYPE_RVALUE_REFERENCE:
-    return base_key("O", key_of_type_impl(input.types.at(0), depth + 1));
-  case ABI_TYPE_CV:
-    return cv_key(input, key_of_type_impl(input.types.at(0), depth + 1));
+    return keys_.intern("O(" + id_word(key_of_type(node.types.at(0), false)) + ")");
   case ABI_TYPE_PACK_EXPANSION:
-    return base_key("Dp", key_of_type_impl(input.types.at(0), depth + 1));
+    return keys_.intern("Dp(" + id_word(key_of_type(node.types.at(0), false)) + ")");
   case ABI_TYPE_VENDOR_QUALIFIED:
-    return base_key("U" + number_word(input.name.size()) + input.name,
-      key_of_type_impl(input.types.at(0), depth + 1));
+    return keys_.intern("U" + source_name(node.name) + "(" +
+      id_word(key_of_type(node.types.at(0), false)) + ")");
   case ABI_TYPE_ARRAY:
-    return base_key("A" + input.array_bound.value,
-      key_of_type_impl(input.types.at(0), depth + 1));
+    return keys_.intern("A" + node.array_bound.value + "(" +
+      id_word(key_of_type(node.types.at(0), false)) + ")");
   case ABI_TYPE_BUILTIN_TRANSFORM:
-    return base_key("u" + number_word(input.name.size()) + input.name,
-      key_of_type_impl(input.types.at(0), depth + 1));
+    return keys_.intern("u" + source_name(node.name) + "(" +
+      id_word(key_of_type(node.types.at(0), false)) + ")");
   case ABI_TYPE_FUNCTION: {
-    std::string key = "F";
-    for(std::size_t i = 0; i < input.types.size(); ++i) {
-      key += key_of_type_impl(input.types[i], depth + 1) + ";";
+    std::string spelling = "F(";
+    for(std::size_t i = 0; i < node.types.size(); ++i) {
+      spelling += id_word(key_of_type(node.types[i], false)) + ";";
     }
-    return key + (input.variadic ? "z" : "") + "E";
+    return keys_.intern(spelling + (node.variadic ? "z)" : ")"));
   }
   case ABI_TYPE_MEMBER_POINTER:
-    return "M(" + key_of_type_impl(input.types.at(0), depth + 1) + "," +
-      key_of_type_impl(input.types.at(1), depth + 1) + ")";
-  case ABI_TYPE_TEMPLATE_SPECIALIZATION: {
-    std::string key = "template:" + strip_scope(input.name) + "<";
-    for(std::size_t i = 0; i < input.argument_refs.size(); ++i) {
-      key += argument_key_ref(input.argument_refs[i], depth + 1) + ";";
-    }
-    return key + ">" + tags_key(input.abi_tags);
-  }
-  case ABI_TYPE_TEMPLATE_PARAMETER_SPECIALIZATION: {
-    std::string key = "TT(" + number_word(input.index) + ")<";
-    for(std::size_t i = 0; i < input.argument_refs.size(); ++i) {
-      key += argument_key_ref(input.argument_refs[i], depth + 1) + ";";
-    }
-    return key + ">";
-  }
+    return keys_.intern("M(" + id_word(key_of_type(node.types.at(0), false)) +
+      "," + id_word(key_of_type(node.types.at(1), false)) + ")");
+  case ABI_TYPE_TEMPLATE_SPECIALIZATION:
   case ABI_TYPE_STD_TEMPLATE_SPECIALIZATION:
-    return "std:" + input.standard_substitution + ":" +
-      (input.standard_substitution_includes_arguments ? "yes" : "no") + ":" +
-      strip_scope(input.name);
+  case ABI_TYPE_TEMPLATE_PARAMETER_SPECIALIZATION: {
+    if(node.kind == ABI_TYPE_STD_TEMPLATE_SPECIALIZATION &&
+       node.standard_substitution_includes_arguments) {
+      return keys_.intern("std(" + node.standard_substitution + ")");
+    }
+    std::string spelling = node.kind == ABI_TYPE_TEMPLATE_PARAMETER_SPECIALIZATION ?
+      "TT(" + number_word(node.index) :
+      "S(" + id_word(name_key(node.name, node.abi_tags));
+    for(std::size_t i = 0; i < node.argument_refs.size(); ++i) {
+      spelling += ":" + id_word(key_of_argument_ref(node.argument_refs[i]));
+    }
+    return keys_.intern(spelling + ")");
+  }
   case ABI_TYPE_MEMBER:
   case ABI_TYPE_MEMBER_TEMPLATE_SPECIALIZATION: {
-    std::string key = input.kind == ABI_TYPE_MEMBER ? "member:" : "member-template:";
-    key += key_of_type_impl(input.types.at(0), depth + 1) + ":" + input.name;
-    for(std::size_t i = 0; i < input.argument_refs.size(); ++i) {
-      key += ":" + argument_key_ref(input.argument_refs[i], depth + 1);
+    std::string spelling = "m(" + id_word(key_of_type(node.types.at(0), true)) +
+      ":" + node.name;
+    for(std::size_t i = 0; i < node.argument_refs.size(); ++i) {
+      spelling += ":" + id_word(key_of_argument_ref(node.argument_refs[i]));
     }
-    return key;
+    return keys_.intern(spelling + ")");
   }
   case ABI_TYPE_DECLTYPE_EXPRESSION:
-    return "DT(" + expression_key_ref(input.expression_ref, depth + 1) + ")";
-  case ABI_TYPE_LAMBDA_CLOSURE: {
-    std::string key = "lambda:" + input.context_ref + ":" +
-      input.discriminator;
-    for(std::size_t i = 0; i < input.types.size(); ++i) {
-      key += ":" + key_of_type_impl(input.types[i], depth + 1);
-    }
-    return key;
-  }
+    return keys_.intern("DT(" + id_word(key_of_expression_ref(node.expression_ref)) +
+      ")");
+  case ABI_TYPE_LAMBDA_CLOSURE:
+    return lambda_closure_key(node.context_ref, node.discriminator, node.types);
   case ABI_TYPE_LOCAL_TYPE:
-    return "local:" + input.context_ref + ":" + input.name + ":" +
-      input.discriminator;
-  case ABI_TYPE_NAMESPACE_LAMBDA: {
-    std::string key = "namespace-lambda:" + input.name;
-    for(std::size_t i = 0; i < input.namespace_qualifiers.size(); ++i) {
-      key += ":" + input.namespace_qualifiers[i];
-    }
+    return local_type_key(node.context_ref, node.name, node.discriminator);
+  case ABI_TYPE_NAMESPACE_LAMBDA:
+    return namespace_lambda_key(node.namespace_qualifiers, node.name);
+  }
+  throw std::logic_error("unknown ABI type kind");
+}
+
+// Local classes, closures, and namespace-scope closures are keyed the same
+// way whether they appear as types or as the owner of a call operator.
+
+AbiKeyId Mangler::local_type_key(const std::string & context_ref,
+                                 const std::string & name,
+                                 const std::string & discriminator)
+{
+  const bool first = discriminator.empty() || discriminator == "-" ||
+    discriminator == "0";
+  return keys_.intern("Z(" + context_ref + ":" + name + ":" +
+    (first ? std::string("0") : discriminator) + ")");
+}
+
+AbiKeyId Mangler::lambda_closure_key(const std::string & context_ref,
+                                     const std::string & discriminator,
+                                     const std::vector<AbiType> & signature)
+{
+  std::string spelling = "Ul(" + context_ref + ":" +
+    (discriminator == "-" ? std::string() : discriminator);
+  for(std::size_t i = 0; i < signature.size(); ++i) {
+    spelling += ":" + id_word(key_of_type(signature[i], false));
+  }
+  return keys_.intern(spelling + ")");
+}
+
+AbiKeyId Mangler::namespace_lambda_key(const std::vector<std::string> & qualifiers,
+                                       const std::string & name)
+{
+  std::string spelling = "NL(";
+  for(std::size_t i = 0; i < qualifiers.size(); ++i) {
+    spelling += qualifiers[i] + "::";
+  }
+  return keys_.intern(spelling + name + ")");
+}
+
+AbiKeyId Mangler::key_of_argument_ref(const std::string & ref)
+{
+  const AbiTemplateArgument & argument = argument_definition(ref);
+  bool ready = false;
+  const AbiKeyId cached = cached_key(&argument, &ready);
+  if(ready) {
+    return cached;
+  }
+  try {
+    const AbiKeyId key = key_of_argument(argument);
+    store_key(&argument, key);
     return key;
+  } catch(...) {
+    release_key(&argument);
+    throw;
+  }
+}
+
+AbiKeyId Mangler::key_of_argument(const AbiTemplateArgument & argument)
+{
+  DepthScope scope(this);
+  switch(argument.kind) {
+  case ABI_TEMPLATE_ARGUMENT_TYPE:
+    return key_of_type(argument.type, false);
+  case ABI_TEMPLATE_ARGUMENT_VALUE:
+    return keys_.intern("v(" + mangle_integral_value(argument.value_type,
+      argument.value) + ")");
+  case ABI_TEMPLATE_ARGUMENT_DEPENDENT_VALUE:
+    return keys_.intern("dv(" + id_word(key_of_type(argument.type, false)) + ":" +
+      mangle_integral_value(argument.value_type, argument.value) + ")");
+  case ABI_TEMPLATE_ARGUMENT_UNTYPED_VALUE:
+    return keys_.intern("uv(" + signed_number_word(argument.value) + ")");
+  case ABI_TEMPLATE_ARGUMENT_EXPRESSION:
+    return keys_.intern("ax(" + id_word(key_of_expression_ref(
+      argument.expression_ref)) + ")");
+  case ABI_TEMPLATE_ARGUMENT_TEMPLATE_ENTITY:
+    return keys_.intern("at(" + id_word(name_key(argument.name,
+      std::vector<std::string>())) + ")");
+  case ABI_TEMPLATE_ARGUMENT_MEMBER_TEMPLATE_ENTITY:
+    return keys_.intern("am(" + id_word(key_of_type(argument.type, true)) + ":" +
+      argument.name + ")");
+  case ABI_TEMPLATE_ARGUMENT_TEMPLATE_PARAMETER_TEMPLATE:
+    return keys_.intern("ap(" + number_word(argument.index) + ")");
+  case ABI_TEMPLATE_ARGUMENT_MEMBER_EXTERNAL_ENTITY:
+    return keys_.intern("ae(" + argument.symbol + ")");
+  case ABI_TEMPLATE_ARGUMENT_ENTITY:
+    return keys_.intern(std::string(argument.address_of ? "aad(" : "aen(") +
+      id_word(key_of_entity(entity_definition(argument.entity_ref))) + ")");
+  case ABI_TEMPLATE_ARGUMENT_PACK: {
+    std::string spelling = "J(";
+    for(std::size_t i = 0; i < argument.argument_refs.size(); ++i) {
+      spelling += id_word(key_of_argument_ref(argument.argument_refs[i])) + ";";
+    }
+    return keys_.intern(spelling + ")");
+  }
+  }
+  throw std::logic_error("unknown ABI template argument kind");
+}
+
+AbiKeyId Mangler::key_of_expression_ref(const std::string & ref)
+{
+  const AbiDependentExpression & expression = expression_definition(ref);
+  bool ready = false;
+  const AbiKeyId cached = cached_key(&expression, &ready);
+  if(ready) {
+    return cached;
+  }
+  try {
+    const AbiKeyId key = key_of_expression(expression);
+    store_key(&expression, key);
+    return key;
+  } catch(...) {
+    release_key(&expression);
+    throw;
+  }
+}
+
+AbiKeyId Mangler::key_of_expression(const AbiDependentExpression & expression)
+{
+  DepthScope scope(this);
+  std::string spelling = "x" + number_word(expression.kind) + "(";
+  switch(expression.kind) {
+  case ABI_EXPRESSION_TEMPLATE_PARAMETER:
+  case ABI_EXPRESSION_FUNCTION_PARAMETER:
+    spelling += number_word(expression.index);
+    break;
+  case ABI_EXPRESSION_LITERAL:
+  case ABI_EXPRESSION_INTEGRAL_VALUE:
+    spelling += signed_number_word(expression.value);
+    break;
+  case ABI_EXPRESSION_UNARY:
+  case ABI_EXPRESSION_BINARY:
+  case ABI_EXPRESSION_OBJECT_MEMBER:
+    spelling += expression_operator_code(expression.op) + ":" + expression.text;
+    break;
+  case ABI_EXPRESSION_CONVERSION:
+  case ABI_EXPRESSION_CAST:
+    spelling += expression_operator_code(expression.op) + ":" +
+      id_word(key_of_type(expression.type, false));
+    break;
+  case ABI_EXPRESSION_SIZEOF_TYPE:
+    spelling += id_word(key_of_type(expression.type, false));
+    break;
+  case ABI_EXPRESSION_MEMBER:
+    spelling += id_word(key_of_type(expression.type, false)) + ":" +
+      (expression.close_member_owner ? "E:" : ":") + expression.text;
+    break;
+  case ABI_EXPRESSION_TEMPLATE_ID:
+  case ABI_EXPRESSION_TYPE_TRAIT:
+    spelling += expression.text;
+    break;
+  case ABI_EXPRESSION_EXTERNAL_ENTITY:
+  case ABI_EXPRESSION_ENTITY:
+    spelling += id_word(key_of_entity(entity_definition(expression.entity_ref)));
+    break;
+  case ABI_EXPRESSION_CONDITIONAL:
+  case ABI_EXPRESSION_PACK_EXPANSION:
+  case ABI_EXPRESSION_CALL:
+    break;
+  }
+  for(std::size_t i = 0; i < expression.expression_refs.size(); ++i) {
+    spelling += ";" + id_word(key_of_expression_ref(expression.expression_refs[i]));
+  }
+  for(std::size_t i = 0; i < expression.argument_refs.size(); ++i) {
+    spelling += ",a" + id_word(key_of_argument_ref(expression.argument_refs[i]));
+  }
+  for(std::size_t i = 0; i < expression.type_arguments.size(); ++i) {
+    spelling += ",t" + id_word(key_of_type(expression.type_arguments[i], false));
+  }
+  return keys_.intern(spelling + ")");
+}
+
+AbiKeyId Mangler::key_of_entity(const AbiEntityFact & entity)
+{
+  DepthScope scope(this);
+  if(entity.kind == ABI_ENTITY_FACT_SYMBOL) {
+    return keys_.intern("sym(" + entity.qualified_name + ")");
+  }
+  if(entity.kind == ABI_ENTITY_FACT_VARIABLE) {
+    return keys_.intern(std::string(entity.internal_linkage ? "ivar(" : "var(") +
+      id_word(name_key(entity.qualified_name, std::vector<std::string>())) + ")");
+  }
+  std::string spelling = "fn(" + id_word(name_key(entity.function.qualified_name,
+    std::vector<std::string>()));
+  for(std::size_t i = 0; i < entity.function.path_operands.size(); ++i) {
+    const AbiFunctionPathOperand & operand = entity.function.path_operands[i];
+    if(operand.kind == ABI_FUNCTION_PATH_TYPE) {
+      spelling += ";t" + id_word(key_of_type(operand.type, false));
+    } else if(operand.kind == ABI_FUNCTION_PATH_TEMPLATE_ARGUMENT) {
+      spelling += ";a" + id_word(key_of_argument_ref(operand.argument_ref));
+    } else {
+      spelling += ";z";
+    }
+  }
+  return keys_.intern(spelling + ")");
+}
+
+// ---------------------------------------------------------------------------
+// <type>
+
+std::string Mangler::mangle_type(const AbiType & type)
+{
+  return mangle_type_impl(type, false);
+}
+
+std::string Mangler::mangle_type_impl(const AbiType & input, bool ignore_cv)
+{
+  DepthScope scope(this);
+  const ResolvedType resolved = resolve_type(input);
+  const bool qualified = !ignore_cv && (resolved.is_const || resolved.is_volatile);
+  if(!qualified) {
+    return mangle_node(*resolved.node, resolved.node->name);
+  }
+  const AbiKeyId key = key_of_type(input, false);
+  std::string spelling;
+  if(substitutions_.lookup(key, &spelling)) {
+    return spelling;
+  }
+  std::string result;
+  if(resolved.is_volatile) result += "V";
+  if(resolved.is_const) result += "K";
+  result += mangle_node(*resolved.node, resolved.node->name);
+  substitutions_.add(key);
+  return result;
+}
+
+// Emits one resolved node, ignoring its own cv qualifiers.  Every candidate
+// kind looks its key up first and registers it after emission, children
+// before parents, which is the Itanium substitution order.
+std::string Mangler::mangle_node(const AbiType & node,
+                                 const std::string & class_name)
+{
+  switch(node.kind) {
+  case ABI_TYPE_NAME_OR_REFERENCE:
+    return mangle_named_type(class_name, node.abi_tags);
+  case ABI_TYPE_NAMED:
+    return mangle_named_type(node.name, node.abi_tags);
+  case ABI_TYPE_BUILTIN:
+    return builtin_type_info(node.builtin).code;
+  case ABI_TYPE_TEMPLATE_PARAMETER: {
+    if(!node.substitutable) {
+      return template_param_spelling(node.index);
+    }
+    const AbiKeyId key = key_of_node(node);
+    std::string spelling;
+    if(substitutions_.lookup(key, &spelling)) return spelling;
+    substitutions_.add(key);
+    return template_param_spelling(node.index);
+  }
+  case ABI_TYPE_POINTER:
+  case ABI_TYPE_LVALUE_REFERENCE:
+  case ABI_TYPE_RVALUE_REFERENCE:
+  case ABI_TYPE_PACK_EXPANSION:
+  case ABI_TYPE_VENDOR_QUALIFIED:
+  case ABI_TYPE_ARRAY:
+  case ABI_TYPE_BUILTIN_TRANSFORM:
+  case ABI_TYPE_FUNCTION:
+  case ABI_TYPE_MEMBER_POINTER: {
+    const AbiKeyId key = key_of_node(node);
+    std::string result;
+    if(substitutions_.lookup(key, &result)) return result;
+    if(node.kind == ABI_TYPE_POINTER) {
+      result = "P" + mangle_type_impl(node.types.at(0), false);
+    } else if(node.kind == ABI_TYPE_LVALUE_REFERENCE) {
+      result = "R" + mangle_type_impl(node.types.at(0), false);
+    } else if(node.kind == ABI_TYPE_RVALUE_REFERENCE) {
+      result = "O" + mangle_type_impl(node.types.at(0), false);
+    } else if(node.kind == ABI_TYPE_PACK_EXPANSION) {
+      result = "Dp" + mangle_type_impl(node.types.at(0), false);
+    } else if(node.kind == ABI_TYPE_VENDOR_QUALIFIED) {
+      result = "U" + source_name(node.name) +
+        mangle_type_impl(node.types.at(0), false);
+    } else if(node.kind == ABI_TYPE_ARRAY) {
+      if(node.array_bound.kind != ABI_ARRAY_BOUND_VALUE) {
+        throw std::logic_error("unsupported non-value array bound");
+      }
+      result = "A" + node.array_bound.value + "_" +
+        mangle_type_impl(node.types.at(0), false);
+    } else if(node.kind == ABI_TYPE_BUILTIN_TRANSFORM) {
+      result = "u" + source_name(node.name) + "I" +
+        mangle_type_impl(node.types.at(0), false) + "E";
+    } else if(node.kind == ABI_TYPE_FUNCTION) {
+      if(node.types.empty()) {
+        throw std::logic_error("function ABI type needs a result");
+      }
+      result = "F" + mangle_type_impl(node.types[0], false);
+      if(node.types.size() == 1) {
+        result += "v";
+      }
+      for(std::size_t i = 1; i < node.types.size(); ++i) {
+        result += mangle_type_impl(node.types[i], false);
+      }
+      if(node.variadic) result += "z";
+      result += "E";
+    } else {
+      result = "M" + mangle_type_impl(node.types.at(0), false) +
+        mangle_type_impl(node.types.at(1), false);
+    }
+    substitutions_.add(key);
+    return result;
+  }
+  case ABI_TYPE_TEMPLATE_SPECIALIZATION:
+  case ABI_TYPE_STD_TEMPLATE_SPECIALIZATION:
+  case ABI_TYPE_TEMPLATE_PARAMETER_SPECIALIZATION: {
+    const AbiKeyId key = key_of_node(node);
+    std::string spelling;
+    if(substitutions_.lookup(key, &spelling)) return spelling;
+    bool nested = false;
+    const std::string body = mangle_template_body(node, &nested);
+    return nested ? "N" + body + "E" : body;
+  }
+  case ABI_TYPE_MEMBER:
+  case ABI_TYPE_MEMBER_TEMPLATE_SPECIALIZATION:
+    return mangle_member_type(node);
+  case ABI_TYPE_DECLTYPE_EXPRESSION: {
+    const AbiKeyId key = key_of_node(node);
+    std::string spelling;
+    if(substitutions_.lookup(key, &spelling)) return spelling;
+    const std::string result = "DT" +
+      mangle_expression_impl(expression_definition(node.expression_ref)) + "E";
+    substitutions_.add(key);
+    return result;
+  }
+  case ABI_TYPE_LAMBDA_CLOSURE:
+  case ABI_TYPE_LOCAL_TYPE: {
+    const AbiKeyId key = key_of_node(node);
+    std::string spelling;
+    if(substitutions_.lookup(key, &spelling)) return spelling;
+    std::string context;
+    const std::string body = mangle_local_body(node, &context);
+    substitutions_.add(key);
+    return context + body;
+  }
+  case ABI_TYPE_NAMESPACE_LAMBDA: {
+    const AbiKeyId key = key_of_node(node);
+    std::string spelling;
+    if(substitutions_.lookup(key, &spelling)) return spelling;
+    std::string result = "N";
+    append_prefixes(node.namespace_qualifiers, node.namespace_qualifiers.size(),
+                    &result);
+    result += source_name(node.name) + "E";
+    substitutions_.add(key);
+    return result;
   }
   }
   throw std::logic_error("unknown ABI type kind");
 }
 
-std::string Mangler::key_of_argument(const AbiTemplateArgument & argument)
+std::string Mangler::mangle_named_type(const std::string & qualified_name,
+                                       const std::vector<std::string> & tags)
 {
-  return key_of_argument_impl(argument, 0);
+  const AbiKeyId key = name_key(qualified_name, tags);
+  std::string spelling;
+  if(substitutions_.lookup(key, &spelling)) {
+    return spelling;
+  }
+  bool nested = false;
+  const std::string body = mangle_name_body(qualified_name, tags, key, &nested);
+  return nested ? "N" + body + "E" : body;
 }
 
-std::string Mangler::argument_key_ref(const std::string & ref,
-                                      std::size_t depth)
+// Body of a template specialization without the N...E wrapper; registers the
+// template name and then the specialization.  The caller has already checked
+// the specialization for substitution.
+std::string Mangler::mangle_template_body(const AbiType & node, bool * nested)
 {
-  const AbiTemplateArgument * argument = argument_definition(ref);
-  if(!argument) {
-    throw std::logic_error("unknown ABI template argument '" + ref + "'");
-  }
-  const std::map<std::string, std::string>::const_iterator cached =
-    argument_key_cache_.find(ref);
-  if(cached != argument_key_cache_.end()) {
-    return cached->second;
-  }
-  const std::string key = key_of_argument_impl(*argument, depth + 1);
-  argument_key_cache_[ref] = key;
-  return key;
-}
-
-std::string Mangler::key_of_argument_impl(const AbiTemplateArgument & argument,
-                                          std::size_t depth)
-{
-  check_depth(depth);
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_TYPE) {
-    return base_key("arg-type", key_of_type_impl(argument.type, depth + 1));
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_VALUE) {
-    return "arg-value(" + builtin_code(argument.value_type) + ":" +
-      number_word(static_cast<unsigned long long>(argument.value)) + ")";
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_DEPENDENT_VALUE) {
-    return "arg-dependent(" + type_key_ref(argument.expression_ref, depth + 1) +":" +
-      builtin_code(argument.value_type) + ":" +
-      number_word(static_cast<unsigned long long>(argument.value)) + ")";
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_ENTITY) {
-    const AbiEntityFact * entity = entity_definition(argument.entity_ref);
-    if(!entity) {
-      throw std::logic_error("unknown ABI entity '" + argument.entity_ref + "'");
-    }
-    return base_key("arg-entity", key_of_entity_impl(*entity, depth + 1));
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_MEMBER_EXTERNAL_ENTITY) {
-    return "arg-member-external(" + argument.symbol + ")";
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_EXPRESSION) {
-    return base_key("arg-expression", expression_key_ref(argument.expression_ref,
-      depth + 1));
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_TEMPLATE_PARAMETER_TEMPLATE) {
-    return "arg-template-param(" + number_word(argument.index) + ")";
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_TEMPLATE_ENTITY) {
-    return "arg-template(" + strip_scope(argument.name) + ")";
-  }
-  std::string key = "arg:" + number_word(static_cast<unsigned long long>(argument.kind));
-  for(std::size_t i = 0; i < argument.argument_refs.size(); ++i) {
-    key += ":" + argument_key_ref(argument.argument_refs[i], depth + 1);
-  }
-  return key;
-}
-
-std::string Mangler::key_of_expression(const AbiDependentExpression & expression)
-{
-  return key_of_expression_impl(expression, 0);
-}
-
-std::string Mangler::expression_key_ref(const std::string & ref,
-                                        std::size_t depth)
-{
-  const AbiDependentExpression * expression = expression_definition(ref);
-  if(!expression) {
-    throw std::logic_error("unknown ABI expression '" + ref + "'");
-  }
-  const std::map<std::string, std::string>::const_iterator cached =
-    expression_key_cache_.find(ref);
-  if(cached != expression_key_cache_.end()) {
-    return cached->second;
-  }
-  const std::string key = key_of_expression_impl(*expression, depth + 1);
-  expression_key_cache_[ref] = key;
-  return key;
-}
-
-std::string Mangler::key_of_expression_impl(
-  const AbiDependentExpression & expression, std::size_t depth)
-{
-  check_depth(depth);
-  std::string key = "expr:" + number_word(static_cast<unsigned long long>(
-    expression.kind));
-  key += ":" + expression.op + ":" + expression.text;
-  key += ":value=" + signed_number_word(expression.value);
-  key += ":index=" + number_word(expression.index);
-  key += std::string(":close=") +
-    (expression.close_member_owner ? "1" : "0");
-  key += std::string(":address=") +
-    (expression.address_of ? "1" : "0");
-  if(expression.kind == ABI_EXPRESSION_TEMPLATE_PARAMETER ||
-     expression.kind == ABI_EXPRESSION_FUNCTION_PARAMETER) {
-    return key;
-  }
-  if(expression.kind == ABI_EXPRESSION_EXTERNAL_ENTITY ||
-     expression.kind == ABI_EXPRESSION_ENTITY) {
-    const AbiEntityFact * entity = entity_definition(expression.entity_ref);
-    if(!entity) {
-      throw std::logic_error("unknown ABI entity '" + expression.entity_ref + "'");
-    }
-    key += ":entity=" + key_of_entity_impl(*entity, depth + 1);
-  }
-  for(std::size_t i = 0; i < expression.expression_refs.size(); ++i) {
-    key += ":expr=" + expression_key_ref(expression.expression_refs[i],
-                                           depth + 1);
-  }
-  key += ":type=" + key_of_type_impl(expression.type, depth + 1);
-  key += ":value-type=" + key_of_type_impl(expression.value_type, depth + 1);
-  for(std::size_t i = 0; i < expression.argument_refs.size(); ++i) {
-    key += ":arg=" + argument_key_ref(expression.argument_refs[i], depth + 1);
-  }
-  for(std::size_t i = 0; i < expression.type_arguments.size(); ++i) {
-    key += ":type-arg=" + key_of_type_impl(expression.type_arguments[i],
-                                             depth + 1);
-  }
-  return key;
-}
-
-std::string Mangler::key_of_entity(const AbiEntityFact & entity)
-{
-  return key_of_entity_impl(entity, 0);
-}
-
-std::string Mangler::key_of_entity_impl(const AbiEntityFact & entity,
-                                        std::size_t depth)
-{
-  check_depth(depth);
-  if(entity.kind == ABI_ENTITY_FACT_SYMBOL) {
-    return "symbol:" + entity.qualified_name;
-  }
-  if(entity.kind == ABI_ENTITY_FACT_VARIABLE) {
-    return "variable:" + strip_scope(entity.qualified_name) +
-      (entity.internal_linkage ? ":internal" : "");
-  }
-  std::string key = "function:" + strip_scope(entity.function.qualified_name);
-  for(std::size_t i = 0; i < entity.function.path_operands.size(); ++i) {
-    const AbiFunctionPathOperand & operand = entity.function.path_operands[i];
-    key += ":" + (operand.kind == ABI_FUNCTION_PATH_TYPE ?
-      key_of_type_impl(operand.type, depth + 1) : operand.argument_ref);
-  }
-  return key;
-}
-
-std::string Mangler::mangle_type(const AbiType & type)
-{
-  const std::string linear = mangle_long_type_chain(type);
-  if(!linear.empty()) {
-    return linear;
-  }
-  return mangle_type_impl(type, 0);
-}
-
-std::string Mangler::mangle_long_type_chain(const AbiType & input)
-{
-  const AbiType * current = &input;
-  AbiType unresolved;
-  std::vector<std::string> prefixes;
-  std::map<std::string, bool> seen;
-  std::size_t steps = 0;
-  while(true) {
-    if(current->kind == ABI_TYPE_NAME_OR_REFERENCE) {
-      const AbiType * referenced = type_definition(current->name);
-      if(!referenced) {
-        unresolved = *current;
-        unresolved.kind = ABI_TYPE_NAMED;
-        current = &unresolved;
-        break;
-      }
-      if(!seen.insert(std::make_pair(current->name, true)).second) {
-        throw std::logic_error("cyclic ABI type definition");
-      }
-      current = referenced;
-      ++steps;
-      continue;
-    }
-    if(current->is_const || current->is_volatile || current->types.size() != 1) {
-      break;
-    }
-    if(current->kind == ABI_TYPE_POINTER) {
-      prefixes.push_back("P");
-    } else if(current->kind == ABI_TYPE_LVALUE_REFERENCE) {
-      prefixes.push_back("R");
-    } else if(current->kind == ABI_TYPE_RVALUE_REFERENCE) {
-      prefixes.push_back("O");
-    } else {
-      break;
-    }
-    current = &current->types[0];
-    ++steps;
-  }
-  if(steps <= 256) {
-    return std::string();
-  }
-  std::string result = mangle_type_impl(*current, 0);
-  for(std::size_t i = prefixes.size(); i > 0; --i) {
-    result = prefixes[i - 1] + result;
-  }
-  return result;
-}
-
-std::string Mangler::mangle_type_impl(const AbiType & input, std::size_t depth)
-{
-  check_depth(depth);
-  if(input.is_const || input.is_volatile) {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) {
-      return spelling;
-    }
-    AbiType base = input;
-    base.is_const = false;
-    base.is_volatile = false;
-    std::string result;
-    if(input.is_volatile) {
-      result += "V";
-    }
-    if(input.is_const) {
-      result += "K";
-    }
-    result += mangle_type_impl(base, depth + 1);
+  const AbiKeyId key = key_of_node(node);
+  *nested = false;
+  std::string result;
+  if(node.kind == ABI_TYPE_TEMPLATE_PARAMETER_SPECIALIZATION) {
+    result = template_param_spelling(node.index);
+    result += mangle_template_args(node.argument_refs);
     substitutions_.add(key);
     return result;
   }
-  if(input.kind == ABI_TYPE_NAME_OR_REFERENCE) {
-    const AbiType * definition_type = type_definition(input.name);
-    if(definition_type) {
-      if(active_type_mangles_.find(input.name) != active_type_mangles_.end()) {
-        throw std::logic_error("cyclic ABI type definition");
-      }
-      active_type_mangles_[input.name] = true;
-      try {
-        const std::string result = mangle_type_impl(*definition_type, depth + 1);
-        active_type_mangles_.erase(input.name);
-        return result;
-      } catch(...) {
-        active_type_mangles_.erase(input.name);
-        throw;
-      }
+  if(node.kind == ABI_TYPE_STD_TEMPLATE_SPECIALIZATION) {
+    if(node.standard_substitution.empty()) {
+      throw std::logic_error("standard template type needs a substitution code");
     }
-    AbiType named = input;
-    named.kind = ABI_TYPE_NAMED;
-    return mangle_type_impl(named, depth + 1);
-  }
-  if(input.kind == ABI_TYPE_CV) {
-    if(input.types.size() != 1) {
-      throw std::logic_error("cv ABI type needs one operand");
-    }
-    AbiType cv = input.types[0];
-    cv.is_const = cv.is_const || input.is_const;
-    cv.is_volatile = cv.is_volatile || input.is_volatile;
-    return mangle_type_impl(cv, depth + 1);
-  }
-  switch(input.kind) {
-  case ABI_TYPE_NAME_OR_REFERENCE:
-    throw std::logic_error("unresolved ABI type reference");
-  case ABI_TYPE_BUILTIN:
-    return mangle_builtin(input);
-  case ABI_TYPE_NAMED:
-    return mangle_named_type(input, depth + 1);
-  case ABI_TYPE_TEMPLATE_PARAMETER: {
-    std::string result = "T";
-    if(input.index != 0) {
-      result += number_word(static_cast<unsigned long long>(input.index - 1));
-    }
-    result += "_";
-    if(input.substitutable) {
-      const std::string key = key_of_type_impl(input, depth + 1);
-      std::string spelling;
-      if(lookup_substitution(&substitutions_, key, &spelling)) {
-        return spelling;
-      }
+    result = node.standard_substitution;
+    if(!node.standard_substitution_includes_arguments) {
+      result += mangle_template_args(node.argument_refs);
       substitutions_.add(key);
     }
     return result;
   }
-  case ABI_TYPE_POINTER: {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    const std::string result = "P" + mangle_type_impl(input.types.at(0), depth + 1);
-    substitutions_.add(key);
-    return result;
+  const AbiKeyId template_key = name_key(node.name, node.abi_tags);
+  *nested = needs_nested_name(name_components(node.name));
+  if(!substitutions_.lookup(template_key, &result)) {
+    result = mangle_name_body(node.name, node.abi_tags, template_key, nested);
   }
-  case ABI_TYPE_LVALUE_REFERENCE:
-  case ABI_TYPE_RVALUE_REFERENCE: {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    const std::string prefix = input.kind == ABI_TYPE_LVALUE_REFERENCE ? "R" : "O";
-    const std::string result = prefix + mangle_type_impl(input.types.at(0), depth + 1);
-    substitutions_.add(key);
-    return result;
+  result += mangle_template_args(node.argument_refs);
+  substitutions_.add(key);
+  return result;
+}
+
+// <nested-name> of a member type: the owner is a <prefix> candidate, so it is
+// looked up and registered as the same component as the owner type itself.
+std::string Mangler::mangle_member_type(const AbiType & node)
+{
+  const AbiKeyId key = key_of_node(node);
+  std::string spelling;
+  if(substitutions_.lookup(key, &spelling)) return spelling;
+  std::string context;
+  std::string body = mangle_owner_body(node.types.at(0), &context);
+  body += source_name(node.name);
+  if(node.kind == ABI_TYPE_MEMBER_TEMPLATE_SPECIALIZATION) {
+    body += mangle_template_args(node.argument_refs);
   }
-  case ABI_TYPE_PACK_EXPANSION: {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    const std::string result = "Dp" + mangle_type_impl(input.types.at(0), depth + 1);
-    substitutions_.add(key);
-    return result;
+  substitutions_.add(key);
+  return context + "N" + body + "E";
+}
+
+// The <prefix> spelling of an owner type without its own N...E wrapper.  A
+// local owner contributes its Z...E context, which wraps the whole nested
+// name and is returned separately.
+std::string Mangler::mangle_owner_body(const AbiType & input,
+                                       std::string * context)
+{
+  DepthScope scope(this);
+  const ResolvedType resolved = resolve_type(input);
+  const AbiType & node = *resolved.node;
+  const AbiKeyId key = key_of_node(node);
+  std::string result;
+  switch(node.kind) {
+  case ABI_TYPE_NAME_OR_REFERENCE:
+  case ABI_TYPE_NAMED: {
+    if(substitutions_.lookup(key, &result)) return result;
+    bool nested = false;
+    return mangle_name_body(node.name, node.abi_tags, key, &nested);
   }
-  case ABI_TYPE_VENDOR_QUALIFIED: {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    const std::string result = "U" + number_word(input.name.size()) + input.name +
-      mangle_type_impl(input.types.at(0), depth + 1);
-    substitutions_.add(key);
-    return result;
-  }
-  case ABI_TYPE_ARRAY: {
-    if(input.array_bound.kind != ABI_ARRAY_BOUND_VALUE) {
-      throw std::logic_error("unsupported non-value array bound");
-    }
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    const std::string result = "A" + input.array_bound.value + "_" +
-      mangle_type_impl(input.types.at(0), depth + 1);
-    substitutions_.add(key);
-    return result;
-  }
-  case ABI_TYPE_BUILTIN_TRANSFORM: {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    const std::string result = "u" + number_word(input.name.size()) + input.name +
-      "I" + mangle_type_impl(input.types.at(0), depth + 1) + "E";
-    substitutions_.add(key);
-    return result;
-  }
-  case ABI_TYPE_FUNCTION: {
-    if(input.types.empty()) {
-      throw std::logic_error("function ABI type needs a result");
-    }
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    std::string result = "F";
-    result += mangle_type_impl(input.types[0], depth + 1);
-    if(input.types.size() == 1) {
-      result += "v";
-    } else {
-      for(std::size_t i = 1; i < input.types.size(); ++i) {
-        result += mangle_type_impl(input.types[i], depth + 1);
-      }
-    }
-    if(input.variadic) result += "z";
-    result += "E";
-    substitutions_.add(key);
-    return result;
-  }
-  case ABI_TYPE_MEMBER_POINTER:
-    return mangle_member_type(input, depth + 1);
   case ABI_TYPE_TEMPLATE_SPECIALIZATION:
-  case ABI_TYPE_TEMPLATE_PARAMETER_SPECIALIZATION:
   case ABI_TYPE_STD_TEMPLATE_SPECIALIZATION:
-    return mangle_template_type(input, depth + 1);
+  case ABI_TYPE_TEMPLATE_PARAMETER_SPECIALIZATION: {
+    if(substitutions_.lookup(key, &result)) return result;
+    bool nested = false;
+    return mangle_template_body(node, &nested);
+  }
   case ABI_TYPE_MEMBER:
-  case ABI_TYPE_MEMBER_TEMPLATE_SPECIALIZATION:
-    return mangle_member_type(input, depth + 1);
-  case ABI_TYPE_CV:
-    throw std::logic_error("invalid cv ABI type");
-  case ABI_TYPE_DECLTYPE_EXPRESSION: {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    const AbiDependentExpression * expression =
-      expression_definition(input.expression_ref);
-    if(!expression) {
-      throw std::logic_error("unknown ABI expression '" +
-        input.expression_ref + "'");
+  case ABI_TYPE_MEMBER_TEMPLATE_SPECIALIZATION: {
+    if(substitutions_.lookup(key, &result)) return result;
+    result = mangle_owner_body(node.types.at(0), context) + source_name(node.name);
+    if(node.kind == ABI_TYPE_MEMBER_TEMPLATE_SPECIALIZATION) {
+      result += mangle_template_args(node.argument_refs);
     }
-    const std::string result = "DT" +
-      mangle_expression_impl(*expression, depth + 1) + "E";
     substitutions_.add(key);
     return result;
   }
-  case ABI_TYPE_LAMBDA_CLOSURE: {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    std::string result = mangle_context(input.context_ref) + "Ul";
-    if(input.types.empty()) {
-      result += "v";
-    } else {
-      for(std::size_t i = 0; i < input.types.size(); ++i) {
-        result += mangle_type(input.types[i]);
-      }
-    }
-    result += "E" + input.discriminator + "_";
-    substitutions_.add(key);
-    return result;
-  }
+  case ABI_TYPE_LAMBDA_CLOSURE:
   case ABI_TYPE_LOCAL_TYPE: {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    const std::string result = mangle_context(input.context_ref) +
-      source_name(input.name) + mangle_local_discriminator(input.discriminator);
+    if(substitutions_.lookup(key, &result)) return result;
+    result = mangle_local_body(node, context);
     substitutions_.add(key);
     return result;
   }
   case ABI_TYPE_NAMESPACE_LAMBDA: {
-    const std::string key = key_of_type_impl(input, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    std::string result = "N";
-    for(std::size_t i = 0; i < input.namespace_qualifiers.size(); ++i) {
-      result += source_name(input.namespace_qualifiers[i]);
-    }
-    result += source_name(input.name) + "E";
+    if(substitutions_.lookup(key, &result)) return result;
+    append_prefixes(node.namespace_qualifiers, node.namespace_qualifiers.size(),
+                    &result);
+    result += source_name(node.name);
     substitutions_.add(key);
     return result;
   }
+  default:
+    return mangle_node(node, node.name);
   }
-  throw std::logic_error("unknown ABI type kind");
 }
 
-std::string Mangler::mangle_named_type(const AbiType & type, std::size_t depth)
+// <local-name> parts of a local class or closure type: the Z...E context
+// and the entity name that follows it.
+std::string Mangler::mangle_local_body(const AbiType & node,
+                                       std::string * context)
 {
-  const std::string key = key_of_type_impl(type, depth + 1);
-  std::string spelling;
-  if(lookup_substitution(&substitutions_, key, &spelling)) {
-    return spelling;
-  }
-  // Function-name prefixes and named types share the ABI substitution
-  // sequence, although the fact model records the former by source spelling
-  // and the latter by a structural key.
-  if(type.abi_tags.empty() &&
-     lookup_substitution(&substitutions_, strip_scope(type.name), &spelling)) {
-    return spelling;
-  }
-  const std::string result = mangle_qualified_name(type.name, false,
-    type.abi_tags);
-  substitutions_.add(key);
-  return result;
-}
-
-std::string mangle_type_body_without_outer_name(const std::string & spelling)
-{
-  if(spelling.size() >= 2 && spelling[0] == 'N' && spelling[spelling.size() - 1] == 'E') {
-    return spelling.substr(1, spelling.size() - 2);
-  }
-  return spelling;
-}
-
-bool nested_name(const std::string & qualified_name)
-{
-  const std::string name = strip_scope(qualified_name);
-  std::size_t count = 1;
-  for(std::size_t i = 0; i + 1 < name.size(); ++i) {
-    if(name[i] == ':' && name[i + 1] == ':') {
-      ++count;
-      ++i;
-    }
-  }
-  return (count > 1 && name.compare(0, 5, "std::") != 0) ||
-    (count > 2 && name.compare(0, 5, "std::") == 0);
-}
-
-std::string Mangler::mangle_template_name(const std::string & qualified_name)
-{
-  const bool nested = nested_name(qualified_name);
-  std::string spelling;
-  if(substitutions_.lookup(strip_scope(qualified_name), &spelling)) {
-    return nested ? "N" + spelling : spelling;
-  }
-  const std::string body = mangle_prefix_chain(qualified_name, true);
-  return nested ? "N" + body : body;
-}
-
-std::string Mangler::mangle_template_type(const AbiType & type,
-                                          std::size_t depth)
-{
-  if(type.kind == ABI_TYPE_TEMPLATE_PARAMETER_SPECIALIZATION) {
-    const std::string key = key_of_type_impl(type, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    std::string result = "T";
-    if(type.index != 0) {
-      result += number_word(static_cast<unsigned long long>(type.index - 1));
-    }
-    result += "_";
-    result += mangle_template_args(type.argument_refs);
-    substitutions_.add(key);
-    return result;
-  }
-  if(type.kind == ABI_TYPE_STD_TEMPLATE_SPECIALIZATION) {
-    if(type.standard_substitution.empty()) {
-      throw std::logic_error("standard template type needs a substitution code");
-    }
-    const std::string key = key_of_type_impl(type, depth + 1);
-    std::string spelling;
-    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-    std::string result = type.standard_substitution;
-    if(!type.standard_substitution_includes_arguments) {
-      result += mangle_template_args(type.argument_refs);
-    }
-    substitutions_.add(key);
-    return result;
-  }
-  const std::string key = key_of_type_impl(type, depth + 1);
-  std::string spelling;
-  if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-  const bool nested = nested_name(type.name);
-  std::string result = mangle_template_name(type.name);
-  result += mangle_template_args(type.argument_refs);
-  if(nested) result += "E";
-  substitutions_.add(key);
-  return result;
-}
-
-std::string Mangler::mangle_template_member_name(const AbiType & type,
-                                                 std::size_t depth)
-{
-  const std::string owner = mangle_owner_prefix(type.types.at(0), depth + 1);
-  std::string result = "N" + owner + number_word(type.name.size()) + type.name;
-  if(type.kind == ABI_TYPE_MEMBER_TEMPLATE_SPECIALIZATION) {
-    result += mangle_template_args(type.argument_refs);
-  }
-  return result + "E";
-}
-
-std::string Mangler::mangle_owner_prefix(const AbiType & input,
-                                         std::size_t depth)
-{
-  check_depth(depth);
-  if(input.kind == ABI_TYPE_NAME_OR_REFERENCE) {
-    const AbiType * referenced = type_definition(input.name);
-    if(referenced) return mangle_owner_prefix(*referenced, depth + 1);
-    AbiType named = input;
-    named.kind = ABI_TYPE_NAMED;
-    return mangle_owner_prefix(named, depth + 1);
-  }
-  if(input.kind == ABI_TYPE_NAMED) {
-    return mangle_type_body_without_outer_name(
-      mangle_qualified_name(input.name, false, input.abi_tags));
-  }
-  if(input.kind == ABI_TYPE_TEMPLATE_SPECIALIZATION) {
-    std::string prefix;
-    if(!substitutions_.lookup(strip_scope(input.name), &prefix)) {
-      prefix = mangle_template_name(input.name);
-      if(!prefix.empty() && prefix[0] == 'N') {
-        prefix.erase(0, 1);
-      }
-    }
-    std::string result = prefix + mangle_template_args(input.argument_refs);
-    return result;
-  }
-  if(input.kind == ABI_TYPE_STD_TEMPLATE_SPECIALIZATION) {
-    if(input.standard_substitution.empty()) {
-      throw std::logic_error("standard template owner needs a substitution code");
-    }
-    std::string result = input.standard_substitution;
-    if(!input.standard_substitution_includes_arguments) {
-      result += mangle_template_args(input.argument_refs);
+  *context = mangle_context(node.context_ref);
+  if(node.kind == ABI_TYPE_LOCAL_TYPE) {
+    std::string result = source_name(node.name);
+    if(!node.discriminator.empty() && node.discriminator != "-") {
+      const unsigned long long value = std::stoull(node.discriminator);
+      if(value != 0) result += "_" + number_word(value - 1);
     }
     return result;
   }
-  const std::string full = mangle_type_impl(input, depth + 1);
-  return mangle_type_body_without_outer_name(full);
+  std::string result = "Ul";
+  if(node.types.empty()) {
+    result += "v";
+  }
+  for(std::size_t i = 0; i < node.types.size(); ++i) {
+    result += mangle_type_impl(node.types[i], false);
+  }
+  result += "E";
+  if(!node.discriminator.empty() && node.discriminator != "-") {
+    result += node.discriminator;
+  }
+  return result + "_";
 }
 
-std::string Mangler::mangle_member_type(const AbiType & type, std::size_t depth)
-{
-  const std::string key = key_of_type_impl(type, depth + 1);
-  std::string spelling;
-  if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
-  if(type.kind == ABI_TYPE_MEMBER_POINTER) {
-    const std::string result = "M" + mangle_type_impl(type.types.at(0), depth + 1) +
-      mangle_type_impl(type.types.at(1), depth + 1);
-    substitutions_.add(key);
-    return result;
-  }
-  const std::string result = mangle_template_member_name(type, depth + 1);
-  substitutions_.add(key);
-  return result;
-}
-
-std::string Mangler::mangle_tag_list(const std::vector<std::string> & tags) const
-{
-  std::vector<std::string> sorted = tags;
-  std::sort(sorted.begin(), sorted.end());
-  sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
-  std::string result;
-  for(std::size_t i = 0; i < sorted.size(); ++i) {
-    result += "B" + number_word(sorted[i].size()) + sorted[i];
-  }
-  return result;
-}
-
-std::string Mangler::mangle_integral_value(const AbiType & type,
-                                           long long value) const
-{
-  const std::string code = builtin_code(type);
-  const bool unsigned_type = code == "h" || code == "t" || code == "j" ||
-    code == "m" || code == "y" || code == "o";
-  unsigned int width = 64;
-  if(code == "h") width = 8;
-  if(code == "t") width = 16;
-  if(code == "j") width = 32;
-  if(unsigned_type) {
-    unsigned long long bits = static_cast<unsigned long long>(value);
-    if(width < 64) bits &= (1ULL << width) - 1;
-    return "L" + code + number_word(bits) + "E";
-  }
-  if(value < 0) {
-    const unsigned long long magnitude = 0ULL -
-      static_cast<unsigned long long>(value);
-    return "L" + code + "n" + number_word(magnitude) + "E";
-  }
-  return "L" + code + number_word(static_cast<unsigned long long>(value)) + "E";
-}
+// ---------------------------------------------------------------------------
+// <template-args> and <template-arg>
 
 std::string Mangler::mangle_template_args(const std::vector<std::string> & refs)
 {
   std::string result = "I";
   for(std::size_t i = 0; i < refs.size(); ++i) {
-    result += mangle_argument_ref(refs[i], 0);
+    result += mangle_argument_ref(refs[i]);
   }
   return result + "E";
 }
 
-std::string Mangler::mangle_type_argument(const std::string & ref,
-                                          std::size_t depth)
+std::string Mangler::mangle_argument_ref(const std::string & ref)
 {
-  const AbiType * type = type_definition(ref);
-  if(!type) {
-    throw std::logic_error("unknown ABI type definition '" + ref + "'");
-  }
-  return mangle_type_impl(*type, depth + 1);
+  return mangle_template_arg(argument_definition(ref));
 }
 
-std::string Mangler::mangle_argument_ref(const std::string & ref,
-                                         std::size_t depth)
+std::string Mangler::mangle_integral_value(const AbiType & type,
+                                           long long value) const
 {
-  const AbiTemplateArgument * argument = argument_definition(ref);
-  if(!argument) {
-    throw std::logic_error("unknown ABI template argument '" + ref + "'");
+  const ResolvedType resolved = resolve_type(type);
+  if(resolved.node->kind != ABI_TYPE_BUILTIN) {
+    throw std::logic_error("integral ABI value needs a builtin type");
   }
-  return mangle_template_arg(*argument);
+  const AbiBuiltinTypeInfo & info = builtin_type_info(resolved.node->builtin);
+  std::string result = "L";
+  result += info.code;
+  if(info.is_unsigned && value < 0) {
+    // A negative stored value for an unsigned type is its modulo bit pattern.
+    unsigned __int128 bits = static_cast<unsigned __int128>(
+      static_cast<__int128>(value));
+    if(info.bits < 128) {
+      bits &= (static_cast<unsigned __int128>(1) << info.bits) - 1;
+    }
+    result += wide_number_word(bits);
+  } else {
+    result += signed_number_word(value);
+  }
+  return result + "E";
 }
 
 std::string Mangler::mangle_template_arg(const AbiTemplateArgument & argument)
 {
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_TYPE) {
-    return mangle_type(argument.type);
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_VALUE) {
+  DepthScope scope(this);
+  switch(argument.kind) {
+  case ABI_TEMPLATE_ARGUMENT_TYPE:
+    return mangle_type_impl(argument.type, false);
+  case ABI_TEMPLATE_ARGUMENT_VALUE:
     return mangle_integral_value(argument.value_type, argument.value);
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_DEPENDENT_VALUE) {
-    return "Tn" + mangle_type_argument(argument.expression_ref, 0) +
+  case ABI_TEMPLATE_ARGUMENT_DEPENDENT_VALUE:
+    return "Tn" + mangle_type_impl(argument.type, false) +
       mangle_integral_value(argument.value_type, argument.value);
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_EXPRESSION) {
-    const AbiDependentExpression * expression =
-      expression_definition(argument.expression_ref);
-    if(!expression) {
-      throw std::logic_error("unknown ABI expression '" +
-        argument.expression_ref + "'");
-    }
-    return "X" + mangle_expression_impl(*expression, 0) + "E";
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_TEMPLATE_PARAMETER_TEMPLATE) {
-    std::string result = "T";
-    if(argument.index != 0) {
-      result += number_word(static_cast<unsigned long long>(argument.index - 1));
-    }
-    return result + "_";
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_MEMBER_TEMPLATE_ENTITY) {
-    const std::string owner = mangle_owner_prefix(argument.type, 0);
-    std::string result = "N" + owner;
-    std::string substitution;
-    if(substitutions_.lookup(argument.substitution, &substitution)) {
-      result += substitution;
+  case ABI_TEMPLATE_ARGUMENT_UNTYPED_VALUE:
+    return "L" + signed_number_word(argument.value) + "E";
+  case ABI_TEMPLATE_ARGUMENT_EXPRESSION:
+    return "X" + mangle_expression_impl(expression_definition(
+      argument.expression_ref)) + "E";
+  case ABI_TEMPLATE_ARGUMENT_TEMPLATE_PARAMETER_TEMPLATE:
+    return template_param_spelling(argument.index);
+  case ABI_TEMPLATE_ARGUMENT_TEMPLATE_ENTITY:
+    return mangle_qualified_name(argument.name);
+  case ABI_TEMPLATE_ARGUMENT_MEMBER_TEMPLATE_ENTITY: {
+    // The owner specialization is not registered here; the fixtures pin the
+    // member template as the next slot.
+    const ResolvedType owner = resolve_type(argument.type);
+    bool nested = false;
+    std::string result = "N";
+    if(owner.node->kind == ABI_TYPE_TEMPLATE_SPECIALIZATION) {
+      const AbiKeyId template_key = name_key(owner.node->name,
+                                             owner.node->abi_tags);
+      std::string prefix;
+      if(!substitutions_.lookup(template_key, &prefix)) {
+        prefix = mangle_name_body(owner.node->name, owner.node->abi_tags,
+                                  template_key, &nested);
+      }
+      result += prefix + mangle_template_args(owner.node->argument_refs);
     } else {
-      result += number_word(argument.name.size()) + argument.name;
-      substitutions_.add(argument.substitution);
+      std::string context;
+      result += mangle_owner_body(argument.type, &context);
+      result = context + result;
+    }
+    const AbiKeyId member_key = name_key(argument.substitution,
+                                         std::vector<std::string>());
+    std::string spelling;
+    if(substitutions_.lookup(member_key, &spelling)) {
+      result += spelling;
+    } else {
+      result += source_name(argument.name);
+      substitutions_.add(member_key);
     }
     return result + "E";
   }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_MEMBER_EXTERNAL_ENTITY) {
+  case ABI_TEMPLATE_ARGUMENT_MEMBER_EXTERNAL_ENTITY:
     return "XadL" + argument.symbol + "EE";
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_ENTITY) {
-    const AbiEntityFact * entity = entity_definition(argument.entity_ref);
-    if(!entity) {
-      throw std::logic_error("unknown ABI entity '" + argument.entity_ref + "'");
-    }
-    return "XadL" + mangle_entity_encoding(*entity) + "EE";
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_TEMPLATE_ENTITY) {
-    return mangle_qualified_name(argument.name, false);
-  }
-  if(argument.kind == ABI_TEMPLATE_ARGUMENT_PACK) {
+  case ABI_TEMPLATE_ARGUMENT_ENTITY:
+    return std::string(argument.address_of ? "XadL" : "XL") +
+      mangle_entity_encoding(entity_definition(argument.entity_ref)) + "EE";
+  case ABI_TEMPLATE_ARGUMENT_PACK: {
     std::string result = "J";
     for(std::size_t i = 0; i < argument.argument_refs.size(); ++i) {
-      result += mangle_argument_ref(argument.argument_refs[i], 0);
+      result += mangle_argument_ref(argument.argument_refs[i]);
     }
     return result + "E";
   }
-  throw std::logic_error("unsupported target");
+  }
+  throw std::logic_error("unknown ABI template argument kind");
 }
+
+// ---------------------------------------------------------------------------
+// <expression>
 
 std::string Mangler::mangle_expression(const AbiDependentExpression & expression)
 {
-  return mangle_expression_impl(expression, 0);
+  return mangle_expression_impl(expression);
+}
+
+std::string Mangler::mangle_expression_ref(const std::string & ref)
+{
+  return mangle_expression_impl(expression_definition(ref));
 }
 
 std::string Mangler::mangle_expression_impl(
-  const AbiDependentExpression & expression, std::size_t depth)
+  const AbiDependentExpression & expression)
 {
-  check_depth(depth);
-  if(expression.kind == ABI_EXPRESSION_TEMPLATE_PARAMETER) {
-    std::string result = "T";
-    if(expression.index != 0) {
-      result += number_word(static_cast<unsigned long long>(expression.index - 1));
-    }
-    return result + "_";
-  }
-  if(expression.kind == ABI_EXPRESSION_FUNCTION_PARAMETER) {
-    return expression.index == 0 ? "fp_" : "fp" +
-      number_word(static_cast<unsigned long long>(expression.index - 1)) + "_";
-  }
-  if(expression.kind == ABI_EXPRESSION_LITERAL ||
-     expression.kind == ABI_EXPRESSION_INTEGRAL_VALUE) {
+  DepthScope scope(this);
+  switch(expression.kind) {
+  case ABI_EXPRESSION_TEMPLATE_PARAMETER:
+    return template_param_spelling(expression.index);
+  case ABI_EXPRESSION_FUNCTION_PARAMETER:
+    return expression.index == 0 ? std::string("fp_") :
+      "fp" + number_word(expression.index - 1) + "_";
+  case ABI_EXPRESSION_LITERAL:
+  case ABI_EXPRESSION_INTEGRAL_VALUE:
     return "Li" + signed_number_word(expression.value) + "E";
-  }
-  if(expression.kind == ABI_EXPRESSION_UNARY) {
-    const std::string operand =
-      mangle_expression_ref(expression.expression_refs.at(0), depth);
-    return expression_operator_code(expression.op) + operand;
-  }
-  if(expression.kind == ABI_EXPRESSION_BINARY) {
-    const std::string left =
-      mangle_expression_ref(expression.expression_refs.at(0), depth);
-    const std::string right =
-      mangle_expression_ref(expression.expression_refs.at(1), depth);
+  case ABI_EXPRESSION_UNARY:
+    return expression_operator_code(expression.op) +
+      mangle_expression_ref(expression.expression_refs.at(0));
+  case ABI_EXPRESSION_BINARY: {
+    const std::string left = mangle_expression_ref(expression.expression_refs.at(0));
+    const std::string right = mangle_expression_ref(expression.expression_refs.at(1));
     return expression_operator_code(expression.op) + left + right;
   }
-  if(expression.kind == ABI_EXPRESSION_CONDITIONAL) {
-    const std::string condition =
-      mangle_expression_ref(expression.expression_refs.at(0), depth);
-    const std::string true_value =
-      mangle_expression_ref(expression.expression_refs.at(1), depth);
-    const std::string false_value =
-      mangle_expression_ref(expression.expression_refs.at(2), depth);
-    return "qu" + condition + true_value + false_value;
-  }
-  if(expression.kind == ABI_EXPRESSION_PACK_EXPANSION) {
-    return "sp" + mangle_expression_ref(expression.expression_refs.at(0), depth);
-  }
-  if(expression.kind == ABI_EXPRESSION_CALL) {
-    std::string result = "cl";
-    for(std::size_t i = 0; i < expression.expression_refs.size(); ++i) {
-      result += mangle_expression_ref(expression.expression_refs[i], depth);
+  case ABI_EXPRESSION_CONDITIONAL: {
+    std::string result = "qu";
+    for(std::size_t i = 0; i < 3; ++i) {
+      result += mangle_expression_ref(expression.expression_refs.at(i));
     }
-    return result + "E";
-  }
-  if(expression.kind == ABI_EXPRESSION_CONVERSION ||
-     expression.kind == ABI_EXPRESSION_CAST) {
-    const std::string operation = expression.kind == ABI_EXPRESSION_CONVERSION ?
-      (expression.op.empty() ? "cv" : expression_operator_code(expression.op)) :
-      expression_operator_code(expression.op);
-    const std::string type = mangle_type(expression.type);
-    const std::string operand =
-      mangle_expression_ref(expression.expression_refs.at(0), depth);
-    return operation + type + operand;
-  }
-  if(expression.kind == ABI_EXPRESSION_TEMPLATE_ID) {
-    const bool nested = nested_name(expression.text);
-    std::string result = mangle_template_name(expression.text);
-    result += mangle_template_args(expression.argument_refs);
-    if(nested) result += "E";
     return result;
   }
-  if(expression.kind == ABI_EXPRESSION_TYPE_TRAIT) {
-    std::string result = "u" + number_word(expression.text.size()) +
-      expression.text;
-    for(std::size_t i = 0; i < expression.type_arguments.size(); ++i) {
-      result += mangle_type(expression.type_arguments[i]);
+  case ABI_EXPRESSION_PACK_EXPANSION:
+    return "sp" + mangle_expression_ref(expression.expression_refs.at(0));
+  case ABI_EXPRESSION_CALL: {
+    std::string result = "cl";
+    for(std::size_t i = 0; i < expression.expression_refs.size(); ++i) {
+      result += mangle_expression_ref(expression.expression_refs[i]);
     }
     return result + "E";
   }
-  if(expression.kind == ABI_EXPRESSION_SIZEOF_TYPE) {
-    return "st" + mangle_type(expression.type);
+  case ABI_EXPRESSION_CONVERSION:
+  case ABI_EXPRESSION_CAST: {
+    const std::string operation = expression.op.empty() ? std::string("cv") :
+      expression_operator_code(expression.op);
+    const std::string type = mangle_type_impl(expression.type, false);
+    return operation + type + mangle_expression_ref(expression.expression_refs.at(0));
   }
-  if(expression.kind == ABI_EXPRESSION_MEMBER) {
-    std::string result = "sr" + mangle_type(expression.type);
+  case ABI_EXPRESSION_TEMPLATE_ID: {
+    bool nested = needs_nested_name(name_components(expression.text));
+    const AbiKeyId key = name_key(expression.text, std::vector<std::string>());
+    std::string result;
+    if(!substitutions_.lookup(key, &result)) {
+      result = mangle_name_body(expression.text, std::vector<std::string>(), key,
+                                &nested);
+    }
+    result += mangle_template_args(expression.argument_refs);
+    return nested ? "N" + result + "E" : result;
+  }
+  case ABI_EXPRESSION_TYPE_TRAIT: {
+    std::string result = "u" + source_name(expression.text);
+    for(std::size_t i = 0; i < expression.type_arguments.size(); ++i) {
+      result += mangle_type_impl(expression.type_arguments[i], false);
+    }
+    return result + "E";
+  }
+  case ABI_EXPRESSION_SIZEOF_TYPE:
+    return "st" + mangle_type_impl(expression.type, false);
+  case ABI_EXPRESSION_MEMBER: {
+    std::string result = "sr" + mangle_type_impl(expression.type, false);
     if(expression.close_member_owner) result += "E";
     result += source_name(expression.text);
     if(!expression.argument_refs.empty()) {
@@ -1175,9 +1227,8 @@ std::string Mangler::mangle_expression_impl(
     }
     return result;
   }
-  if(expression.kind == ABI_EXPRESSION_OBJECT_MEMBER) {
-    const std::string object =
-      mangle_expression_ref(expression.expression_refs.at(0), depth);
+  case ABI_EXPRESSION_OBJECT_MEMBER: {
+    const std::string object = mangle_expression_ref(expression.expression_refs.at(0));
     std::string result = expression_operator_code(expression.op) + object +
       source_name(expression.text);
     if(!expression.argument_refs.empty()) {
@@ -1185,49 +1236,26 @@ std::string Mangler::mangle_expression_impl(
     }
     return result;
   }
-  if(expression.kind == ABI_EXPRESSION_EXTERNAL_ENTITY ||
-     expression.kind == ABI_EXPRESSION_ENTITY) {
-    const AbiEntityFact * entity = entity_definition(expression.entity_ref);
-    if(!entity) {
-      throw std::logic_error("unknown ABI entity '" + expression.entity_ref + "'");
-    }
-    return "L" + mangle_entity_encoding(*entity) + "E";
+  case ABI_EXPRESSION_EXTERNAL_ENTITY:
+  case ABI_EXPRESSION_ENTITY:
+    return "L" + mangle_entity_encoding(entity_definition(expression.entity_ref)) +
+      "E";
   }
-  throw std::logic_error("unsupported target");
+  throw std::logic_error("unknown ABI expression kind");
 }
 
-std::string Mangler::mangle_expression_ref(const std::string & ref,
-                                           std::size_t depth)
+// ---------------------------------------------------------------------------
+// Shared name helpers used by the type path
+
+AbiKeyId Mangler::name_key(const std::string & qualified_name,
+                           const std::vector<std::string> & tags)
 {
-  const AbiDependentExpression * expression = expression_definition(ref);
-  if(!expression) {
-    throw std::logic_error("unknown ABI expression '" + ref + "'");
-  }
-  return mangle_expression_impl(*expression, depth + 1);
+  return keys_.intern("N:" + strip_scope(qualified_name) + canonical_tags(tags));
 }
 
-std::string Mangler::mangle_entity_encoding(const AbiEntityFact & entity)
+std::string Mangler::mangle_tag_list(const std::vector<std::string> & tags) const
 {
-  Mangler nested(definitions_);
-  return nested.mangle_entity_impl(entity, 0);
-}
-
-std::string Mangler::mangle_entity_impl(const AbiEntityFact & entity,
-                                        std::size_t depth)
-{
-  check_depth(depth);
-  if(entity.kind == ABI_ENTITY_FACT_SYMBOL) {
-    return entity.qualified_name;
-  }
-  if(entity.kind == ABI_ENTITY_FACT_FUNCTION) {
-    AbiFunctionShape shape;
-    shape.target = entity.function;
-    return mangle_function(shape);
-  }
-  const std::string name = entity.internal_linkage ?
-    mangle_internal_name(entity.qualified_name) :
-    mangle_qualified_name(entity.qualified_name, false);
-  return "_Z" + name;
+  return canonical_tags(tags);
 }
 
 }  // namespace abi_mangle

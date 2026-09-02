@@ -1,21 +1,155 @@
 #pragma once
 
-// ABI fact model for the PA14 standalone abimangle tool.
+// Typed ABI fact model shared by the abimangle fact reader and the Itanium
+// name encoder.  Later compiler stages build these records directly and call
+// mangle_target; the line-oriented fact text is only the standalone tool's
+// input form and is parsed once into this model.
 
 #include <cstddef>
 #include <map>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace abi_mangle {
 
-enum AbiFactRecordKind
+// Deepest nesting the reader accepts inside one type spelling and the encoder
+// follows through definition references before rejecting the facts.  Every
+// recursive path in the reader and the encoder is bounded by this constant, so
+// malformed or cyclic facts fail deterministically instead of overflowing the
+// stack.
+const std::size_t ABI_MAXIMUM_NESTING_DEPTH = 2048;
+
+// Fixed vocabularies.  The reader resolves each fact word to its enum once and
+// the encoder and serializer index the same tables by enum.
+
+enum AbiBuiltinType
 {
-  ABI_FACT_RECORD_DEFINITION,
-  ABI_FACT_RECORD_TARGET,
-  ABI_FACT_RECORD_FUNCTION
+  ABI_BUILTIN_VOID,
+  ABI_BUILTIN_BOOL,
+  ABI_BUILTIN_CHAR,
+  ABI_BUILTIN_SCHAR,
+  ABI_BUILTIN_UCHAR,
+  ABI_BUILTIN_SHORT,
+  ABI_BUILTIN_USHORT,
+  ABI_BUILTIN_INT,
+  ABI_BUILTIN_UINT,
+  ABI_BUILTIN_LONG,
+  ABI_BUILTIN_ULONG,
+  ABI_BUILTIN_LONGLONG,
+  ABI_BUILTIN_ULONGLONG,
+  ABI_BUILTIN_INT128,
+  ABI_BUILTIN_UINT128,
+  ABI_BUILTIN_FLOAT,
+  ABI_BUILTIN_DOUBLE,
+  ABI_BUILTIN_LONGDOUBLE,
+  ABI_BUILTIN_FLOAT128,
+  ABI_BUILTIN_WCHAR,
+  ABI_BUILTIN_CHAR16,
+  ABI_BUILTIN_CHAR32,
+  ABI_BUILTIN_NULLPTR,
+  ABI_BUILTIN_AUTO,
+  ABI_BUILTIN_COMPLEX_FLOAT,
+  ABI_BUILTIN_COMPLEX_DOUBLE,
+  ABI_BUILTIN_COMPLEX_LONGDOUBLE,
+  ABI_BUILTIN_COUNT
 };
+
+struct AbiBuiltinTypeInfo
+{
+  const char * word;   // normalized fact spelling
+  const char * code;   // Itanium <builtin-type>
+  unsigned bits;       // value width of an integral type, 0 otherwise
+  bool is_unsigned;
+};
+
+const AbiBuiltinTypeInfo & builtin_type_info(AbiBuiltinType type);
+bool lookup_builtin_type(const std::string & word, AbiBuiltinType * type);
+
+enum AbiSpecialFunctionKind
+{
+  ABI_SPECIAL_CONSTRUCTOR_COMPLETE,
+  ABI_SPECIAL_CONSTRUCTOR_BASE,
+  ABI_SPECIAL_CONSTRUCTOR_ALLOCATING,
+  ABI_SPECIAL_DESTRUCTOR_DELETING,
+  ABI_SPECIAL_DESTRUCTOR_COMPLETE,
+  ABI_SPECIAL_DESTRUCTOR_BASE,
+  ABI_SPECIAL_FUNCTION_COUNT
+};
+
+struct AbiSpecialFunctionInfo
+{
+  const char * word;
+  const char * code;   // Itanium <ctor-dtor-name>
+};
+
+const AbiSpecialFunctionInfo & special_function_info(AbiSpecialFunctionKind kind);
+bool lookup_special_function(const std::string & word,
+                             AbiSpecialFunctionKind * kind);
+
+enum AbiOperatorKind
+{
+  ABI_OPERATOR_NEW,
+  ABI_OPERATOR_NEW_ARRAY,
+  ABI_OPERATOR_DELETE,
+  ABI_OPERATOR_DELETE_ARRAY,
+  ABI_OPERATOR_PLUS,          // unary or binary by shape
+  ABI_OPERATOR_MINUS,         // unary or binary by shape
+  ABI_OPERATOR_ADDRESS_OF,    // unary address-of or binary bit-and by shape
+  ABI_OPERATOR_DEREF,         // unary dereference or binary multiply by shape
+  ABI_OPERATOR_UNARY_PLUS,
+  ABI_OPERATOR_BINARY_PLUS,
+  ABI_OPERATOR_UNARY_MINUS,
+  ABI_OPERATOR_BINARY_MINUS,
+  ABI_OPERATOR_BIT_AND,
+  ABI_OPERATOR_MULTIPLY,
+  ABI_OPERATOR_DIVIDE,
+  ABI_OPERATOR_REMAINDER,
+  ABI_OPERATOR_BIT_OR,
+  ABI_OPERATOR_BIT_XOR,
+  ABI_OPERATOR_ASSIGN,
+  ABI_OPERATOR_PLUS_ASSIGN,
+  ABI_OPERATOR_MINUS_ASSIGN,
+  ABI_OPERATOR_MULTIPLY_ASSIGN,
+  ABI_OPERATOR_DIVIDE_ASSIGN,
+  ABI_OPERATOR_REMAINDER_ASSIGN,
+  ABI_OPERATOR_BIT_AND_ASSIGN,
+  ABI_OPERATOR_BIT_OR_ASSIGN,
+  ABI_OPERATOR_BIT_XOR_ASSIGN,
+  ABI_OPERATOR_SHIFT_LEFT,
+  ABI_OPERATOR_SHIFT_RIGHT,
+  ABI_OPERATOR_SHIFT_LEFT_ASSIGN,
+  ABI_OPERATOR_SHIFT_RIGHT_ASSIGN,
+  ABI_OPERATOR_EQUAL,
+  ABI_OPERATOR_NOT_EQUAL,
+  ABI_OPERATOR_LESS,
+  ABI_OPERATOR_GREATER,
+  ABI_OPERATOR_LESS_EQUAL,
+  ABI_OPERATOR_GREATER_EQUAL,
+  ABI_OPERATOR_SPACESHIP,
+  ABI_OPERATOR_LOGICAL_NOT,
+  ABI_OPERATOR_LOGICAL_AND,
+  ABI_OPERATOR_LOGICAL_OR,
+  ABI_OPERATOR_COMPLEMENT,
+  ABI_OPERATOR_INCREMENT,
+  ABI_OPERATOR_DECREMENT,
+  ABI_OPERATOR_COMMA,
+  ABI_OPERATOR_MEMBER_POINTER,
+  ABI_OPERATOR_ARROW,
+  ABI_OPERATOR_CALL,
+  ABI_OPERATOR_INDEX,
+  ABI_OPERATOR_CO_AWAIT,
+  ABI_OPERATOR_COUNT
+};
+
+struct AbiOperatorInfo
+{
+  const char * word;         // canonical fact spelling
+  const char * code;         // Itanium <operator-name>, binary form when shaped
+  const char * unary_code;   // unary form for shape-dependent operators, or 0
+};
+
+const AbiOperatorInfo & operator_info(AbiOperatorKind kind);
+bool lookup_operator(const std::string & word, AbiOperatorKind * kind);
 
 enum AbiDefinitionKind
 {
@@ -28,14 +162,13 @@ enum AbiDefinitionKind
 
 enum AbiTypeKind
 {
-  ABI_TYPE_NAME_OR_REFERENCE,
+  ABI_TYPE_NAME_OR_REFERENCE,   // definition id or bare qualified class name
   ABI_TYPE_NAMED,
   ABI_TYPE_BUILTIN,
   ABI_TYPE_TEMPLATE_PARAMETER,
   ABI_TYPE_POINTER,
   ABI_TYPE_LVALUE_REFERENCE,
   ABI_TYPE_RVALUE_REFERENCE,
-  ABI_TYPE_CV,
   ABI_TYPE_PACK_EXPANSION,
   ABI_TYPE_VENDOR_QUALIFIED,
   ABI_TYPE_ARRAY,
@@ -70,7 +203,6 @@ enum AbiTemplateArgumentKind
   ABI_TEMPLATE_ARGUMENT_TEMPLATE_ENTITY,
   ABI_TEMPLATE_ARGUMENT_MEMBER_TEMPLATE_ENTITY,
   ABI_TEMPLATE_ARGUMENT_TEMPLATE_PARAMETER_TEMPLATE,
-  ABI_TEMPLATE_ARGUMENT_EXTERNAL_ENTITY,
   ABI_TEMPLATE_ARGUMENT_MEMBER_EXTERNAL_ENTITY,
   ABI_TEMPLATE_ARGUMENT_ENTITY,
   ABI_TEMPLATE_ARGUMENT_PACK
@@ -138,7 +270,6 @@ enum AbiFunctionPathOperandKind
 {
   ABI_FUNCTION_PATH_TYPE,
   ABI_FUNCTION_PATH_TEMPLATE_ARGUMENT,
-  ABI_FUNCTION_PATH_RESULT_TYPE,
   ABI_FUNCTION_PATH_VARIADIC
 };
 
@@ -152,13 +283,10 @@ enum AbiFunctionRecordKind
   ABI_FUNCTION_RECORD_LOCAL_CONTEXT,
   ABI_FUNCTION_RECORD_LAMBDA_CONTEXT,
   ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT,
-  ABI_FUNCTION_RECORD_TERMINAL_SOURCE,
   ABI_FUNCTION_RECORD_TERMINAL,
   ABI_FUNCTION_RECORD_VARIADIC,
   ABI_FUNCTION_RECORD_ABI_TAG,
   ABI_FUNCTION_RECORD_QUALIFIER,
-  ABI_FUNCTION_RECORD_OPERATOR_TERMINAL,
-  ABI_FUNCTION_RECORD_CONVERSION_TERMINAL,
   ABI_FUNCTION_RECORD_PARAMETER,
   ABI_FUNCTION_RECORD_RESULT
 };
@@ -171,6 +299,23 @@ enum AbiFunctionQualifier
   ABI_FUNCTION_QUALIFIER_RVALUE_REFERENCE
 };
 
+enum AbiTerminalKind
+{
+  ABI_TERMINAL_SOURCE,             // ordinary unqualified source name
+  ABI_TERMINAL_SPECIAL,            // constructor or destructor variant
+  ABI_TERMINAL_OPERATOR,
+  ABI_TERMINAL_LITERAL_OPERATOR,   // name holds the unencoded suffix
+  ABI_TERMINAL_CONVERSION          // the owning record's type is the target
+};
+
+struct AbiTerminal
+{
+  AbiTerminalKind kind = ABI_TERMINAL_SOURCE;
+  AbiSpecialFunctionKind special_function = ABI_SPECIAL_CONSTRUCTOR_COMPLETE;
+  AbiOperatorKind operator_kind = ABI_OPERATOR_CALL;
+  std::string name;
+};
+
 struct AbiArrayBound
 {
   AbiArrayBoundKind kind = ABI_ARRAY_BOUND_VALUE;
@@ -180,8 +325,8 @@ struct AbiArrayBound
 struct AbiType
 {
   AbiTypeKind kind = ABI_TYPE_NAME_OR_REFERENCE;
+  AbiBuiltinType builtin = ABI_BUILTIN_VOID;
   std::string name;
-  std::string substitution;
   std::string standard_substitution;
   std::string expression_ref;
   std::string context_ref;
@@ -191,11 +336,8 @@ struct AbiType
   bool is_const = false;
   bool is_volatile = false;
   bool variadic = false;
-  bool lvalue_ref = false;
-  bool rvalue_ref = false;
   bool substitutable = false;
   bool standard_substitution_includes_arguments = false;
-  bool tagged = false;
   std::vector<AbiType> types;
   std::vector<std::string> argument_refs;
   std::vector<std::string> namespace_qualifiers;
@@ -205,7 +347,8 @@ struct AbiType
 struct AbiTemplateArgument
 {
   AbiTemplateArgumentKind kind = ABI_TEMPLATE_ARGUMENT_TYPE;
-  AbiType type;
+  AbiType type;           // type argument, dependent-value parameter type,
+                          // or member-template owner
   AbiType value_type;
   AbiType owner_type;
   std::string name;
@@ -215,7 +358,6 @@ struct AbiTemplateArgument
   std::string symbol;
   long long value = 0;
   std::size_t index = 0;
-  bool has_value_type = false;
   bool address_of = false;
   bool member_is_function = false;
   bool member_function_const = false;
@@ -231,14 +373,12 @@ struct AbiDependentExpression
 {
   AbiExpressionKind kind = ABI_EXPRESSION_LITERAL;
   AbiType type;
-  AbiType value_type;
   std::string text;
   std::string op;
   std::string entity_ref;
   long long value = 0;
   std::size_t index = 0;
   bool close_member_owner = false;
-  bool address_of = false;
   std::vector<std::string> expression_refs;
   std::vector<std::string> argument_refs;
   std::vector<AbiType> type_arguments;
@@ -258,7 +398,7 @@ struct AbiFunctionTarget
   std::string context_ref;
   std::string source_name;
   std::string discriminator;
-  std::string terminal;
+  AbiTerminal terminal;   // local, lambda, and namespace-lambda forms
   std::vector<AbiFunctionPathOperand> path_operands;
   std::vector<AbiType> signature_parameter_types;
   std::vector<std::string> namespace_qualifiers;
@@ -277,17 +417,6 @@ struct AbiEntityFact
   std::string qualified_name;
   AbiFunctionTarget function;
   bool internal_linkage = false;
-};
-
-struct AbiDefinitionRecord
-{
-  AbiDefinitionKind kind = ABI_DEFINITION_TYPE;
-  std::string id;
-  AbiType type;
-  AbiTemplateArgument template_argument;
-  AbiDependentExpression expression;
-  AbiLocalContext context;
-  AbiEntityFact entity;
 };
 
 struct AbiTargetRecord
@@ -318,33 +447,57 @@ struct AbiFunctionRecord
   std::string context_ref;
   std::string source_name;
   std::string discriminator;
-  std::string terminal;
-  std::string literal_suffix;
-  AbiType type;
+  AbiTerminal terminal;
+  AbiType type;           // parameter, result, or conversion target
   std::vector<AbiType> types;
   std::vector<std::string> argument_refs;
   std::vector<std::string> namespace_qualifiers;
   std::vector<AbiFunctionQualifier> qualifiers;
 };
 
-struct AbiFunctionShape
+struct AbiTypeDefinition
 {
-  AbiFunctionTarget target;
-  std::vector<AbiFunctionRecord> records;
+  std::string id;
+  AbiType type;
 };
 
-struct AbiFactRecord
+struct AbiArgumentDefinition
 {
-  AbiFactRecordKind kind = ABI_FACT_RECORD_TARGET;
-  AbiDefinitionRecord definition;
-  AbiTargetRecord target;
-  AbiFunctionRecord function;
+  std::string id;
+  AbiTemplateArgument argument;
 };
 
+struct AbiExpressionDefinition
+{
+  std::string id;
+  AbiDependentExpression expression;
+};
+
+struct AbiContextDefinition
+{
+  std::string id;
+  AbiLocalContext context;
+};
+
+struct AbiEntityDefinition
+{
+  std::string id;
+  AbiEntityFact entity;
+};
+
+// One ABI name: its file-local definitions, one target, and the function
+// records that follow an encoding-form target.
 struct AbiFactCase
 {
   std::string label;
-  std::vector<AbiFactRecord> records;
+  std::vector<AbiTypeDefinition> types;
+  std::vector<AbiArgumentDefinition> arguments;
+  std::vector<AbiExpressionDefinition> expressions;
+  std::vector<AbiContextDefinition> contexts;
+  std::vector<AbiEntityDefinition> entities;
+  bool has_target = false;
+  AbiTargetRecord target;
+  std::vector<AbiFunctionRecord> function_records;
 };
 
 struct AbiFactFile
@@ -352,31 +505,52 @@ struct AbiFactFile
   std::vector<AbiFactCase> cases;
 };
 
-struct AbiDefinitionTable
+// Index from definition id to the typed fact it names.  The table does not
+// own the facts; the case (or a later stage's own storage) does.
+class AbiDefinitionTable
 {
-  std::map<std::string, AbiDefinitionRecord> definitions;
+public:
+  void add_type(const std::string & id, const AbiType & type);
+  void add_argument(const std::string & id, const AbiTemplateArgument & argument);
+  void add_expression(const std::string & id,
+                      const AbiDependentExpression & expression);
+  void add_context(const std::string & id, const AbiLocalContext & context);
+  void add_entity(const std::string & id, const AbiEntityFact & entity);
+  void add_case(const AbiFactCase & fact_case);
 
-  void add(const AbiDefinitionRecord & definition)
-  {
-    if(!definitions.insert(std::make_pair(definition.id, definition)).second) {
-      throw std::logic_error("duplicate ABI definition '" + definition.id + "'");
-    }
-  }
+  const AbiType * find_type(const std::string & id) const;
+  const AbiTemplateArgument * find_argument(const std::string & id) const;
+  const AbiDependentExpression * find_expression(const std::string & id) const;
+  const AbiLocalContext * find_context(const std::string & id) const;
+  const AbiEntityFact * find_entity(const std::string & id) const;
+  std::size_t size() const { return entries_.size(); }
 
-  const AbiDefinitionRecord * find(const std::string & id) const
+private:
+  struct Entry
   {
-    const std::map<std::string, AbiDefinitionRecord>::const_iterator it =
-      definitions.find(id);
-    return it == definitions.end() ? 0 : &it->second;
-  }
+    AbiDefinitionKind kind;
+    const void * fact;
+  };
+
+  void add(const std::string & id, AbiDefinitionKind kind, const void * fact);
+  const void * find(const std::string & id, AbiDefinitionKind kind) const;
+
+  std::map<std::string, Entry> entries_;
 };
 
-AbiFactRecord parse_fact_record_words(const std::vector<std::string> & words);
+// Fact reader and serializer (tool boundary).
+void parse_fact_record_words(const std::vector<std::string> & words,
+                             AbiFactCase * fact_case);
 AbiFactFile parse_fact_text(const std::string & text);
 std::string serialize_fact_file(const AbiFactFile & file);
-std::string mangle_fact_case(const AbiFactCase & fact_case);
+
+// Encoder entry points.  mangle_target is the direct entry for later stages:
+// function_records carry the encoding-form components and are empty for
+// every other target form.
 std::string mangle_target(const AbiTargetRecord & target,
+                          const std::vector<AbiFunctionRecord> & function_records,
                           const AbiDefinitionTable & definitions);
+std::string mangle_fact_case(const AbiFactCase & fact_case);
 std::string mangle_fact_files(const std::vector<std::string> & input_paths);
 
 }  // namespace abi_mangle
