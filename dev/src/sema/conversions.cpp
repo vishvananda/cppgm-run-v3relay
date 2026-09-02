@@ -20,6 +20,12 @@ bool IsConst(const TypeTable& types, TypeId type)
       types.At(type).is_const;
 }
 
+bool IsVolatile(const TypeTable& types, TypeId type)
+{
+  return type != 0 && types.Kind(type) == TYPE_CV &&
+      types.At(type).is_volatile;
+}
+
 // Qualification conversion for object pointers.  The recursive check keeps
 // the C++ rule that adding qualification below a pointer also qualifies every
 // intervening pointer level.
@@ -31,12 +37,29 @@ bool QualificationCompatible(const TypeTable& types, TypeId source,
     return true;
   const bool source_const = IsConst(types, source);
   const bool target_const = IsConst(types, target);
+  const bool source_volatile = IsVolatile(types, source);
+  const bool target_volatile = IsVolatile(types, target);
+  if ((source_const && !target_const) ||
+      (source_volatile && !target_volatile))
+    return false;
   if (target_const && !source_const)
+    added = true;
+  if (target_volatile && !source_volatile)
     added = true;
   TypeId s = types.Unqualified(source);
   TypeId t = types.Unqualified(target);
   if (s == t)
-    return !source_const || target_const;
+    return true;
+  if (types.Kind(s) == TYPE_ARRAY && types.Kind(t) == TYPE_ARRAY &&
+      types.At(s).array_bound == types.At(t).array_bound)
+  {
+    bool nested_added = false;
+    if (!QualificationCompatible(types, types.At(s).base,
+                                 types.At(t).base, nested_added))
+      return false;
+    added = added || nested_added;
+    return true;
+  }
   if (types.Kind(s) != TYPE_POINTER || types.Kind(t) != TYPE_POINTER)
     return false;
 
@@ -44,7 +67,9 @@ bool QualificationCompatible(const TypeTable& types, TypeId source,
   if (!QualificationCompatible(types, types.At(s).base, types.At(t).base,
                                nested_added))
     return false;
-  if (nested_added && !target_const && !IsConst(types, types.At(t).base))
+  if (nested_added && !target_const && !target_volatile &&
+      !IsConst(types, types.At(t).base) &&
+      !IsVolatile(types, types.At(t).base))
     return false;
   added = added || nested_added;
   return true;
@@ -53,6 +78,188 @@ bool QualificationCompatible(const TypeTable& types, TypeId source,
 bool SameUnqualified(const TypeTable& types, TypeId left, TypeId right)
 {
   return types.Unqualified(left) == types.Unqualified(right);
+}
+
+bool PointerToVoidCompatible(const TypeTable& types, TypeId source,
+                             TypeId target, bool& added)
+{
+  added = false;
+  source = types.Unqualified(source);
+  target = types.Unqualified(target);
+  if (types.Kind(source) != TYPE_POINTER ||
+      types.Kind(target) != TYPE_POINTER)
+    return false;
+  const TypeId source_pointee = types.At(source).base;
+  const TypeId target_pointee = types.At(target).base;
+  const TypeId target_unqualified = types.Unqualified(target_pointee);
+  if (types.Kind(target_unqualified) != TYPE_FUNDAMENTAL ||
+      types.At(target_unqualified).fundamental != FT_VOID ||
+      types.Kind(types.Unqualified(source_pointee)) == TYPE_FUNCTION)
+    return false;
+  if (IsConst(types, source_pointee) &&
+      !IsConst(types, target_pointee))
+    return false;
+  if (IsVolatile(types, source_pointee) &&
+      !IsVolatile(types, target_pointee))
+    return false;
+  added = (IsConst(types, target_pointee) &&
+           !IsConst(types, source_pointee)) ||
+      (IsVolatile(types, target_pointee) &&
+       !IsVolatile(types, source_pointee));
+  return true;
+}
+
+ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
+                                 ValueCategory source_category,
+                                 bool is_null_literal,
+                                 bool is_function_lvalue, TypeId target)
+{
+  ImplicitConversion result;
+  result.to = target;
+  if (source == 0 || target == 0)
+    return result;
+
+  TypeId source_value = source;
+  if (types.Kind(source_value) == TYPE_REFERENCE)
+    source_value = types.Referent(source_value);
+  const bool source_array = types.Kind(source_value) == TYPE_ARRAY;
+  const bool source_function = types.Kind(source_value) == TYPE_FUNCTION;
+
+  if (source_array)
+  {
+    source_value = types.Decay(source_value);
+    result.rank = RANK_EXACT;
+    result.kind = CONV_ARRAY_TO_POINTER;
+  }
+  else if (source_function)
+  {
+    source_value = types.Decay(source_value);
+    result.rank = RANK_EXACT;
+    result.kind = CONV_FUNCTION_TO_POINTER;
+  }
+  else if (source_category == VC_LVALUE)
+  {
+    result.kind = CONV_LVALUE_TO_RVALUE;
+    result.rank = RANK_EXACT;
+  }
+
+  if (is_null_literal && !types.IsNullPointerType(source_value) &&
+      types.IsNullPointerType(target))
+  {
+    result.rank = RANK_CONVERSION;
+    result.kind = CONV_NULL_TO_NULLPTR;
+    return result;
+  }
+  if (is_null_literal && types.IsPointer(target))
+  {
+    result.rank = RANK_CONVERSION;
+    result.kind = CONV_NULL_TO_POINTER;
+    return result;
+  }
+  if (types.IsNullPointerType(source_value) && types.IsPointer(target))
+  {
+    result.rank = RANK_CONVERSION;
+    result.kind = CONV_NULL_TO_POINTER;
+    return result;
+  }
+
+  if (SameUnqualified(types, source_value, target))
+  {
+    bool qualification = false;
+    if (!QualificationCompatible(types, source_value, target,
+                                 qualification))
+    {
+      // Top-level cv is discarded by the lvalue-to-rvalue conversion when a
+      // value is passed by value.  It is not a qualification conversion (and
+      // the reference path above deliberately does not use this fallback).
+      if (types.Unqualified(source_value) != types.Unqualified(target))
+        return ImplicitConversion();
+      qualification = false;
+    }
+    result.rank = RANK_EXACT;
+    result.qualification = qualification;
+    if (qualification)
+      result.kind = CONV_QUALIFICATION;
+    return result;
+  }
+
+  if (types.IsPointer(source_value) && types.IsPointer(target))
+  {
+    bool qualification = false;
+    if (QualificationCompatible(types, source_value, target,
+                                qualification))
+    {
+      result.rank = RANK_EXACT;
+      result.kind = qualification ? CONV_QUALIFICATION : CONV_POINTER;
+      result.qualification = qualification;
+      return result;
+    }
+    if (PointerToVoidCompatible(types, source_value, target, qualification))
+    {
+      result.rank = RANK_CONVERSION;
+      result.kind = CONV_POINTER;
+      result.qualification = qualification;
+      return result;
+    }
+  }
+  if (types.IsPointer(source_value) &&
+      types.Kind(types.Unqualified(target)) == TYPE_FUNDAMENTAL &&
+      types.At(types.Unqualified(target)).fundamental == FT_BOOL)
+  {
+    result.rank = RANK_CONVERSION;
+    result.kind = CONV_POINTER_TO_BOOL;
+    return result;
+  }
+
+  const bool source_enum =
+      types.Kind(types.Unqualified(source_value)) == TYPE_ENUM;
+  const bool target_enum =
+      types.Kind(types.Unqualified(target)) == TYPE_ENUM;
+  if (types.IsArithmetic(source_value) && types.IsArithmetic(target))
+  {
+    if (types.IsIntegral(source_value) && types.IsIntegral(target))
+    {
+      const TypeId promoted = types.Promote(source_value);
+      if (promoted == types.Unqualified(target) && !target_enum)
+      {
+        result.rank = RANK_PROMOTION;
+        result.kind = CONV_INTEGRAL_PROMOTION;
+      }
+      else
+      {
+        result.rank = RANK_CONVERSION;
+        result.kind = CONV_INTEGRAL_CONVERSION;
+      }
+      (void)source_enum;
+      return result;
+    }
+    if (IsFloating(types, source_value) && IsFloating(types, target))
+    {
+      const std::size_t source_size = FundamentalSize(
+          types.At(types.Unqualified(source_value)).fundamental);
+      const std::size_t target_size = FundamentalSize(
+          types.At(types.Unqualified(target)).fundamental);
+      result.rank = source_size < target_size ? RANK_PROMOTION :
+          RANK_CONVERSION;
+      result.kind = source_size < target_size ? CONV_FLOATING_PROMOTION :
+          CONV_FLOATING_CONVERSION;
+      return result;
+    }
+    result.rank = RANK_CONVERSION;
+    result.kind = IsFloating(types, target) ? CONV_FLOATING_CONVERSION :
+        CONV_INTEGRAL_CONVERSION;
+    return result;
+  }
+  if (types.IsScalar(source_value) &&
+      types.Kind(types.Unqualified(target)) == TYPE_FUNDAMENTAL &&
+      types.At(types.Unqualified(target)).fundamental == FT_BOOL)
+  {
+    result.rank = RANK_CONVERSION;
+    result.kind = CONV_BOOLEAN;
+    return result;
+  }
+  (void)is_function_lvalue;
+  return ImplicitConversion();
 }
 
 } // namespace
@@ -82,159 +289,75 @@ ImplicitConversion Classify(TypeTable& types, TypeId source,
   TypeId source_value = source;
   if (types.Kind(source_value) == TYPE_REFERENCE)
     source_value = types.Referent(source_value);
-  const bool source_array = types.Kind(source_value) == TYPE_ARRAY;
   const bool source_function = types.Kind(source_value) == TYPE_FUNCTION;
 
   if (target_reference)
   {
-    if (source_category == VC_LVALUE &&
-        (target_rvalue_reference || !source_array))
+    bool qualification = false;
+    const bool related = QualificationCompatible(types, source_value,
+                                                  target_value, qualification);
+    if (related && source_category == VC_LVALUE && !target_rvalue_reference)
     {
-      bool qualification = false;
-      if (SameUnqualified(types, source_value, target_value) &&
-          QualificationCompatible(types, source_value, target_value,
-                                  qualification))
-      {
-        if (target_rvalue_reference && source_function)
-          result.function_lvalue_to_lvalue_ref = true;
-        else if (target_rvalue_reference)
-          return result;
-        result.rank = RANK_EXACT;
-        result.kind = qualification ? CONV_QUALIFICATION : CONV_IDENTITY;
-        result.qualification = qualification;
-        result.reference = REFERENCE_DIRECT;
-        return result;
-      }
-    }
-    if (target_rvalue_reference && source_category == VC_LVALUE &&
-        !source_function)
-      return result;
-    // A const reference can bind a converted temporary.  The caller still
-    // checks the exact direct-binding restrictions for non-const references.
-    if (types.Kind(target_value) == TYPE_CV &&
-        types.At(target_value).is_const)
-    {
-      ImplicitConversion converted = Classify(
-          types, source_value, VC_PRVALUE, is_null_literal,
-          is_function_lvalue, target_value);
-      if (converted.Viable())
-      {
-        converted.reference = REFERENCE_TEMPORARY;
-        converted.to = target;
-        return converted;
-      }
-    }
-    return result;
-  }
-
-  if (source_array)
-  {
-    source_value = types.Decay(source_value);
-    result.rank = RANK_EXACT;
-    result.kind = CONV_ARRAY_TO_POINTER;
-  }
-  else if (source_function)
-  {
-    source_value = types.Decay(source_value);
-    result.rank = RANK_EXACT;
-    result.kind = CONV_FUNCTION_TO_POINTER;
-  }
-  else if (source_category == VC_LVALUE)
-  {
-    result.kind = CONV_LVALUE_TO_RVALUE;
-    result.rank = RANK_EXACT;
-  }
-
-  if (is_null_literal && types.IsNullPointerType(target_value))
-  {
-    result.rank = RANK_CONVERSION;
-    result.kind = CONV_NULL_TO_NULLPTR;
-    return result;
-  }
-  if (is_null_literal && types.IsPointer(target_value))
-  {
-    result.rank = RANK_CONVERSION;
-    result.kind = CONV_NULL_TO_POINTER;
-    return result;
-  }
-  if (types.IsNullPointerType(source_value) && types.IsPointer(target_value))
-  {
-    result.rank = RANK_CONVERSION;
-    result.kind = CONV_NULL_TO_POINTER;
-    return result;
-  }
-
-  if (source_value == target_value)
-  {
-    if (result.kind == CONV_IDENTITY)
-      result.kind = CONV_IDENTITY;
-    result.rank = RANK_EXACT;
-    return result;
-  }
-  bool qualification = false;
-  if (types.IsPointer(source_value) && types.IsPointer(target_value) &&
-      QualificationCompatible(types, source_value, target_value,
-                               qualification))
-  {
-    result.rank = RANK_CONVERSION;
-    result.kind = qualification ? CONV_QUALIFICATION : CONV_POINTER;
-    result.qualification = qualification;
-    return result;
-  }
-  if (types.IsPointer(source_value) &&
-      types.Kind(types.Unqualified(target_value)) == TYPE_FUNDAMENTAL &&
-      types.At(types.Unqualified(target_value)).fundamental == FT_BOOL)
-  {
-    result.rank = RANK_CONVERSION;
-    result.kind = CONV_POINTER_TO_BOOL;
-    return result;
-  }
-
-  const bool source_enum = types.Kind(types.Unqualified(source_value)) == TYPE_ENUM;
-  const bool target_enum = types.Kind(types.Unqualified(target_value)) == TYPE_ENUM;
-  if (types.IsArithmetic(source_value) && types.IsArithmetic(target_value))
-  {
-    if (types.IsIntegral(source_value) && types.IsIntegral(target_value))
-    {
-      const TypeId promoted = types.Promote(source_value);
-      if (promoted == types.Unqualified(target_value) && !target_enum)
-      {
-        result.rank = RANK_PROMOTION;
-        result.kind = CONV_INTEGRAL_PROMOTION;
-      }
-      else
-      {
-        result.rank = RANK_CONVERSION;
-        result.kind = source_enum || target_enum ? CONV_INTEGRAL_CONVERSION :
-            CONV_INTEGRAL_CONVERSION;
-      }
+      result.rank = RANK_EXACT;
+      result.kind = qualification ? CONV_QUALIFICATION : CONV_IDENTITY;
+      result.qualification = qualification;
+      result.reference = REFERENCE_DIRECT;
+      result.function_lvalue_to_lvalue_ref = source_function ||
+          is_function_lvalue;
       return result;
     }
-    if (IsFloating(types, source_value) && IsFloating(types, target_value))
+    if (related && source_category == VC_LVALUE && target_rvalue_reference &&
+        !source_function && !is_function_lvalue)
+      return result;
+    if (related && source_category == VC_XVALUE && !target_rvalue_reference &&
+        !(IsConst(types, target_value) || IsVolatile(types, target_value)))
+      return result;
+    if (related && source_category == VC_XVALUE)
     {
-      const std::size_t source_size = FundamentalSize(
-          types.At(types.Unqualified(source_value)).fundamental);
-      const std::size_t target_size = FundamentalSize(
-          types.At(types.Unqualified(target_value)).fundamental);
-      result.rank = source_size < target_size ? RANK_PROMOTION : RANK_CONVERSION;
-      result.kind = source_size < target_size ? CONV_FLOATING_PROMOTION :
-          CONV_FLOATING_CONVERSION;
+      result.rank = RANK_EXACT;
+      result.kind = qualification ? CONV_QUALIFICATION : CONV_IDENTITY;
+      result.qualification = qualification;
+      result.reference = REFERENCE_DIRECT;
+      result.rvalue_ref_to_rvalue = target_rvalue_reference;
       return result;
     }
-    result.rank = RANK_CONVERSION;
-    result.kind = IsFloating(types, target_value) ? CONV_FLOATING_CONVERSION :
-        CONV_INTEGRAL_CONVERSION;
+    if (related && source_category == VC_PRVALUE &&
+        (target_rvalue_reference ||
+         IsConst(types, target_value) || IsVolatile(types, target_value)))
+    {
+      result.rank = RANK_EXACT;
+      result.kind = qualification ? CONV_QUALIFICATION : CONV_IDENTITY;
+      result.qualification = qualification;
+      result.reference = REFERENCE_DIRECT;
+      result.rvalue_ref_to_rvalue = target_rvalue_reference;
+      return result;
+    }
+
+    // A converted temporary can bind a const lvalue reference or an rvalue
+    // reference.  Same-type lvalues were rejected above for rvalue refs, so
+    // this path cannot silently turn `int` into `const int&&`.
+    const bool drops_source_qualification =
+        (IsConst(types, source_value) && !IsConst(types, target_value)) ||
+        (IsVolatile(types, source_value) &&
+         !IsVolatile(types, target_value));
+    if (drops_source_qualification)
+      return result;
+    ImplicitConversion converted = ClassifyValue(
+        types, source_value, source_category, is_null_literal,
+        is_function_lvalue, target_value);
+    if (converted.Viable() &&
+        (target_rvalue_reference || IsConst(types, target_value) ||
+         IsVolatile(types, target_value)))
+    {
+      converted.reference = REFERENCE_TEMPORARY;
+      converted.to = target;
+      converted.rvalue_ref_to_rvalue = target_rvalue_reference;
+      return converted;
+    }
     return result;
   }
-  if (types.IsScalar(source_value) &&
-      types.Kind(types.Unqualified(target_value)) == TYPE_FUNDAMENTAL &&
-      types.At(types.Unqualified(target_value)).fundamental == FT_BOOL)
-  {
-    result.rank = RANK_CONVERSION;
-    result.kind = CONV_BOOLEAN;
-    return result;
-  }
-  return ImplicitConversion();
+  return ClassifyValue(types, source, source_category, is_null_literal,
+                       is_function_lvalue, target_value);
 }
 
 ConversionComparison Compare(const ImplicitConversion& left,
@@ -246,6 +369,10 @@ ConversionComparison Compare(const ImplicitConversion& left,
     return CONVERSION_WORSE;
   if (left.rank == RANK_NONE)
     return CONVERSION_EQUAL;
+  if ((left.kind == CONV_POINTER_TO_BOOL) !=
+      (right.kind == CONV_POINTER_TO_BOOL))
+    return left.kind == CONV_POINTER_TO_BOOL ? CONVERSION_WORSE :
+        CONVERSION_BETTER;
   if (left.reference != right.reference)
   {
     if (left.reference == REFERENCE_DIRECT)

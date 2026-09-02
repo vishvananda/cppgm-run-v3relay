@@ -1,5 +1,6 @@
 #include "sema/expr_sema.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -297,7 +298,9 @@ bool ExpressionAnalyzer::IsModifiableLvalue(SemaId node) const
 {
   if (node == 0 || tree_.At(node).category != VC_LVALUE)
     return false;
-  const TypeId type = tree_.At(node).type;
+  TypeId type = tree_.At(node).type;
+  if (types_.Kind(type) == TYPE_REFERENCE)
+    type = types_.Referent(type);
   if (types_.Kind(type) == TYPE_ARRAY || types_.Kind(type) == TYPE_FUNCTION)
     return false;
   return !IsConstObject(types_, type);
@@ -310,6 +313,8 @@ SemaId ExpressionAnalyzer::AnalyzeUnary(AstId expression, ScopeId scope)
   const ETokenType op = Operator(expression);
   const SemaId operand = Analyze(Child(expression, 0), scope);
   const Info info = NodeInfo(operand);
+  const TypeId value_type = types_.Kind(info.type) == TYPE_REFERENCE ?
+      types_.Referent(info.type) : info.type;
   TypeId result_type = 0;
   ValueCategory category = VC_PRVALUE;
   switch (op)
@@ -317,7 +322,8 @@ SemaId ExpressionAnalyzer::AnalyzeUnary(AstId expression, ScopeId scope)
   case OP_AMP:
     if (info.category != VC_LVALUE && !info.is_function_lvalue)
       throw std::runtime_error("address-of requires an lvalue");
-    result_type = types_.Pointer(info.type);
+    result_type = types_.Pointer(types_.Kind(info.type) == TYPE_REFERENCE ?
+        types_.Referent(info.type) : info.type);
     break;
   case OP_STAR:
   {
@@ -329,22 +335,23 @@ SemaId ExpressionAnalyzer::AnalyzeUnary(AstId expression, ScopeId scope)
     break;
   }
   case OP_INC: case OP_DEC:
-    if (!IsModifiableLvalue(operand) || !types_.IsScalar(info.type))
+    if (!IsModifiableLvalue(operand) || !types_.IsScalar(value_type))
       throw std::runtime_error("increment requires a modifiable scalar lvalue");
-    result_type = info.type;
+    result_type = types_.Kind(info.type) == TYPE_REFERENCE ?
+        types_.Referent(info.type) : info.type;
     category = VC_LVALUE;
     break;
   case OP_LNOT:
-    if (!types_.IsScalar(info.type) || IsScopedEnum(types_, info.type))
+    if (!types_.IsScalar(value_type) || IsScopedEnum(types_, value_type))
       throw std::runtime_error("logical not requires a scalar operand");
     result_type = types_.Fundamental(FT_BOOL);
     break;
   case OP_PLUS: case OP_MINUS: case OP_COMPL:
-    if (!types_.IsArithmetic(info.type) ||
-        (op == OP_COMPL && !types_.IsIntegral(info.type)))
+    if (!types_.IsArithmetic(value_type) ||
+        (op == OP_COMPL && !types_.IsIntegral(value_type)))
       throw std::runtime_error("unary arithmetic operator has invalid operand");
-    result_type = types_.IsIntegral(info.type) ? types_.Promote(info.type) :
-        types_.Unqualified(info.type);
+    result_type = types_.IsIntegral(value_type) ? types_.Promote(value_type) :
+        types_.Unqualified(value_type);
     break;
   default:
     throw std::runtime_error("unsupported unary operator");
@@ -364,7 +371,9 @@ SemaId ExpressionAnalyzer::AnalyzePostfix(AstId expression, ScopeId scope)
   const SemaId operand = Analyze(Child(expression, 0), scope);
   const Info info = NodeInfo(operand);
   if ((Operator(expression) != OP_INC && Operator(expression) != OP_DEC) ||
-      !IsModifiableLvalue(operand) || !types_.IsScalar(info.type))
+      !IsModifiableLvalue(operand) ||
+      !types_.IsScalar(types_.Kind(info.type) == TYPE_REFERENCE ?
+          types_.Referent(info.type) : info.type))
     throw std::runtime_error("postfix operator has invalid operand");
   const SemaId result = MakeExpression(SEMA_POSTFIX, expression,
                                        types_.Decay(info.type), VC_PRVALUE,
@@ -381,6 +390,32 @@ bool ExpressionAnalyzer::CanConvert(SemaId expression, TypeId target) const
       source.is_null_literal || IsZeroLiteral(0, expression),
       source.is_function_lvalue, target);
   return conversion.Viable();
+}
+
+bool ExpressionAnalyzer::RetargetFunctionName(SemaId expression,
+                                               TypeId target)
+{
+  if (expression == 0 || tree_.At(expression).kind != SEMA_ID_EXPRESSION ||
+      tree_.At(expression).function == 0)
+    return false;
+  const SemaNode& source = tree_.At(expression);
+  const QualifiedName name = ReadQualifiedName(tokens_, source.first,
+                                               source.last);
+  vector<BindingId> bindings;
+  if (name.Qualified())
+    model_.LookupQualifiedSet(source.scope, name, LOOKUP_ANY, bindings);
+  else
+    model_.LookupSet(source.scope, name.Last(), LOOKUP_ANY, bindings);
+  BindingId binding = 0;
+  FunctionEntityId function = 0;
+  if (!SelectTargetFunction(model_, types_, bindings, target, binding,
+                            function))
+    return false;
+  SemaNode& retargeted = tree_.At(expression);
+  retargeted.binding = binding;
+  retargeted.function = function;
+  retargeted.type = model_.FunctionAt(function).type;
+  return true;
 }
 
 SemaId ExpressionAnalyzer::AnalyzeBinary(AstId expression, ScopeId scope)
@@ -412,6 +447,9 @@ SemaId ExpressionAnalyzer::AnalyzeBinary(AstId expression, ScopeId scope)
     break;
   case OP_EQ: case OP_NE: case OP_LT: case OP_GT: case OP_LE: case OP_GE:
     if (types_.IsArithmetic(left_type) && types_.IsArithmetic(right_type))
+      result_type = types_.Fundamental(FT_BOOL);
+    else if (types_.IsNullPointerType(left_type) &&
+             types_.IsNullPointerType(right_type))
       result_type = types_.Fundamental(FT_BOOL);
     else if (types_.IsPointer(left_type) && types_.IsPointer(right_type))
     {
@@ -486,18 +524,20 @@ SemaId ExpressionAnalyzer::AnalyzeAssignment(AstId expression, ScopeId scope)
   const SemaId right = Analyze(Child(expression, 1), scope);
   const Info lhs = NodeInfo(left);
   const Info rhs = NodeInfo(right);
+  const TypeId lhs_value = types_.Kind(lhs.type) == TYPE_REFERENCE ?
+      types_.Referent(lhs.type) : lhs.type;
   if (!IsModifiableLvalue(left))
     throw std::runtime_error("assignment requires a modifiable lvalue");
   if (op == OP_ASS)
   {
-    if (!CanConvert(right, lhs.type))
+    if (!CanConvert(right, lhs_value))
       throw std::runtime_error("assignment conversion is not viable");
   }
   else
   {
     const bool pointer_add = (op == OP_PLUSASS || op == OP_MINUSASS) &&
-        types_.IsPointer(lhs.type) && types_.IsIntegral(rhs.type);
-    const bool arithmetic = types_.IsArithmetic(lhs.type) &&
+        types_.IsPointer(lhs_value) && types_.IsIntegral(rhs.type);
+    const bool arithmetic = types_.IsArithmetic(lhs_value) &&
         types_.IsArithmetic(rhs.type);
     if (!pointer_add && !arithmetic)
       throw std::runtime_error("compound assignment operands are invalid");
@@ -506,12 +546,12 @@ SemaId ExpressionAnalyzer::AnalyzeAssignment(AstId expression, ScopeId scope)
         op == OP_XORASS || op == OP_BORASS)
     {
       if (!arithmetic || (op == OP_MODASS &&
-                          (!types_.IsIntegral(lhs.type) ||
+                          (!types_.IsIntegral(lhs_value) ||
                            !types_.IsIntegral(rhs.type))))
         throw std::runtime_error("compound assignment operands are invalid");
     }
   }
-  const SemaId result = MakeExpression(SEMA_ASSIGNMENT, expression, lhs.type,
+  const SemaId result = MakeExpression(SEMA_ASSIGNMENT, expression, lhs_value,
                                        VC_LVALUE, scope, op);
   Append(result, left);
   Append(result, right);
@@ -582,19 +622,28 @@ SemaId ExpressionAnalyzer::AnalyzeSubscript(AstId expression, ScopeId scope)
     throw std::runtime_error("invalid subscript expression");
   SemaId first = Analyze(Child(expression, 0), scope);
   SemaId second = Analyze(Child(expression, 1), scope);
-  const bool first_pointer = types_.IsPointer(NodeInfo(first).type) ||
-      types_.Kind(NodeInfo(first).type) == TYPE_ARRAY;
-  const bool second_pointer = types_.IsPointer(NodeInfo(second).type) ||
-      types_.Kind(NodeInfo(second).type) == TYPE_ARRAY;
+  TypeId first_type = NodeInfo(first).type;
+  TypeId second_type = NodeInfo(second).type;
+  if (types_.Kind(first_type) == TYPE_REFERENCE)
+    first_type = types_.Referent(first_type);
+  if (types_.Kind(second_type) == TYPE_REFERENCE)
+    second_type = types_.Referent(second_type);
+  const bool first_pointer = types_.IsPointer(first_type) ||
+      types_.Kind(first_type) == TYPE_ARRAY;
+  const bool second_pointer = types_.IsPointer(second_type) ||
+      types_.Kind(second_type) == TYPE_ARRAY;
   if (!first_pointer && second_pointer)
+  {
     std::swap(first, second);
-  const Info base = NodeInfo(first);
-  if (types_.Kind(base.type) != TYPE_ARRAY && !types_.IsPointer(base.type))
+    std::swap(first_type, second_type);
+  }
+  if (types_.Kind(first_type) != TYPE_ARRAY && !types_.IsPointer(first_type))
     throw std::runtime_error("subscript base is not an array or pointer");
-  if (!types_.IsIntegral(NodeInfo(second).type))
+  if (!types_.IsIntegral(second_type))
     throw std::runtime_error("subscript index is not integral");
-  TypeId element = types_.Kind(base.type) == TYPE_ARRAY ?
-      types_.At(base.type).base : types_.At(types_.Unqualified(base.type)).base;
+  TypeId element = types_.Kind(first_type) == TYPE_ARRAY ?
+      types_.At(first_type).base :
+      types_.At(types_.Unqualified(first_type)).base;
   const SemaId result = MakeExpression(SEMA_SUBSCRIPT, expression, element,
                                        VC_LVALUE, scope);
   Append(result, first);
@@ -611,6 +660,11 @@ bool ExpressionAnalyzer::IsTypeName(AstId expression, ScopeId scope,
   if (node.kind != AST_ID_EXPRESSION && node.kind != AST_IDENTIFIER)
     return false;
   const QualifiedName name = ReadQualifiedName(tokens_, node.first, node.last);
+  if (!name.Qualified() && name.Last() == "nullptr_t")
+  {
+    type = types_.Fundamental(FT_NULLPTR_T);
+    return true;
+  }
   const BindingId binding = name.Qualified() ?
       model_.LookupQualified(scope, name, LOOKUP_TYPES) :
       model_.LookupTypeName(scope, name.Last());
@@ -628,6 +682,8 @@ bool ExpressionAnalyzer::IsFundamentalCastCallee(AstId callee) const
   if (callee == 0)
     return false;
   const AstNode& node = arena_.At(callee);
+  if (node.kind != AST_ID_EXPRESSION && node.kind != AST_IDENTIFIER)
+    return false;
   if (node.first >= tokens_.size())
     return false;
   const Pa6Token& token = tokens_[node.first];
@@ -649,11 +705,14 @@ SemaId ExpressionAnalyzer::AnalyzeCast(AstId expression, ScopeId scope)
   const SemaId operand = Analyze(Child(expression, 1), scope);
   if (types_.Kind(target) == TYPE_REFERENCE)
   {
-    const TypeId referent = types_.Referent(target);
     const Info source = NodeInfo(operand);
     if (types_.At(target).lvalue_reference && source.category != VC_LVALUE)
       throw std::runtime_error("lvalue reference cast requires an lvalue");
-    tree_.At(operand).type = referent;
+    // The cast expression retains its reference type in the semantic tree;
+    // its value category is the category of the referred-to expression.
+    // Keeping the reference wrapper is observable for decltype and for an
+    // rvalue-reference-to-array used as a subscript base.
+    tree_.At(operand).type = target;
     tree_.At(operand).category = types_.At(target).lvalue_reference ?
         VC_LVALUE : VC_XVALUE;
     return operand;
@@ -713,7 +772,12 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
     throw std::runtime_error("invalid call expression");
   const AstId callee = Child(expression, 0);
   const AstId arguments = Child(expression, 1);
+
+  // A functional cast is represented by the same postfix-call AST shape as a
+  // function call.  Resolve its type before ordinary name lookup, so a type
+  // alias cannot be mistaken for an overload set.
   TypeId target = 0;
+  bool functional_cast = false;
   if (IsFundamentalCastCallee(callee))
   {
     const AstNode& node = arena_.At(callee);
@@ -723,33 +787,195 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
           IsFundamentalTypeKeyword(tokens_[i].simple_type))
         keywords.push_back(tokens_[i].simple_type);
     if (keywords.empty())
-      throw std::runtime_error("invalid functional cast type");
-    target = types_.FundamentalFromKeywords(keywords);
+    {
+      // `decltype(e)(v)` is parsed as a type-specifier-shaped callee.  The
+      // parser keeps the parsed operand as its only child when available.
+      AstId decltype_node = FindChild(callee, AST_DECL_SPECIFIER);
+      if (decltype_node == 0)
+        decltype_node = FindChild(callee, AST_DECLTYPE_SPECIFIER);
+      if (decltype_node != 0 && !arena_.At(decltype_node).children.empty())
+        target = builder_.DecltypeForSemantics(
+            arena_.At(decltype_node).children[0], scope);
+      else
+        throw std::runtime_error("invalid decltype functional cast");
+    }
+    else
+      target = types_.FundamentalFromKeywords(keywords);
+    functional_cast = true;
   }
-  else if (!IsTypeName(callee, scope, target))
-    throw std::runtime_error("call expressions: CP2");
+  else if (IsTypeName(callee, scope, target))
+    functional_cast = true;
 
   const vector<AstId>& args = arena_.At(arguments).children;
-  if (args.size() > 1)
-    throw std::runtime_error("functional cast has too many arguments");
-  if (args.empty())
+  if (functional_cast)
   {
-    const SemaId result = MakeExpression(SEMA_LITERAL, expression, target,
+    if (args.size() > 1)
+      throw std::runtime_error("functional cast has too many arguments");
+    if (args.empty())
+    {
+      const SemaId result = MakeExpression(SEMA_LITERAL, 0, target,
+                                           VC_PRVALUE, scope);
+      tree_.At(result).has_value = types_.IsIntegral(target) ||
+          types_.IsNullPointerType(target);
+      tree_.At(result).value = 0;
+      return result;
+    }
+    const SemaId operand = Analyze(args[0], scope);
+    const Info source = NodeInfo(operand);
+    if (!Classify(types_, source.type, source.category,
+                  source.is_null_literal || IsZeroLiteral(0, operand),
+                  source.is_function_lvalue, target).Viable())
+      throw std::runtime_error("functional cast is not viable");
+    const SemaId result = MakeExpression(SEMA_CAST, expression, target,
                                          VC_PRVALUE, scope);
-    tree_.At(result).has_value = types_.IsIntegral(target) ||
-        types_.IsNullPointerType(target);
-    tree_.At(result).value = 0;
+    Append(result, operand);
     return result;
   }
-  const SemaId operand = Analyze(args[0], scope);
-  const Info source = NodeInfo(operand);
-  if (!Classify(types_, source.type, source.category,
-                source.is_null_literal || IsZeroLiteral(0, operand),
-                source.is_function_lvalue, target).Viable())
-    throw std::runtime_error("functional cast is not viable");
-  const SemaId result = MakeExpression(SEMA_CAST, expression, target,
-                                       VC_PRVALUE, scope);
-  Append(result, operand);
+
+  const AstNode& callee_node = arena_.At(callee);
+  const bool named_callee = callee_node.kind == AST_ID_EXPRESSION ||
+      callee_node.kind == AST_IDENTIFIER;
+  QualifiedName name;
+  vector<BindingId> bindings;
+  if (named_callee)
+  {
+    name = ReadQualifiedName(tokens_, callee_node.first, callee_node.last);
+    if (name.Qualified())
+      model_.LookupQualifiedSet(scope, name, LOOKUP_ANY, bindings);
+    else
+      model_.LookupSet(scope, name.Last(), LOOKUP_ANY, bindings);
+  }
+
+  // Analyze arguments before selecting a candidate so every source
+  // expression is owned by the semantic tree in source order.  Conversion
+  // nodes are added only after the selected parameter list is known.
+  vector<SemaId> analyzed_arguments;
+  vector<OverloadArgument> overload_arguments;
+  analyzed_arguments.reserve(args.size());
+  overload_arguments.reserve(args.size());
+  for (size_t i = 0; i < args.size(); ++i)
+  {
+    const SemaId argument = Analyze(args[i], scope);
+    const Info info = NodeInfo(argument);
+    analyzed_arguments.push_back(argument);
+    OverloadArgument overload_argument(
+        info.type, info.category,
+        info.is_null_literal || IsZeroLiteral(0, argument),
+        info.is_function_lvalue);
+    if (tree_.At(argument).kind == SEMA_ID_EXPRESSION &&
+        tree_.At(argument).function != 0)
+    {
+      const SemaNode& semantic = tree_.At(argument);
+      const QualifiedName argument_name = ReadQualifiedName(
+          tokens_, semantic.first, semantic.last);
+      vector<BindingId> argument_bindings;
+      if (argument_name.Qualified())
+        model_.LookupQualifiedSet(semantic.scope, argument_name,
+                                  LOOKUP_ANY, argument_bindings);
+      else
+        model_.LookupSet(semantic.scope, argument_name.Last(), LOOKUP_ANY,
+                         argument_bindings);
+      for (size_t candidate = 0; candidate < argument_bindings.size();
+           ++candidate)
+      {
+        const Binding& binding = model_.BindingAt(argument_bindings[candidate]);
+        if (binding.kind != BINDING_FUNCTION || binding.function == 0)
+          continue;
+        if (std::find(overload_argument.function_candidates.begin(),
+                      overload_argument.function_candidates.end(),
+                      binding.function) ==
+            overload_argument.function_candidates.end())
+          overload_argument.function_candidates.push_back(binding.function);
+      }
+    }
+    overload_arguments.push_back(overload_argument);
+  }
+
+  FunctionEntityId function = 0;
+  TypeId function_type = 0;
+  SemaId indirect_callee = 0;
+  bool has_function_binding = false;
+  for (size_t i = 0; i < bindings.size(); ++i)
+    if (model_.BindingAt(bindings[i]).kind == BINDING_FUNCTION)
+    {
+      has_function_binding = true;
+      break;
+    }
+  if (named_callee && has_function_binding)
+  {
+    OverloadSelection selection;
+    if (!SelectBestOverload(model_, types_, bindings, overload_arguments,
+                            selection))
+      throw std::runtime_error("no unique viable function overload");
+    function = selection.function;
+    function_type = model_.FunctionAt(function).type;
+  }
+  else if (named_callee && bindings.empty() && name.components.size() == 1 &&
+           !name.global && name.Last() == "__builtin_abort")
+  {
+    if (!args.empty())
+      throw std::runtime_error("__builtin_abort takes no arguments");
+    vector<TypeId> parameters;
+    function_type = types_.Function(types_.Fundamental(FT_VOID), parameters);
+    function = model_.CreateFunction(model_.GlobalScope(), name.Last(),
+                                     function_type);
+  }
+  else if (named_callee && bindings.empty() && name.components.size() == 1 &&
+           !name.global && name.Last() == "__builtin_constant_p")
+  {
+    if (args.size() != 1)
+      throw std::runtime_error("__builtin_constant_p takes one argument");
+    const SemaId result = MakeExpression(SEMA_LITERAL, 0,
+        types_.Fundamental(FT_INT), VC_PRVALUE, scope);
+    long long value = 0;
+    tree_.At(result).has_value = true;
+    tree_.At(result).value = TryConstant(analyzed_arguments[0], value) ? 1 : 0;
+    return result;
+  }
+  else
+  {
+    indirect_callee = Analyze(callee, scope);
+    if (!CallableFunctionType(types_, NodeInfo(indirect_callee).type,
+                              function_type))
+      throw std::runtime_error("called expression is not a function");
+  }
+
+  const TypeNode& callable = types_.At(types_.Unqualified(function_type));
+  if ((!callable.variadic && callable.parameters.size() != args.size()) ||
+      (callable.variadic && args.size() < callable.parameters.size()))
+    throw std::runtime_error("wrong number of call arguments");
+
+  vector<SemaId> converted_arguments;
+  converted_arguments.reserve(analyzed_arguments.size());
+  for (size_t i = 0; i < analyzed_arguments.size(); ++i)
+  {
+    SemaId argument = analyzed_arguments[i];
+    if (i < callable.parameters.size())
+      argument = Initialize(argument, callable.parameters[i],
+                             InitContext(false, false, false, false, true));
+    converted_arguments.push_back(argument);
+  }
+
+  const TypeId result_type = callable.result;
+  ValueCategory result_category = VC_PRVALUE;
+  if (types_.Kind(result_type) == TYPE_REFERENCE)
+    result_category = types_.At(result_type).lvalue_reference ? VC_LVALUE :
+        VC_XVALUE;
+  const SemaId result = MakeExpression(SEMA_CALL, expression, result_type,
+                                       result_category, scope);
+  if (function != 0)
+  {
+    const SemaId callee_semantic = tree_.Make(SEMA_CALLEE);
+    SemaNode& callee_value = tree_.At(callee_semantic);
+    callee_value.type = function_type;
+    callee_value.function = function;
+    callee_value.scope = scope;
+    Append(result, callee_semantic);
+  }
+  else
+    Append(result, indirect_callee);
+  for (size_t i = 0; i < converted_arguments.size(); ++i)
+    Append(result, converted_arguments[i]);
   return result;
 }
 
@@ -800,6 +1026,15 @@ SemaId ExpressionAnalyzer::Initialize(SemaId expression, TypeId target,
 {
   if (expression == 0 || target == 0)
     throw std::runtime_error("invalid initializer");
+
+  // A function name is initially analyzed against the ordinary lookup set,
+  // which is enough to give it a semantic node but not enough to choose an
+  // overload.  Re-resolve it here once the destination function pointer or
+  // reference type is known (13.4).
+  if (tree_.At(expression).kind == SEMA_ID_EXPRESSION &&
+      tree_.At(expression).function != 0)
+    (void)RetargetFunctionName(expression, target);
+
   SemaNode& source_node = tree_.At(expression);
   const Info source = NodeInfo(expression);
   const ImplicitConversion conversion = Classify(
@@ -810,22 +1045,30 @@ SemaId ExpressionAnalyzer::Initialize(SemaId expression, TypeId target,
     throw std::runtime_error("initializer conversion is not viable");
   if (types_.Kind(target) == TYPE_REFERENCE)
   {
-    const TypeId referent = types_.Referent(target);
-    if (types_.At(target).lvalue_reference &&
-        source.category != VC_LVALUE &&
-        !(types_.Kind(referent) == TYPE_CV && types_.At(referent).is_const))
-      throw std::runtime_error("non-const lvalue reference binds a temporary");
-    if (!types_.At(target).lvalue_reference && source.category == VC_LVALUE &&
-        !source.is_function_lvalue)
-      throw std::runtime_error("rvalue reference binds an lvalue");
-    source_node.type = referent;
-    source_node.category = types_.At(target).lvalue_reference ? VC_LVALUE :
-        VC_XVALUE;
+    if (conversion.reference == REFERENCE_TEMPORARY &&
+        conversion.rank != RANK_EXACT)
+    {
+      const SemaNode original = source_node;
+      const SemaId converted = tree_.Make(SEMA_CAST);
+      SemaNode& wrapper = tree_.At(converted);
+      wrapper.type = types_.Referent(target);
+      wrapper.category = VC_PRVALUE;
+      wrapper.op = KW_AUTO;
+      wrapper.scope = original.scope;
+      wrapper.first = original.first;
+      wrapper.last = original.last;
+      tree_.Append(converted, expression);
+      return converted;
+    }
     return expression;
   }
   if (IsZeroLiteral(0, expression))
-    source_node.type = types_.IsPointer(target) ? types_.Unqualified(target) :
-        target;
+  {
+    if (types_.IsPointer(target))
+      source_node.type = types_.Unqualified(target);
+    else if (types_.IsNullPointerType(target))
+      source_node.type = target;
+  }
   else if (context.constexpr_value && source_node.kind == SEMA_LITERAL &&
            source_node.first < tokens_.size() &&
            tokens_[source_node.first].lit_scalar &&

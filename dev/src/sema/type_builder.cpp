@@ -162,6 +162,10 @@ TypeId ScopeBuilder::LookupType(ScopeId scope, const QualifiedName& name) const
 {
   if (name.Empty())
     throw std::runtime_error("invalid type name");
+  // `nullptr_t` is a language-provided scalar type in the PA12 model even
+  // though it is not introduced by a source declaration in the scope tree.
+  if (!name.Qualified() && name.Last() == "nullptr_t")
+    return types_.Fundamental(FT_NULLPTR_T);
   // Ordinary lookup for an unqualified type name honours 3.3.10 hiding;
   // qualified names ignore non-types at every step (3.4.3).
   const BindingId binding = name.Qualified() ?
@@ -349,6 +353,8 @@ void ScopeBuilder::BuildParameters(AstId clause, ScopeId lookup_scope,
     const TypeId base = BuildTypeSequence(parameter.children[0], lookup_scope,
                                           true, string());
     const AstId declarator = FindChild(child, AST_DECLARATOR);
+    if (declarator != 0 && FindChild(declarator, AST_PARAMETER_PACK) != 0)
+      variadic = true;
     ParameterInfo info;
     info.type = BuildDeclaratorType(declarator, base, lookup_scope);
     info.name = IdentifierName(FindIdentifier(declarator));

@@ -7,6 +7,7 @@
 #include "parser/ast_model.h"
 #include "parser/recog_token.h"
 #include "sema/conversions.h"
+#include "sema/overload.h"
 #include "sema/sema_tree.h"
 
 class ScopeBuilder;
@@ -87,6 +88,7 @@ private:
   bool IsFundamentalCastCallee(AstId callee) const;
   bool IsFunctionType(TypeId type) const;
   bool IsModifiableLvalue(SemaId node) const;
+  bool RetargetFunctionName(SemaId expression, TypeId target);
   TypeId ExpressionType(SemaId node) const;
   TypeId CommonConditionalType(SemaId left, SemaId right) const;
   bool CanConvert(SemaId expression, TypeId target) const;

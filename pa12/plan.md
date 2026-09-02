@@ -341,7 +341,9 @@ listed):
   657/657; the file audit passes; the 10k/20k/40k probe remains linear and
   within the parser-only baseline.
 - CP2 calls, overload sets, ranking, target-directed selection, indirect
-  calls, built-ins, decltype over calls — target ≈ 153/166.
+  calls, built-ins, decltype over calls — completed at 153/166; focused call
+  fixtures match, through-pa11 remains 657/657, the file audit passes, and
+  the 10k/20k/40k semantics probe is linear and near parser-only cost.
 - CP3 parser functional casts and `::` statements, 7.3.4p2 directive
   application — 157/166; through-pa10 589/589 and PA10 dumps unchanged.
 - CP4 class-aware fixtures (anonymous/local unions with constructor actions,
@@ -512,24 +514,49 @@ Known uncertainties:
   empty `expression-statement` has no fixture; print the node with no
   children.
 
-## Active Checkpoint: CP2 — call expressions, overload sets, and conversion ranking
+## Completed Checkpoint: CP2 — call expressions, overload sets, and conversion ranking
 
-Goal: extend the existing semantic tree so direct, qualified, aliased,
-using-directed, indirect, built-in, variadic, and function-reference calls
-resolve canonical function entities and print callee/argument children;
-implement target-directed overload selection and the CP2 `decltype` call
-facts. Preserve the CP1 86/166 baseline and leave class-aware and parser-only
-fixtures for CP3/CP4.
+Outcome: `ExpressionAnalyzer::AnalyzeCall` now owns direct, qualified,
+aliased, using-directed, indirect, built-in, variadic, and function-reference
+calls. `overload.cpp` selects canonical function entities with bounded
+candidate sets, per-argument viability, target-directed function selection,
+and strict conversion dominance. Shared conversion logic now covers
+qualification, array/function decay, references and temporaries, null-pointer
+conversions, and reference-returning call results; variadic parameter packs,
+`nullptr_t` lookup/comparison, qualifier precedence, and reference-array
+subscripts use the same model.
 
-Implementation boundary: finish `ExpressionAnalyzer::AnalyzeCall` and its
-candidate/viability/ranking path using `SemaModel::LookupSet`/
-`LookupQualifiedSet` and `ConversionClassifier`; then connect call results,
-reference binding, array/function decay, null-pointer conversions, built-ins,
-and `BuildDecltype` to the existing dump. Start with
-`pa12/tests/spec/100-simple-call.t`, `pa12/tests/spec/100-overload-ranking.t`,
-`pa12/tests/general/200-using-directive-call.t`, and
-`pa12/tests/general/300-bad-ambiguous-overload.t`.
+Evidence: the four packet fixtures and focused reference/conversion regressions
+pass; `make test-pa12` reports 153/166 (13 deferred failures, with coverage
+unchanged); `make test-report-through-pa11` reports 657/657; the pa12 file
+audit passes with its existing header-layout warning; and the five-run
+10k/20k/40k probe remains linear (assignment semantics 0.24/0.47/0.90s,
+declaration semantics 0.20/0.41/0.82s) and close to `--emit-ast`.
 
-Exit evidence: focused call fixtures and the full `make test-pa12` run,
-`make test-report-through-pa11`, and the pa12 file audit; target approximately
-153/166 without reducing the CP1 coverage or changing the probe shape.
+Completed implementation packet: `dev/src/sema/overload.{h,cpp}` and its
+frontend source-set entry; `expr_sema.{h,cpp}` call selection, built-ins,
+reference results, assignment/subscript handling, and target retargeting;
+`conversions.cpp` standard/reference conversion classification;
+`type_builder.cpp` variadic packs and `nullptr_t`; and `scope_model.cpp`
+lexical qualifier precedence.
+
+## Active Checkpoint: CP3 — parser/front-end expression and statement boundaries
+
+Goal: preserve the CP2 153/166 semantic baseline while closing the remaining
+parser-owned functional-cast and local-declaration forms and the outstanding
+statement-tree layout boundary. Leave the nine class/member/constructor
+fixtures for CP4.
+
+Implementation boundary: trace the parser AST contracts through the existing
+semantic entry points for `decltype(...)` functional casts, scoped-enum
+functional casts, local `extern` declarations, and default-statement
+declaration ownership/indentation. Start with
+`pa12/tests/general/300-decltype-functional-cast.t`,
+`pa12/tests/general/300-scoped-enum-functional-cast-integral.t`,
+`pa12/tests/general/300-local-extern-function-declaration.t`, and
+`pa12/tests/general/200-switch-default-declaration.t`. Keep the existing
+using-directive qualifier regression green.
+
+Exit evidence: focused parser/statement fixtures, `make test-pa12`,
+`make test-report-through-pa11`, and the pa12 file audit; target the ledger's
+157/166 CP3 checkpoint without reducing CP2 coverage.

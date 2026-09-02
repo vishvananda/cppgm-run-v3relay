@@ -486,6 +486,20 @@ void SemaModel::LookupQualifiedSet(ScopeId scope, const QualifiedName& name,
 BindingId SemaModel::LookupUnqualified(ScopeId scope, const std::string& name,
                                        unsigned filter) const
 {
+  // A qualifier is resolved lexically before namespace using-directives are
+  // considered.  This matters when a block says `using namespace imported`
+  // but its enclosing namespace already owns a nearer `detail` namespace:
+  // `detail::name` must continue down the lexical namespace path.  Ordinary
+  // value lookup below retains the usual using-directive search behavior.
+  if (filter == LOOKUP_QUALIFIER)
+    for (ScopeId current = scope;; current = scopes_[current].parent)
+    {
+      const BindingId direct = DirectBinding(current, name, filter);
+      if (direct != 0)
+        return direct;
+      if (current == GlobalScope())
+        break;
+    }
   std::vector<ScopeId> visited;
   for (ScopeId current = scope;; current = scopes_[current].parent)
   {
