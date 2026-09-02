@@ -360,18 +360,7 @@ AstId Pa10Parser::parse_using_declaration()
 		return 0;
 	}
 	const size_t target_start = pos_;
-	if (parse_qualified_name() == 0)
-	{
-		restore(saved);
-		return 0;
-	}
-	for (size_t i = target_start; i < pos_; ++i)
-		if (token(i).IsSimple(OP_LT))
-		{
-			restore(saved);
-			return 0;
-		}
-	if (!consume_simple(OP_SEMICOLON))
+	if (parse_qualified_name() == 0 || !consume_simple(OP_SEMICOLON))
 	{
 		restore(saved);
 		return 0;
@@ -565,15 +554,17 @@ AstId Pa10Parser::parse_enum_specifier()
 			return 0;
 		}
 	}
-	// Scoped enumerators belong to the enum scope, which is created by sema;
-	// keeping them out of the parser's enclosing scope also preserves the
-	// declaration/expression distinction for a later same-spelled name.
 	scopes_.Bind(declared_identifier(result), BIND_TYPE);
 	if (scoped)
 		add(result, make_token(AST_ENUM_KEY, key_at));
 	add(result, underlying);
 	if (!is_simple(OP_LBRACE))
+	{
+		// No body: an opaque declaration or an elaborated specifier.  The
+		// node keeps its name span; sema tells the two apart by context.
+		arena_.At(result).kind = AST_ENUM_DECLARATION;
 		return result;
+	}
 	enter_bracket(OP_LBRACE);
 	while (!is_simple(OP_RBRACE))
 	{
@@ -604,10 +595,6 @@ AstId Pa10Parser::parse_enum_specifier()
 		restore(saved);
 		return 0;
 	}
-	// Keep the name spelling in text while extending the source extent to the
-	// closing brace.  Sema uses that extent to distinguish a definition from
-	// an opaque declaration, including an empty enum body.
-	arena_.At(result).last = pos_;
 	// Unscoped enumerators are values in the enclosing scope.  Scoped
 	// enumerators are deliberately not visible to the parser outside the
 	// enum; semantic lookup supplies their actual enum scope later.

@@ -1,97 +1,29 @@
+// Specifier- and declarator-derived type construction for the ScopeBuilder.
 #include "sema/scope_builder.h"
 
-#include <sstream>
 #include <stdexcept>
 
 using std::string;
 using std::vector;
 
-ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens, AstArena& arena,
-                           TypeTable& types, SemaModel& model)
-    : tokens_(tokens), arena_(arena), types_(types), model_(model),
-      const_eval_(tokens, arena, model, types)
+ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens,
+                           const AstArena& arena, SemaModel& model)
+    : tokens_(tokens), arena_(arena), model_(model), types_(model.Types()),
+      const_eval_(tokens, arena, model, *this)
 {
 }
 
-TypeId ScopeBuilder::BuildSpecifierType(AstId specifier_sequence,
-                                        ScopeId lookup_scope)
+TypeId ScopeBuilder::TypeOfTypeId(AstId type_id, ScopeId scope)
 {
-  return BuildTypeSequence(specifier_sequence, lookup_scope, true);
+  return BuildTypeId(type_id, scope);
 }
 
-TypeId ScopeBuilder::BuildTypeSequence(AstId sequence, ScopeId lookup_scope,
-                                       bool allow_elaborated_declaration)
+TypeId ScopeBuilder::TypeOfExpression(AstId expression, ScopeId scope)
 {
-  const AstNode& value = arena_.At(sequence);
-  vector<ETokenType> fundamental_tokens;
-  TypeId result = 0;
-  bool is_const = false;
-  bool is_volatile = false;
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-  {
-    const AstId child = value.children[i];
-    const AstNode& node = arena_.At(child);
-    if (node.kind == AST_CV_QUALIFIER)
-    {
-      if (node.first < tokens_.size() && tokens_[node.first].IsSimple(KW_CONST))
-        is_const = true;
-      if (node.first < tokens_.size() && tokens_[node.first].IsSimple(KW_VOLATILE))
-        is_volatile = true;
-      continue;
-    }
-    if ((node.kind == AST_DECL_SPECIFIER || node.kind == AST_TYPE_SPECIFIER) &&
-        node.first < tokens_.size() && node.last == node.first + 1 &&
-        tokens_[node.first].kind == PA6_SIMPLE_TOKEN)
-    {
-      const ETokenType token = tokens_[node.first].simple_type;
-      if (token == KW_CONST)
-      {
-        is_const = true;
-        continue;
-      }
-      if (token == KW_VOLATILE)
-      {
-        is_volatile = true;
-        continue;
-      }
-      if (IsBuiltinToken(token))
-      {
-        fundamental_tokens.push_back(token);
-        continue;
-      }
-      if (token == KW_CONSTEXPR || IsIgnoredSpecifier(token))
-        continue;
-    }
-    const TypeId child_type = BuildTypeNode(child, lookup_scope,
-                                            allow_elaborated_declaration);
-    if (child_type != 0)
-    {
-      if (result != 0)
-        throw std::runtime_error("multiple type specifiers");
-      result = child_type;
-    }
-  }
-  if (result == 0 && !fundamental_tokens.empty())
-    result = BuildFundamental(fundamental_tokens);
-  if (result == 0)
-    throw std::runtime_error("declaration has no type");
-  return AddCv(result, is_const, is_volatile);
+  return BuildExpressionType(expression, scope).type;
 }
 
-bool ScopeBuilder::IsBuiltinToken(ETokenType token) const
-{
-  switch (token)
-  {
-  case KW_CHAR: case KW_CHAR16_T: case KW_CHAR32_T: case KW_WCHAR_T:
-  case KW_BOOL: case KW_SHORT: case KW_INT: case KW_LONG: case KW_SIGNED:
-  case KW_UNSIGNED: case KW_FLOAT: case KW_DOUBLE: case KW_VOID:
-    return true;
-  default:
-    return false;
-  }
-}
-
-bool ScopeBuilder::IsIgnoredSpecifier(ETokenType token) const
+bool ScopeBuilder::IsIgnoredSpecifier(ETokenType token)
 {
   switch (token)
   {
@@ -104,87 +36,109 @@ bool ScopeBuilder::IsIgnoredSpecifier(ETokenType token) const
   }
 }
 
-TypeId ScopeBuilder::BuildFundamental(const vector<ETokenType>& tokens) const
+TypeId ScopeBuilder::BuildSpecifierType(AstId specifier_sequence,
+                                        ScopeId lookup_scope,
+                                        const string& anonymous_name)
 {
-  bool is_unsigned = false;
-  bool is_signed = false;
-  bool is_short = false;
-  unsigned long_count = 0;
-  ETokenType named = static_cast<ETokenType>(-1);
-  for (std::size_t i = 0; i < tokens.size(); ++i)
-  {
-    switch (tokens[i])
-    {
-    case KW_UNSIGNED: is_unsigned = true; break;
-    case KW_SIGNED: is_signed = true; break;
-    case KW_SHORT: is_short = true; break;
-    case KW_LONG: ++long_count; break;
-    default: named = tokens[i]; break;
-    }
-  }
-  EFundamentalType result = FT_INT;
-  if (named == KW_CHAR)
-    result = is_unsigned ? FT_UNSIGNED_CHAR : is_signed ? FT_SIGNED_CHAR : FT_CHAR;
-  else if (named == KW_CHAR16_T)
-    result = FT_CHAR16_T;
-  else if (named == KW_CHAR32_T)
-    result = FT_CHAR32_T;
-  else if (named == KW_WCHAR_T)
-    result = FT_WCHAR_T;
-  else if (named == KW_BOOL)
-    result = FT_BOOL;
-  else if (named == KW_FLOAT)
-    result = FT_FLOAT;
-  else if (named == KW_DOUBLE)
-    result = long_count == 0 ? FT_DOUBLE : FT_LONG_DOUBLE;
-  else if (named == KW_VOID)
-    result = FT_VOID;
-  else if (is_short)
-    result = is_unsigned ? FT_UNSIGNED_SHORT_INT : FT_SHORT_INT;
-  else if (long_count >= 2)
-    result = is_unsigned ? FT_UNSIGNED_LONG_LONG_INT : FT_LONG_LONG_INT;
-  else if (long_count == 1)
-    result = is_unsigned ? FT_UNSIGNED_LONG_INT : FT_LONG_INT;
-  else if (is_unsigned)
-    result = FT_UNSIGNED_INT;
-  return types_.Fundamental(result);
+  return BuildTypeSequence(specifier_sequence, lookup_scope, true,
+                           anonymous_name);
 }
 
+// decl-specifier-seq or type-specifier-seq: fundamental keywords combine,
+// cv-qualifiers accumulate, exactly one other specifier may name the type.
+TypeId ScopeBuilder::BuildTypeSequence(AstId sequence, ScopeId lookup_scope,
+                                       bool in_declaration,
+                                       const string& anonymous_name)
+{
+  const AstNode& value = arena_.At(sequence);
+  vector<ETokenType> fundamental;
+  TypeId result = 0;
+  bool is_const = false;
+  bool is_volatile = false;
+  for (std::size_t i = 0; i < value.children.size(); ++i)
+  {
+    const AstId child = value.children[i];
+    const AstNode& node = arena_.At(child);
+    const bool single_token = node.first < tokens_.size() &&
+        node.last == node.first + 1 &&
+        tokens_[node.first].kind == PA6_SIMPLE_TOKEN;
+    if (single_token && (node.kind == AST_CV_QUALIFIER ||
+                         node.kind == AST_DECL_SPECIFIER ||
+                         node.kind == AST_TYPE_SPECIFIER))
+    {
+      const ETokenType token = tokens_[node.first].simple_type;
+      if (token == KW_CONST)
+        is_const = true;
+      else if (token == KW_VOLATILE)
+        is_volatile = true;
+      else if (IsFundamentalTypeKeyword(token))
+        fundamental.push_back(token);
+      else if (!IsIgnoredSpecifier(token))
+        throw std::runtime_error("unsupported declaration specifier");
+      continue;
+    }
+    const TypeId child_type = BuildTypeNode(child, lookup_scope, in_declaration,
+                                            anonymous_name);
+    if (result != 0)
+      throw std::runtime_error("multiple type specifiers");
+    result = child_type;
+  }
+  if (result != 0 && !fundamental.empty())
+    throw std::runtime_error("multiple type specifiers");
+  if (result == 0 && !fundamental.empty())
+    result = types_.FundamentalFromKeywords(fundamental);
+  if (result == 0)
+    throw std::runtime_error("declaration has no type");
+  return types_.Cv(result, is_const, is_volatile);
+}
+
+TypeId ScopeBuilder::LookupType(ScopeId scope, const QualifiedName& name) const
+{
+  if (name.Empty())
+    throw std::runtime_error("invalid type name");
+  // Ordinary lookup for an unqualified type name honours 3.3.10 hiding;
+  // qualified names ignore non-types at every step (3.4.3).
+  const BindingId binding = name.Qualified() ?
+      model_.LookupQualified(scope, name, LOOKUP_TYPES) :
+      model_.LookupTypeName(scope, name.components[0]);
+  if (binding == 0 || model_.BindingAt(binding).type == 0)
+    throw std::runtime_error("unknown type name: " + name.Last());
+  return model_.BindingAt(binding).type;
+}
+
+// One specifier that denotes a type: a class or enum specifier, an elaborated
+// class specifier, decltype, a (possibly qualified) type name, or a keyword.
 TypeId ScopeBuilder::BuildTypeNode(AstId node, ScopeId lookup_scope,
-                                   bool allow_elaborated_declaration)
+                                   bool in_declaration,
+                                   const string& anonymous_name)
 {
   const AstNode& value = arena_.At(node);
-  if (value.kind == AST_CLASS_SPECIFIER)
-    return BuildClassSpecifier(node, lookup_scope);
-  if (value.kind == AST_CLASS_FORWARD_DECLARATION)
-    return BuildForwardType(node, lookup_scope,
-                            allow_elaborated_declaration);
-  if (value.kind == AST_ENUM_SPECIFIER)
-    return BuildEnumType(node, lookup_scope, active_anonymous_name_);
-  if (value.kind == AST_DECLTYPE_SPECIFIER ||
-      (value.kind == AST_DECL_SPECIFIER && !value.children.empty()))
+  switch (value.kind)
   {
+  case AST_CLASS_SPECIFIER:
+    return BuildClassDefinition(node, lookup_scope, anonymous_name);
+  case AST_CLASS_FORWARD_DECLARATION:
+    return BuildElaboratedClass(node, lookup_scope, in_declaration);
+  case AST_ENUM_SPECIFIER: case AST_ENUM_DECLARATION:
+    return BuildEnum(node, lookup_scope, anonymous_name);
+  case AST_DECLTYPE_SPECIFIER:
+    if (value.children.size() != 1)
+      throw std::runtime_error("invalid decltype specifier");
+    return BuildDecltype(value.children[0], lookup_scope);
+  case AST_DECL_SPECIFIER:
     if (!value.children.empty())
       return BuildDecltype(value.children[0], lookup_scope);
-  }
-  if ((value.kind == AST_DECL_SPECIFIER || value.kind == AST_TYPE_NAME) &&
-      value.first < tokens_.size())
-  {
-    const vector<string> name = NameComponents(value.first, value.last);
-    if (name.empty())
-      throw std::runtime_error("invalid type name");
-    const BindingId binding = name.size() == 1 ?
-        model_.LookupTypeName(lookup_scope, name[0]) :
-        ResolveName(lookup_scope, name, LOOKUP_TYPES);
-    if (binding == 0 || model_.BindingAt(binding).type == 0)
-      throw std::runtime_error("unknown type name: " + name.back());
-    return model_.BindingAt(binding).type;
-  }
-  if (value.kind == AST_TYPE_SPECIFIER && value.first < tokens_.size())
-  {
-    vector<ETokenType> token;
-    token.push_back(tokens_[value.first].simple_type);
-    return BuildFundamental(token);
+    return LookupType(lookup_scope, NodeName(node));
+  case AST_TYPE_NAME:
+    return LookupType(lookup_scope, NodeName(node));
+  case AST_TYPE_SPECIFIER:
+    if (value.first < tokens_.size() &&
+        tokens_[value.first].kind == PA6_SIMPLE_TOKEN)
+      return types_.FundamentalFromKeywords(
+          vector<ETokenType>(1, tokens_[value.first].simple_type));
+    break;
+  default:
+    break;
   }
   throw std::runtime_error("unsupported type specifier");
 }
@@ -194,42 +148,27 @@ TypeId ScopeBuilder::BuildTypeId(AstId node, ScopeId lookup_scope)
   const AstNode& value = arena_.At(node);
   if (value.kind != AST_TYPE_ID || value.children.empty())
     throw std::runtime_error("invalid type-id");
-  const TypeId base = BuildTypeSequence(value.children[0], lookup_scope, false);
-  if (value.children.size() == 1)
+  const TypeId base = BuildTypeSequence(value.children[0], lookup_scope, false,
+                                        string());
+  if (value.children.size() == 1 || value.children[1] == 0)
     return base;
   return BuildDeclaratorType(value.children[1], base, lookup_scope);
 }
 
-TypeId ScopeBuilder::AddCv(TypeId base, bool is_const, bool is_volatile)
-{
-  if (base == 0 || (!is_const && !is_volatile))
-    return base;
-  if (types_.Kind(base) == TYPE_CV)
-  {
-    const TypeNode& old = types_.At(base);
-    return types_.Cv(old.base, old.is_const || is_const,
-                     old.is_volatile || is_volatile);
-  }
-  return types_.Cv(base, is_const, is_volatile);
-}
-
+// ptr-operators and their cv-qualifiers, left to right.
 TypeId ScopeBuilder::ApplyPrefix(TypeId base, const vector<AstId>& prefix)
 {
   TypeId result = base;
   for (std::size_t i = 0; i < prefix.size(); ++i)
   {
     const AstNode& node = arena_.At(prefix[i]);
-    if (node.kind == AST_CV_QUALIFIER)
-    {
-      const bool is_const = node.first < tokens_.size() &&
-          tokens_[node.first].IsSimple(KW_CONST);
-      result = AddCv(result, is_const, !is_const);
-      continue;
-    }
-    if (node.kind != AST_PTR_OPERATOR || node.first >= tokens_.size())
-      continue;
+    if (node.first >= tokens_.size())
+      throw std::runtime_error("invalid declarator operator");
     const Pa6Token& token = tokens_[node.first];
-    if (token.IsSimple(OP_STAR))
+    if (node.kind == AST_CV_QUALIFIER)
+      result = types_.Cv(result, token.IsSimple(KW_CONST),
+                         token.IsSimple(KW_VOLATILE));
+    else if (token.IsSimple(OP_STAR))
       result = types_.Pointer(result);
     else if (token.IsSimple(OP_AMP))
       result = types_.Reference(result, true);
@@ -241,21 +180,22 @@ TypeId ScopeBuilder::ApplyPrefix(TypeId base, const vector<AstId>& prefix)
   return result;
 }
 
+// Parameter clauses and array bounds, right to left onto the base (8.3).
 TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
                                  ScopeId lookup_scope)
 {
   TypeId result = base;
-  for (std::size_t i = 0; i < suffix.size(); ++i)
+  for (std::size_t i = suffix.size(); i != 0; --i)
   {
-    const AstNode& node = arena_.At(suffix[i]);
+    const AstNode& node = arena_.At(suffix[i - 1]);
     if (node.kind == AST_PARAMETER_CLAUSE)
     {
       vector<ParameterInfo> parameters;
       bool variadic = false;
-      BuildParameters(suffix[i], lookup_scope, parameters, variadic);
-      vector<TypeId> types;
+      BuildParameters(suffix[i - 1], lookup_scope, parameters, variadic);
+      vector<TypeId> types(parameters.size());
       for (std::size_t p = 0; p < parameters.size(); ++p)
-        types.push_back(parameters[p].type);
+        types[p] = parameters[p].type;
       result = types_.Function(result, types, variadic);
     }
     else if (node.kind == AST_ARRAY_SUFFIX)
@@ -268,10 +208,18 @@ TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
         throw std::runtime_error("array bound must be positive");
       result = types_.Array(result, static_cast<std::size_t>(bound));
     }
+    else if (node.kind == AST_TRAILING_RETURN_TYPE)
+      throw std::runtime_error("trailing return types are unsupported");
+    // function-qualifiers, attributes and virt-specifiers do not change the
+    // PA11 type.
   }
   return result;
 }
 
+// 8.3: the ptr-operators before the declarator-id apply to the base first,
+// then the suffixes after it, right to left; a parenthesised declarator then
+// takes that type as its base (`int *(*p)[3]` is pointer to array of 3
+// pointer to int).
 TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
                                          ScopeId lookup_scope)
 {
@@ -280,34 +228,32 @@ TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
   const AstNode& node = arena_.At(declarator);
   vector<AstId> prefix;
   vector<AstId> suffix;
-  AstId direct = 0;
+  AstId nested = 0;
+  bool seen_direct = false;
   for (std::size_t i = 0; i < node.children.size(); ++i)
   {
     const AstId child = node.children[i];
     const AstKind kind = arena_.At(child).kind;
     if (kind == AST_IDENTIFIER || kind == AST_NESTED_DECLARATOR)
     {
-      direct = child;
-      continue;
+      seen_direct = true;
+      if (kind == AST_NESTED_DECLARATOR)
+        nested = child;
     }
-    if (direct == 0 && (kind == AST_PTR_OPERATOR || kind == AST_CV_QUALIFIER))
+    else if (!seen_direct &&
+             (kind == AST_PTR_OPERATOR || kind == AST_CV_QUALIFIER))
       prefix.push_back(child);
-    else if (kind == AST_PARAMETER_PACK)
-      continue;
-    else
+    else if (kind != AST_PARAMETER_PACK)
       suffix.push_back(child);
   }
-  if (direct != 0 && arena_.At(direct).kind == AST_NESTED_DECLARATOR)
-  {
-    const AstNode& nested = arena_.At(direct);
-    if (nested.children.size() != 1)
-      throw std::runtime_error("invalid nested declarator");
-    const TypeId outer = ApplySuffix(base, suffix, lookup_scope);
-    const TypeId inner = BuildDeclaratorType(nested.children[0], outer,
-                                             lookup_scope);
-    return ApplyPrefix(inner, prefix);
-  }
-  return ApplySuffix(ApplyPrefix(base, prefix), suffix, lookup_scope);
+  const TypeId declared = ApplySuffix(ApplyPrefix(base, prefix), suffix,
+                                      lookup_scope);
+  if (nested == 0)
+    return declared;
+  const AstNode& inner = arena_.At(nested);
+  if (inner.children.size() != 1)
+    throw std::runtime_error("invalid nested declarator");
+  return BuildDeclaratorType(inner.children[0], declared, lookup_scope);
 }
 
 void ScopeBuilder::BuildParameters(AstId clause, ScopeId lookup_scope,
@@ -330,61 +276,85 @@ void ScopeBuilder::BuildParameters(AstId clause, ScopeId lookup_scope,
     if (parameter.children.empty())
       throw std::runtime_error("invalid parameter declaration");
     const TypeId base = BuildTypeSequence(parameter.children[0], lookup_scope,
-                                          false);
-    AstId declarator = 0;
-    for (std::size_t p = 1; p < parameter.children.size(); ++p)
-      if (arena_.At(parameter.children[p]).kind == AST_DECLARATOR)
-        declarator = parameter.children[p];
+                                          true, string());
+    const AstId declarator = FindChild(child, AST_DECLARATOR);
     ParameterInfo info;
-    info.type = declarator == 0 ? base :
-        BuildDeclaratorType(declarator, base, lookup_scope);
+    info.type = BuildDeclaratorType(declarator, base, lookup_scope);
     info.name = IdentifierName(FindIdentifier(declarator));
     parameters.push_back(info);
   }
+  // 8.3.5p4: a lone unnamed `void` parameter is an empty parameter list.
   if (!variadic && parameters.size() == 1 && parameters[0].name.empty() &&
       types_.Kind(parameters[0].type) == TYPE_FUNDAMENTAL &&
       types_.At(parameters[0].type).fundamental == FT_VOID)
     parameters.clear();
 }
 
-TypeId ScopeBuilder::BuildExpressionType(AstId expression,
-                                         ScopeId lookup_scope, bool& lvalue)
+// Static type and value category of the operand forms PA11 supports.
+ScopeBuilder::ExpressionType ScopeBuilder::BuildExpressionType(
+    AstId expression, ScopeId lookup_scope)
 {
   const AstNode& node = arena_.At(expression);
-  if (node.kind == AST_PARENTHESIZED_EXPRESSION)
+  ExpressionType result;
+  result.type = 0;
+  result.lvalue = false;
+  result.names_type = false;
+  switch (node.kind)
   {
+  case AST_PARENTHESIZED_EXPRESSION:
     if (node.children.size() != 1)
-      throw std::runtime_error("unsupported decltype expression");
-    return BuildExpressionType(node.children[0], lookup_scope, lvalue);
-  }
-  if (node.kind == AST_ID_EXPRESSION || node.kind == AST_IDENTIFIER)
+      throw std::runtime_error("invalid parenthesized expression");
+    return BuildExpressionType(node.children[0], lookup_scope);
+  case AST_ID_EXPRESSION: case AST_IDENTIFIER:
   {
-    const vector<string> name = NameComponents(expression);
-    const BindingId binding = ResolveName(lookup_scope, name, LOOKUP_ANY);
+    const BindingId binding = model_.Lookup(lookup_scope, NodeName(expression),
+                                           LOOKUP_ANY);
     if (binding == 0 || model_.BindingAt(binding).type == 0)
-      throw std::runtime_error("unknown decltype name");
+      throw std::runtime_error("unknown name in expression");
     const Binding& value = model_.BindingAt(binding);
-    lvalue = value.kind != BINDING_FUNCTION &&
-        value.kind != BINDING_ENUMERATOR;
-    return value.type;
+    result.type = value.type;
+    result.names_type = value.kind == BINDING_TYPE ||
+        value.kind == BINDING_TYPE_ALIAS;
+    // 5.1.1p8: a name of a variable, parameter or function is an lvalue;
+    // an enumerator is a prvalue.
+    result.lvalue = value.kind == BINDING_VARIABLE ||
+        value.kind == BINDING_PARAMETER || value.kind == BINDING_FUNCTION;
+    return result;
   }
-  if (node.kind == AST_LITERAL && node.first < tokens_.size())
-  {
-    lvalue = false;
-    return types_.Fundamental(tokens_[node.first].lit_type);
+  case AST_LITERAL:
+    if (node.first >= tokens_.size() || !tokens_[node.first].lit_scalar)
+      throw std::runtime_error("unsupported literal operand");
+    result.type = types_.Fundamental(tokens_[node.first].lit_type);
+    return result;
+  case AST_KEYWORD_LITERAL:
+    result.type = types_.Fundamental(FT_BOOL);
+    return result;
+  case AST_CAST_EXPRESSION:
+    if (node.children.size() != 2)
+      throw std::runtime_error("invalid cast expression");
+    result.type = BuildTypeId(node.children[0], lookup_scope);
+    result.lvalue = types_.Kind(result.type) == TYPE_REFERENCE;
+    return result;
+  case AST_SIZEOF_EXPRESSION: case AST_TYPE_TRAIT_EXPRESSION:
+    // 5.3.3p6, 5.3.6p3: std::size_t, which is unsigned long on this target.
+    result.type = types_.Fundamental(FT_UNSIGNED_LONG_INT);
+    return result;
+  default:
+    throw std::runtime_error("unsupported expression operand");
   }
-  throw std::runtime_error("unsupported decltype expression");
 }
 
+// 7.1.6.2p4: decltype(id) is the declared type; decltype((lvalue)) is an
+// lvalue reference to it.
 TypeId ScopeBuilder::BuildDecltype(AstId expression, ScopeId lookup_scope)
 {
-  const AstNode& node = arena_.At(expression);
-  if (node.kind == AST_PARENTHESIZED_EXPRESSION)
-  {
-    bool lvalue = false;
-    const TypeId type = BuildExpressionType(expression, lookup_scope, lvalue);
-    return lvalue ? types_.Reference(type, true) : type;
-  }
-  bool lvalue = false;
-  return BuildExpressionType(expression, lookup_scope, lvalue);
+  const ExpressionType operand = BuildExpressionType(expression, lookup_scope);
+  if (operand.names_type)
+    throw std::runtime_error("decltype operand names a type");
+  const bool parenthesized =
+      arena_.At(expression).kind == AST_PARENTHESIZED_EXPRESSION;
+  if (parenthesized && operand.lvalue &&
+      types_.Kind(operand.type) != TYPE_REFERENCE)
+    return types_.Reference(operand.type, true);
+  return operand.type;
 }

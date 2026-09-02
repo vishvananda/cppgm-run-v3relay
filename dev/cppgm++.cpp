@@ -448,7 +448,7 @@ int run_emit_types_mode(const vector<string> & args)
     }
     TypeTable types;
     SemaModel model(types);
-    ScopeBuilder builder(collector.tokens, arena, types, model);
+    ScopeBuilder builder(collector.tokens, arena, model);
     builder.Build(root);
     PrintTypesUnit(out, i + 1, model);
   }

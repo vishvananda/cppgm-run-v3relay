@@ -119,6 +119,10 @@ enum AstKind
 	AST_BIT_FIELD_DECLARATION,
 	AST_BIT_FIELD_DECLARATOR,
 	AST_ENUM_SPECIFIER,
+	// enum-key name enum-base? without a body: an opaque-enum-declaration or
+	// an elaborated enum specifier; sema decides by context.  Printed like an
+	// enum-specifier.
+	AST_ENUM_DECLARATION,
 	AST_ENUMERATOR,
 	AST_NAMESPACE_DEFINITION,
 	AST_NAMESPACE_ALIAS_DEFINITION,
@@ -175,8 +179,23 @@ public:
 
 	void Add(AstId parent, AstId child);
 
+	// Token extent of the whole declaration that a bare unnamed class or enum
+	// specifier forms.  Such a node has no name span; later passes derive a
+	// stable identity for the unnamed type from this extent.  Cold sidecar:
+	// recorded only for those rare nodes.
+	void RecordDeclarationExtent(AstId id, std::size_t first, std::size_t last);
+	bool DeclarationExtent(AstId id, std::size_t& first, std::size_t& last) const;
+
 private:
+	struct Extent
+	{
+		AstId node;
+		std::size_t first;
+		std::size_t last;
+	};
+
 	std::vector<AstNode> nodes_;
+	std::vector<Extent> extents_;
 };
 
 void PrintAst(std::ostream& out, const AstArena& arena, AstId root,

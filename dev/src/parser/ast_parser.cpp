@@ -670,18 +670,14 @@ AstId Pa10Parser::parse_specified_declaration(bool member_context)
 			const AstKind kind = arena_.At(children[0]).kind;
 			if (kind == AST_CLASS_SPECIFIER ||
 				kind == AST_CLASS_FORWARD_DECLARATION ||
-				kind == AST_ENUM_SPECIFIER)
+				kind == AST_ENUM_SPECIFIER || kind == AST_ENUM_DECLARATION)
 			{
-				// Anonymous class/enum specifiers have no declarator-id from
-				// which later semantic passes can derive a stable identity.  The
-				// complete declaration extent is sufficient for that identity and
-				// remains invisible in the normal named-node spelling.
-				AstNode& anonymous = arena_.At(children[0]);
-				if (anonymous.text.empty() && anonymous.first == anonymous.last)
-				{
-					anonymous.first = saved.position;
-					anonymous.last = pos_;
-				}
+				// An unnamed specifier has no name span; record the extent of
+				// the declaration it forms so sema can give the type an identity.
+				const AstNode& specifier = arena_.At(children[0]);
+				if (specifier.first == specifier.last)
+					arena_.RecordDeclarationExtent(children[0], saved.position,
+						pos_);
 				return children[0];
 			}
 		}

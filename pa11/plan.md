@@ -5,364 +5,190 @@ Grading: `cppgm++ --emit-types -o x.my x.t`; exit status must match
 a byte-exact dump).  No reference binary: the 68 checked-in `.ref` files
 under `pa11/tests/{spec,general}` are the only format oracle, so every dump
 convention below is fixture-pinned.  Harness: forked batch runner, 10 s per
-test.  `cppgm.tests/course/pa11` is empty.
+test.  `cppgm.tests/course/pa11` is empty.  Final review, findings,
+performance evidence and validation are in `audit.md`.
 
 ## Stage Design
 
 Data flow per translation unit (fresh state per file, argv order):
 `PreprocEngine::RunSingleFile` → `Pa6TokenCollector::tokens` →
-`Pa10Parser` (arena AST, unchanged dump) → `ScopeBuilder(tokens, arena,
-types).Build(root)` → `SemaModel` (scope tree + interned types) →
-`PrintTypesUnit`.  Any exception → EXIT_FAILURE.  The builder reads names
-from node token spans `[first, last)` (typed tokens), never by splitting
-`text`; it never re-parses tokens except the typed checks named below.
+`Pa10Parser` (arena AST, dump unchanged) → `ScopeBuilder(tokens, arena,
+model).Build(root)` → `SemaModel` (scope tree, entities, interned types) →
+`PrintTypesUnit`.  Any exception → EXIT_FAILURE.  The builder reads every
+name from a node's token span through `ReadQualifiedName`; it never splits
+dump text and never re-parses tokens beyond the typed checks named below.
 
-Owning boundaries (new directory `dev/src/sema/`; PA10 parser files change
-only where CP2 says so):
+Owning boundaries (`dev/src/sema/`; parser files change only as listed):
 
-- `sema/type_table.h/.cpp` — `TypeId` (0 = null), `TypeKind {Fundamental,
-  Cv, Pointer, LvalueRef, RvalueRef, Array, Function, Class, Enum,
-  TemplateTypeParam, TemplateTemplateParam}`, `TypeNode {kind, fundamental,
-  cv, inner, bound, params, varargs, ret, entity}`, `TypeTable` interning
-  every constructor (`Fundamental/Cv/Pointer/Reference/Array/Function/
-  Class/Enum/TemplateParam`) through a `std::map` key so equal types share
-  one id and equality is `==`.  `Spell(TypeId)` renders on demand:
-  fundamentals via `FundamentalTypeToStringMap` (`long int`, `unsigned
-  char`), `const `/`volatile ` prefix, `pointer to X`, `lvalue-reference to
-  X`, `rvalue-reference to X`, `array of N X`, `function of (P, Q, ...)
-  returning R` (`()` when empty), `<key> <name>` for classes (`struct C`,
-  `class C`, `union U`), `enum <name>` / `enum class <name>`, `typename T`,
-  `template-parameter TT`.  `SizeOf/AlignOf(TypeId)`: fundamental table
-  (char/bool 1, short 2, int/wchar_t/char32_t/float 4, long/long long/
-  double/pointers 8, long double 16), enum → its underlying type, arrays
-  multiply, incomplete class / class layout / function / void → error.
-- `sema/scope_model.h/.cpp` — `ScopeKind {Namespace, TemplateParameters,
-  Class, Enum, Function, Block}`; `Scope {kind, name span/spelling, parent,
-  bindings (declaration order), children (creation order), using_directives,
-  inline flag, name index: unordered_map<string, vector<index>> used only
-  for lookup, never for output order}`; `Binding {BindingKind {Type,
-  TypeAlias, Enumerator, Function, Variable, Parameter, Namespace}, name,
-  TypeId, class_key (Type lines), has_value/value (enumerators and const
-  integral objects with constant initializers), scope link (namespace,
-  namespace alias, class, scoped enum)}`.  `ClassEntity {scope, key, complete}`,
-  `EnumEntity {scope or enumerator list, scoped, underlying TypeId,
-  fixed}`.  Lookup (3.4): `LookupUnqualified(scope, name, filter)` walks
-  parents; in each scope the latest binding matching the filter wins
-  (3.3.10: a value hides a type for ordinary lookup), then that scope's
-  using-directive closure (visited set) and inline children (7.3.1p8).
-  Filters: Any, TypesOnly (3.4.4 elaborated), ScopePrefix (3.4.3p1: skip
-  values).  `LookupQualified(span)`: leading `::` → global; first component
-  ScopePrefix-unqualified; later components inside the found namespace
-  (direct, inline set, then using-directives, 3.4.3.2p2), class scope, or
-  enum (scoped scope or unscoped enumerator list); a TypeAlias component is
-  followed to its class/enum.  Any `<` inside the span → error.
-- `sema/const_eval.h/.cpp` — `ConstEvaluator::Evaluate(AstId) → IntValue
-  {TypeId, bits, is_signed}` over AST expression nodes: `literal` (token
-  `lit_type/lit_value` at `node.first`; integer, character, bool only),
-  `id-expression` (enumerator value, const integral variable/parameter with
-  recorded constant), `parenthesized-expression`, unary `+ - ! ~`, binary
-  arithmetic/shift/relational/equality/bitwise, `&&`/`||` evaluating only
-  the selected operand, `conditional-expression`, `cast-expression`
-  (`static_cast<integral>` and C-style `(int)e`), `sizeof-expression` /
-  `type-trait-expression alignof` over a `type-id` or an `id-expression`
-  that resolves to a type.  Usual arithmetic conversions (int promotion,
-  signed/unsigned); signed overflow and evaluated division by zero → error.
-  Consumers: array bounds (converted value must be > 0), enumerators
-  (implicit = previous + 1, first 0), `static_assert` (false → error).
-- `sema/scope_builder.h/.cpp` (+ `sema/type_builder.cpp` for
-  specifier/declarator type construction) — the AST walker described under
-  Declaration rules.  Unsupported constructs throw (EXIT_FAILURE) rather
-  than being silently skipped.
-- `sema/types_dump.cpp` — `PrintTypesUnit(out, k, model)`: framing from
-  `ast_model` (`PrintHeader`, `start/end translation unit k`), then
-  `translation-unit`, then each scope at depth d: `scope namespace <name>`
-  (root `<global>`), `scope template-parameters`, `scope class <name>`,
-  `scope enum <name>`, `scope function <name>`, `scope block`; then its
-  bindings `<kind> <name> <type>[ <value>]` (Namespace bindings are not
-  printed; an empty name still prints both spaces: `parameter  int`), then
-  child scopes in creation order.  Two spaces per depth, `'\n'` per line.
-- `dev/cppgm++.cpp::run_emit_types_mode` — mirror `run_emit_ast_mode`; one
-  `TypeTable`, parser and builder per file.
-- `dev/frontend_source_sets.mk` — add the `sema/*` units to
-  `FRONTEND_OBJ_BASENAMES_cppgm++`.
+- `type_table.h/.cpp` — `TypeId` (0 = null), `TypeKind`, `TypeKeyword`
+  (struct/class/union, typename/class, template-parameter), `TypeNode`,
+  `TypeTable`.  Derived types are interned on typed keys (`cv_`,
+  `pointers_`, `references_`, `arrays_`, `functions_`) so equal types share
+  one id.  Class, enum and template-parameter types carry `entity` plus the
+  spelling of the declaration that introduced them: one entity may own
+  several type ids (one per declaration spelling, as the dump prints them);
+  semantic identity is the entity.  `Cv` merges qualifier layers, applies to
+  array elements and is ignored on references and functions; `Pointer`,
+  `Reference`, `Array`, `Function` reject the ill-formed compositions
+  (8.3.1/8.3.2/8.3.4/8.3.5).  `Spell(ostream&, TypeId)` renders on demand
+  (fundamentals via `FundamentalTypeToStringMap`).  `SizeOf`/`AlignOf` use
+  `FundamentalSize` (char 1, short/char16_t 2, int/wchar_t/char32_t/float
+  4, long/long long/double/pointer 8, long double 16); enum → underlying,
+  reference → referent, array → element × bound; class, function, void →
+  error.  `FundamentalFromKeywords` is the one 3.9.1 keyword table;
+  `FundamentalIsIntegral/IsUnsigned` back constant evaluation.
+- `qualified_name.h/.cpp` — `QualifiedName {global, components}` and
+  `ReadQualifiedName(tokens, first, last)`: identifiers and `::` only; a
+  template-id, operator name, destructor or decltype qualifier in the span
+  throws (unsupported in PA11), which is how using-declarations and type
+  names that contain template-ids fail.
+- `scope_model.h/.cpp` — `ScopeKind`, `BindingKind`, `LookupFilter`,
+  `Binding {name, kind, type, namespace_scope, const value}`, `Scope {kind,
+  name, parent, inline flag, bindings (declaration order), children
+  (creation order), using_directives, index}`, `ClassEntity {class_scope,
+  is_union, defined}`, `EnumEntity {enum_scope, underlying, scoped,
+  defined}`, `SemaModel`.  The per-scope `index` (name → bindings in
+  declaration order) is built once a scope exceeds 8 bindings; output order
+  always comes from the vectors.  Lookup: `DirectBinding` (latest match in
+  one scope), `LookupUnqualified(scope, name, filter)` (parents, then each
+  namespace's inline children and using-directives with a visited set),
+  `LookupTypeName` (3.3.10: a later object/function/enumerator/parameter
+  hides a type name), `LookupQualified(scope, QualifiedName, filter)`
+  (leading `::` → global; first component with `LOOKUP_QUALIFIER`; later
+  components inside the nominated scope: namespace with inline set and
+  using-directives (3.4.3.2p2), class scope, scoped enum scope, or the
+  enumerators of an unscoped enum), `Lookup` dispatching on the name form.
+  The scope a binding nominates is derived on demand (`NominatedScope`:
+  namespace binding → its scope; type binding → the entity's class or
+  enumerator scope), so an alias declared before the class is defined still
+  qualifies once the definition exists.
+- `const_eval.h/.cpp` — `ConstEvaluator::Evaluate(AstId, ScopeId)` over
+  `literal`, `true/false`, `id-expression` (binding with a recorded constant
+  value), parentheses, unary `+ - ! ~`, binary arithmetic/shift/relational/
+  equality/bitwise/comma, `&&`/`||` evaluating only the selected operand,
+  conditional, casts and `sizeof`/`alignof`.  Signed 64-bit with checked
+  overflow; evaluated division by zero → error.  Operand types come from the
+  builder through `ConstantOperandTypes` (`TypeOfTypeId`,
+  `TypeOfExpression`) so there is one type-construction path.
+- `scope_builder.h/.cpp` (declarations, scopes, classes, enums, templates,
+  statements) + `type_builder.cpp` (specifier sequences, declarators,
+  type-ids, parameters, decltype and operand types).  `ScopeBuilder`
+  implements `ConstantOperandTypes`; `BuildSpecifierType(seq, scope,
+  anonymous_name)` threads the first declarator's name explicitly for
+  unnamed class/enum specifiers.  Unsupported constructs (special members,
+  bit-fields, explicit instantiations, template-ids in names, trailing
+  return types) throw rather than being skipped.
+- `types_dump.cpp` — `PrintTypesUnit`: `start/end translation unit k`,
+  `translation-unit`, then each scope at depth d as `scope <kind>[ <name>]`
+  (root `<global>`; blocks and template scopes have no name), its bindings
+  `<kind> <name> <type>[ <value>]` (enumerator values in decimal; namespace
+  bindings unprinted; an empty parameter name still prints both spaces),
+  then child scopes.  Two spaces per depth.
+- `dev/cppgm++.cpp::run_emit_types_mode` — one `TypeTable`, `SemaModel`,
+  parser and builder per file.
+- Parser facts consumed (`dev/src/parser/ast_model.h`): node `kind`,
+  `children`, and the token span `[first, last)` of every node that carries
+  text; `AST_ENUM_SPECIFIER` is a definition (possibly empty body) and
+  `AST_ENUM_DECLARATION` a body-less `enum-key name enum-base?` (opaque
+  declaration or elaborated specifier — both print `enum-specifier`);
+  `AstArena::DeclarationExtent` is a cold sidecar recording the declaration
+  extent of a bare unnamed class/enum specifier for its generated identity.
 
 Declaration rules (fixture-pinned):
 
 - Every declaration appends a binding line; redeclarations are not merged
-  (`struct C; class C {};` → `type C struct C` then `type C class C`, one
-  `scope class C`; `void f(T); void n::f(T) {}` → two `function f` lines).
-- Namespaces: `namespace N` reopens the existing child scope; a namespace
-  name and an object/function name in one scope collide both ways →
-  error.  `inline` sets the flag; no output marker.  Alias definitions
-  bind an unprinted Namespace binding; a non-namespace target → error.
-  Using directives add to the current scope only.  Using declarations copy
-  the found binding with its kind (`type-alias` stays `type-alias`, class/
-  enum stays `type`, `variable`, `function`, `enumerator`); unresolved
-  target, namespace target, or template-id target → error.
-- Specifiers → base type: keyword combinations per 3.9.1 (reuse the PA7
-  table from `nsdecl_parser` if callable, else replicate); cv applies to
-  the base; `constexpr` adds top-level const to object declarators only;
-  `static extern thread_local inline virtual` ignored; an identifier or
-  qualified name must resolve to Type/TypeAlias/template parameter (else
-  error); `decltype(e)`: `id-expression` → declared type (enumerator → its
-  enum), `parenthesized-expression{id-expression}` naming a variable →
-  lvalue-reference to the declared type, naming an enumerator → the enum
-  type; other operands → error.  Elaborated `class-forward-declaration`
-  inside a specifier seq uses TypesOnly lookup and may find a class hidden
-  by a function; not found → declare it in the nearest enclosing namespace
-  or block scope.  Elaborated `enum E` must find an enumeration → else
-  error.
-- Declarator → type (8.3): suffixes right-to-left onto the base
-  (`array-suffix` bound via `ConstEvaluator`; `parameter-clause`; `(void)`
-  alone → empty; `parameter-pack ...` → varargs; parameter types are kept
-  as declared — no array/function decay: `function of (array of 3 int)`),
-  then `ptr-operator`s left-to-right with following `cv-qualifier`, then
-  recurse into `nested-declarator`.  Pointer/array of reference, reference
-  to reference, array of void/function, function returning array/function,
-  bound ≤ 0 → error.  `function-qualifier` (noexcept/throw), attributes,
-  `virt-specifier` ignored; `trailing-return-type` → error.
-- Declarators: typedef → `type-alias`; function type → `function`; else
-  `variable`.  A const/constexpr integral variable whose initializer
-  evaluates records its value for later constant expressions (failure to
-  evaluate only means "not a constant").  Function definitions bind the
-  function in the scope named by the (possibly qualified) declarator-id,
-  create `scope function <name>` under that scope, bind `parameter`s, and
-  resolve parameter types in that scope; the body compound-statement is a
-  `scope block`; nested compound statements nest; other statements are
-  recursed only to find declarations and blocks.  Function declarations
-  create no scope.
-- Classes: definition → entity (reusing a forward declaration in the same
-  scope), `type <name> <key> <name>`, `scope class <name>`; forward
-  declaration → the type line only.  struct/class interchangeable; union
-  vs non-union → error.  Members processed in order: simple declarations,
-  member function definitions (function scope inside the class scope),
-  nested classes/enums, typedef/alias, using declarations, static_assert;
-  access specifiers ignored; special members and bit-fields → error.
-  Anonymous class/enum inside a declaration takes the first declarator's
-  name (`typedef struct {…} S;` → `type S struct S`, `type-alias S struct
-  S`; `static struct {…} entries[2];` → `type entries struct entries`).
-  Bare anonymous union at namespace scope: entity name
-  `__anonymous_<key>_type__<first>_<last>` from the declaration's token
-  extent (fixture: `__anonymous_union_type__0_10` for a 10-token
-  declaration) and its members are also bound as `variable`s in the
-  enclosing scope.
-- Enums: unscoped definitions bind `type E enum E` then each `enumerator
-  <n> enum E <v>` in the enclosing scope and print no scope; scoped enums
-  bind the type and create `scope enum <name>` holding the enumerators
-  (also for opaque `enum class E;`).  Opaque unscoped without an enum-base
-  → error; opaque redeclaration with a different underlying type → error.
-  A qualified enum name (`enum class writer::state : char {…}`) is a new
-  entity in the current scope spelled with the joined name (`type
-  writer::state enum class writer::state`, `scope enum writer::state`).
-  Enumerator values print as decimal of the converted value.
-- Templates: `template-declaration` creates `scope template-parameters`
-  under the current scope, binds `type T typename T` per type-parameter
-  and `type TT template-parameter TT` per template-template parameter (its
-  inner clause is not a scope, so its names are invisible), ignores
-  non-type parameters, then processes the declaration inside that scope
-  (`type P struct P` and `scope class P` land there).  Template-ids in
-  types → error.
-- `sizeof(id-expression)` whose qualified/unqualified name resolves to a
-  type is `sizeof(type)`.
+  (`struct C; class C {};` → `type C struct C`, `type C class C`, one
+  `scope class C`; a use between them spells the latest declaration's key).
+- Namespaces: `namespace N` reopens the child scope; a namespace name and
+  another entity of that name in one scope → error (3.3.1p4).  `inline`
+  sets the flag; unnamed → `scope namespace <unnamed>` plus an implicit
+  using-directive.  Aliases bind an unprinted namespace binding; a
+  non-namespace target → error.  Using directives add to the current scope
+  only.  Using declarations copy the found binding's kind, type and
+  constant value (`type-alias` stays `type-alias`, class/enum stay `type`);
+  unresolved, namespace or template-id target → error.
+- Specifiers: 3.9.1 keyword combinations; cv applies to the base;
+  `constexpr` adds top-level const to object declarators (7.1.5p9);
+  `static extern thread_local inline virtual friend mutable explicit
+  register` change nothing; a name must resolve to a type (ordinary lookup
+  with 3.3.10 hiding when unqualified); `decltype(e)`: `id-expression` →
+  declared type, `(lvalue)` → lvalue reference to it, enumerators are
+  prvalues; other operands → error.  Elaborated `struct S` uses
+  types-only lookup, must name a class if found, and otherwise declares S in
+  the nearest enclosing namespace or block scope when it is part of a
+  declaration (7.1.6.3p2, 3.3.2p7); elaborated `enum E` must name an
+  enumeration.
+- Declarators (8.3): ptr-operators with their cv-qualifiers apply to the
+  base left to right, then suffixes right to left (`int a[2][3]` is array of
+  2 array of 3 int), then a parenthesised declarator takes that type as its
+  base (`int *(*p)[3]` is pointer to array of 3 pointer to int).  Array
+  bounds via `ConstEvaluator`, converted value > 0.  `(void)` alone → empty
+  parameter list; `...` → variadic; parameter types stay as declared (no
+  decay).  `noexcept`/`throw()`, attributes and virt-specifiers are ignored;
+  a trailing return type → error.
+- Declarators bind `type-alias` (typedef), `function` (function type) or
+  `variable`; a const integral variable whose initializer evaluates records
+  its value.  Function definitions bind in the scope the declarator-id
+  names, create `scope function <name>` there, bind `parameter`s resolved
+  in that scope, and own the body `scope block`; nested compound statements
+  nest; other statements contribute only declarations and blocks.
+- Classes: a definition completes a class declared earlier in the same
+  scope (or the qualified scope), else introduces one; struct/class are
+  interchangeable, union versus non-union → error; redefinition → error.
+  Members: simple declarations, member function definitions, nested
+  classes/enums, typedefs/aliases, using declarations, static_assert;
+  access specifiers ignored; special members and bit-fields → error.  An
+  unnamed class/enum in a declaration takes the first declarator's name
+  (`typedef struct {…} S;` → `type S struct S` and `type-alias S struct S`).
+  A bare anonymous union is `__anonymous_union_type__<first>_<last>` from
+  its declaration extent (`__anonymous_union_type__0_10` for a 10-token
+  declaration) and its members are also bound as variables in the enclosing
+  scope.
+- Enums: unscoped definitions bind `type E enum E` and each `enumerator <n>
+  enum E <v>` in the enclosing scope (no scope line); scoped enums bind the
+  type and create `scope enum <name>` holding the enumerators, also for
+  opaque `enum class E;`.  Opaque unscoped without enum-base → error;
+  redeclaration with another underlying type or scoped-ness → error.  A
+  qualified definition (`enum class writer::state : char {…}`) completes
+  the member entity but prints as a new declaration in the current scope
+  spelled with the joined name (`type writer::state enum class
+  writer::state`, `scope enum writer::state` holding the enumerators);
+  the member declaration keeps its local spelling.
+- Templates: `scope template-parameters` under the current scope, `type T
+  typename T` / `type T class T` per type parameter and `type TT
+  template-parameter TT` per template template parameter (its inner clause
+  is not a scope); non-type parameters are typed but not bound; the
+  declaration is built inside that scope.  Template-ids in names → error.
+- `sizeof(T)` / `alignof(T)` whose id-expression resolves to a type name
+  is taken over the type; `sizeof`/`alignof` results have type
+  `unsigned long int`.
 
-## Failure Map
+## Performance Bounds
 
-CP1 now passes its 35-fixture boundary and the stage reports 45/68.  The
-remaining 23 failures are deferred by the checkpoint split.  By owning
-boundary:
-
-| group | owner | tests |
-| --- | --- | --- |
-| driver, scopes, namespaces, using, aliases, classes, declarator types, decltype, literal bounds | CP1 | 35 |
-| enums, constant evaluation, sizeof/alignof, static_assert, anonymous union naming, qualified enum name (1 input fails PA10 parsing) | CP2 | 29 |
-| template-parameter scopes, template-id rejection | CP3 | 4 |
-
-## Performance Risks
-
-- Lookup is O(scope depth × per-name index hits); using-directive closure
-  uses a visited set, so mutually nominating namespaces terminate.  Output
-  order comes from vectors, never from hash iteration.
-- Types are interned once; spelling is rendered only when printing, cost
-  linear in the dump.  No `SameType` structural recursion on hot paths.
-- Constant expressions are evaluated once at their declaration; const
-  variable values are cached on the binding, so 5000 chained enumerators
-  (`B = A + 1`) stay linear.  No retry loops, no deferred worklists.
-- Recursion depth follows AST depth (blocks, declarators, expressions),
-  bounded by the PA10 parser's accepted depth.
-- Probe evidence: 20000 declarations over 200 namespaces with qualified
-  typedef lookups and a 10-deep block chain took 0.23 s / 57116 KB; the same
-  input supplied twice as separate argv inputs took 0.41 s / 58972 KB, so
-  time and peak memory remain linear and under the packet limits.
+- Declaration in a scope: O(1) amortized (per-scope name index past 8
+  bindings; linear scan below that).  Lookup: O(scope depth) hash probes
+  plus the using-directive closure, each namespace visited once.
+- Types are interned once on typed keys; spelling is rendered only when
+  printing, linear in the dump.  Entity scopes are derived per lookup step
+  in O(1); no scan over entities anywhere.
+- Constant expressions are evaluated once at their declaration; values are
+  cached on the binding, so chained enumerators and constexpr chains stay
+  linear.  No retry loops, no deferred worklists.
+- Recursion depth follows AST depth, bounded by the PA10 parser.
+- Evidence (medians of interleaved runs, immutable executables) is in
+  `audit.md`; every probe is linear and sub-second at 20000–40000
+  declarations.
 
 ## Checkpoint Ledger
 
-- CP1 core model + driver + namespaces/classes/functions/types — COMPLETE
-  (45/68 stage tests; all 35 packet fixtures pass; through-pa10 is 589/589;
-  file audit passes).
+- CP1 core model, driver, namespaces/classes/functions/types — 45/68 stage
+  tests, through-pa10 589/589.
 - CP2 enums, constant evaluation, sizeof/alignof, static_assert, parser
-  extents and qualified enum names — COMPLETE (66/68; the two remaining
-  failures are the deferred CP3 template fixtures; through-pa10 is 589/589;
-  file audit passes).
-- CP3 template-parameter scopes and template-id rejection — COMPLETE (68/68;
-  through-pa10 is 589/589; through-pa11 is 657/657; file audit passes with
-  2 existing warnings; the 200-namespace probe is sub-second and scales
-  linearly to the doubled input).
-- CP4 architecture cleanup, audit, performance evidence in `audit.md` —
-  PENDING.
-
-## Completed Checkpoint: CP1 — core scope/type model
-
-The driver, type table, scope model, lookup, declarator-derived types,
-declaration collection for namespaces/classes/functions/blocks, and printer
-are complete. Enum specifiers, `static_assert`, templates and non-literal
-constant expressions remain unsupported as planned for CP2/CP3. Evidence is
-recorded in `audit.md`: the 35 CP1 fixtures pass, the stage is 45/68,
-through-pa10 is 589/589, and the file audit passes. Expected-failure fixtures
-remain counted only when the success fixtures of the same group pass.
-
-### Implementation Packet
-
-Files and symbols to create or change:
-
-- `dev/src/sema/type_table.h/.cpp`: `TypeId`, `TypeKind`, `TypeNode`,
-  `TypeTable` (`Fundamental`, `Cv`, `Pointer`, `Reference`, `Array`,
-  `Function`, `Class`, `Enum`, `TemplateParam`), `Spell`, `SizeOf`,
-  `AlignOf` (SizeOf/AlignOf may stay minimal until CP2).
-- `dev/src/sema/scope_model.h/.cpp`: `ScopeKind`, `Scope`, `Binding`,
-  `BindingKind`, `ClassEntity`, `EnumEntity` (shell), `SemaModel` (owns
-  scopes, entities, the global scope), `LookupUnqualified`,
-  `LookupQualified`, lookup filters.
-- `dev/src/sema/const_eval.h/.cpp`: `ConstEvaluator` with `Evaluate`
-  handling `literal` and `parenthesized-expression` now; all other node
-  kinds throw until CP2.
-- `dev/src/sema/type_builder.cpp` (declared in `scope_builder.h`):
-  `BuildSpecifierType(seq, lookup_scope)`, `BuildDeclaratorType(decl,
-  base, lookup_scope)`, parameter clause and `(void)` normalization.
-- `dev/src/sema/scope_builder.h/.cpp`: `ScopeBuilder(tokens, arena,
-  types, model)`, `Build(root)`, per-kind handlers for
-  `AST_NAMESPACE_DEFINITION`, `AST_NAMESPACE_ALIAS_DEFINITION`,
-  `AST_USING_DIRECTIVE`, `AST_USING_DECLARATION`, `AST_ALIAS_DECLARATION`,
-  `AST_SIMPLE_DECLARATION`, `AST_FUNCTION_DEFINITION`,
-  `AST_CLASS_SPECIFIER`, `AST_CLASS_FORWARD_DECLARATION`,
-  `AST_LINKAGE_SPECIFICATION`, `AST_EMPTY_DECLARATION`,
-  `AST_COMPOUND_STATEMENT` and statement recursion.
-- `dev/src/sema/types_dump.cpp`: `PrintTypesUnit`.
-- `dev/cppgm++.cpp`: replace the body of `run_emit_types_mode`.
-- `dev/frontend_source_sets.mk`: extend `FRONTEND_OBJ_BASENAMES_cppgm++`.
-
-AST facts to rely on (`dev/src/parser/ast_model.h`, `ast_parser.h`):
-`decl-specifier` nodes are `make_token` for keywords and single
-identifiers, `make_join` for qualified names (read tokens `[first,last)`),
-`decltype(...)` nodes carry the operand as a child; `class-forward-
-declaration NAME{class-key}` and `class-specifier NAME{class-key,
-members…}` appear both bare and inside `decl-specifier-seq`; `declarator`
-children are `ptr-operator`, `cv-qualifier`, `identifier` (span = tokens
-of a possibly qualified declarator-id), `nested-declarator{declarator}`,
-`parameter-clause{parameter-declaration{decl-specifier-seq, declarator?}
-…, parameter-pack}`, `array-suffix{expr?}`, `function-qualifier`;
-`namespace-definition NAME{inline?, decls}`, `using-directive{target}`,
-`using-declaration{target}`, `namespace-alias-definition NAME{target}`,
-`alias-declaration NAME{type-id{type-specifier-seq{type-specifier |
-cv-qualifier | type-name | decltype-specifier}, abstract-declarator?}}`;
-`function-definition{decl-specifier-seq, declarator, compound-statement}`;
-`Pa6Token` literal fields `lit_type`, `lit_value`.
-
-Fixture groups (35): spec `100-alias-and-function`, `100-bad-unknown-type`,
-`100-class-scope`, `100-empty`, `100-global`, `100-namespace-alias`,
-`100-namespace`, `100-qualified-type-lookup`, `100-using-declaration`,
-`100-using-directive`, `200-class-key-compatible-redeclaration`,
-`200-decltype`, `200-namespace-anonymous-class-array-object`,
-`300-binding-after-namespace-bad`, `300-namespace-after-binding-bad`,
-`300-namespace-alias-non-namespace-bad`; general `100-bad-using-target`,
-`100-class-forward`, `100-function-pointer-void-parameter`,
-`100-namespace-class`, `100-namespace-reopen`, `100-nested-class`,
-`100-variadic-function-declaration`, `200-alias-qualified-class-lookup`,
-`200-bad-pointer-to-reference-alias`, `200-class-qualified-lookup`,
-`200-constexpr-object-vs-function-types`,
-`200-elaborated-type-hidden-by-function`,
-`200-inline-namespace-qualified-lookup`,
-`200-namespace-alias-qualified-using-directive-target`,
-`200-qualified-decltype`,
-`200-qualified-namespace-function-definition-parameter-type`,
-`200-void-parameter-normalization`, `300-block-zero-array-bound-bad`,
-`300-noexcept-function-pointer-declarator`.
-
-Required spec facts (N3485): 3.3.1 point of declaration is sequential;
-3.3.6/3.3.7 namespace and class scopes; 3.3.10 a later object/function
-hides a class name for ordinary lookup, elaborated lookup (3.4.4) ignores
-non-types; 3.4.1 unqualified lookup walks enclosing scopes, using-directive
-names visible in the nominating scope (7.3.4); 3.4.3p1 the name before
-`::` ignores objects/functions/enumerators; 3.4.3.2p2 qualified namespace
-lookup consults inline namespaces then using-directives of that namespace;
-7.1.3 typedef/alias name denotes the same type; 7.1.5 constexpr object is
-const; 7.1.6.2p4 `decltype(id)` is the declared type, `decltype((lvalue))`
-is `T&`; 7.1.6.3p2 undeclared elaborated class declares in the enclosing
-namespace/block; 7.3.1 reopening and inline namespaces (p8); 7.3.2 alias
-must name a namespace; 7.3.3 using-declaration cannot name a template-id;
-8.3.1/8.3.2 no pointer to or reference to reference; 8.3.4 array bound is
-an integral constant > 0; 8.3.5 `(void)` is an empty parameter list, `...`
-is varargs; 8.3p1 names in a qualified declarator's declarator are looked
-up in the qualifier's scope.
-
-Commands:
-
-- Focused: `cd pa11 && make check TEST=tests/spec/100-global.t` (any single
-  fixture); `make run INPUT=tests/spec/100-class-scope.t` prints the dump.
-- Broad: `make test-pa11`, then `make test-report-through-pa11` (through
-  pa10 must stay 589/589), `perl scripts/cppgm_file_audit.pl --stage pa11
-  --paths dev/src` (limits: 3000 lines/source, 2400/header, 240/function).
-- Performance probe: generate `/tmp/pa11_probe.t` with 200 namespaces each
-  holding 100 typedef/variable declarations that qualify into earlier
-  namespaces plus one function with 10-deep nested blocks; run
-  `/usr/bin/time -f '%e s %M KB' ./dev/cppgm++ --emit-types -o /tmp/p.out
-  /tmp/pa11_probe.t`, then double the input and confirm linear time and
-  memory (< 1 s, < 100 MB).
-
-Known uncertainties (decide by the listed default, note in `audit.md`):
-
-- Class-key spelling at use sites after `struct C; class C {}`: default to
-  the key of the latest declaration on the entity; binding lines use their
-  own declaration's key.
-- Unnamed namespaces (`namespace { }`): default `scope namespace
-  <unnamed>` plus an implicit using-directive.
-- Top-level cv on parameter types and function/array parameter decay:
-  keep exactly as declared (fixture pins undecayed arrays).
-- Block-scope function declarations and `extern "C"` blocks: bind in the
-  current scope, no extra output.
-- The bare anonymous union name needs the declaration's token extent,
-  which the PA10 AST does not record; CP2 adds it (parser change) — CP1
-  must not print such declarations and may throw on them.
-
-## Completed Checkpoint: CP2 — enums and constant evaluation
-
-Enum entities now own canonical enum scopes, enumerator bindings, underlying
-types, and constant values. Constant evaluation covers the packet operators,
-short-circuiting, checked signed arithmetic, casts, `sizeof`, and `alignof`;
-those values feed array bounds, enumerators, and `static_assert`. Parser
-extents support qualified enum definitions and stable anonymous-union scopes.
-The focused CP2 fixtures and negative cases pass; `make test-pa11` is 66/68,
-through-pa10 is 589/589, and the pa11 file audit passes. The 200-namespace
-probe measured 0.37 s / 56,936 KB and its doubled input 0.80 s / 110,524 KB,
-with linear scaling in time.
-
-## Completed Checkpoint: CP3 — template parameter scopes and template-id rejection
-
-Template declarations now own a semantic template-parameter scope. Type and
-template-template parameters receive canonical `TemplateParam` types before
-the wrapped declaration is built, so template members resolve through the
-same scope chain as other declarations. The parser and semantic builder both
-reject using-declarations whose target contains a template-id.
-
-Evidence: the two deferred fixtures pass, the existing
-`300-using-declaration-template-id-bad` fixture remains passing, `make test-pa11`
-reports 68/68, through-pa10 reports 589/589, and
-`make test-report-through-pa11` reports 657/657. The file audit passes with
-the existing two warnings. The specified probe measured 0.44 s / 57480 KB;
-the doubled input measured 0.58 s / 110472 KB, with approximately linear
-time and memory growth.
-
-## Active Checkpoint: CP4 — architecture cleanup, audit, performance evidence
-
-Consolidate the PA11 implementation structure, resolve the remaining audit
-findings where appropriate, and keep the verified performance evidence in
-`audit.md` while preserving the complete through-pa11 suite.
+  extents and qualified enum names — 66/68.
+- CP3 template-parameter scopes and template-id rejection — 68/68,
+  through-pa11 657/657.
+- CP4 final architecture cleanup (this audit) — parallel type resolver,
+  textual keys and joined names removed; entity-linked types with derived
+  scopes; indexed lookup; quadratic paths and several correctness defects
+  fixed; 657/657 through pa11, file audit passing, fixture outputs
+  unchanged.

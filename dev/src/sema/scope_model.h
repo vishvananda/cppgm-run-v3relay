@@ -1,12 +1,20 @@
 #pragma once
 
 #include <cstddef>
-#include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "sema/qualified_name.h"
 #include "sema/type_table.h"
 
+// The PA11 scope tree: scopes own bindings in declaration order and child
+// scopes in creation order (both are dump order); a per-scope name index
+// serves lookup once a scope grows past a handful of names.  Class and enum
+// entities carry the facts shared by all declarations of one type: the member
+// scope and whether a definition has been seen.  Every scope reachable through
+// a binding is derived on demand from the binding's kind and type, so no
+// binding holds a copy of a scope that may not exist yet.
 typedef std::size_t ScopeId;
 typedef std::size_t BindingId;
 typedef std::size_t ClassEntityId;
@@ -42,20 +50,20 @@ enum LookupFilter
   LOOKUP_ENUMERATORS = 1u << 4,
   LOOKUP_ANY = LOOKUP_TYPES | LOOKUP_VALUES | LOOKUP_FUNCTIONS |
       LOOKUP_NAMESPACES | LOOKUP_ENUMERATORS,
+  // 3.4.3p1: the name before `::` ignores objects, functions and enumerators.
   LOOKUP_QUALIFIER = LOOKUP_TYPES | LOOKUP_NAMESPACES
 };
 
 struct Binding
 {
+  // Printed spelling.  A qualified out-of-class enum definition keeps its
+  // qualified spelling as the dump requires; lookup never reads that form.
   std::string name;
   BindingKind kind;
   TypeId type;
-  ScopeId target_scope;
-  ClassEntityId class_entity;
-  EnumEntityId enum_entity;
+  ScopeId namespace_scope; // BINDING_NAMESPACE: the nominated namespace
   bool has_const_value;
   long long const_value;
-  bool print;
 
   Binding();
 };
@@ -63,23 +71,23 @@ struct Binding
 struct Scope
 {
   ScopeKind kind;
-  std::string name;
+  std::string name; // printed after the scope kind; empty for blocks and template scopes
   ScopeId parent;
   bool inline_namespace;
   std::vector<BindingId> bindings;
   std::vector<ScopeId> children;
   std::vector<ScopeId> using_directives;
+  // name -> bindings of that name in declaration order; built once the scope
+  // holds more than kSmallScope bindings, empty before that.
+  std::unordered_map<std::string, std::vector<BindingId> > index;
 
   Scope();
 };
 
 struct ClassEntity
 {
-  ScopeId parent_scope;
-  std::string name;
-  std::string class_key;
-  TypeId current_type;
-  ScopeId class_scope;
+  ScopeId class_scope; // 0 until defined
+  bool is_union;
   bool defined;
 
   ClassEntity();
@@ -87,11 +95,10 @@ struct ClassEntity
 
 struct EnumEntity
 {
-  ScopeId parent_scope;
-  std::string name;
-  TypeId type;
-  TypeId underlying;
+  // Scope holding the enumerators: the enum scope of a scoped enumeration or
+  // the declaring scope of a defined unscoped one; 0 before that exists.
   ScopeId enum_scope;
+  TypeId underlying;
   bool scoped;
   bool defined;
 
@@ -111,45 +118,61 @@ public:
 
   BindingId AddBinding(ScopeId scope, const std::string& name,
                        BindingKind kind, TypeId type = 0,
-                       ScopeId target_scope = 0, bool print = true,
-                       ClassEntityId class_entity = 0,
-                       EnumEntityId enum_entity = 0);
+                       ScopeId namespace_scope = 0);
   void AddUsingDirective(ScopeId scope, ScopeId target);
   Binding& BindingAt(BindingId id);
   const Binding& BindingAt(BindingId id) const;
 
-  BindingId LookupUnqualified(ScopeId scope, const std::string& name,
-                              unsigned filter) const;
-  BindingId LookupTypeName(ScopeId scope, const std::string& name) const;
-  BindingId LookupQualified(ScopeId scope,
-                            const std::vector<std::string>& components,
-                            unsigned filter) const;
-
+  // Latest binding of `name` declared directly in `scope` that passes the
+  // filter; 0 when none.
   BindingId DirectBinding(ScopeId scope, const std::string& name,
                           unsigned filter = LOOKUP_ANY) const;
-  ClassEntityId GetOrCreateClass(ScopeId parent, const std::string& name);
+  // 3.4.1 unqualified lookup restricted to the filter (elaborated lookup
+  // uses LOOKUP_TYPES, the qualifier position LOOKUP_QUALIFIER).
+  BindingId LookupUnqualified(ScopeId scope, const std::string& name,
+                              unsigned filter) const;
+  // Ordinary lookup of a type name: a later object, function, enumerator or
+  // parameter of the same name hides the type (3.3.10p2).
+  BindingId LookupTypeName(ScopeId scope, const std::string& name) const;
+  // 3.4.3 qualified lookup through namespaces, class scopes and enums.
+  BindingId LookupQualified(ScopeId scope, const QualifiedName& name,
+                            unsigned filter) const;
+  // Dispatches on the name form: global, qualified, or unqualified.
+  BindingId Lookup(ScopeId scope, const QualifiedName& name,
+                   unsigned filter) const;
+  // Scope a binding denotes when used as a qualifier: the nominated
+  // namespace, the member scope of a class, or the enumerator scope of an
+  // enumeration (also through a type alias).  False when it has none yet.
+  bool NominatedScope(BindingId binding, ScopeId& scope) const;
+  // Member scope of a class type or enumerator scope of an enum type.
+  bool ScopeOfType(TypeId type, ScopeId& scope) const;
+
+  ClassEntityId CreateClass(bool is_union);
   ClassEntity& ClassAt(ClassEntityId id);
   const ClassEntity& ClassAt(ClassEntityId id) const;
-  ScopeId TargetScopeForType(TypeId type) const;
-  EnumEntityId GetOrCreateEnum(ScopeId parent, const std::string& name);
+  EnumEntityId CreateEnum(bool scoped, TypeId underlying);
   EnumEntity& EnumAt(EnumEntityId id);
   const EnumEntity& EnumAt(EnumEntityId id) const;
   TypeTable& Types();
   const TypeTable& Types() const;
 
 private:
-  bool Matches(const Binding& binding, unsigned filter) const;
+  static const std::size_t kSmallScope = 8;
+
+  static bool Matches(const Binding& binding, unsigned filter);
   BindingId SearchScope(ScopeId scope, const std::string& name,
                         unsigned filter, std::vector<ScopeId>& visited) const;
   BindingId SearchNamespace(ScopeId scope, const std::string& name,
                             unsigned filter, std::vector<ScopeId>& visited) const;
-  std::string EntityKey(ScopeId scope, const std::string& name) const;
+  BindingId SearchUsingDirectives(ScopeId scope, const std::string& name,
+                                  unsigned filter,
+                                  std::vector<ScopeId>& visited) const;
+  BindingId SearchMember(ScopeId scope, EntityId unscoped_enum,
+                         const std::string& name, unsigned filter) const;
 
   TypeTable& types_;
   std::vector<Scope> scopes_;
   std::vector<Binding> bindings_;
   std::vector<ClassEntity> classes_;
   std::vector<EnumEntity> enums_;
-  std::map<std::string, ClassEntityId> class_by_name_;
-  std::map<std::string, EnumEntityId> enum_by_name_;
 };

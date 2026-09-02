@@ -113,6 +113,7 @@ const char* const Names[AST_KIND_COUNT] =
 	"bit-field-declaration",
 	"bit-field-declarator",
 	"enum-specifier",
+	"enum-specifier",
 	"enumerator",
 	"namespace-definition",
 	"namespace-alias-definition",
@@ -174,6 +175,29 @@ void AstArena::Add(AstId parent, AstId child)
 {
 	if (child != 0)
 		At(parent).children.push_back(child);
+}
+
+void AstArena::RecordDeclarationExtent(AstId id, std::size_t first,
+	std::size_t last)
+{
+	Extent extent;
+	extent.node = id;
+	extent.first = first;
+	extent.last = last;
+	extents_.push_back(extent);
+}
+
+bool AstArena::DeclarationExtent(AstId id, std::size_t& first,
+	std::size_t& last) const
+{
+	for (std::size_t i = 0; i < extents_.size(); ++i)
+		if (extents_[i].node == id)
+		{
+			first = extents_[i].first;
+			last = extents_[i].last;
+			return true;
+		}
+	return false;
 }
 
 void PrintAst(std::ostream& out, const AstArena& arena, AstId root,

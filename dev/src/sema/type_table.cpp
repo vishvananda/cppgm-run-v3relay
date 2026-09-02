@@ -1,14 +1,91 @@
 #include "sema/type_table.h"
 
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 
 TypeNode::TypeNode()
     : kind(TYPE_INVALID), fundamental(FT_INT), base(0), result(0),
       array_bound(0), is_const(false), is_volatile(false),
-      lvalue_reference(true), variadic(false)
+      lvalue_reference(true), variadic(false), scoped(false),
+      keyword(TK_NONE), entity(0)
 {
 }
+
+bool IsFundamentalTypeKeyword(ETokenType token)
+{
+  switch (token)
+  {
+  case KW_CHAR: case KW_CHAR16_T: case KW_CHAR32_T: case KW_WCHAR_T:
+  case KW_BOOL: case KW_SHORT: case KW_INT: case KW_LONG: case KW_SIGNED:
+  case KW_UNSIGNED: case KW_FLOAT: case KW_DOUBLE: case KW_VOID:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool FundamentalIsIntegral(EFundamentalType type)
+{
+  switch (type)
+  {
+  case FT_SIGNED_CHAR: case FT_SHORT_INT: case FT_INT: case FT_LONG_INT:
+  case FT_LONG_LONG_INT: case FT_UNSIGNED_CHAR: case FT_UNSIGNED_SHORT_INT:
+  case FT_UNSIGNED_INT: case FT_UNSIGNED_LONG_INT:
+  case FT_UNSIGNED_LONG_LONG_INT: case FT_WCHAR_T: case FT_CHAR:
+  case FT_CHAR16_T: case FT_CHAR32_T: case FT_BOOL:
+    return true;
+  case FT_FLOAT: case FT_DOUBLE: case FT_LONG_DOUBLE: case FT_VOID:
+  case FT_NULLPTR_T:
+    return false;
+  }
+  return false;
+}
+
+bool FundamentalIsUnsigned(EFundamentalType type)
+{
+  switch (type)
+  {
+  case FT_UNSIGNED_CHAR: case FT_UNSIGNED_SHORT_INT: case FT_UNSIGNED_INT:
+  case FT_UNSIGNED_LONG_INT: case FT_UNSIGNED_LONG_LONG_INT:
+  case FT_CHAR16_T: case FT_CHAR32_T: case FT_BOOL:
+    return true;
+  default:
+    return false; // char and wchar_t are signed on this target
+  }
+}
+
+std::size_t FundamentalSize(EFundamentalType type)
+{
+  switch (type)
+  {
+  case FT_SIGNED_CHAR: case FT_UNSIGNED_CHAR: case FT_CHAR: case FT_BOOL:
+    return 1;
+  case FT_SHORT_INT: case FT_UNSIGNED_SHORT_INT: case FT_CHAR16_T:
+    return 2;
+  case FT_INT: case FT_UNSIGNED_INT: case FT_WCHAR_T: case FT_CHAR32_T:
+  case FT_FLOAT:
+    return 4;
+  case FT_LONG_INT: case FT_LONG_LONG_INT: case FT_UNSIGNED_LONG_INT:
+  case FT_UNSIGNED_LONG_LONG_INT: case FT_DOUBLE:
+    return 8;
+  case FT_LONG_DOUBLE:
+    return 16;
+  case FT_VOID: case FT_NULLPTR_T:
+    break;
+  }
+  return 0;
+}
+
+bool TypeTable::FunctionKey::operator<(const FunctionKey& other) const
+{
+  if (result != other.result)
+    return result < other.result;
+  if (variadic != other.variadic)
+    return variadic < other.variadic;
+  return parameters < other.parameters;
+}
+
 TypeTable::TypeTable()
     : nodes_(1)
 {
@@ -18,17 +95,6 @@ TypeId TypeTable::Add(const TypeNode& node)
 {
   nodes_.push_back(node);
   return nodes_.size() - 1;
-}
-
-TypeId TypeTable::Derived(const std::string& key, const TypeNode& node)
-{
-  const std::map<std::string, TypeId>::const_iterator found =
-      derived_.find(key);
-  if (found != derived_.end())
-    return found->second;
-  const TypeId id = Add(node);
-  derived_[key] = id;
-  return id;
 }
 
 TypeId TypeTable::Fundamental(EFundamentalType type)
@@ -45,19 +111,86 @@ TypeId TypeTable::Fundamental(EFundamentalType type)
   return id;
 }
 
+TypeId TypeTable::FundamentalFromKeywords(
+    const std::vector<ETokenType>& keywords)
+{
+  bool is_unsigned = false;
+  bool is_signed = false;
+  bool is_short = false;
+  unsigned long_count = 0;
+  ETokenType named = KW_INT;
+  for (std::size_t i = 0; i < keywords.size(); ++i)
+  {
+    switch (keywords[i])
+    {
+    case KW_UNSIGNED: is_unsigned = true; break;
+    case KW_SIGNED: is_signed = true; break;
+    case KW_SHORT: is_short = true; break;
+    case KW_LONG: ++long_count; break;
+    case KW_INT: break;
+    default:
+      if (!IsFundamentalTypeKeyword(keywords[i]))
+        throw std::runtime_error("invalid fundamental type specifier");
+      named = keywords[i];
+      break;
+    }
+  }
+  EFundamentalType result = FT_INT;
+  switch (named)
+  {
+  case KW_CHAR:
+    result = is_unsigned ? FT_UNSIGNED_CHAR : is_signed ? FT_SIGNED_CHAR : FT_CHAR;
+    break;
+  case KW_CHAR16_T: result = FT_CHAR16_T; break;
+  case KW_CHAR32_T: result = FT_CHAR32_T; break;
+  case KW_WCHAR_T: result = FT_WCHAR_T; break;
+  case KW_BOOL: result = FT_BOOL; break;
+  case KW_FLOAT: result = FT_FLOAT; break;
+  case KW_DOUBLE: result = long_count == 0 ? FT_DOUBLE : FT_LONG_DOUBLE; break;
+  case KW_VOID: result = FT_VOID; break;
+  default:
+    if (is_short)
+      result = is_unsigned ? FT_UNSIGNED_SHORT_INT : FT_SHORT_INT;
+    else if (long_count >= 2)
+      result = is_unsigned ? FT_UNSIGNED_LONG_LONG_INT : FT_LONG_LONG_INT;
+    else if (long_count == 1)
+      result = is_unsigned ? FT_UNSIGNED_LONG_INT : FT_LONG_INT;
+    else if (is_unsigned)
+      result = FT_UNSIGNED_INT;
+    break;
+  }
+  return Fundamental(result);
+}
+
 TypeId TypeTable::Cv(TypeId base, bool is_const, bool is_volatile)
 {
   if (base == 0 || (!is_const && !is_volatile))
     return base;
-  TypeNode node;
-  node.kind = TYPE_CV;
-  node.base = base;
-  node.is_const = is_const;
-  node.is_volatile = is_volatile;
-  std::ostringstream key;
-  key << "cv:" << base << ':' << (is_const ? 1 : 0) << ':'
-      << (is_volatile ? 1 : 0);
-  return Derived(key.str(), node);
+  const TypeNode& node = At(base);
+  switch (node.kind)
+  {
+  case TYPE_REFERENCE: case TYPE_FUNCTION:
+    return base;
+  case TYPE_ARRAY:
+    return Array(Cv(node.base, is_const, is_volatile), node.array_bound);
+  case TYPE_CV:
+    return Cv(node.base, node.is_const || is_const,
+              node.is_volatile || is_volatile);
+  default:
+    break;
+  }
+  const std::pair<TypeId, unsigned> key(
+      base, (is_const ? 1u : 0u) | (is_volatile ? 2u : 0u));
+  const std::map<std::pair<TypeId, unsigned>, TypeId>::const_iterator found =
+      cv_.find(key);
+  if (found != cv_.end())
+    return found->second;
+  TypeNode result;
+  result.kind = TYPE_CV;
+  result.base = base;
+  result.is_const = is_const;
+  result.is_volatile = is_volatile;
+  return cv_[key] = Add(result);
 }
 
 TypeId TypeTable::Pointer(TypeId base)
@@ -66,12 +199,13 @@ TypeId TypeTable::Pointer(TypeId base)
     throw std::runtime_error("pointer has no pointee type");
   if (Kind(base) == TYPE_REFERENCE)
     throw std::runtime_error("pointer to reference is ill-formed");
+  const std::map<TypeId, TypeId>::const_iterator found = pointers_.find(base);
+  if (found != pointers_.end())
+    return found->second;
   TypeNode node;
   node.kind = TYPE_POINTER;
   node.base = base;
-  std::ostringstream key;
-  key << "ptr:" << base;
-  return Derived(key.str(), node);
+  return pointers_[base] = Add(node);
 }
 
 TypeId TypeTable::Reference(TypeId base, bool lvalue)
@@ -80,28 +214,38 @@ TypeId TypeTable::Reference(TypeId base, bool lvalue)
     throw std::runtime_error("reference has no referred type");
   if (Kind(base) == TYPE_REFERENCE)
     throw std::runtime_error("reference to reference is ill-formed");
+  const std::pair<TypeId, bool> key(base, lvalue);
+  const std::map<std::pair<TypeId, bool>, TypeId>::const_iterator found =
+      references_.find(key);
+  if (found != references_.end())
+    return found->second;
   TypeNode node;
   node.kind = TYPE_REFERENCE;
   node.base = base;
   node.lvalue_reference = lvalue;
-  std::ostringstream key;
-  key << "ref:" << base << ':' << (lvalue ? 1 : 0);
-  return Derived(key.str(), node);
+  return references_[key] = Add(node);
 }
 
 TypeId TypeTable::Array(TypeId element, std::size_t bound)
 {
   if (element == 0 || bound == 0)
     throw std::runtime_error("array bound must be positive");
-  if (Kind(element) == TYPE_FUNCTION)
-    throw std::runtime_error("array of functions is ill-formed");
+  const TypeKind kind = Kind(element);
+  const TypeNode& unqualified = At(Unqualified(element));
+  if (kind == TYPE_FUNCTION || kind == TYPE_REFERENCE ||
+      (unqualified.kind == TYPE_FUNDAMENTAL &&
+       unqualified.fundamental == FT_VOID))
+    throw std::runtime_error("array element type is not an object type");
+  const std::pair<TypeId, std::size_t> key(element, bound);
+  const std::map<std::pair<TypeId, std::size_t>, TypeId>::const_iterator
+      found = arrays_.find(key);
+  if (found != arrays_.end())
+    return found->second;
   TypeNode node;
   node.kind = TYPE_ARRAY;
   node.base = element;
   node.array_bound = bound;
-  std::ostringstream key;
-  key << "array:" << element << ':' << bound;
-  return Derived(key.str(), node);
+  return arrays_[key] = Add(node);
 }
 
 TypeId TypeTable::Function(TypeId result, const std::vector<TypeId>& parameters,
@@ -109,44 +253,54 @@ TypeId TypeTable::Function(TypeId result, const std::vector<TypeId>& parameters,
 {
   if (result == 0)
     throw std::runtime_error("function has no return type");
+  const TypeKind result_kind = Kind(result);
+  if (result_kind == TYPE_ARRAY || result_kind == TYPE_FUNCTION)
+    throw std::runtime_error("function returning array or function");
+  FunctionKey key;
+  key.result = result;
+  key.variadic = variadic;
+  key.parameters = parameters;
+  const std::map<FunctionKey, TypeId>::const_iterator found =
+      functions_.find(key);
+  if (found != functions_.end())
+    return found->second;
   TypeNode node;
   node.kind = TYPE_FUNCTION;
   node.result = result;
   node.parameters = parameters;
   node.variadic = variadic;
-  std::ostringstream key;
-  key << "function:" << result << ':' << (variadic ? 1 : 0);
-  for (std::size_t i = 0; i < parameters.size(); ++i)
-    key << ':' << parameters[i];
-  return Derived(key.str(), node);
+  return functions_[key] = Add(node);
 }
 
-TypeId TypeTable::Class(const std::string& name, const std::string& class_key)
+TypeId TypeTable::Class(EntityId entity, TypeKeyword key,
+                        const std::string& name)
 {
   TypeNode node;
   node.kind = TYPE_CLASS;
+  node.entity = entity;
+  node.keyword = key;
   node.name = name;
-  node.class_key = class_key;
   return Add(node);
 }
 
-TypeId TypeTable::Enum(const std::string& name, bool scoped, TypeId underlying)
+TypeId TypeTable::Enum(EntityId entity, bool scoped, TypeId underlying,
+                       const std::string& name)
 {
   TypeNode node;
   node.kind = TYPE_ENUM;
+  node.entity = entity;
+  node.scoped = scoped;
+  node.base = underlying;
   node.name = name;
-  node.class_key = scoped ? "class" : "";
-  node.base = underlying == 0 ? Fundamental(FT_INT) : underlying;
   return Add(node);
 }
 
-TypeId TypeTable::TemplateParam(const std::string& name,
-                               const std::string& keyword)
+TypeId TypeTable::TemplateParam(TypeKeyword key, const std::string& name)
 {
   TypeNode node;
   node.kind = TYPE_TEMPLATE_PARAM;
+  node.keyword = key;
   node.name = name;
-  node.class_key = keyword;
   return Add(node);
 }
 
@@ -162,82 +316,81 @@ TypeKind TypeTable::Kind(TypeId id) const
   return At(id).kind;
 }
 
-std::string TypeTable::SpellParameters(const TypeNode& node) const
+TypeId TypeTable::Unqualified(TypeId id) const
 {
-  std::ostringstream out;
-  for (std::size_t i = 0; i < node.parameters.size(); ++i)
-  {
-    if (i != 0)
-      out << ", ";
-    out << Spell(node.parameters[i]);
-  }
-  if (node.variadic)
-  {
-    if (!node.parameters.empty())
-      out << ", ";
-    out << "...";
-  }
-  return out.str();
+  while (id != 0 && At(id).kind == TYPE_CV)
+    id = At(id).base;
+  return id;
 }
 
-std::string TypeTable::Spell(TypeId id) const
+static const char* KeywordSpelling(TypeKeyword key)
+{
+  switch (key)
+  {
+  case TK_STRUCT: return "struct";
+  case TK_CLASS: return "class";
+  case TK_UNION: return "union";
+  case TK_TYPENAME: return "typename";
+  case TK_TEMPLATE_PARAMETER: return "template-parameter";
+  case TK_NONE: break;
+  }
+  return "";
+}
+
+void TypeTable::Spell(std::ostream& out, TypeId id) const
 {
   const TypeNode& node = At(id);
   switch (node.kind)
   {
   case TYPE_FUNDAMENTAL:
-    switch (node.fundamental)
-    {
-    case FT_SIGNED_CHAR: return "signed char";
-    case FT_SHORT_INT: return "short int";
-    case FT_INT: return "int";
-    case FT_LONG_INT: return "long int";
-    case FT_LONG_LONG_INT: return "long long int";
-    case FT_UNSIGNED_CHAR: return "unsigned char";
-    case FT_UNSIGNED_SHORT_INT: return "unsigned short int";
-    case FT_UNSIGNED_INT: return "unsigned int";
-    case FT_UNSIGNED_LONG_INT: return "unsigned long int";
-    case FT_UNSIGNED_LONG_LONG_INT: return "unsigned long long int";
-    case FT_WCHAR_T: return "wchar_t";
-    case FT_CHAR: return "char";
-    case FT_CHAR16_T: return "char16_t";
-    case FT_CHAR32_T: return "char32_t";
-    case FT_BOOL: return "bool";
-    case FT_FLOAT: return "float";
-    case FT_DOUBLE: return "double";
-    case FT_LONG_DOUBLE: return "long double";
-    case FT_VOID: return "void";
-    case FT_NULLPTR_T: return "nullptr_t";
-    }
-    break;
+    out << FundamentalTypeToStringMap.at(node.fundamental);
+    return;
   case TYPE_CV:
-    return std::string(node.is_const ? "const " : "") +
-        (node.is_volatile ? "volatile " : "") + Spell(node.base);
+    out << (node.is_const ? "const " : "") << (node.is_volatile ? "volatile " : "");
+    Spell(out, node.base);
+    return;
   case TYPE_POINTER:
-    return "pointer to " + Spell(node.base);
+    out << "pointer to ";
+    Spell(out, node.base);
+    return;
   case TYPE_REFERENCE:
-    return std::string(node.lvalue_reference ? "lvalue" : "rvalue") +
-        "-reference to " + Spell(node.base);
+    out << (node.lvalue_reference ? "lvalue" : "rvalue") << "-reference to ";
+    Spell(out, node.base);
+    return;
   case TYPE_ARRAY:
-  {
-    std::ostringstream out;
-    out << "array of " << node.array_bound << ' ' << Spell(node.base);
-    return out.str();
-  }
+    out << "array of " << node.array_bound << ' ';
+    Spell(out, node.base);
+    return;
   case TYPE_FUNCTION:
-    return "function of (" + SpellParameters(node) + ") returning " +
-        Spell(node.result);
-  case TYPE_CLASS:
-    return node.class_key + " " + node.name;
+    out << "function of (";
+    for (std::size_t i = 0; i < node.parameters.size(); ++i)
+    {
+      if (i != 0)
+        out << ", ";
+      Spell(out, node.parameters[i]);
+    }
+    if (node.variadic)
+      out << (node.parameters.empty() ? "..." : ", ...");
+    out << ") returning ";
+    Spell(out, node.result);
+    return;
+  case TYPE_CLASS: case TYPE_TEMPLATE_PARAM:
+    out << KeywordSpelling(node.keyword) << ' ' << node.name;
+    return;
   case TYPE_ENUM:
-    return std::string(node.class_key.empty() ? "enum " : "enum class ") +
-        node.name;
-  case TYPE_TEMPLATE_PARAM:
-    return node.class_key + " " + node.name;
+    out << (node.scoped ? "enum class " : "enum ") << node.name;
+    return;
   case TYPE_INVALID:
     break;
   }
   throw std::runtime_error("cannot spell invalid type");
+}
+
+std::string TypeTable::Spell(TypeId id) const
+{
+  std::ostringstream out;
+  Spell(out, id);
+  return out.str();
 }
 
 std::size_t TypeTable::SizeOf(TypeId id) const
@@ -246,26 +399,21 @@ std::size_t TypeTable::SizeOf(TypeId id) const
   switch (node.kind)
   {
   case TYPE_FUNDAMENTAL:
-    switch (node.fundamental)
-    {
-    case FT_SIGNED_CHAR: case FT_UNSIGNED_CHAR: case FT_CHAR:
-    case FT_BOOL: return 1;
-    case FT_SHORT_INT: case FT_UNSIGNED_SHORT_INT: return 2;
-    case FT_INT: case FT_UNSIGNED_INT: case FT_FLOAT: return 4;
-    case FT_LONG_INT: case FT_LONG_LONG_INT: case FT_UNSIGNED_LONG_INT:
-    case FT_UNSIGNED_LONG_LONG_INT: case FT_DOUBLE: return 8;
-    case FT_LONG_DOUBLE: return 16;
-    case FT_WCHAR_T: case FT_CHAR16_T: return 2;
-    case FT_CHAR32_T: return 4;
-    case FT_VOID: case FT_NULLPTR_T: break;
-    }
+  {
+    const std::size_t size = FundamentalSize(node.fundamental);
+    if (size != 0)
+      return size;
     break;
-  case TYPE_CV: return SizeOf(node.base);
-  case TYPE_POINTER: case TYPE_REFERENCE: return 8;
-  case TYPE_ARRAY: return SizeOf(node.base) * node.array_bound;
-  case TYPE_ENUM: return SizeOf(node.base);
-  case TYPE_CLASS: case TYPE_FUNCTION: case TYPE_TEMPLATE_PARAM: break;
-  case TYPE_INVALID: break;
+  }
+  case TYPE_CV: case TYPE_REFERENCE: case TYPE_ENUM:
+    return SizeOf(node.base);
+  case TYPE_POINTER:
+    return 8;
+  case TYPE_ARRAY:
+    return SizeOf(node.base) * node.array_bound;
+  case TYPE_CLASS: case TYPE_FUNCTION: case TYPE_TEMPLATE_PARAM:
+  case TYPE_INVALID:
+    break;
   }
   throw std::runtime_error("sizeof incomplete or non-object type");
 }
@@ -273,11 +421,8 @@ std::size_t TypeTable::SizeOf(TypeId id) const
 std::size_t TypeTable::AlignOf(TypeId id) const
 {
   const TypeNode& node = At(id);
-  if (node.kind == TYPE_ARRAY)
+  if (node.kind == TYPE_ARRAY || node.kind == TYPE_CV ||
+      node.kind == TYPE_REFERENCE)
     return AlignOf(node.base);
-  if (node.kind == TYPE_CV)
-    return AlignOf(node.base);
-  if (node.kind == TYPE_POINTER || node.kind == TYPE_REFERENCE)
-    return 8;
   return SizeOf(id);
 }

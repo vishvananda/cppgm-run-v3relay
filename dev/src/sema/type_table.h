@@ -4,11 +4,19 @@
 #include <iosfwd>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "posttoken_types.h"
 
-typedef std::size_t TypeId;
+// Canonical PA11 types.  Derived types (cv, pointer, reference, array,
+// function) are interned on typed keys so equal types share one id and
+// equality is `==`.  Class, enum, and template-parameter types carry the
+// entity they denote plus the spelling of the declaration that introduced
+// them; the dump prints every declaration with its own spelling, so two type
+// ids may name one entity and semantic identity is the entity, not the id.
+typedef std::size_t TypeId;   // 0 is the null type
+typedef std::size_t EntityId; // class or enum entity in the SemaModel
 
 enum TypeKind
 {
@@ -23,23 +31,44 @@ enum TypeKind
   TYPE_ENUM,
   TYPE_TEMPLATE_PARAM
 };
+
+// Keyword spelled before a named type: the class-key of a class type or the
+// declaring keyword of a template type parameter.
+enum TypeKeyword
+{
+  TK_NONE,
+  TK_STRUCT,
+  TK_CLASS,
+  TK_UNION,
+  TK_TYPENAME,
+  TK_TEMPLATE_PARAMETER
+};
+
 struct TypeNode
 {
   TypeKind kind;
-  EFundamentalType fundamental;
-  TypeId base;
-  TypeId result;
-  std::vector<TypeId> parameters;
+  EFundamentalType fundamental;   // TYPE_FUNDAMENTAL
+  TypeId base;                    // cv/pointer/reference/array operand, enum underlying type
+  TypeId result;                  // function return type
+  std::vector<TypeId> parameters; // function parameter types
   std::size_t array_bound;
   bool is_const;
   bool is_volatile;
   bool lvalue_reference;
   bool variadic;
-  std::string name;
-  std::string class_key;
+  bool scoped;                    // TYPE_ENUM
+  TypeKeyword keyword;            // TYPE_CLASS, TYPE_TEMPLATE_PARAM
+  EntityId entity;                // TYPE_CLASS, TYPE_ENUM
+  std::string name;               // declared spelling of a named type
 
   TypeNode();
 };
+
+// Fundamental-type facts for the Linux x86-64 target.
+bool IsFundamentalTypeKeyword(ETokenType token);
+bool FundamentalIsIntegral(EFundamentalType type);
+bool FundamentalIsUnsigned(EFundamentalType type);
+std::size_t FundamentalSize(EFundamentalType type); // 0 for void and nullptr_t
 
 class TypeTable
 {
@@ -47,28 +76,46 @@ public:
   TypeTable();
 
   TypeId Fundamental(EFundamentalType type);
+  // 3.9.1 simple-type-specifier combination such as {unsigned, long, long}.
+  TypeId FundamentalFromKeywords(const std::vector<ETokenType>& keywords);
+  // Adds qualifiers to a type: merges with an existing cv layer, applies to
+  // the element type of an array (3.9.3p5), and is ignored on reference and
+  // function types (8.3.2p1, 8.3.5p6).
   TypeId Cv(TypeId base, bool is_const, bool is_volatile = false);
   TypeId Pointer(TypeId base);
   TypeId Reference(TypeId base, bool lvalue = true);
   TypeId Array(TypeId element, std::size_t bound);
   TypeId Function(TypeId result, const std::vector<TypeId>& parameters,
                   bool variadic = false);
-  TypeId Class(const std::string& name, const std::string& class_key);
-  TypeId Enum(const std::string& name, bool scoped, TypeId underlying = 0);
-  TypeId TemplateParam(const std::string& name, const std::string& keyword);
+  TypeId Class(EntityId entity, TypeKeyword key, const std::string& name);
+  TypeId Enum(EntityId entity, bool scoped, TypeId underlying,
+              const std::string& name);
+  TypeId TemplateParam(TypeKeyword key, const std::string& name);
 
   const TypeNode& At(TypeId id) const;
   TypeKind Kind(TypeId id) const;
+  TypeId Unqualified(TypeId id) const; // strips top-level cv
+  void Spell(std::ostream& out, TypeId id) const;
   std::string Spell(TypeId id) const;
   std::size_t SizeOf(TypeId id) const;
   std::size_t AlignOf(TypeId id) const;
 
 private:
+  struct FunctionKey
+  {
+    TypeId result;
+    bool variadic;
+    std::vector<TypeId> parameters;
+    bool operator<(const FunctionKey& other) const;
+  };
+
   TypeId Add(const TypeNode& node);
-  TypeId Derived(const std::string& key, const TypeNode& node);
-  std::string SpellParameters(const TypeNode& node) const;
 
   std::vector<TypeNode> nodes_;
   std::map<EFundamentalType, TypeId> fundamentals_;
-  std::map<std::string, TypeId> derived_;
+  std::map<std::pair<TypeId, unsigned>, TypeId> cv_;
+  std::map<TypeId, TypeId> pointers_;
+  std::map<std::pair<TypeId, bool>, TypeId> references_;
+  std::map<std::pair<TypeId, std::size_t>, TypeId> arrays_;
+  std::map<FunctionKey, TypeId> functions_;
 };

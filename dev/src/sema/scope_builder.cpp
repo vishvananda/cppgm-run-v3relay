@@ -1,3 +1,4 @@
+// Declaration collection and scope ownership for the PA11 semantic model.
 #include "sema/scope_builder.h"
 
 #include <limits>
@@ -11,14 +12,11 @@ void ScopeBuilder::Build(AstId root)
 {
   if (root == 0)
     throw std::runtime_error("empty AST");
-  if (arena_.At(root).kind == AST_TRANSLATION_UNIT)
-  {
-    const vector<AstId>& children = arena_.At(root).children;
-    for (std::size_t i = 0; i < children.size(); ++i)
-      BuildNode(children[i], model_.GlobalScope());
-    return;
-  }
-  BuildNode(root, model_.GlobalScope());
+  if (arena_.At(root).kind != AST_TRANSLATION_UNIT)
+    throw std::runtime_error("AST root is not a translation unit");
+  const vector<AstId>& children = arena_.At(root).children;
+  for (std::size_t i = 0; i < children.size(); ++i)
+    BuildNode(children[i], model_.GlobalScope());
 }
 
 void ScopeBuilder::BuildNode(AstId node, ScopeId scope)
@@ -34,243 +32,183 @@ void ScopeBuilder::BuildNode(AstId node, ScopeId scope)
   case AST_ALIAS_DECLARATION: BuildAlias(node, scope); return;
   case AST_SIMPLE_DECLARATION: BuildSimpleDeclaration(node, scope); return;
   case AST_FUNCTION_DEFINITION: BuildFunctionDefinition(node, scope); return;
-  case AST_ENUM_SPECIFIER:
-    (void)BuildEnumType(node, scope);
+  case AST_ENUM_SPECIFIER: case AST_ENUM_DECLARATION:
+    (void)BuildEnum(node, scope, string());
     return;
   case AST_CLASS_SPECIFIER:
-    (void)BuildClassSpecifier(node, scope);
+    (void)BuildClassDefinition(node, scope, string());
     return;
-  case AST_CLASS_FORWARD_DECLARATION: BuildClassForward(node, scope); return;
+  case AST_CLASS_FORWARD_DECLARATION:
+    (void)BuildClassForward(node, scope);
+    return;
   case AST_LINKAGE_SPECIFICATION: BuildLinkage(node, scope); return;
   case AST_COMPOUND_STATEMENT:
     (void)BuildCompound(node, scope);
     return;
-  case AST_EMPTY_DECLARATION:
+  case AST_STATIC_ASSERT_DECLARATION: BuildStaticAssert(node, scope); return;
+  case AST_TEMPLATE_DECLARATION: BuildTemplate(node, scope); return;
+  case AST_EMPTY_DECLARATION: case AST_ACCESS_SPECIFIER:
     return;
-  case AST_STATIC_ASSERT_DECLARATION:
-    BuildStaticAssert(node, scope);
-    return;
-  case AST_TEMPLATE_DECLARATION:
-    BuildTemplate(node, scope);
-    return;
-  case AST_EXPLICIT_INSTANTIATION_DECLARATION:
-    throw std::runtime_error("unsupported pa11 declaration");
   default:
-    return;
+    throw std::runtime_error("unsupported pa11 declaration");
   }
 }
 
+// 14.1: a template-declaration owns a scope for its parameters; the declared
+// entity lands inside it.
 void ScopeBuilder::BuildTemplate(AstId node, ScopeId scope)
 {
-  const AstNode& value = arena_.At(node);
-  AstId clause = 0;
+  const AstId clause = FindChild(node, AST_TEMPLATE_PARAMETER_CLAUSE);
   AstId declaration = 0;
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-  {
-    const AstId child = value.children[i];
-    const AstKind kind = arena_.At(child).kind;
-    if (kind == AST_TEMPLATE_PARAMETER_CLAUSE)
-      clause = child;
-    else if (declaration == 0)
-      declaration = child;
-  }
+  const vector<AstId>& children = arena_.At(node).children;
+  for (std::size_t i = 0; i < children.size() && declaration == 0; ++i)
+    if (children[i] != clause)
+      declaration = children[i];
   if (clause == 0 || declaration == 0)
     throw std::runtime_error("invalid template declaration");
 
   const ScopeId template_scope = model_.CreateScope(
-      SCOPE_TEMPLATE_PARAMETERS, std::string(), scope);
-  BuildTemplateParameters(clause, template_scope);
+      SCOPE_TEMPLATE_PARAMETERS, string(), scope);
+  const AstId list = FindChild(clause, AST_TEMPLATE_PARAMETER_LIST);
+  if (list != 0)
+  {
+    const vector<AstId>& parameters = arena_.At(list).children;
+    for (std::size_t i = 0; i < parameters.size(); ++i)
+      BuildTemplateParameter(parameters[i], template_scope);
+  }
   BuildNode(declaration, template_scope);
 }
 
-void ScopeBuilder::BuildTemplateParameters(AstId clause, ScopeId scope)
-{
-  const AstNode& value = arena_.At(clause);
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-  {
-    const AstNode& child = arena_.At(value.children[i]);
-    if (child.kind != AST_TEMPLATE_PARAMETER_LIST)
-      continue;
-    for (std::size_t p = 0; p < child.children.size(); ++p)
-      BuildTemplateParameter(child.children[p], scope);
-  }
-}
-
+// Type parameters become named template-parameter types; the parameter list
+// of a template template parameter is not a scope, so its names stay
+// invisible.  Non-type parameters are typed but not bound (out of scope).
 void ScopeBuilder::BuildTemplateParameter(AstId parameter, ScopeId scope)
 {
   const AstNode& value = arena_.At(parameter);
   if (value.kind == AST_TYPE_PARAMETER)
   {
-    bool template_template = false;
-    std::string name;
-    std::string keyword;
-    for (std::size_t i = 0; i < value.children.size(); ++i)
-    {
-      const AstNode& child = arena_.At(value.children[i]);
-      if (child.kind == AST_TEMPLATE_TEMPLATE_PARAMETER)
-        template_template = true;
-      else if (child.kind == AST_IDENTIFIER)
-        name = IdentifierName(value.children[i]);
-      else if (child.kind == AST_PARAMETER_KEY &&
-               child.first < tokens_.size())
-        keyword = tokens_[child.first].spelling;
-    }
-    if (name.empty())
+    const AstId identifier = FindChild(parameter, AST_IDENTIFIER);
+    if (identifier == 0)
       return;
-    const TypeId type = types_.TemplateParam(
-        name, template_template ? "template-parameter" : keyword);
-    model_.AddBinding(scope, name, BINDING_TYPE, type);
+    const AstId key = FindChild(parameter, AST_PARAMETER_KEY);
+    TypeKeyword keyword = TK_TYPENAME;
+    if (FindChild(parameter, AST_TEMPLATE_TEMPLATE_PARAMETER) != 0)
+      keyword = TK_TEMPLATE_PARAMETER;
+    else if (key != 0 && arena_.At(key).first < tokens_.size() &&
+             tokens_[arena_.At(key).first].IsSimple(KW_CLASS))
+      keyword = TK_CLASS;
+    const string name = IdentifierName(identifier);
+    model_.AddBinding(scope, name, BINDING_TYPE,
+                      types_.TemplateParam(keyword, name));
     return;
   }
-
   if (value.kind == AST_NON_TYPE_TEMPLATE_PARAMETER)
   {
-    AstId specifiers = 0;
-    AstId declarator = 0;
-    for (std::size_t i = 0; i < value.children.size(); ++i)
-    {
-      const AstKind kind = arena_.At(value.children[i]).kind;
-      if (kind == AST_DECL_SPECIFIER_SEQ)
-        specifiers = value.children[i];
-      else if (kind == AST_DECLARATOR)
-        declarator = value.children[i];
-    }
+    const AstId specifiers = FindChild(parameter, AST_DECL_SPECIFIER_SEQ);
     if (specifiers == 0)
       throw std::runtime_error("template parameter has no type");
     const TypeId base = BuildSpecifierType(specifiers, scope);
-    const TypeId type = declarator == 0 ? base :
-        BuildDeclaratorType(declarator, base, scope);
-    const std::string name = IdentifierName(FindIdentifier(declarator));
-    if (!name.empty())
-      model_.AddBinding(scope, name, BINDING_VARIABLE, type);
+    (void)BuildDeclaratorType(FindChild(parameter, AST_DECLARATOR), base,
+                              scope);
   }
 }
 
+// 7.3.1: a named namespace reopens its scope; an unnamed namespace is
+// `<unnamed>` and nominated by an implicit using-directive (7.3.1.1p1).
 void ScopeBuilder::BuildNamespace(AstId node, ScopeId scope)
 {
   const AstNode& value = arena_.At(node);
-  const string name = value.text.empty() ? "<unnamed>" : value.text;
-  bool is_inline = false;
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-    if (arena_.At(value.children[i]).kind == AST_INLINE)
-      is_inline = true;
-
+  const bool is_inline = FindChild(node, AST_INLINE) != 0;
   ScopeId target = 0;
-  if (name == "<unnamed>")
+  if (value.first == value.last)
   {
-    target = model_.CreateScope(SCOPE_NAMESPACE, name, scope, is_inline);
+    target = model_.CreateScope(SCOPE_NAMESPACE, "<unnamed>", scope, is_inline);
     model_.AddUsingDirective(scope, target);
   }
   else
   {
-    const BindingId existing = model_.DirectBinding(
-        scope, name, LOOKUP_NAMESPACES);
+    const string name = IdentifierName(node);
+    const BindingId existing = model_.DirectBinding(scope, name,
+                                                    LOOKUP_NAMESPACES);
     if (existing != 0)
     {
-      target = model_.BindingAt(existing).target_scope;
-      if (target == 0)
-        throw std::runtime_error("invalid namespace binding");
-      model_.ScopeAt(target).inline_namespace =
-          model_.ScopeAt(target).inline_namespace || is_inline;
+      target = model_.BindingAt(existing).namespace_scope;
+      if (is_inline)
+        model_.ScopeAt(target).inline_namespace = true;
     }
     else
     {
-      if (model_.DirectBinding(scope, name, LOOKUP_ANY) != 0)
-        throw std::runtime_error("namespace and ordinary name conflict");
       target = model_.CreateScope(SCOPE_NAMESPACE, name, scope, is_inline);
-      model_.AddBinding(scope, name, BINDING_NAMESPACE, 0, target, false);
+      model_.AddBinding(scope, name, BINDING_NAMESPACE, 0, target);
     }
   }
-
   for (std::size_t i = 0; i < value.children.size(); ++i)
-  {
-    const AstKind kind = arena_.At(value.children[i]).kind;
-    if (kind != AST_INLINE)
+    if (arena_.At(value.children[i]).kind != AST_INLINE)
       BuildNode(value.children[i], target);
-  }
 }
 
 void ScopeBuilder::BuildNamespaceAlias(AstId node, ScopeId scope)
 {
-  const AstNode& value = arena_.At(node);
-  if (value.children.empty())
+  const AstId target = FindChild(node, AST_TARGET);
+  if (target == 0)
     throw std::runtime_error("namespace alias has no target");
-  const ScopeId target = ResolveNamespace(scope, value.children[0]);
-  const string name = value.text;
-  if (name.empty())
-    throw std::runtime_error("namespace alias has no name");
-  model_.AddBinding(scope, name, BINDING_NAMESPACE, 0, target, false);
+  model_.AddBinding(scope, IdentifierName(node), BINDING_NAMESPACE, 0,
+                    ResolveNamespace(scope, target));
 }
 
 void ScopeBuilder::BuildUsingDirective(AstId node, ScopeId scope)
 {
-  const AstNode& value = arena_.At(node);
-  if (value.children.empty())
+  const AstId target = FindChild(node, AST_TARGET);
+  if (target == 0)
     throw std::runtime_error("using-directive has no target");
-  model_.AddUsingDirective(scope, ResolveNamespace(scope, value.children[0]));
+  model_.AddUsingDirective(scope, ResolveNamespace(scope, target));
 }
 
+// 7.3.3: the found declaration is re-bound in the current scope with its
+// kind, type and constant value.  Template-ids are rejected while the name
+// is read; namespaces cannot be named (7.3.3p7).
 void ScopeBuilder::BuildUsingDeclaration(AstId node, ScopeId scope)
 {
-  const AstNode& value = arena_.At(node);
-  if (value.children.empty())
+  const AstId target_node = FindChild(node, AST_TARGET);
+  if (target_node == 0)
     throw std::runtime_error("using-declaration has no target");
-  const AstId target_node = value.children[0];
-  const vector<string> name = NameComponents(target_node);
-  for (std::size_t i = 0; i < name.size(); ++i)
-    if (name[i].find('<') != string::npos)
-      throw std::runtime_error("using-declaration names a template-id");
-  const BindingId target = ResolveName(scope, name, LOOKUP_ANY);
+  const QualifiedName name = NodeName(target_node);
+  const BindingId target = model_.Lookup(scope, name, LOOKUP_ANY);
   if (target == 0 || model_.BindingAt(target).kind == BINDING_NAMESPACE)
     throw std::runtime_error("using-declaration target not found");
-  const Binding& binding = model_.BindingAt(target);
-  const BindingId imported = model_.AddBinding(
-      scope, name.back(), binding.kind, binding.type, binding.target_scope,
-      true, binding.class_entity, binding.enum_entity);
-  Binding& imported_binding = model_.BindingAt(imported);
-  imported_binding.has_const_value = binding.has_const_value;
-  imported_binding.const_value = binding.const_value;
+  const Binding source = model_.BindingAt(target);
+  Binding& imported = model_.BindingAt(model_.AddBinding(
+      scope, name.Last(), source.kind, source.type));
+  imported.has_const_value = source.has_const_value;
+  imported.const_value = source.const_value;
 }
 
 void ScopeBuilder::BuildAlias(AstId node, ScopeId scope)
 {
-  const AstNode& value = arena_.At(node);
-  if (value.children.empty())
+  const AstId type_id = FindChild(node, AST_TYPE_ID);
+  if (type_id == 0)
     throw std::runtime_error("alias has no type");
-  const TypeId type = BuildTypeId(value.children[0], scope);
-  model_.AddBinding(scope, value.text, BINDING_TYPE_ALIAS, type,
-                    model_.TargetScopeForType(type));
+  model_.AddBinding(scope, IdentifierName(node), BINDING_TYPE_ALIAS,
+                    BuildTypeId(type_id, scope));
 }
 
 void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
 {
-  const AstNode& value = arena_.At(node);
-  AstId specifiers = 0;
-  AstId list = 0;
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-  {
-    const AstKind kind = arena_.At(value.children[i]).kind;
-    if (kind == AST_DECL_SPECIFIER_SEQ)
-      specifiers = value.children[i];
-    else if (kind == AST_INIT_DECLARATOR_LIST)
-      list = value.children[i];
-  }
+  const AstId specifiers = FindChild(node, AST_DECL_SPECIFIER_SEQ);
+  const AstId list = FindChild(node, AST_INIT_DECLARATOR_LIST);
   if (specifiers == 0)
     throw std::runtime_error("simple declaration has no specifiers");
 
+  // An unnamed class or enum in the specifiers takes the first declarator's
+  // name (`typedef struct { ... } S;` declares `struct S`).
   string anonymous_name;
-  const AstNode& declarations = list == 0 ? arena_.At(node) : arena_.At(list);
-  for (std::size_t i = 0; i < declarations.children.size() &&
-      anonymous_name.empty(); ++i)
+  if (list != 0 && !arena_.At(list).children.empty())
   {
-    const AstNode& item = arena_.At(declarations.children[i]);
-    if (item.kind == AST_INIT_DECLARATOR && !item.children.empty())
-      anonymous_name = IdentifierName(FindIdentifier(item.children[0]));
+    const AstId first = arena_.At(list).children[0];
+    anonymous_name = IdentifierName(FindIdentifier(
+        FindChild(first, AST_DECLARATOR)));
   }
-  const string saved_anonymous = active_anonymous_name_;
-  active_anonymous_name_ = anonymous_name;
-  const TypeId base = BuildSpecifierType(specifiers, scope);
-  active_anonymous_name_ = saved_anonymous;
+  const TypeId base = BuildSpecifierType(specifiers, scope, anonymous_name);
   if (list == 0)
     return;
 
@@ -279,63 +217,61 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
   const vector<AstId>& items = arena_.At(list).children;
   for (std::size_t i = 0; i < items.size(); ++i)
   {
-    const AstNode& item = arena_.At(items[i]);
-    if (item.kind != AST_INIT_DECLARATOR || item.children.empty())
+    const AstId declarator = FindChild(items[i], AST_DECLARATOR);
+    if (arena_.At(items[i]).kind != AST_INIT_DECLARATOR || declarator == 0)
       throw std::runtime_error("invalid init-declarator");
-    const AstId declarator = item.children[0];
+    // 8.3p1: a qualified declarator-id declares in the named scope and its
+    // declarator is resolved there.
     string name;
     const ScopeId target_scope = ResolveDeclarationScope(
         scope, FindIdentifier(declarator), name);
     TypeId type = BuildDeclaratorType(declarator, base, target_scope);
-    const TypeKind kind = types_.Kind(type);
-    if (is_constexpr && !is_typedef && kind != TYPE_FUNCTION)
-      type = AddCv(type, true, false);
-    const BindingKind binding_kind = is_typedef ? BINDING_TYPE_ALIAS :
-        kind == TYPE_FUNCTION ? BINDING_FUNCTION : BINDING_VARIABLE;
-    const BindingId binding = model_.AddBinding(target_scope, name,
-                                                binding_kind, type);
-    bool is_const_object = is_constexpr;
-    TypeId value_type = type;
-    while (types_.Kind(value_type) == TYPE_CV)
-    {
-      const TypeNode& cv = types_.At(value_type);
-      is_const_object = is_const_object || cv.is_const;
-      value_type = cv.base;
-    }
-    if (!is_typedef && binding_kind == BINDING_VARIABLE &&
-        is_const_object && (types_.Kind(value_type) == TYPE_FUNDAMENTAL ||
-                            types_.Kind(value_type) == TYPE_ENUM))
-    {
-      const AstId initializer = FindInitializer(items[i]);
-      if (initializer != 0)
-      {
-        const AstNode& init = arena_.At(initializer);
-        if (init.children.size() != 1)
-          throw std::runtime_error("invalid constant initializer");
-        Binding& stored = model_.BindingAt(binding);
-        stored.const_value = const_eval_.Evaluate(init.children[0],
-                                                   target_scope);
-        stored.has_const_value = true;
-      }
-      else if (is_constexpr)
-        throw std::runtime_error("constexpr variable has no initializer");
-    }
+    const bool is_function = types_.Kind(type) == TYPE_FUNCTION;
+    // 7.1.5p9: a constexpr object is const.
+    if (is_constexpr && !is_typedef && !is_function)
+      type = types_.Cv(type, true);
+    const BindingKind kind = is_typedef ? BINDING_TYPE_ALIAS :
+        is_function ? BINDING_FUNCTION : BINDING_VARIABLE;
+    const BindingId binding = model_.AddBinding(target_scope, name, kind, type);
+    if (kind == BINDING_VARIABLE)
+      RecordConstantValue(binding, items[i], is_constexpr, target_scope);
   }
 }
 
+// A const integral object with a constant initializer is usable in later
+// constant expressions (5.19p2); its value is recorded once here.
+void ScopeBuilder::RecordConstantValue(BindingId binding, AstId init_declarator,
+                                       bool is_constexpr, ScopeId scope)
+{
+  const TypeId type = model_.BindingAt(binding).type;
+  const TypeId unqualified = types_.Unqualified(type);
+  const bool is_const = types_.Kind(type) == TYPE_CV && types_.At(type).is_const;
+  const TypeKind kind = types_.Kind(unqualified);
+  if (!is_const || (kind != TYPE_FUNDAMENTAL && kind != TYPE_ENUM))
+    return;
+  const AstId initializer = FindChild(init_declarator, AST_INITIALIZER);
+  if (initializer == 0)
+  {
+    if (is_constexpr)
+      throw std::runtime_error("constexpr variable has no initializer");
+    return;
+  }
+  if (arena_.At(initializer).children.size() != 1)
+    throw std::runtime_error("invalid constant initializer");
+  const long long value = const_eval_.Evaluate(
+      arena_.At(initializer).children[0], scope);
+  Binding& stored = model_.BindingAt(binding);
+  stored.const_value = value;
+  stored.has_const_value = true;
+}
+
+// The function binds in the scope its declarator-id names; parameters are
+// resolved there and bound in a function scope that owns the body block.
 void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
 {
-  const AstNode& value = arena_.At(node);
-  AstId specifiers = 0;
-  AstId declarator = 0;
-  AstId body = 0;
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-  {
-    const AstKind kind = arena_.At(value.children[i]).kind;
-    if (kind == AST_DECL_SPECIFIER_SEQ) specifiers = value.children[i];
-    else if (kind == AST_DECLARATOR) declarator = value.children[i];
-    else if (kind == AST_COMPOUND_STATEMENT) body = value.children[i];
-  }
+  const AstId specifiers = FindChild(node, AST_DECL_SPECIFIER_SEQ);
+  const AstId declarator = FindChild(node, AST_DECLARATOR);
+  const AstId body = FindChild(node, AST_COMPOUND_STATEMENT);
   if (specifiers == 0 || declarator == 0 || body == 0)
     throw std::runtime_error("invalid function definition");
   string name;
@@ -348,212 +284,18 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   model_.AddBinding(target_scope, name, BINDING_FUNCTION, type);
   const ScopeId function_scope = model_.CreateScope(
       SCOPE_FUNCTION, name, target_scope);
-  AddFunctionParameters(function_scope, declarator, target_scope);
+
+  const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
+  if (clause != 0)
+  {
+    vector<ParameterInfo> parameters;
+    bool variadic = false;
+    BuildParameters(clause, target_scope, parameters, variadic);
+    for (std::size_t i = 0; i < parameters.size(); ++i)
+      model_.AddBinding(function_scope, parameters[i].name, BINDING_PARAMETER,
+                        parameters[i].type);
+  }
   (void)BuildCompound(body, function_scope);
-}
-
-TypeId ScopeBuilder::BuildEnumType(AstId node, ScopeId scope,
-                                   const string& anonymous_name)
-{
-  const AstNode& value = arena_.At(node);
-  bool scoped = false;
-  AstId underlying_node = 0;
-  vector<AstId> enumerators;
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-  {
-    const AstId child = value.children[i];
-    const AstKind kind = arena_.At(child).kind;
-    if (kind == AST_ENUM_KEY)
-      scoped = true;
-    else if (kind == AST_TYPE_ID)
-      underlying_node = child;
-    else if (kind == AST_ENUMERATOR)
-      enumerators.push_back(child);
-  }
-  bool has_definition = !enumerators.empty();
-  for (std::size_t i = value.first; i < value.last && i < tokens_.size(); ++i)
-    if (tokens_[i].IsSimple(OP_RBRACE))
-      has_definition = true;
-
-  vector<string> components;
-  if (!value.text.empty())
-  {
-    string component;
-    for (std::size_t i = 0; i < value.text.size(); ++i)
-    {
-      if (i + 1 < value.text.size() && value.text[i] == ':' &&
-          value.text[i + 1] == ':')
-      {
-        if (!component.empty())
-        {
-          components.push_back(component);
-          component.clear();
-        }
-        ++i;
-      }
-      else
-        component += value.text[i];
-    }
-    if (!component.empty())
-      components.push_back(component);
-  }
-  if (components.empty())
-  {
-    string name = anonymous_name;
-    if (name.empty())
-    {
-      if (value.first >= value.last)
-        throw std::runtime_error("unnamed enum requires a declaration name");
-      std::ostringstream generated;
-      generated << "__anonymous_enum_type__" << value.first << '_'
-                << value.last;
-      name = generated.str();
-    }
-    components.push_back(name);
-  }
-
-  ScopeId parent = scope;
-  if (components.size() > 1)
-  {
-    vector<string> prefix(components.begin(), components.end() - 1);
-    const BindingId qualifier = ResolveName(scope, prefix, LOOKUP_QUALIFIER);
-    if (qualifier == 0 || model_.BindingAt(qualifier).target_scope == 0)
-      throw std::runtime_error("qualified enum scope not found");
-    parent = model_.BindingAt(qualifier).target_scope;
-  }
-  const string name = components.back();
-  string full_name = components[0];
-  for (std::size_t i = 1; i < components.size(); ++i)
-    full_name += "::" + components[i];
-
-  const BindingId existing_binding = model_.DirectBinding(
-      parent, name, LOOKUP_TYPES);
-  BindingId inherited_binding = existing_binding;
-  if (inherited_binding == 0 && components.size() == 1 && !has_definition)
-    inherited_binding = model_.LookupTypeName(scope, name);
-  EnumEntityId entity_id = 0;
-  if (inherited_binding != 0 &&
-      model_.BindingAt(inherited_binding).enum_entity != 0)
-    entity_id = model_.BindingAt(inherited_binding).enum_entity;
-  if (!has_definition && !scoped && underlying_node == 0 && entity_id == 0)
-    throw std::runtime_error("unscoped enum needs an underlying type");
-  if (!has_definition && entity_id == 0 && inherited_binding != 0)
-    throw std::runtime_error("enum name does not name an enum");
-  if (entity_id == 0)
-    entity_id = model_.GetOrCreateEnum(parent, name);
-
-  EnumEntity& entity = model_.EnumAt(entity_id);
-  TypeId underlying = underlying_node == 0 ? types_.Fundamental(FT_INT) :
-      BuildTypeId(underlying_node, scope);
-  TypeId unqualified_underlying = underlying;
-  while (types_.Kind(unqualified_underlying) == TYPE_CV)
-    unqualified_underlying = types_.At(unqualified_underlying).base;
-  if (types_.Kind(unqualified_underlying) != TYPE_FUNDAMENTAL)
-    throw std::runtime_error("enum underlying type is not integral");
-  const EFundamentalType underlying_kind =
-      types_.At(unqualified_underlying).fundamental;
-  switch (underlying_kind)
-  {
-  case FT_FLOAT: case FT_DOUBLE: case FT_LONG_DOUBLE: case FT_VOID:
-  case FT_NULLPTR_T:
-    throw std::runtime_error("enum underlying type is not integral");
-  default: break;
-  }
-  if (entity.type != 0)
-  {
-    if (entity.scoped != scoped || entity.underlying != underlying)
-      throw std::runtime_error("enum redeclaration disagrees with its type");
-    if (has_definition && entity.defined)
-      throw std::runtime_error("enum redefinition");
-  }
-  else
-  {
-    entity.scoped = scoped;
-    entity.underlying = underlying;
-    entity.type = types_.Enum(full_name, scoped, underlying);
-  }
-  if (!has_definition)
-  {
-    if (entity.scoped && entity.enum_scope == 0)
-      entity.enum_scope = model_.CreateScope(SCOPE_ENUM, full_name, scope);
-    if (inherited_binding == 0)
-    {
-      const ScopeId target = entity.enum_scope;
-      model_.AddBinding(parent, name, BINDING_TYPE, entity.type, target, true,
-                        0, entity_id);
-    }
-    else if (model_.BindingAt(inherited_binding).enum_entity != entity_id)
-      throw std::runtime_error("enum name does not name this enum");
-    return entity.type;
-  }
-
-  const bool qualified_definition = components.size() > 1;
-  if (qualified_definition && entity.enum_scope != 0 &&
-      model_.ScopeAt(entity.enum_scope).parent != scope)
-  {
-    entity.enum_scope = 0;
-  }
-  if (entity.scoped && entity.enum_scope == 0)
-    entity.enum_scope = model_.CreateScope(
-        SCOPE_ENUM, full_name, qualified_definition ? scope : parent);
-
-  TypeId enum_type = entity.type;
-  if (qualified_definition)
-  {
-    // A qualified out-of-class definition has a declaration spelling of its
-    // fully-qualified name while the member declaration retains its local
-    // spelling.  Keep both bindings tied to the same entity and underlying
-    // type contract; the qualified view is the one printed at namespace scope.
-    enum_type = types_.Enum(full_name, scoped, underlying);
-    entity.type = enum_type;
-    if (existing_binding != 0)
-      model_.BindingAt(existing_binding).target_scope = entity.enum_scope;
-    const BindingId qualified = model_.DirectBinding(
-        scope, full_name, LOOKUP_TYPES);
-    if (qualified == 0)
-      model_.AddBinding(scope, full_name, BINDING_TYPE, enum_type,
-                        entity.enum_scope, true, 0, entity_id);
-  }
-  else if (existing_binding == 0)
-  {
-    model_.AddBinding(parent, name, BINDING_TYPE, enum_type,
-                      entity.enum_scope, true, 0, entity_id);
-  }
-  entity.defined = true;
-
-  const ScopeId value_scope = entity.scoped ? entity.enum_scope : parent;
-  long long previous = 0;
-  bool have_previous = false;
-  for (std::size_t i = 0; i < enumerators.size(); ++i)
-  {
-    const AstNode& enumerator = arena_.At(enumerators[i]);
-    long long value_value = 0;
-    if (enumerator.children.empty())
-    {
-      if (have_previous)
-      {
-        if (previous == std::numeric_limits<long long>::max())
-          throw std::runtime_error("enumerator value overflows");
-        value_value = previous + 1;
-      }
-    }
-    else
-      value_value = const_eval_.Evaluate(enumerator.children[0], value_scope);
-    const string enumerator_name = enumerator.text;
-    if (enumerator_name.empty())
-      throw std::runtime_error("enumerator has no name");
-    if (model_.DirectBinding(value_scope, enumerator_name) != 0)
-      throw std::runtime_error("duplicate enumerator");
-    const BindingId binding = model_.AddBinding(
-        value_scope, enumerator_name, BINDING_ENUMERATOR, enum_type);
-    Binding& stored = model_.BindingAt(binding);
-    stored.enum_entity = entity_id;
-    stored.has_const_value = true;
-    stored.const_value = value_value;
-    previous = value_value;
-    have_previous = true;
-  }
-  return enum_type;
 }
 
 void ScopeBuilder::BuildStaticAssert(AstId node, ScopeId scope)
@@ -565,114 +307,6 @@ void ScopeBuilder::BuildStaticAssert(AstId node, ScopeId scope)
     throw std::runtime_error("static_assert failed");
 }
 
-void ScopeBuilder::BuildClassForward(AstId node, ScopeId scope)
-{
-  const AstNode& value = arena_.At(node);
-  const string name = TypeName(node);
-  if (name.empty())
-    throw std::runtime_error("unnamed class forward declaration");
-  const ClassEntityId entity = model_.GetOrCreateClass(scope, name);
-  const TypeId type = types_.Class(name, ClassKey(node));
-  ClassEntity& class_entity = model_.ClassAt(entity);
-  class_entity.current_type = type;
-  class_entity.class_key = ClassKey(node);
-  model_.AddBinding(scope, name, BINDING_TYPE, type, 0, true, entity);
-  (void)value;
-}
-
-TypeId ScopeBuilder::BuildClassSpecifier(AstId node, ScopeId scope,
-                                         const string& anonymous_name)
-{
-  return BuildClassType(node, scope,
-                        anonymous_name.empty() ? active_anonymous_name_ :
-                        anonymous_name);
-}
-
-TypeId ScopeBuilder::BuildClassType(AstId node, ScopeId scope,
-                                    const string& anonymous_name)
-{
-  const AstNode& value = arena_.At(node);
-  string name = value.text.empty() ? anonymous_name : value.text;
-  const string key = ClassKey(node);
-  const bool injected_anonymous_union = value.text.empty() &&
-      anonymous_name.empty() && key == "union";
-  if (name.empty() && injected_anonymous_union)
-  {
-    if (value.first >= value.last)
-      throw std::runtime_error("anonymous union has no source extent");
-    std::ostringstream generated;
-    generated << "__anonymous_union_type__" << value.first << '_'
-              << value.last;
-    name = generated.str();
-  }
-  if (name.empty())
-    throw std::runtime_error("unnamed class requires a declaration name");
-  const ClassEntityId entity = model_.GetOrCreateClass(scope, name);
-  ClassEntity& class_entity = model_.ClassAt(entity);
-  if (class_entity.defined)
-    throw std::runtime_error("class redefinition");
-  const TypeId type = types_.Class(name, key);
-  class_entity.current_type = type;
-  class_entity.class_key = key;
-  class_entity.defined = true;
-  class_entity.class_scope = model_.CreateScope(SCOPE_CLASS, name, scope);
-  if (!injected_anonymous_union)
-  {
-    const BindingId binding = model_.AddBinding(
-        scope, name, BINDING_TYPE, type, class_entity.class_scope, true,
-        entity);
-    model_.BindingAt(binding).target_scope = class_entity.class_scope;
-  }
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-  {
-    const AstKind kind = arena_.At(value.children[i]).kind;
-    if (kind == AST_CLASS_KEY || kind == AST_BASE_CLAUSE ||
-        kind == AST_ACCESS_SPECIFIER)
-      continue;
-    BuildNode(value.children[i], class_entity.class_scope);
-  }
-  if (injected_anonymous_union)
-  {
-    const Scope& members = model_.ScopeAt(class_entity.class_scope);
-    for (std::size_t i = 0; i < members.bindings.size(); ++i)
-    {
-      const Binding& member = model_.BindingAt(members.bindings[i]);
-      if (!member.print)
-        continue;
-      const BindingId injected = model_.AddBinding(
-          scope, member.name, member.kind, member.type, member.target_scope,
-          true, member.class_entity, member.enum_entity);
-      Binding& stored = model_.BindingAt(injected);
-      stored.has_const_value = member.has_const_value;
-      stored.const_value = member.const_value;
-    }
-  }
-  return type;
-}
-
-TypeId ScopeBuilder::BuildForwardType(AstId node, ScopeId scope,
-                                      bool declaration)
-{
-  const string name = TypeName(node);
-  if (name.empty())
-    throw std::runtime_error("unnamed elaborated type");
-  const BindingId existing = model_.LookupUnqualified(scope, name,
-                                                      LOOKUP_TYPES);
-  if (existing != 0 && model_.BindingAt(existing).class_entity != 0)
-    return model_.BindingAt(existing).type;
-  if (existing != 0 && !declaration)
-    return model_.BindingAt(existing).type;
-  const ClassEntityId entity = model_.GetOrCreateClass(scope, name);
-  ClassEntity& class_entity = model_.ClassAt(entity);
-  if (class_entity.current_type != 0)
-    return class_entity.current_type;
-  const TypeId type = types_.Class(name, ClassKey(node));
-  class_entity.current_type = type;
-  class_entity.class_key = ClassKey(node);
-  model_.AddBinding(scope, name, BINDING_TYPE, type, 0, true, entity);
-  return type;
-}
-
 void ScopeBuilder::BuildLinkage(AstId node, ScopeId scope)
 {
   const vector<AstId>& children = arena_.At(node).children;
@@ -682,33 +316,308 @@ void ScopeBuilder::BuildLinkage(AstId node, ScopeId scope)
 
 ScopeId ScopeBuilder::BuildCompound(AstId node, ScopeId parent)
 {
-  const ScopeId block = model_.CreateScope(SCOPE_BLOCK, "block", parent);
+  const ScopeId block = model_.CreateScope(SCOPE_BLOCK, string(), parent);
   const vector<AstId>& children = arena_.At(node).children;
   for (std::size_t i = 0; i < children.size(); ++i)
     BuildStatement(children[i], block);
   return block;
 }
 
+// Statements contribute declarations and nested blocks only.
 void ScopeBuilder::BuildStatement(AstId node, ScopeId scope)
 {
   if (node == 0)
     return;
   const AstKind kind = arena_.At(node).kind;
   if (IsDeclarationKind(kind))
-  {
     BuildNode(node, scope);
-    return;
-  }
-  if (kind == AST_COMPOUND_STATEMENT)
-  {
+  else if (kind == AST_COMPOUND_STATEMENT)
     (void)BuildCompound(node, scope);
-    return;
+  else
+  {
+    const vector<AstId>& children = arena_.At(node).children;
+    for (std::size_t i = 0; i < children.size(); ++i)
+      BuildStatement(children[i], scope);
   }
-  const vector<AstId>& children = arena_.At(node).children;
-  for (std::size_t i = 0; i < children.size(); ++i)
-    BuildStatement(children[i], scope);
 }
 
+// Identity for a type declared without a name or declarator: the token
+// extent of its declaration, as the dump format fixes.
+string ScopeBuilder::AnonymousTypeName(AstId node, const char* kind) const
+{
+  std::size_t first = 0;
+  std::size_t last = 0;
+  if (!arena_.DeclarationExtent(node, first, last))
+    throw std::runtime_error("unnamed type requires a declaration name");
+  std::ostringstream generated;
+  generated << "__anonymous_" << kind << "_type__" << first << '_' << last;
+  return generated.str();
+}
+
+// 9p1: a class-specifier completes a class entity declared earlier in the
+// same scope (or the qualified scope), or introduces a new one.  A bare
+// anonymous union injects its members into the enclosing scope (9.5p5).
+TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
+                                         const string& anonymous_name)
+{
+  const AstNode& value = arena_.At(node);
+  const TypeKeyword key = ClassKey(node);
+  const QualifiedName name = NodeName(node);
+  string spelling = name.Empty() ? anonymous_name : name.Joined();
+  const bool injected_union = name.Empty() && anonymous_name.empty() &&
+      key == TK_UNION;
+  if (spelling.empty())
+    spelling = AnonymousTypeName(node, key == TK_UNION ? "union" :
+                                 key == TK_CLASS ? "class" : "struct");
+
+  ClassEntityId entity = 0;
+  if (!injected_union)
+  {
+    const ScopeId declaring = name.Qualified() ?
+        ResolveQualifierScope(scope, name.Prefix()) : scope;
+    const BindingId existing = model_.DirectBinding(
+        declaring, name.Empty() ? spelling : name.Last(), LOOKUP_TYPES);
+    if (existing != 0)
+    {
+      const TypeNode& previous = types_.At(model_.BindingAt(existing).type);
+      if (previous.kind != TYPE_CLASS)
+        throw std::runtime_error("class name already denotes another type");
+      if ((previous.keyword == TK_UNION) != (key == TK_UNION))
+        throw std::runtime_error("class-key disagrees with prior declaration");
+      entity = previous.entity;
+    }
+    else if (name.Qualified())
+      throw std::runtime_error("qualified class definition names no class");
+  }
+  if (entity == 0)
+    entity = model_.CreateClass(key == TK_UNION);
+  if (model_.ClassAt(entity).defined)
+    throw std::runtime_error("class redefinition");
+  const TypeId type = types_.Class(entity, key, spelling);
+  const ScopeId class_scope = model_.CreateScope(SCOPE_CLASS, spelling, scope);
+  // Members may declare further classes, which grows the entity table: keep
+  // ids, not entity references, across the member walk.
+  model_.ClassAt(entity).defined = true;
+  model_.ClassAt(entity).class_scope = class_scope;
+  if (!injected_union)
+    model_.AddBinding(scope, spelling, BINDING_TYPE, type);
+  for (std::size_t i = 0; i < value.children.size(); ++i)
+  {
+    const AstKind kind = arena_.At(value.children[i]).kind;
+    if (kind != AST_CLASS_KEY && kind != AST_BASE_CLAUSE)
+      BuildNode(value.children[i], class_scope);
+  }
+  if (injected_union)
+  {
+    const vector<BindingId> members = model_.ScopeAt(class_scope).bindings;
+    for (std::size_t i = 0; i < members.size(); ++i)
+    {
+      const Binding member = model_.BindingAt(members[i]);
+      Binding& injected = model_.BindingAt(model_.AddBinding(
+          scope, member.name, member.kind, member.type));
+      injected.has_const_value = member.has_const_value;
+      injected.const_value = member.const_value;
+    }
+  }
+  return type;
+}
+
+// `struct S;` declares S in the current scope unless the scope already
+// declares a class S (3.3.1, 7.1.6.3).
+TypeId ScopeBuilder::BuildClassForward(AstId node, ScopeId scope)
+{
+  const QualifiedName name = NodeName(node);
+  if (name.Empty())
+    throw std::runtime_error("unnamed class forward declaration");
+  if (name.Qualified())
+  {
+    // A qualified redeclaration must find its class and declares nothing new.
+    const BindingId found = model_.LookupQualified(scope, name, LOOKUP_TYPES);
+    if (found == 0 || types_.Kind(model_.BindingAt(found).type) != TYPE_CLASS)
+      throw std::runtime_error("qualified class declaration names no class");
+    return model_.BindingAt(found).type;
+  }
+  const TypeKeyword key = ClassKey(node);
+  ClassEntityId entity = 0;
+  const BindingId existing = model_.DirectBinding(scope, name.Last(),
+                                                  LOOKUP_TYPES);
+  if (existing != 0)
+  {
+    const TypeNode& previous = types_.At(model_.BindingAt(existing).type);
+    if (previous.kind != TYPE_CLASS)
+      throw std::runtime_error("class name already denotes another type");
+    if ((previous.keyword == TK_UNION) != (key == TK_UNION))
+      throw std::runtime_error("class-key disagrees with prior declaration");
+    entity = previous.entity;
+  }
+  if (entity == 0)
+    entity = model_.CreateClass(key == TK_UNION);
+  const TypeId type = types_.Class(entity, key, name.Last());
+  model_.AddBinding(scope, name.Last(), BINDING_TYPE, type);
+  return type;
+}
+
+// 3.4.4: an elaborated-type-specifier ignores non-type names.  When nothing
+// is found and the specifier is part of a declaration, it declares the class
+// in the nearest enclosing namespace or block scope (7.1.6.3p2, 3.3.2p7).
+TypeId ScopeBuilder::BuildElaboratedClass(AstId node, ScopeId scope,
+                                          bool may_declare)
+{
+  const QualifiedName name = NodeName(node);
+  if (name.Empty())
+    throw std::runtime_error("unnamed elaborated type");
+  const BindingId existing = model_.Lookup(scope, name, LOOKUP_TYPES);
+  if (existing != 0)
+  {
+    const TypeId type = model_.BindingAt(existing).type;
+    if (types_.Kind(type) != TYPE_CLASS)
+      throw std::runtime_error("elaborated class specifier names a non-class");
+    return type;
+  }
+  if (!may_declare || name.Qualified())
+    throw std::runtime_error("elaborated class specifier names no class");
+  ScopeId target = scope;
+  while (model_.ScopeAt(target).kind != SCOPE_NAMESPACE &&
+         model_.ScopeAt(target).kind != SCOPE_BLOCK)
+    target = model_.ScopeAt(target).parent;
+  return BuildClassForward(node, target);
+}
+
+// 7.2: enum-specifiers and opaque-enum-declarations declare or complete an
+// enumeration; an elaborated `enum E` without enum-base names an existing one.
+TypeId ScopeBuilder::BuildEnum(AstId node, ScopeId scope,
+                               const string& anonymous_name)
+{
+  const AstNode& value = arena_.At(node);
+  const bool definition = value.kind == AST_ENUM_SPECIFIER;
+  const bool scoped = FindChild(node, AST_ENUM_KEY) != 0;
+  const AstId underlying_node = FindChild(node, AST_TYPE_ID);
+  vector<AstId> enumerators;
+  for (std::size_t i = 0; i < value.children.size(); ++i)
+    if (arena_.At(value.children[i]).kind == AST_ENUMERATOR)
+      enumerators.push_back(value.children[i]);
+
+  QualifiedName name = NodeName(node);
+  if (name.Empty())
+  {
+    if (!definition)
+      throw std::runtime_error("unnamed enum declaration");
+    name.components.push_back(anonymous_name.empty() ?
+                              AnonymousTypeName(node, "enum") : anonymous_name);
+  }
+  if (!definition && !scoped && underlying_node == 0)
+  {
+    // Elaborated enum specifier (7.1.6.3p2: the name must be found).
+    const BindingId found = model_.Lookup(scope, name, LOOKUP_TYPES);
+    if (found == 0 || types_.Kind(model_.BindingAt(found).type) != TYPE_ENUM)
+      throw std::runtime_error("elaborated enum specifier names no enum");
+    return model_.BindingAt(found).type;
+  }
+  if (!definition && name.Qualified())
+    throw std::runtime_error("qualified opaque enum declaration");
+
+  const ScopeId parent = name.Qualified() ?
+      ResolveQualifierScope(scope, name.Prefix()) : scope;
+  TypeId underlying = underlying_node == 0 ? types_.Fundamental(FT_INT) :
+      BuildTypeId(underlying_node, scope);
+  const TypeId underlying_kind = types_.Unqualified(underlying);
+  if (types_.Kind(underlying_kind) != TYPE_FUNDAMENTAL ||
+      !FundamentalIsIntegral(types_.At(underlying_kind).fundamental))
+    throw std::runtime_error("enum underlying type is not integral");
+  return BuildEnumDefinition(node, scope, parent, name, name.Joined(), scoped,
+                             underlying, enumerators);
+}
+
+TypeId ScopeBuilder::BuildEnumDefinition(AstId node, ScopeId scope,
+                                         ScopeId parent,
+                                         const QualifiedName& name,
+                                         const string& spelling, bool scoped,
+                                         TypeId underlying,
+                                         const vector<AstId>& enumerators)
+{
+  const bool definition = arena_.At(node).kind == AST_ENUM_SPECIFIER;
+  const BindingId existing = model_.DirectBinding(parent, name.Last(),
+                                                  LOOKUP_TYPES);
+  EnumEntityId entity = 0;
+  TypeId type = 0;
+  if (existing != 0)
+  {
+    type = model_.BindingAt(existing).type;
+    if (types_.Kind(type) != TYPE_ENUM)
+      throw std::runtime_error("enum name already denotes another type");
+    entity = types_.At(type).entity;
+    const EnumEntity& previous = model_.EnumAt(entity);
+    // 7.2p3: redeclarations agree on scoped-ness and underlying type.
+    if (previous.scoped != scoped || previous.underlying != underlying)
+      throw std::runtime_error("enum redeclaration disagrees with its type");
+    if (definition && previous.defined)
+      throw std::runtime_error("enum redefinition");
+  }
+  else if (name.Qualified())
+    throw std::runtime_error("qualified enum definition names no enum");
+  else
+    entity = model_.CreateEnum(scoped, underlying);
+
+  if (existing == 0 || name.Qualified())
+  {
+    // The first declaration in a scope, or the out-of-class definition,
+    // prints its own type line with its own spelling; the latter also owns
+    // the enumerators from here on.
+    type = types_.Enum(entity, scoped, underlying, spelling);
+    if (scoped)
+      model_.EnumAt(entity).enum_scope =
+          model_.CreateScope(SCOPE_ENUM, spelling, scope);
+    model_.AddBinding(scope, spelling, BINDING_TYPE, type);
+  }
+  if (!definition)
+    return type;
+  EnumEntity& enum_entity = model_.EnumAt(entity);
+  enum_entity.defined = true;
+  if (!scoped)
+    enum_entity.enum_scope = parent;
+  const ScopeId enumerator_scope = enum_entity.enum_scope;
+  BindEnumerators(enumerators, enumerator_scope, type);
+  return type;
+}
+
+// 7.2p1: an omitted value is the previous value plus one, the first is zero.
+void ScopeBuilder::BindEnumerators(const vector<AstId>& enumerators,
+                                   ScopeId scope, TypeId type)
+{
+  long long previous = -1;
+  for (std::size_t i = 0; i < enumerators.size(); ++i)
+  {
+    const AstNode& enumerator = arena_.At(enumerators[i]);
+    long long value = 0;
+    if (!enumerator.children.empty())
+      value = const_eval_.Evaluate(enumerator.children[0], scope);
+    else if (previous == std::numeric_limits<long long>::max())
+      throw std::runtime_error("enumerator value overflows");
+    else
+      value = previous + 1;
+    const string name = IdentifierName(enumerators[i]);
+    if (model_.DirectBinding(scope, name) != 0)
+      throw std::runtime_error("enumerator redeclares a name");
+    Binding& binding = model_.BindingAt(model_.AddBinding(
+        scope, name, BINDING_ENUMERATOR, type));
+    binding.has_const_value = true;
+    binding.const_value = value;
+    previous = value;
+  }
+}
+
+AstId ScopeBuilder::FindChild(AstId node, AstKind kind) const
+{
+  if (node == 0)
+    return 0;
+  const vector<AstId>& children = arena_.At(node).children;
+  for (std::size_t i = 0; i < children.size(); ++i)
+    if (children[i] != 0 && arena_.At(children[i]).kind == kind)
+      return children[i];
+  return 0;
+}
+
+// The declarator-id of a (possibly nested) declarator.
 AstId ScopeBuilder::FindIdentifier(AstId declarator) const
 {
   if (declarator == 0)
@@ -721,168 +630,79 @@ AstId ScopeBuilder::FindIdentifier(AstId declarator) const
     return 0;
   for (std::size_t i = 0; i < node.children.size(); ++i)
   {
-    const AstKind kind = arena_.At(node.children[i]).kind;
-    if (kind == AST_IDENTIFIER)
-      return node.children[i];
-    if (kind == AST_DECLARATOR || kind == AST_ABSTRACT_DECLARATOR ||
-        kind == AST_NESTED_DECLARATOR)
-    {
-      const AstId found = FindIdentifier(node.children[i]);
-      if (found != 0)
-        return found;
-    }
+    const AstId found = FindIdentifier(node.children[i]);
+    if (found != 0)
+      return found;
   }
   return 0;
 }
 
-AstId ScopeBuilder::FindInitializer(AstId init_declarator) const
+QualifiedName ScopeBuilder::NodeName(AstId node) const
 {
-  if (init_declarator == 0)
-    return 0;
-  const AstNode& value = arena_.At(init_declarator);
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-    if (arena_.At(value.children[i]).kind == AST_INITIALIZER)
-      return value.children[i];
-  return 0;
-}
-
-AstId ScopeBuilder::FindParameterClause(AstId declarator) const
-{
-  if (declarator == 0)
-    return 0;
-  const AstNode& node = arena_.At(declarator);
-  for (std::size_t i = 0; i < node.children.size(); ++i)
-    if (arena_.At(node.children[i]).kind == AST_PARAMETER_CLAUSE)
-      return node.children[i];
-  return 0;
+  if (node == 0)
+    return QualifiedName();
+  const AstNode& value = arena_.At(node);
+  return ReadQualifiedName(tokens_, value.first, value.last);
 }
 
 string ScopeBuilder::IdentifierName(AstId identifier) const
 {
-  const vector<string> components = NameComponents(identifier);
-  return components.empty() ? string() : components.back();
+  const QualifiedName name = NodeName(identifier);
+  return name.Empty() ? string() : name.Last();
 }
 
-vector<string> ScopeBuilder::NameComponents(std::size_t first,
-                                            std::size_t last) const
+ScopeId ScopeBuilder::ResolveQualifierScope(ScopeId scope,
+                                            const QualifiedName& prefix) const
 {
-  vector<string> result;
-  string component;
-  for (std::size_t i = first; i < last && i < tokens_.size(); ++i)
-  {
-    const Pa6Token& token = tokens_[i];
-    if (token.kind == PA6_IDENTIFIER_TOKEN)
-    {
-      component += token.spelling;
-      continue;
-    }
-    if (token.IsSimple(OP_COLON2))
-    {
-      if (!component.empty())
-      {
-        result.push_back(component);
-        component.clear();
-      }
-      continue;
-    }
-    if (token.IsRshiftPart())
-      component += ">";
-    else if (token.kind == PA6_SIMPLE_TOKEN && token.simple_type == OP_LT)
-      component += "<";
-    else if (token.kind == PA6_SIMPLE_TOKEN && token.simple_type == OP_GT)
-      component += ">";
-  }
-  if (!component.empty())
-    result.push_back(component);
-  return result;
-}
-
-vector<string> ScopeBuilder::NameComponents(AstId node) const
-{
-  if (node == 0)
-    return vector<string>();
-  const AstNode& value = arena_.At(node);
-  if (value.first < value.last)
-    return NameComponents(value.first, value.last);
-  if (!value.text.empty())
-    return vector<string>(1, value.text);
-  return vector<string>();
-}
-
-BindingId ScopeBuilder::ResolveName(ScopeId scope,
-                                   const vector<string>& name,
-                                   unsigned filter) const
-{
-  if (name.empty())
-    return 0;
-  if (name.size() == 1)
-    return model_.LookupUnqualified(scope, name[0], filter);
-  return model_.LookupQualified(scope, name, filter);
+  if (prefix.Empty())
+    return prefix.global ? model_.GlobalScope() : scope;
+  const BindingId binding = model_.Lookup(scope, prefix, LOOKUP_QUALIFIER);
+  ScopeId target = 0;
+  if (binding == 0 || !model_.NominatedScope(binding, target))
+    throw std::runtime_error("qualifier does not name a scope");
+  return target;
 }
 
 ScopeId ScopeBuilder::ResolveDeclarationScope(ScopeId scope, AstId identifier,
                                               string& name) const
 {
-  const vector<string> components = NameComponents(identifier);
-  if (components.empty())
+  const QualifiedName components = NodeName(identifier);
+  if (components.Empty())
     throw std::runtime_error("declarator has no name");
-  name = components.back();
-  if (components.size() == 1)
-    return scope;
-  vector<string> prefix(components.begin(), components.end() - 1);
-  const BindingId binding = ResolveName(scope, prefix, LOOKUP_QUALIFIER);
-  if (binding == 0 || model_.BindingAt(binding).target_scope == 0)
-    throw std::runtime_error("qualified declarator scope not found");
-  return model_.BindingAt(binding).target_scope;
+  name = components.Last();
+  return components.Qualified() ?
+      ResolveQualifierScope(scope, components.Prefix()) : scope;
 }
 
 ScopeId ScopeBuilder::ResolveNamespace(ScopeId scope, AstId target) const
 {
-  const vector<string> name = NameComponents(target);
-  const BindingId binding = ResolveName(scope, name, LOOKUP_NAMESPACES);
-  if (binding == 0 || model_.BindingAt(binding).target_scope == 0)
+  const BindingId binding = model_.Lookup(scope, NodeName(target),
+                                         LOOKUP_NAMESPACES);
+  if (binding == 0)
     throw std::runtime_error("namespace target not found");
-  return model_.BindingAt(binding).target_scope;
+  return model_.BindingAt(binding).namespace_scope;
 }
 
-string ScopeBuilder::ClassKey(AstId node) const
+TypeKeyword ScopeBuilder::ClassKey(AstId node) const
 {
-  const AstNode& value = arena_.At(node);
-  for (std::size_t i = 0; i < value.children.size(); ++i)
+  const AstId key = FindChild(node, AST_CLASS_KEY);
+  if (key != 0 && arena_.At(key).first < tokens_.size())
   {
-    const AstNode& child = arena_.At(value.children[i]);
-    if (child.kind != AST_CLASS_KEY || child.first >= tokens_.size())
-      continue;
-    switch (tokens_[child.first].simple_type)
-    {
-    case KW_CLASS: return "class";
-    case KW_UNION: return "union";
-    case KW_STRUCT: return "struct";
-    default: break;
-    }
+    const Pa6Token& token = tokens_[arena_.At(key).first];
+    if (token.IsSimple(KW_STRUCT))
+      return TK_STRUCT;
+    if (token.IsSimple(KW_UNION))
+      return TK_UNION;
   }
-  return "class";
-}
-
-string ScopeBuilder::TypeName(AstId node) const
-{
-  const vector<string> name = NameComponents(node);
-  if (name.empty())
-    return string();
-  string result = name[0];
-  for (std::size_t i = 1; i < name.size(); ++i)
-    result += "::" + name[i];
-  return result;
+  return TK_CLASS;
 }
 
 bool ScopeBuilder::SequenceHasKeyword(AstId sequence, ETokenType keyword) const
 {
-  if (sequence == 0)
-    return false;
-  const AstNode& value = arena_.At(sequence);
-  for (std::size_t i = 0; i < value.children.size(); ++i)
+  const vector<AstId>& children = arena_.At(sequence).children;
+  for (std::size_t i = 0; i < children.size(); ++i)
   {
-    const AstNode& child = arena_.At(value.children[i]);
+    const AstNode& child = arena_.At(children[i]);
     if (child.first < tokens_.size() && child.last == child.first + 1 &&
         tokens_[child.first].IsSimple(keyword))
       return true;
@@ -890,7 +710,7 @@ bool ScopeBuilder::SequenceHasKeyword(AstId sequence, ETokenType keyword) const
   return false;
 }
 
-bool ScopeBuilder::IsDeclarationKind(AstKind kind) const
+bool ScopeBuilder::IsDeclarationKind(AstKind kind)
 {
   switch (kind)
   {
@@ -900,26 +720,10 @@ bool ScopeBuilder::IsDeclarationKind(AstKind kind) const
   case AST_FUNCTION_DEFINITION: case AST_CLASS_SPECIFIER:
   case AST_CLASS_FORWARD_DECLARATION: case AST_LINKAGE_SPECIFICATION:
   case AST_EMPTY_DECLARATION: case AST_ENUM_SPECIFIER:
-  case AST_STATIC_ASSERT_DECLARATION: case AST_TEMPLATE_DECLARATION:
-  case AST_EXPLICIT_INSTANTIATION_DECLARATION:
+  case AST_ENUM_DECLARATION: case AST_STATIC_ASSERT_DECLARATION:
+  case AST_TEMPLATE_DECLARATION: case AST_EXPLICIT_INSTANTIATION_DECLARATION:
     return true;
   default:
     return false;
   }
-}
-
-void ScopeBuilder::AddFunctionParameters(ScopeId function_scope,
-                                         AstId declarator,
-                                         ScopeId lookup_scope)
-{
-  const AstId clause = FindParameterClause(declarator);
-  if (clause == 0)
-    return;
-  vector<ParameterInfo> parameters;
-  bool variadic = false;
-  BuildParameters(clause, lookup_scope, parameters, variadic);
-  (void)variadic;
-  for (std::size_t i = 0; i < parameters.size(); ++i)
-    model_.AddBinding(function_scope, parameters[i].name,
-                      BINDING_PARAMETER, parameters[i].type);
 }
