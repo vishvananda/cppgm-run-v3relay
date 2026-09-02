@@ -1,6 +1,9 @@
 #include "lowir_cy86_codegen.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -63,9 +66,19 @@ std::string global_label(const std::string & name)
 
 std::string memory(const std::string & base, long long offset)
 {
-  if(offset == 0) return "[" + base + "]";
-  if(offset > 0) return "[" + base + "+" + signed_number(offset) + "]";
-  return "[" + base + signed_number(offset) + "]";
+  std::string effective_base = base;
+  char * end = 0;
+  if(base.size() > 2 && base.compare(0, 2, "bp") == 0) {
+    const long long base_offset = std::strtoll(base.c_str() + 2,
+                                               &end, 10);
+    if(end != 0 && *end == '\0') {
+      effective_base = "bp";
+      offset += base_offset;
+    }
+  }
+  if(offset == 0) return "[" + effective_base + "]";
+  if(offset > 0) return "[" + effective_base + "+" + signed_number(offset) + "]";
+  return "[" + effective_base + signed_number(offset) + "]";
 }
 
 std::string local_memory(long long offset)
@@ -331,6 +344,41 @@ private:
     return index < 4 ? names[index] : "x";
   }
 
+  std::string scratch_memory(std::size_t area, std::size_t offset = 0) const
+  {
+    return memory(scratch_base(area), static_cast<long long>(offset));
+  }
+
+  std::string scratch_base(std::size_t area) const
+  {
+    const long long offset = -static_cast<long long>(layout_.local_size +
+                                                     16 * (area + 1));
+    return "bp" + signed_number(offset);
+  }
+
+  static std::string local_base(long long offset)
+  {
+    return "bp" + signed_number(offset);
+  }
+
+  void pad_f80(const std::string & base)
+  {
+    writer_.instruction("move64", "z64 0");
+    writer_.instruction("move32", memory(base, 10) + " z32");
+    writer_.instruction("move16", memory(base, 14) + " z16");
+  }
+
+  void copy_memory(const std::string & source, const std::string & target,
+                   std::size_t bytes)
+  {
+    for(std::size_t offset = 0; offset < bytes; offset += 8) {
+      writer_.instruction("move64", "z64 " + memory(source,
+                                                       static_cast<long long>(offset)));
+      writer_.instruction("move64", memory(target,
+                                            static_cast<long long>(offset)) + " z64");
+    }
+  }
+
   void emit_prologue()
   {
     writer_.label(function_label(function_.name));
@@ -374,17 +422,11 @@ private:
     }
     const std::size_t size = value_size(parameter.type);
     for(std::size_t offset = 0; offset < size; offset += 8) {
-      writer_.instruction("move64", register_memory("z", offset) + " " +
+      writer_.instruction("move64", "z64 " +
                           memory("x64", static_cast<long long>(offset)));
       writer_.instruction("move64", local_memory(target.offset +
                           static_cast<long long>(offset)) + " z64");
     }
-  }
-
-  static std::string register_memory(const std::string & base,
-                                     std::size_t offset)
-  {
-    return memory(base + "64", static_cast<long long>(offset));
   }
 
   void emit_epilogue()
@@ -414,7 +456,7 @@ private:
   {
     if(operand.kind == Operand::OP_TEMP) {
       const ValueInfo & source = value(operand.text);
-      if(is_wide(source.type)) {
+      if(type_is_f80(source.type)) {
         writer_.instruction("isub64", base + "64 bp " +
                             number(static_cast<std::size_t>(-source.offset)));
       } else {
@@ -460,6 +502,65 @@ private:
     }
   }
 
+  void load_storage_address(const Operand & operand, const std::string & base)
+  {
+    if(operand.kind == Operand::OP_TEMP && !is_wide(value(operand.text).type)) {
+      LowType pointer;
+      pointer.text = "ptr";
+      load_value(operand, pointer, base);
+    } else {
+      load_address(operand, base);
+    }
+  }
+
+  void stage_f80_operand(const Operand & operand, std::size_t area)
+  {
+    const std::string scratch = scratch_base(area);
+    if(operand.kind == Operand::OP_FLOAT) {
+      writer_.instruction("move80", scratch_memory(area) + " " +
+                          literal_text(operand));
+      pad_f80(scratch);
+      return;
+    }
+    load_address(operand, "x");
+    copy_memory("x64", scratch, 16);
+  }
+
+  void stage_f80_storage(const Operand & operand, std::size_t area)
+  {
+    const std::string scratch = scratch_base(area);
+    load_storage_address(operand, "x");
+    copy_memory("x64", scratch, 16);
+  }
+
+  void store_wide_from_scratch(const std::string & destination,
+                               const std::string & source)
+  {
+    const ValueInfo & target = value(destination);
+    copy_memory(source, local_base(target.offset), 16);
+  }
+
+  void store_wide_operand(const Operand & destination, const std::string & source,
+                          std::size_t bytes)
+  {
+    load_storage_address(destination, "y");
+    copy_memory(source, "y64", bytes);
+  }
+
+  void copy_wide_operand_to_value(const Operand & source,
+                                  const std::string & destination,
+                                  const LowType & type)
+  {
+    const ValueInfo & target = value(destination);
+    if(source.kind == Operand::OP_FLOAT && type_is_f80(type)) {
+      stage_f80_operand(source, 0);
+      copy_memory(scratch_base(0), local_base(target.offset), 16);
+      return;
+    }
+    load_address(source, "x");
+    copy_memory("x64", local_base(target.offset), value_size(type));
+  }
+
   void store_result(const std::string & destination, const LowType & type,
                     const std::string & base)
   {
@@ -474,12 +575,22 @@ private:
 
   void emit_const(const Instruction & instruction)
   {
+    if(type_is_f80(instruction.type)) {
+      stage_f80_operand(instruction.first, 0);
+      store_wide_from_scratch(instruction.dest, scratch_base(0));
+      return;
+    }
     load_value(instruction.first, instruction.type, "x");
     store_result(instruction.dest, instruction.type, "x");
   }
 
   void emit_copy(const Instruction & instruction)
   {
+    if(is_wide(instruction.type)) {
+      copy_wide_operand_to_value(instruction.first, instruction.dest,
+                                 instruction.type);
+      return;
+    }
     load_value(instruction.first, instruction.type, "x");
     store_result(instruction.dest, instruction.type, "x");
   }
@@ -492,6 +603,18 @@ private:
 
   void emit_load(const Instruction & instruction)
   {
+    if(is_wide(instruction.type)) {
+      if(type_is_f80(instruction.type)) {
+        stage_f80_storage(instruction.first, 0);
+        store_wide_from_scratch(instruction.dest, scratch_base(0));
+      } else {
+        const ValueInfo & target = value(instruction.dest);
+        load_storage_address(instruction.first, "x");
+        copy_memory("x64", local_base(target.offset),
+                    value_size(instruction.type));
+      }
+      return;
+    }
     const std::string suffix = width_suffix(instruction.type);
     if(instruction.first.kind == Operand::OP_GLOBAL) {
       writer_.instruction("move" + suffix,
@@ -503,12 +626,31 @@ private:
       load_value(instruction.first, LowType(), "x");
       writer_.instruction("move" + suffix,
                           "x" + suffix + " [x64]");
+      if(instruction.type.text == "i32" && instruction.first.kind == Operand::OP_TEMP) {
+        const ValueInfo & source = value(instruction.first.text);
+        if(source.type.text == "ptr" || lowir_model::describe_low_type(source.type).object()) {
+          writer_.instruction("move8", "t8 32");
+          writer_.instruction("lshift64", "x64 x64 t8");
+          writer_.instruction("srshift64", "x64 x64 t8");
+        }
+      }
     }
     store_result(instruction.dest, instruction.type, "x");
   }
 
   void emit_store(const Instruction & instruction)
   {
+    if(is_wide(instruction.type)) {
+      if(type_is_f80(instruction.type)) {
+        stage_f80_operand(instruction.first, 0);
+        store_wide_operand(instruction.second, scratch_base(0), 16);
+      } else {
+        load_address(instruction.first, "x");
+        store_wide_operand(instruction.second, "x64",
+                           value_size(instruction.type));
+      }
+      return;
+    }
     const std::string suffix = width_suffix(instruction.type);
     load_value(instruction.first, instruction.type, "x");
     if(instruction.second.kind == Operand::OP_GLOBAL) {
@@ -526,6 +668,16 @@ private:
 
   void emit_binary(const Instruction & instruction)
   {
+    if(type_is_f80(instruction.type)) {
+      stage_f80_operand(instruction.first, 0);
+      stage_f80_operand(instruction.second, 1);
+      writer_.instruction("f" + instruction.op + "80",
+                          scratch_memory(2) + " " + scratch_memory(0) +
+                          " " + scratch_memory(1));
+      pad_f80(scratch_base(2));
+      store_wide_from_scratch(instruction.dest, scratch_base(2));
+      return;
+    }
     const std::string suffix = width_suffix(instruction.type);
     const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
     load_value(instruction.first, instruction.type, "y");
@@ -562,6 +714,18 @@ private:
 
   void emit_compare(const Instruction & instruction)
   {
+    if(type_is_f80(instruction.type)) {
+      stage_f80_operand(instruction.first, 0);
+      stage_f80_operand(instruction.second, 1);
+      writer_.instruction("f" + instruction.op + "80", "z8 " +
+                          scratch_memory(0) + " " + scratch_memory(1));
+      writer_.instruction("move64", "x64 0");
+      writer_.instruction("move8", "x8 z8");
+      LowType result;
+      result.text = "i64";
+      store_result(instruction.dest, result, "x");
+      return;
+    }
     const std::string suffix = width_suffix(instruction.type);
     const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
     load_value(instruction.first, instruction.type, "y");
@@ -593,6 +757,19 @@ private:
 
   void emit_unary(const Instruction & instruction)
   {
+    if(type_is_f80(instruction.type)) {
+      if(instruction.op != "neg") {
+        throw std::runtime_error("unsupported floating unary operation");
+      }
+      stage_f80_operand(instruction.first, 0);
+      writer_.instruction("move80", scratch_memory(1) + " 0.0L");
+      pad_f80(scratch_base(1));
+      writer_.instruction("fsub80", scratch_memory(2) + " " +
+                          scratch_memory(1) + " " + scratch_memory(0));
+      pad_f80(scratch_base(2));
+      store_wide_from_scratch(instruction.dest, scratch_base(2));
+      return;
+    }
     const std::string suffix = width_suffix(instruction.type);
     if(instruction.op == "decay") {
       load_value(instruction.first, instruction.type, "x");
@@ -622,18 +799,55 @@ private:
 
   void emit_convert(const Instruction & instruction)
   {
-    if(instruction.op != "zext" && instruction.op != "sext" &&
-       instruction.op != "trunc") {
-      throw std::runtime_error("wide conversion is outside the scalar CY86 checkpoint");
+    if(instruction.op == "zext" || instruction.op == "sext" ||
+       instruction.op == "trunc") {
+      load_value(instruction.first, instruction.source_type, "x");
+      if(instruction.op == "sext") {
+        const LowTypeInfo source = lowir_model::describe_low_type(instruction.source_type);
+        writer_.instruction("move8", "t8 " + number(64 - source.bits));
+        writer_.instruction("lshift64", "x64 x64 t8");
+        writer_.instruction("srshift64", "x64 x64 t8");
+      }
+      store_result(instruction.dest, instruction.type, "x");
+      return;
     }
-    load_value(instruction.first, instruction.source_type, "x");
-    if(instruction.op == "sext") {
-      const LowTypeInfo source = lowir_model::describe_low_type(instruction.source_type);
-      writer_.instruction("move8", "t8 " + number(64 - source.bits));
-      writer_.instruction("lshift64", "x64 x64 t8");
-      writer_.instruction("srshift64", "x64 x64 t8");
+
+    const LowTypeInfo source = lowir_model::describe_low_type(instruction.source_type);
+    const LowTypeInfo destination = lowir_model::describe_low_type(instruction.type);
+    if(source.floating()) {
+      if(type_is_f80(instruction.source_type)) {
+        stage_f80_operand(instruction.first, 0);
+      } else {
+        load_value(instruction.first, instruction.source_type, "x");
+        writer_.instruction(instruction.source_type.text + "convf80",
+                            scratch_memory(0) + " x" + width_suffix(instruction.source_type));
+        pad_f80(scratch_base(0));
+      }
+    } else {
+      load_value(instruction.first, instruction.source_type, "x");
+      const bool unsigned_source = instruction.op == "uitofp";
+      writer_.instruction(std::string(unsigned_source ? "u" : "s") +
+                          number(source.bits) + "convf80",
+                          scratch_memory(0) + " x" + width_suffix(instruction.source_type));
+      pad_f80(scratch_base(0));
     }
-    store_result(instruction.dest, instruction.type, "x");
+
+    if(destination.floating()) {
+      if(type_is_f80(instruction.type)) {
+        store_wide_from_scratch(instruction.dest, scratch_base(0));
+      } else {
+        const ValueInfo & target = value(instruction.dest);
+        writer_.instruction("f80conv" + instruction.type.text,
+                            local_memory(target.offset) + " " + scratch_memory(0));
+      }
+    } else {
+      const ValueInfo & target = value(instruction.dest);
+      const bool unsigned_destination = instruction.op == "fptoui";
+      writer_.instruction("f80conv" +
+                          std::string(unsigned_destination ? "u" : "s") +
+                          number(destination.bits),
+                          local_memory(target.offset) + " " + scratch_memory(0));
+    }
   }
 
   std::size_t index_element_size(const LowType & type) const
@@ -741,47 +955,79 @@ private:
     const LowType expected = call_parameter_type(instruction, index);
     const Operand & operand = instruction.args[index];
     if(call_argument_is_address(instruction, index)) {
-      load_address(operand, "x");
+      if(operand.kind == Operand::OP_FLOAT && type_is_f80(expected)) {
+        stage_f80_operand(operand, 0);
+        writer_.instruction("isub64", "x64 bp " +
+                            number(layout_.local_size + 16));
+      } else {
+        load_address(operand, "x");
+      }
       writer_.instruction("move64", target + "64 x64");
     } else {
       load_value(operand, expected, target);
     }
   }
 
+  void emit_hidden_result_argument(const Instruction & instruction,
+                                   const std::string & target)
+  {
+    if(!instruction.dest.empty()) {
+      Operand destination;
+      destination.kind = Operand::OP_TEMP;
+      destination.text = instruction.dest;
+      load_address(destination, "x");
+    } else {
+      writer_.instruction("isub64", "x64 bp " +
+                          number(layout_.local_size + 16));
+    }
+    writer_.instruction("move64", target + "64 x64");
+  }
+
   void emit_call(const Instruction & instruction)
   {
     const bool indirect = instruction.first.kind != Operand::OP_GLOBAL;
     const std::size_t argument_count = instruction.args.size();
+    const bool hidden_result = is_wide(instruction.type);
+    const std::size_t abi_argument_count = argument_count +
+                                            (hidden_result ? 1 : 0);
+    const std::size_t stack_bytes = abi_argument_count > 4 ?
+      (abi_argument_count - 4) * 8 : 0;
     if(indirect) {
       load_value(instruction.first, LowType(), "x");
-      writer_.instruction("isub64", "sp sp 8");
-      writer_.instruction("move64", "[sp] x64");
-    } else if(argument_count > 4) {
+      writer_.instruction("isub64", "sp sp " + number(stack_bytes + 8));
+      writer_.instruction("move64", memory("sp",
+                          static_cast<long long>(stack_bytes)) + " x64");
+    } else if(stack_bytes != 0) {
       writer_.instruction("isub64", "sp sp " +
-                          number((argument_count - 4) * 8));
+                          number(stack_bytes));
     }
-    for(std::size_t i = 0; i < argument_count; ++i) {
-      if(i < 4) {
-        static const char * const registers[] = { "x", "y", "z", "t" };
-        emit_call_argument(instruction, i, registers[i]);
+    for(std::size_t abi_index = 0; abi_index < abi_argument_count; ++abi_index) {
+      const bool in_registers = abi_index < 4;
+      const std::string target = in_registers ? parameter_register(abi_index) : "x";
+      if(hidden_result && abi_index == 0) {
+        emit_hidden_result_argument(instruction, target);
       } else {
-        emit_call_argument(instruction, i, "x");
-        const long long offset = static_cast<long long>((i - 4) * 8);
-        writer_.instruction("move64", memory("sp", offset) + " 0");
-        writer_.instruction("move64", memory("sp", offset) + " x64");
+        const std::size_t argument_index = abi_index - (hidden_result ? 1 : 0);
+        if(!in_registers) {
+          emit_call_argument(instruction, argument_index, target);
+          const long long offset = static_cast<long long>((abi_index - 4) * 8);
+          writer_.instruction("move64", memory("sp", offset) + " 0");
+          writer_.instruction("move64", memory("sp", offset) + " x64");
+        } else {
+          emit_call_argument(instruction, argument_index, target);
+        }
       }
     }
     if(indirect) {
-      writer_.instruction("call", "[sp]");
-      writer_.instruction("iadd64", "sp sp 8");
+      writer_.instruction("call", memory("sp", static_cast<long long>(stack_bytes)));
+      writer_.instruction("iadd64", "sp sp " + number(stack_bytes + 8));
     } else {
       writer_.instruction("call", function_label(instruction.first.text));
-      if(argument_count > 4) {
-        writer_.instruction("iadd64", "sp sp " +
-                            number((argument_count - 4) * 8));
+      if(stack_bytes != 0) {
+        writer_.instruction("iadd64", "sp sp " + number(stack_bytes));
       }
     }
-    if(!instruction.dest.empty()) {
+    if(!instruction.dest.empty() && !hidden_result) {
       store_result(instruction.dest, instruction.type, "x");
     }
   }
@@ -876,9 +1122,68 @@ private:
     writer_.instruction("jump", block_label(instruction.second.text));
   }
 
+  void emit_eh_push(const Instruction & instruction)
+  {
+    writer_.instruction("isub64", "sp sp 32");
+    writer_.instruction("move64", "z64 [g____cppgm_eh_top]");
+    writer_.instruction("move64", "[sp] z64");
+    writer_.instruction("move64", "z64 " + block_label(instruction.first.text));
+    writer_.instruction("move64", "[sp+8] z64");
+    writer_.instruction("move64", "[sp+16] bp");
+    writer_.instruction("move64", "z64 sp");
+    writer_.instruction("iadd64", "z64 z64 32");
+    writer_.instruction("move64", "[sp+24] z64");
+    writer_.instruction("move64", "z64 sp");
+    writer_.instruction("move64", "[g____cppgm_eh_top] z64");
+  }
+
+  void emit_eh_end()
+  {
+    writer_.instruction("move64", "x64 [g____cppgm_eh_top]");
+    writer_.instruction("move64", "y64 [x64]");
+    writer_.instruction("move64", "[g____cppgm_eh_top] y64");
+    writer_.instruction("move64", "sp x64");
+    writer_.instruction("iadd64", "sp sp 32");
+  }
+
+  void emit_eh_dispatch()
+  {
+    const std::string handler = context_.next_label("__eh_handler__");
+    const std::string unhandled = context_.next_label("__eh_unhandled__");
+    writer_.instruction("move64", "x64 [g____cppgm_eh_top]");
+    writer_.instruction("ieq64", "z8 x64 0");
+    writer_.instruction("jumpif", "z8 " + unhandled);
+    writer_.label(handler);
+    writer_.instruction("move64", "y64 [x64]");
+    writer_.instruction("move64", "[g____cppgm_eh_top] y64");
+    writer_.instruction("move64", "z64 [x64+8]");
+    writer_.instruction("move64", "bp [x64+16]");
+    writer_.instruction("move64", "sp [x64+24]");
+    writer_.instruction("jump", "z64");
+    writer_.label(unhandled);
+    writer_.instruction("move64", "x64 [g____cppgm_eh_value]");
+    writer_.instruction("call", "fn____cppgm_eh_unhandled");
+    writer_.instruction("syscall1", "t64 60 x64");
+    writer_.blank();
+  }
+
   void emit_return(const Instruction & instruction)
   {
-    if(instruction.type.text != "void") {
+    if(is_wide(instruction.type)) {
+      if(layout_.hidden_result.empty()) {
+        throw std::runtime_error("wide return is missing its hidden result pointer");
+      }
+      const ValueInfo & hidden = value(layout_.hidden_result);
+      if(type_is_f80(instruction.type)) {
+        stage_f80_operand(instruction.first, 0);
+        writer_.instruction("move64", "x64 " + local_memory(hidden.offset));
+        copy_memory(scratch_base(0), "x64", 16);
+      } else {
+        load_address(instruction.first, "x");
+        writer_.instruction("move64", "y64 " + local_memory(hidden.offset));
+        copy_memory("x64", "y64", value_size(instruction.type));
+      }
+    } else if(instruction.type.text != "void") {
       load_value(instruction.first, instruction.type, "x");
     }
     writer_.instruction("jump", epilogue_label());
@@ -913,6 +1218,27 @@ private:
       case Instruction::IK_JUMP: emit_jump(instruction); break;
       case Instruction::IK_BRANCH: emit_branch(instruction); break;
       case Instruction::IK_SWITCH: emit_switch(instruction); break;
+      case Instruction::IK_EH_TRY:
+      case Instruction::IK_EH_CLEANUP:
+        emit_eh_push(instruction);
+        break;
+      case Instruction::IK_EH_END: emit_eh_end(); break;
+      case Instruction::IK_THROW:
+        load_value(instruction.first, instruction.type, "x");
+        writer_.instruction("move64", "[g____cppgm_eh_value] x64");
+        emit_eh_dispatch();
+        break;
+      case Instruction::IK_EXCEPTION:
+      case Instruction::IK_EXCEPTION_SELECTOR:
+        writer_.instruction("move64", "x64 [g____cppgm_eh_value]");
+        store_result(instruction.dest, instruction.type, "x");
+        break;
+      case Instruction::IK_RESUME: emit_eh_dispatch(); break;
+      case Instruction::IK_EH_CLEANUP_CLAUSE:
+      case Instruction::IK_EH_CATCH:
+      case Instruction::IK_EH_FILTER:
+      case Instruction::IK_EH_CATCH_ALL:
+        break;
       case Instruction::IK_RETURN: emit_return(instruction); break;
       default:
         throw std::runtime_error("unsupported LowIR instruction in scalar CY86 checkpoint");
@@ -939,10 +1265,43 @@ void emit_start(const Program & program, const LowirProgramFacts & facts,
   writer.instruction("syscall1", "t64 60 x64");
 }
 
+void emit_f80_data(const Operand & operand, Cy86Writer & writer)
+{
+  const long double value = std::strtold(operand.text.c_str(), 0);
+  unsigned char bytes[sizeof(long double)] = {};
+  std::memcpy(bytes, &value, sizeof(value));
+  std::int64_t low = 0;
+  std::uint16_t high = 0;
+  std::memcpy(&low, bytes, sizeof(low));
+  std::memcpy(&high, bytes + sizeof(low), sizeof(high));
+  writer.instruction("data64", signed_number(static_cast<long long>(low)));
+  writer.instruction("data16", number(static_cast<std::size_t>(high)));
+  for(std::size_t i = 0; i < 6; ++i) {
+    writer.instruction("data8", "0");
+  }
+}
+
+void emit_f80_zero_data(Cy86Writer & writer)
+{
+  writer.instruction("data64", "0");
+  writer.instruction("data16", "0");
+  for(std::size_t i = 0; i < 6; ++i) {
+    writer.instruction("data8", "0");
+  }
+}
+
 void emit_global_scalar(const lowir_model::GlobalDefinition & global,
                         const CodegenContext & context, Cy86Writer & writer)
 {
   writer.label(global_label(global.name));
+  if(type_is_f80(global.type)) {
+    if(global.init_kind == lowir_model::GlobalDefinition::INIT_ZERO) {
+      emit_f80_zero_data(writer);
+    } else {
+      emit_f80_data(global.init_operand, writer);
+    }
+    return;
+  }
   if(global.init_kind == lowir_model::GlobalDefinition::INIT_ZERO) {
     const std::string suffix = width_suffix(global.type);
     writer.instruction("data" + suffix, "0");
@@ -988,6 +1347,12 @@ void emit_global_structured(const lowir_model::GlobalDefinition & global,
                          (item.addr_addend == 0 ? std::string() :
                           (item.addr_addend > 0 ? "+" : "") +
                           signed_number(item.addr_addend)));
+    } else if(type_is_f80(item.type)) {
+      if(item.kind == lowir_model::GlobalDefinition::DataItem::ITEM_ZERO) {
+        emit_f80_zero_data(writer);
+      } else {
+        emit_f80_data(item.literal_operand, writer);
+      }
     } else {
       writer.instruction("data" + width_suffix(item.type),
                          literal_text(item.literal_operand));
@@ -1009,6 +1374,21 @@ void emit_globals(const Program & program, const CodegenContext & context,
   }
 }
 
+void emit_eh_runtime(Cy86Writer & writer)
+{
+  writer.label("fn____cppgm_eh_unhandled");
+  writer.instruction("syscall1", "t64 60 x64");
+}
+
+void emit_eh_globals(Cy86Writer & writer)
+{
+  writer.label("g____cppgm_eh_top");
+  writer.instruction("data64", "0");
+  writer.blank();
+  writer.label("g____cppgm_eh_value");
+  writer.instruction("data64", "0");
+}
+
 }  // namespace
 
 std::string EmitCy86Program(const lowir_model::Program & program,
@@ -1021,6 +1401,14 @@ std::string EmitCy86Program(const lowir_model::Program & program,
     writer.blank();
     FunctionEmitter(program.functions[i], context, writer).emit();
   }
+  if(facts.uses_eh) {
+    writer.blank();
+    emit_eh_runtime(writer);
+  }
   emit_globals(program, context, writer);
+  if(facts.uses_eh) {
+    writer.blank();
+    emit_eh_globals(writer);
+  }
   return writer.str();
 }

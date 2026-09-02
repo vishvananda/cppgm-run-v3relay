@@ -287,45 +287,42 @@ function translates in well under a second and scales linearly.
   atomics, scalar and structured globals. Evidence: 86/96 pa13 fixtures,
   823/823 through-pa12, and the pa13 file audit pass; the ten remaining
   failures are the planned f80/object/EH boundary.
-- CP3 — wide values and EH: f80 staging and conversions, `f80`/`obj`
-  parameters and returns through hidden pointers, EH handler stack and
-  runtime support emission: 96/96, through-pa13 clean.
+- CP3 (completed) — wide values and EH: f80 staging and conversions,
+  `f80`/`obj` parameters and returns through hidden pointers, EH handler stack
+  and runtime support emission. Evidence: focused packet fixtures 10/10
+  byte-exact, `make test-pa13` 96/96, through-pa12 823/823, and the pa13 file
+  audit passed (two pre-existing header-division warnings only).
 - CP4 — architecture audit and cleanup (one operand-loading authority, one
   width table, one label counter, linear passes, audit warnings), `audit.md`.
 
-## Active Checkpoint: CP3 — wide values and EH
+## Active Checkpoint: CP4 — architecture audit and cleanup
 
-Goal: extend deterministic CY86 emission to f80 staging, object/f80 ABI
-boundaries, and exception-handler runtime support while preserving the 86
-passing pa13 fixtures and all earlier PAs. Progress proof: the ten remaining
-pa13 success fixtures become byte-exact EXIT_SUCCESS with no malformed-fixture
-regressions.
+Goal: consolidate the validated pa13 emitter around one operand-loading
+authority and one width table, retain the one program-wide label counter and
+linear passes, and document the resulting audit boundaries without regressing
+the 96 pa13 or 823 earlier-PA fixtures.
 
 ### Implementation Packet
 
 Files/symbols:
 
-- `dev/src/lowir_cy86_codegen.h/.cpp`: extend the existing `FrameLayout`,
-  value map, scratch staging, wide calls/returns, global encoding, and EH
-  handler emission; keep every emission family under the 240-line audit limit.
-- `dev/lowir2cy86.cpp`: preserve the validated parse → emit → output path and
-  the existing help, batch, and `-o` envelope.
-- `dev/frontend_source_sets.mk`: retain `lowir_cy86_codegen` in the
-  lowir2cy86 source set; keep parser and validator unchanged.
+- `dev/src/lowir_cy86_codegen.cpp`: unify operand/address loading and width
+  selection, retain bounded frame/value lookup and the program-wide label
+  counter, and keep every emission family under the 240-line audit limit.
+- `dev/src/lowir_cy86_codegen.h`, `dev/lowir2cy86.cpp`, and
+  `dev/frontend_source_sets.mk`: preserve the public emitter boundary,
+  validated parse → emit → output path, and source-set wiring.
+- `audit.md`: record the final pa13 codegen structure and any justified
+  warnings.
 
-Fixture groups: `100-small-direct-object-argument`,
-`200-direct-object-return-boundary-smoke`, `200-f80-{direct-call,global,
-unary-binary-cmp}`, `200-{float-width-conversions,integral-float-conversions}`,
-and `100-eh-{cleanup-resume,end-normal,same-function-catch}`. Keep the 86
-passing fixtures and 29 malformed fixtures as the regression boundary.
+Fixture groups: all pa13 spec fixtures, with the 96/96 success and 29 malformed
+fixture boundaries preserved.
 
-Required implementation facts: preserve the existing names and layout, use
-one program-wide synthetic-label counter, 16-byte f80/object staging and
-hidden result pointers, and the EH globals/handler stack specified in Stage
-Design. Validate before emission, use hash maps for top-level and per-function
-lookup, and build output once. Resolve unpinned shapes by the LowIR contract
-and nearby fixtures, not by test-specific branches.
+Required implementation facts: preserve the checked-in names/layout and wide
+ABI/EH behavior, use hash maps for top-level and per-function lookup, validate
+before emission, and build output once. Resolve cleanup changes by the LowIR
+contract and audit results, not by fixture-specific branches.
 
-Commands: focused wide/object and EH checks; broad
+Commands: focused codegen/audit checks; broad
 `make test-report-through-pa12`, `make test-pa13`, and
 `perl scripts/cppgm_file_audit.pl --stage pa13 --paths dev/src`.
