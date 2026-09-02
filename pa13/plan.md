@@ -275,98 +275,56 @@ function translates in well under a second and scales linearly.
 
 ## Checkpoint Ledger
 
-- CP1 (active) — LowIR lexer, parser, typed model, validator, driver wiring:
-  29/96 (all EXIT_FAILURE fixtures pass through real validation; success
-  fixtures still report EXIT_NOT_IMPLEMENTED from the driver's translation
-  step), through-pa12 823/823, file audit passing.
-- CP2 — CY86 codegen core: frame layout, prologue/epilogue, `start` with
-  init/fini, integer/pointer/f32/f64 instruction families, index/copyobj/
-  zeroinit, direct/indirect/stack-arg calls, terminators, atomics, scalar and
-  structured globals: ≥ 82/96.
+- CP1 (completed) — LowIR lexer, parser, typed model, validator, and driver
+  wiring: `make test-pa13` reaches 29/96 (all 29 EXIT_FAILURE fixtures pass
+  through real validation; all 67 clean fixtures parse and validate before the
+  intentional translation-boundary status), through-pa12 823/823, and the
+  pa13 file audit passes. The final 100k/200k probe scales 0.35s/0.72s and
+  85MB/153MB RSS.
+- CP2 (active) — CY86 codegen core: frame layout, prologue/epilogue, `start`
+  with init/fini, integer/pointer/f32/f64 instruction families,
+  index/copyobj/zeroinit, direct/indirect/stack-arg calls, terminators,
+  atomics, scalar and structured globals: target ≥ 82/96.
 - CP3 — wide values and EH: f80 staging and conversions, `f80`/`obj`
   parameters and returns through hidden pointers, EH handler stack and
   runtime support emission: 96/96, through-pa13 clean.
 - CP4 — architecture audit and cleanup (one operand-loading authority, one
   width table, one label counter, linear passes, audit warnings), `audit.md`.
 
-## Active Checkpoint: CP1 — LowIR front half and driver
+## Active Checkpoint: CP2 — CY86 codegen core
 
-Goal: `dev/lowir2cy86.cpp` parses every input, validates the combined program,
-and only then reaches the (still unimplemented) translation step.  Progress
-proof: the 29 EXIT_FAILURE fixtures move from EXIT_NOT_IMPLEMENTED to pass
-because validation rejects them, while all 67 success fixtures must still
-report EXIT_NOT_IMPLEMENTED (any success fixture reporting EXIT_FAILURE is a
-parser/validator bug — check `.my.exit_status` files after `make test-pa13`).
+Goal: emit deterministic CY86 for the scalar, pointer, control-flow, call,
+atomic, and global forms covered by the 53 non-wide success fixtures, while
+preserving CP1 parsing and validation. Progress proof: those fixtures move
+from EXIT_NOT_IMPLEMENTED to byte-exact EXIT_SUCCESS without changing the 29
+malformed-fixture failures or earlier-PA results.
 
 ### Implementation Packet
 
 Files/symbols:
 
-- `dev/src/lowir_model.h`: add `LowTypeInfo`, `describe_low_type`; keep the
-  scaffold structs (switch arms in `Instruction::args`, memory orders dropped).
-- `dev/src/lowir_parse.cpp` (new): `namespace lowir_model { class LowirLexer;
-  class LowirParser; LowirProgram parse_lowir_program_text(text, name);
-  LowirProgram parse_lowir_program_files(paths); LowTypeInfo
-  describe_low_type(const LowType &); }`.  Unreadable file → `ParseError`.
-- `dev/src/lowir_validate.h/.cpp` (new): `struct LowirProgramFacts`,
-  `LowirProgramFacts ValidateLowirProgram(const lowir_model::Program &)`;
-  the check list in Stage Design, implemented as small per-boundary
-  functions (`ValidateTopLevelSymbols`, `ValidateMetadata…`,
-  `ValidateFunctionBody`, `ValidateInstructionTypes`).
-- `dev/lowir2cy86.cpp`: after `parse_output_invocation`, call
-  `parse_lowir_program_files(srcfiles)` and `ValidateLowirProgram`, then
-  `throw NotImplementedException()` for the translation step (CP2 replaces
-  it with `EmitCy86Program` + file write).
-- `dev/frontend_source_sets.mk`: `FRONTEND_OBJ_BASENAMES_lowir2cy86 :=
-  lowir_parse lowir_validate`.
+- `dev/src/lowir_cy86_codegen.h/.cpp`: add `EmitCy86Program` and a
+  per-function `FrameLayout`/value map with one-pass frame construction;
+  keep every emission family under the 240-line audit limit.
+- `dev/lowir2cy86.cpp`: retain help, batch mode, and `-o` parsing, then write
+  `EmitCy86Program(program, facts)` to the requested file; report an
+  unwritable output as failure.
+- `dev/frontend_source_sets.mk`: add `lowir_cy86_codegen` to the lowir2cy86
+  source set; reuse `lowir_parse` and `lowir_validate` unchanged.
 
-Fixture groups: the 29 `*-bad-*` fixtures (must fail) and the 67 success
-fixtures (must parse and validate cleanly; they exercise every grammar form:
-`obj<8x4>` slots/params/returns, `!dbg` on headers and instructions,
-`[projection=…]` on `index`, call signatures with metadata, structured globals
-with `zero N` and `ptr addr @f`, `switch` arms, `return ptr nullptr`, literal
-operands in every value position, `declare global @ext` without a type).
+Fixture groups: the 53 scalar/pointer/control/call/atomic/global successes
+listed in the Failure Map, including `f32`/`f64`, object storage, metadata,
+switch, and direct/indirect calls. Keep the 29 malformed fixtures and the 14
+wide/EH successes as the regression boundary for CP3.
 
-Required spec facts (from `pa13/README.md`, `pa13/lowir.md`, `pa13.gram`):
-grammar is token-based, whitespace/newline insensitive; metadata brackets may
-repeat (`[a=x] [b=y]`) and hold comma lists; metadata values are identifiers
-or `@names` (`tls_for=@g`), `yes/no` for flags; `readonly`/`thread_local`
-bare keywords are legacy spellings of `storage=`; `cmp` type is the operand
-type and its result is i64; terminators are `jump branch switch return throw
-resume`; `eh_try/eh_cleanup/eh_end/exception` are ordinary instructions;
-types are `void i1 i8 u8 i16 u16 i32 u32 i64 f32 f64 f80 ptr obj<NxM>`
-(M a positive power of two); parameter/call-signature parameter names are
-temporaries; `alias object <identifier> = @target`; one entry function
-(`role=entry` or `@main`), at most one init/fini (`role=init/fini` or
-`@__cppgm_init/@__cppgm_fini`), singleton roles unique; convert legality
-table and pointer-only parameter metadata as listed in Stage Design.
+Required implementation facts: names and CY86 layout are fixture-pinned in
+Stage Design; use `start`, source-order functions, EH-free globals, one
+program-wide synthetic-label counter, and width-aware loads/stores. Validate
+before emission, use hash maps for top-level and per-function lookup, and
+build output once. Resolve any unpinned shape by the LowIR contract and
+nearby fixtures, not by test-specific branches.
 
-Commands: focused `cd pa13 && make test` (or `make -C .. test-pa13`); a
-single case `make -C pa13 check TEST=tests/spec/200-bad-duplicate-block.t`;
-broad `make test-report-through-pa12` (must stay 823/823) and
-`perl scripts/cppgm_file_audit.pl --stage pa13 --paths dev/src` (no fatal
-findings; keep functions under 240 lines, headers declarative, no
-`EXIT_NOT_IMPLEMENTED` spelling inside `dev/src`).
-
-Performance probe: generate `/tmp/big.t` with one function of 200k
-`const`/`binary`/`store` lines over a few slots and 2k blocks, plus 5k
-globals, and run `time dev/lowir2cy86 -o /tmp/big.cy86 /tmp/big.t`; parse +
-validate must be linear (compare 100k vs 200k lines).
-
-Known uncertainties (resolve by probing fixtures, never by special-casing
-names): whether temps must be defined textually before use or merely defined
-somewhere in the function (only "undefined" cases are pinned; accept
-anywhere-defined); whether a program without an entry function is rejected
-(no fixture; reject); whether integer literals may be hexadecimal (none in
-fixtures; lex `0x` prefixes anyway and keep the spelling); whether `!dbg`
-file tokens may contain characters other than `[A-Za-z0-9_./-]` (read to the
-comma); whether slots may be declared after blocks (grammar allows; accept).
-For CP2/CP3: the exact trigger of the 64-byte wide-scratch reservation
-(observed with `f80` anywhere and `obj` parameters, absent with `obj` temps,
-slots and returns); the CY86 shape for narrow-width binary ops, 8-bit
-operands, `zext` from a temp, `load` of narrow ints from slots/globals, calls
-mixing indirect callees with stack args, and `addr @g + N` initializers (none
-pinned; generalize the width table); whether the synthesized-label counter is
-program-wide (assumed) or per function; `bswap16/32/64` are not PA9 `cy86`
-opcodes, so the PA9 `cy86` tool cannot be used as a runtime probe for
-`200-bswap-unary`.
+Commands: focused `make -C pa13 check TEST=tests/spec/100-ret0.t` plus one
+representative call/control case; broad `make test-report-through-pa12`,
+`make test-pa13`, and
+`perl scripts/cppgm_file_audit.pl --stage pa13 --paths dev/src`.

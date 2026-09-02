@@ -32,5 +32,5 @@ FRONTEND_OBJ_BASENAMES_cppgm++ := preproc_host parser/ast_parser parser/ast_pars
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer posttoken_stream \
 	posttoken_tables unicode
 FRONTEND_OBJ_BASENAMES_lowiropt :=
-FRONTEND_OBJ_BASENAMES_lowir2cy86 :=
+FRONTEND_OBJ_BASENAMES_lowir2cy86 := lowir_parse lowir_validate
 FRONTEND_OBJ_BASENAMES_lowir2native :=

@@ -28,6 +28,51 @@ struct LowType
   std::string text;
 };
 
+struct LowTypeInfo
+{
+  enum Kind
+  {
+    LTI_INVALID,
+    LTI_VOID,
+    LTI_INTEGER,
+    LTI_FLOAT,
+    LTI_POINTER,
+    LTI_OBJECT
+  } kind = LTI_INVALID;
+
+  unsigned bits = 0;
+  std::size_t bytes = 0;
+  std::size_t alignment = 0;
+  bool signed_integer = false;
+
+  bool valid() const
+  {
+    return kind != LTI_INVALID;
+  }
+
+  bool integer() const
+  {
+    return kind == LTI_INTEGER;
+  }
+
+  bool floating() const
+  {
+    return kind == LTI_FLOAT;
+  }
+
+  bool pointer() const
+  {
+    return kind == LTI_POINTER;
+  }
+
+  bool object() const
+  {
+    return kind == LTI_OBJECT;
+  }
+};
+
+LowTypeInfo describe_low_type(const LowType & type);
+
 struct Operand
 {
   enum Kind
