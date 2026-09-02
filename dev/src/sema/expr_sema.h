@@ -28,7 +28,8 @@ public:
   // Copy-initialization of `expression` to `target` (8.5p14).  The literal
   // initializer of a constexpr object takes the object's cv-qualified type.
   SemaId Initialize(SemaId expression, TypeId target,
-                    bool constexpr_object = false);
+                    bool constexpr_object = false,
+                    bool list_initialization = false);
   bool TryConstant(SemaId expression, long long& value) const;
   long long Value(SemaId expression) const;
   const SemaNode& Node(SemaId expression) const;
@@ -122,6 +123,8 @@ private:
                              std::vector<TypeId>& arguments) const;
   void LookupNameBindings(const QualifiedName& name, ScopeId scope,
                           std::vector<BindingId>& bindings);
+  void FilterAccessibleBindings(ScopeId scope,
+                                std::vector<BindingId>& bindings) const;
   void FunctionCandidates(const QualifiedName& name, ScopeId scope,
                           std::vector<FunctionEntityId>& candidates);
   bool IsOperatorFunction(ETokenType op) const;
@@ -131,7 +134,9 @@ private:
                                         ScopeId scope);
   SemaId BuildConstructorTemporary(
       AstId source, TypeId target, ScopeId scope,
-      const std::vector<SemaId>& arguments);
+      const std::vector<SemaId>& arguments,
+      bool list_initialization = false,
+      bool copy_initialization = false);
   SemaId BuildResolvedCall(AstId source, ScopeId scope,
                            FunctionEntityId function,
                            SemaId implicit_object,
@@ -145,6 +150,10 @@ private:
                                const std::vector<SemaId>& arguments);
   TypeId CommonConditionalType(SemaId left, SemaId right) const;
   bool CanConvert(SemaId expression, TypeId target) const;
+  bool IsNarrowingListInitialization(SemaId expression,
+                                     TypeId target) const;
+  void CheckBaseConversionAccess(TypeId source, TypeId target,
+                                 ScopeId scope) const;
   void FoldLiteral(SemaId node, AstId expression);
   void FoldUnary(SemaId node, ETokenType op, SemaId operand);
   void FoldBinary(SemaId node, ETokenType op, SemaId left, SemaId right);

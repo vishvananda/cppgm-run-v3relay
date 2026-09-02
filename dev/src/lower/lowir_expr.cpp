@@ -408,8 +408,11 @@ Lowerer::Value Lowerer::Convert(Value value, TypeId target)
       std::vector<ClassEntityId> visited;
       if (!FindBasePath(model_, source_class, target_class, path, visited))
         Unsupported("a derived pointer without a base path");
+      std::size_t offset = 0;
       for (std::size_t i = 0; i < path.size(); ++i)
-        value.operand = ProjectField(value.operand, path[i].offset,
+        offset += path[i].offset;
+      if (!path.empty())
+        value.operand = ProjectField(value.operand, offset,
                                      lowir_model::IPK_BASE_SUBOBJECT);
       value.type = target;
       value.lvalue = false;
@@ -995,8 +998,8 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
     else
       address = AddressValue(LowerLValue(object_node));
     const ClassEntityId object_entity = types_.At(class_type).entity;
-    ClassEntityId owner_entity = 0;
-    if (model_.ScopeAt(binding.scope).kind == SCOPE_CLASS)
+    ClassEntityId owner_entity = binding.declaring_class;
+    if (owner_entity == 0 && model_.ScopeAt(binding.scope).kind == SCOPE_CLASS)
       owner_entity = model_.ScopeAt(binding.scope).class_entity;
     if (owner_entity == 0)
       Unsupported("a member without a class owner");
@@ -1005,8 +1008,11 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
     std::vector<ClassEntityId> visited;
     if (!FindBasePath(model_, object_entity, owner_entity, path, visited))
       Unsupported("a member whose class is unrelated to its object");
+    std::size_t offset = 0;
     for (std::size_t i = 0; i < path.size(); ++i)
-      address.operand = ProjectField(address.operand, path[i].offset,
+      offset += path[i].offset;
+    if (!path.empty())
+      address.operand = ProjectField(address.operand, offset,
                                      lowir_model::IPK_BASE_SUBOBJECT);
     const ClassField* field = model_.FieldFor(value.binding);
     if (field == 0)
@@ -1895,8 +1901,11 @@ void Lowerer::ProjectDerivedReference(Value& value, TypeId source,
     std::vector<ClassEntityId> visited;
     if (!FindBasePath(model_, source_class, target_class, path, visited))
       Unsupported("a derived reference without a base path");
+    std::size_t offset = 0;
     for (std::size_t i = 0; i < path.size(); ++i)
-      value.operand = ProjectField(value.operand, path[i].offset,
+      offset += path[i].offset;
+    if (!path.empty())
+      value.operand = ProjectField(value.operand, offset,
                                    lowir_model::IPK_BASE_SUBOBJECT);
   }
 }

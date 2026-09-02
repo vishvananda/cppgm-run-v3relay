@@ -126,6 +126,8 @@ TypeId ScopeBuilder::LookupType(ScopeId scope, const QualifiedName& name) const
       model_.LookupTypeName(scope, name.components[0]);
   if (binding == 0 || model_.BindingAt(binding).type == 0)
     throw std::runtime_error("unknown type name: " + name.Last());
+  if (!model_.IsAccessible(binding, scope))
+    throw std::runtime_error("inaccessible type name: " + name.Last());
   const Binding& value = model_.BindingAt(binding);
   const TypeId type = value.type;
   // A leading-global namespace qualification is retained in the type dump

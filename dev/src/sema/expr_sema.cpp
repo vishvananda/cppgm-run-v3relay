@@ -373,6 +373,26 @@ SemaId ExpressionAnalyzer::AnalyzeName(AstId expression, ScopeId scope)
   vector<BindingId> candidates;
   LookupNameBindings(name, scope, candidates);
   if (candidates.empty())
+  {
+    ScopeId context_scope = scope;
+    ClassEntityId context_class = 0;
+    while (context_scope != model_.GlobalScope())
+    {
+      const Scope& owner = model_.ScopeAt(context_scope);
+      if (owner.kind == SCOPE_CLASS && owner.class_entity != 0)
+      {
+        context_class = owner.class_entity;
+        break;
+      }
+      context_scope = owner.parent;
+    }
+    if (context_class != 0 && !name.Qualified())
+    {
+      model_.LookupMember(context_class, name.Last(), LOOKUP_ANY, candidates);
+      FilterAccessibleBindings(scope, candidates);
+    }
+  }
+  if (candidates.empty())
     throw std::runtime_error("unknown name in expression");
 
   // 7.3.4p6: the level names one entity or an overload set; non-function
@@ -474,6 +494,17 @@ SemaId ExpressionAnalyzer::AnalyzeName(AstId expression, ScopeId scope)
   return result;
 }
 
+void ExpressionAnalyzer::FilterAccessibleBindings(
+    ScopeId scope, vector<BindingId>& bindings) const
+{
+  vector<BindingId> accessible;
+  accessible.reserve(bindings.size());
+  for (size_t i = 0; i < bindings.size(); ++i)
+    if (model_.IsAccessible(bindings[i], scope))
+      accessible.push_back(bindings[i]);
+  bindings.swap(accessible);
+}
+
 void ExpressionAnalyzer::LookupNameBindings(const QualifiedName& name,
                                             ScopeId scope,
                                             vector<BindingId>& bindings)
@@ -483,7 +514,10 @@ void ExpressionAnalyzer::LookupNameBindings(const QualifiedName& name,
   else
     model_.LookupSet(scope, name.Last(), LOOKUP_ANY, bindings);
   if (!name.template_id)
+  {
+    FilterAccessibleBindings(scope, bindings);
     return;
+  }
 
   // A template-id names the instances of the function templates in the set.
   vector<TypeId> arguments;
@@ -506,6 +540,7 @@ void ExpressionAnalyzer::LookupNameBindings(const QualifiedName& name,
                                              function, binding))
       bindings.push_back(binding);
   }
+  FilterAccessibleBindings(scope, bindings);
 }
 
 // Types of a template-id's arguments: each depth-0 comma-separated span is a
@@ -666,7 +701,7 @@ OverloadArgument ExpressionAnalyzer::MakeOperatorArgument(
   try
   {
     (void)builder_.ResolveConstructor(
-        class_type, constructor_arguments, scope);
+        class_type, constructor_arguments, scope, true);
   }
   catch (const std::runtime_error&)
   {
@@ -682,14 +717,15 @@ OverloadArgument ExpressionAnalyzer::MakeOperatorArgument(
 
 SemaId ExpressionAnalyzer::BuildConstructorTemporary(
     AstId source, TypeId target, ScopeId scope,
-    const vector<SemaId>& arguments)
+    const vector<SemaId>& arguments, bool list_initialization,
+    bool copy_initialization)
 {
   const TypeId class_type = types_.Unqualified(target);
   if (types_.Kind(class_type) != TYPE_CLASS)
     throw std::runtime_error("constructor temporary target is not a class");
   const FunctionEntityId constructor =
       builder_.ResolveConstructor(
-          class_type, arguments, scope);
+          class_type, arguments, scope, copy_initialization);
   const FunctionEntity& entity = model_.FunctionAt(constructor);
   const TypeNode& callable = types_.At(types_.Unqualified(entity.type));
   if (arguments.size() + 1 > callable.parameters.size())
@@ -698,7 +734,8 @@ SemaId ExpressionAnalyzer::BuildConstructorTemporary(
   vector<SemaId> converted;
   converted.reserve(callable.parameters.size() - 1);
   for (size_t i = 0; i < arguments.size(); ++i)
-    converted.push_back(Initialize(arguments[i], callable.parameters[i + 1]));
+    converted.push_back(Initialize(arguments[i], callable.parameters[i + 1],
+                                   false, list_initialization));
   for (size_t parameter = arguments.size() + 1;
        parameter < callable.parameters.size(); ++parameter)
   {
@@ -774,7 +811,7 @@ SemaId ExpressionAnalyzer::BuildResolvedCall(
           throw;
         const vector<SemaId> constructor_arguments(1, arguments[i]);
         const SemaId temporary = BuildConstructorTemporary(
-            0, class_type, scope, constructor_arguments);
+            0, class_type, scope, constructor_arguments, false, true);
         converted.push_back(Initialize(
             temporary, callable.parameters[parameter]));
       }
@@ -874,6 +911,7 @@ SemaId ExpressionAnalyzer::TryOperatorCall(
       vector<BindingId> member_bindings;
       model_.LookupMember(types_.At(object_unqualified).entity, name,
                           LOOKUP_FUNCTIONS, member_bindings);
+      FilterAccessibleBindings(scope, member_bindings);
       for (size_t i = 0; i < member_bindings.size(); ++i)
       {
         const Binding& binding = model_.BindingAt(member_bindings[i]);
@@ -940,6 +978,7 @@ SemaId ExpressionAnalyzer::TryCallableObjectCall(
   vector<BindingId> bindings;
   model_.LookupMember(types_.At(object_type).entity, "operator()",
                       LOOKUP_FUNCTIONS, bindings);
+  FilterAccessibleBindings(scope, bindings);
   vector<OverloadCandidate> candidates;
   for (size_t i = 0; i < bindings.size(); ++i)
   {
@@ -1014,6 +1053,7 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
   std::vector<BindingId> candidates;
   model_.LookupMember(types_.At(class_type).entity, name.Last(), LOOKUP_ANY,
                       candidates);
+  FilterAccessibleBindings(scope, candidates);
   if (candidates.empty())
     throw std::runtime_error("unknown class member");
   BindingId binding = candidates.back();
@@ -1169,6 +1209,82 @@ bool ExpressionAnalyzer::CanConvert(SemaId expression, TypeId target) const
   return Classify(model_, types_, source.type, source.category,
                   IsNullPointerConstant(expression),
                   source.is_function_lvalue, target).Viable();
+}
+
+void ExpressionAnalyzer::CheckBaseConversionAccess(TypeId source,
+                                                    TypeId target,
+                                                    ScopeId scope) const
+{
+  TypeId source_type = source;
+  TypeId target_type = target;
+  if (types_.Kind(source_type) == TYPE_REFERENCE)
+    source_type = types_.Referent(source_type);
+  if (types_.Kind(target_type) == TYPE_REFERENCE)
+    target_type = types_.Referent(target_type);
+  source_type = types_.Unqualified(source_type);
+  target_type = types_.Unqualified(target_type);
+
+  if (types_.Kind(source_type) == TYPE_POINTER &&
+      types_.Kind(target_type) == TYPE_POINTER)
+  {
+    source_type = types_.Unqualified(types_.At(source_type).base);
+    target_type = types_.Unqualified(types_.At(target_type).base);
+  }
+  if (types_.Kind(source_type) != TYPE_CLASS ||
+      types_.Kind(target_type) != TYPE_CLASS)
+    return;
+  const ClassEntityId source_class = static_cast<ClassEntityId>(
+      types_.At(source_type).entity);
+  const ClassEntityId target_class = static_cast<ClassEntityId>(
+      types_.At(target_type).entity);
+  if (model_.IsDerivedFrom(source_class, target_class) &&
+      !model_.IsBaseAccessible(source_class, target_class, scope))
+    throw std::runtime_error("inaccessible base-class conversion");
+}
+
+bool ExpressionAnalyzer::IsNarrowingListInitialization(
+    SemaId expression, TypeId target) const
+{
+  TypeId source_type = types_.Unqualified(NodeInfo(expression).type);
+  TypeId target_type = target;
+  if (types_.Kind(target_type) == TYPE_REFERENCE)
+    target_type = types_.Referent(target_type);
+  target_type = types_.Unqualified(target_type);
+  if (types_.Kind(source_type) != TYPE_FUNDAMENTAL ||
+      types_.Kind(target_type) != TYPE_FUNDAMENTAL)
+    return false;
+
+  const EFundamentalType source_fundamental =
+      types_.At(source_type).fundamental;
+  const EFundamentalType target_fundamental =
+      types_.At(target_type).fundamental;
+  const bool source_floating = source_fundamental == FT_FLOAT ||
+      source_fundamental == FT_DOUBLE ||
+      source_fundamental == FT_LONG_DOUBLE;
+  const bool target_floating = target_fundamental == FT_FLOAT ||
+      target_fundamental == FT_DOUBLE ||
+      target_fundamental == FT_LONG_DOUBLE;
+  const bool target_integral = FundamentalIsIntegral(target_fundamental);
+  if (source_floating && target_integral)
+    return true;
+  if (source_floating && target_floating &&
+      FundamentalSize(source_fundamental) > FundamentalSize(target_fundamental))
+    return true;
+  if (FundamentalIsIntegral(source_fundamental) && target_floating)
+  {
+    // A constant integral expression is permitted when its value can be
+    // represented exactly by the destination floating type.  This bounded
+    // test covers the target's binary precision without evaluating a float.
+    const SemaNode& node = tree_.At(expression);
+    if (!node.has_value)
+      return true;
+    const long long value = node.value;
+    const long long limit = target_fundamental == FT_FLOAT ?
+        (1LL << 24) : target_fundamental == FT_DOUBLE ?
+        (1LL << 53) : std::numeric_limits<long long>::max();
+    return value > limit || value < -limit;
+  }
+  return false;
 }
 
 bool ExpressionAnalyzer::RetargetFunctionName(SemaId expression,
@@ -1546,6 +1662,7 @@ SemaId ExpressionAnalyzer::AnalyzeCast(AstId expression, ScopeId scope)
     throw std::runtime_error("invalid cast expression");
   const TypeId target = builder_.TypeOfTypeId(Child(expression, 0), scope);
   const SemaId operand = Analyze(Child(expression, 1), scope);
+  CheckBaseConversionAccess(NodeInfo(operand).type, target, scope);
   const TypeId target_kind = types_.Unqualified(target);
   if (types_.Kind(target_kind) == TYPE_POINTER ||
       types_.Kind(target_kind) == TYPE_MEMBER_POINTER)
@@ -1629,6 +1746,7 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
     model_.LookupMember(types_.At(object_type).entity,
                         arena_.At(member_name).text, LOOKUP_FUNCTIONS,
                         result.bindings);
+    FilterAccessibleBindings(scope, result.bindings);
     if (result.bindings.empty())
       throw std::runtime_error("member call names no function");
     for (std::size_t i = 0; i < result.bindings.size(); ++i) {
@@ -1809,6 +1927,7 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
       argument_types.push_back(overload_arguments[i].type);
     vector<BindingId> call_bindings;
     model_.LookupCallSet(scope, name.Last(), argument_types, call_bindings);
+    FilterAccessibleBindings(scope, call_bindings);
     bindings.swap(call_bindings);
   }
 
@@ -2064,7 +2183,8 @@ SemaId ExpressionAnalyzer::AnalyzeNew(AstId expression, ScopeId scope)
         for (size_t i = 0; i < arguments.size(); ++i)
           constructor_arguments.push_back(Analyze(arguments[i], scope));
         initialization = BuildConstructorTemporary(
-            initializer, allocated_type, scope, constructor_arguments);
+            initializer, allocated_type, scope, constructor_arguments,
+            initializer_kind == AST_BRACED_INIT_LIST);
       }
     } else {
       initialization = BuildConstructorTemporary(
@@ -2108,7 +2228,7 @@ SemaId ExpressionAnalyzer::AnalyzeFunctionalCast(
     converted.reserve(callable.parameters.size() - 1);
     for (size_t i = 0; i < analyzed_arguments.size(); ++i)
       converted.push_back(Initialize(analyzed_arguments[i],
-                                     callable.parameters[i + 1]));
+                                     callable.parameters[i + 1], false, true));
     for (size_t parameter = analyzed_arguments.size() + 1;
          parameter < callable.parameters.size(); ++parameter)
     {
@@ -2210,7 +2330,7 @@ SemaId ExpressionAnalyzer::AnalyzeBraced(AstId expression, ScopeId scope,
       if (children.size() == 1)
       {
         const SemaId child = Analyze(children[0], scope);
-        Initialize(child, target);
+        Initialize(child, target, false, true);
         Append(result, child);
       }
       return result;
@@ -2297,7 +2417,7 @@ SemaId ExpressionAnalyzer::AnalyzeAggregateClause(
     for (size_t i = 0; i < arguments.size(); ++i)
       analyzed.push_back(Analyze(arguments[i], scope));
     ++index;
-    return BuildConstructorTemporary(clause, target, scope, analyzed);
+    return BuildConstructorTemporary(clause, target, scope, analyzed, true);
   }
   if (IsAggregateType(target))
     return AnalyzeElidedAggregate(clauses, index, scope, target);
@@ -2311,7 +2431,7 @@ SemaId ExpressionAnalyzer::AnalyzeAggregateClause(
   if (types_.Kind(unqualified) == TYPE_CLASS)
     return BuildConstructorTemporary(clause, target, scope,
                                      std::vector<SemaId>(1, expression));
-  Initialize(expression, target);
+  Initialize(expression, target, false, true);
   return expression;
 }
 
@@ -2379,7 +2499,8 @@ bool ExpressionAnalyzer::IsNullPointerConstant(SemaId semantic) const
 }
 
 SemaId ExpressionAnalyzer::Initialize(SemaId expression, TypeId target,
-                                       bool constexpr_object)
+                                       bool constexpr_object,
+                                       bool list_initialization)
 {
   if (expression == 0 || target == 0)
     throw std::runtime_error("invalid initializer");
@@ -2398,6 +2519,10 @@ SemaId ExpressionAnalyzer::Initialize(SemaId expression, TypeId target,
       IsNullPointerConstant(expression), source.is_function_lvalue, target);
   if (!conversion.Viable())
     throw std::runtime_error("initializer conversion is not viable");
+  CheckBaseConversionAccess(source.type, target, tree_.At(expression).scope);
+  if (list_initialization &&
+      IsNarrowingListInitialization(expression, target))
+    throw std::runtime_error("narrowing conversion in list-initialization");
   if (types_.Kind(target) == TYPE_REFERENCE)
   {
     // 8.5.3p5: a temporary created through a promotion or conversion is

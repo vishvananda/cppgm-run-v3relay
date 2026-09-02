@@ -295,10 +295,16 @@ void ScopeBuilder::BuildUsingDeclaration(AstId node, ScopeId scope)
   }
   if (target == 0 || model_.BindingAt(target).kind == BINDING_NAMESPACE)
     throw std::runtime_error("using-declaration target not found");
+  if (!model_.IsAccessible(target, scope))
+    throw std::runtime_error("using-declaration names an inaccessible member");
   const Binding source = model_.BindingAt(target);
   Binding& imported = model_.BindingAt(model_.AddBinding(
       scope, name.Last(), source.kind, source.type));
   imported.function = source.function;
+  imported.declaring_class = source.declaring_class;
+  imported.access = member_access_;
+  imported.static_member = source.static_member;
+  imported.field_index = source.field_index;
   imported.has_const_value = source.has_const_value;
   imported.const_value = source.const_value;
 }
@@ -350,12 +356,14 @@ void ScopeBuilder::BuildInheritedConstructors(ClassEntityId derived,
     function.special_member = SPECIAL_MEMBER_CONSTRUCTOR;
     function.in_class_definition = true;
     function.synthesized = true;
+    function.explicit_constructor = source.explicit_constructor;
     function.default_arguments = source_default_arguments;
     function.default_semantic_arguments = source_default_semantic_arguments;
     function.parameter_names = source_parameter_names;
     const BindingId binding = model_.AddBinding(
         scope, name, BINDING_FUNCTION, function_type);
     model_.BindingAt(binding).function = inherited;
+    model_.BindingAt(binding).declaring_class = derived;
     owner.constructors.push_back(inherited);
 
     if (!EmitsSemantics())
@@ -365,6 +373,7 @@ void ScopeBuilder::BuildInheritedConstructors(ClassEntityId derived,
     DeferSemantic(function_node);
     const ScopeId function_scope = model_.CreateScope(
         SCOPE_FUNCTION, name, scope);
+    model_.ScopeAt(function_scope).function_entity = inherited;
     const BindingId this_binding = model_.AddBinding(
         function_scope, "this", BINDING_PARAMETER,
         function_type == 0 ? 0 : types_.At(types_.Unqualified(
@@ -454,15 +463,27 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     anonymous_name = generated.str();
   }
   const TypeId base = BuildSpecifierType(specifiers, scope, anonymous_name);
+  const bool is_friend = SequenceHasKeyword(specifiers, KW_FRIEND);
+  ClassEntityId friend_owner = 0;
+  const bool has_friend_owner = model_.ClassForScope(scope, friend_owner);
   if (list == 0)
   {
+    if (is_friend && has_friend_owner &&
+        types_.Kind(types_.Unqualified(base)) == TYPE_CLASS)
+    {
+      const ClassEntityId friend_class = static_cast<ClassEntityId>(
+          types_.At(types_.Unqualified(base)).entity);
+      std::vector<ClassEntityId>& friends = model_.ClassAt(
+          friend_owner).friend_classes;
+      if (std::find(friends.begin(), friends.end(), friend_class) == friends.end())
+        friends.push_back(friend_class);
+    }
     if (EmitsSemantics() && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
       MakeSemantic(SEMA_SIMPLE_DECLARATION, scope,
                    semantic_parent != 0 ? semantic_parent :
                        SemanticParent(scope));
     return;
   }
-
   const vector<AstId>& items = arena_.At(list).children;
   SemaId declaration_node = 0;
   if (EmitsSemantics() && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
@@ -480,7 +501,6 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     const AstId identifier = FindIdentifier(declarator);
     const QualifiedName declared_name = NodeName(identifier);
     ScopeId target_scope = ResolveDeclarationScope(scope, identifier, name);
-    const bool is_friend = SequenceHasKeyword(specifiers, KW_FRIEND);
     if (is_friend && !declared_name.Qualified())
       target_scope = EnclosingNamespace(scope);
     const AstId initializer = FindChild(items[i], AST_INITIALIZER);
@@ -524,12 +544,22 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
           HasConstFunctionQualifier(declarator),
           HasVolatileFunctionQualifier(declarator),
           SequenceHasKeyword(specifiers, KW_STATIC),
-          IsNoThrowDeclarator(declarator, target_scope), default_arguments);
-      if (is_friend && !had_visible_declaration &&
-          model_.ClassForScope(scope, member_class))
+          IsNoThrowDeclarator(declarator, target_scope), default_arguments,
+          SequenceHasKeyword(specifiers, KW_EXPLICIT));
+      if (is_friend && has_friend_owner)
       {
-        model_.BindingAt(binding).hidden_friend = true;
-        model_.ClassAt(member_class).hidden_friends.push_back(binding);
+        std::vector<FunctionEntityId>& friends = model_.ClassAt(
+            friend_owner).friend_functions;
+        if (std::find(friends.begin(), friends.end(), function) == friends.end())
+          friends.push_back(function);
+        if (!had_visible_declaration)
+        {
+          model_.BindingAt(binding).hidden_friend = true;
+          std::vector<BindingId>& hidden = model_.ClassAt(
+              friend_owner).hidden_friends;
+          if (std::find(hidden.begin(), hidden.end(), binding) == hidden.end())
+            hidden.push_back(binding);
+        }
       }
       if (EmitsSemantics() && !is_member)
         MakeSemantic(SEMA_FUNCTION_DECLARATION, target_scope,
@@ -541,6 +571,7 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     binding = model_.AddBinding(target_scope, name, kind, type);
     model_.BindingAt(binding).access = is_member ? member_access_ :
         ACCESS_PUBLIC;
+    model_.BindingAt(binding).declaring_class = is_member ? member_class : 0;
     model_.BindingAt(binding).static_member = static_member;
     TypeId linkage_type = type;
     while (linkage_type != 0 &&
@@ -639,17 +670,37 @@ void ScopeBuilder::BuildVariable(BindingId binding, AstId initializer,
       value = arena_.At(value).children[0];
     }
     const AstKind value_kind = arena_.At(value).kind;
-    if ((value_kind == AST_PAREN_INITIALIZER ||
-         value_kind == AST_BRACED_INIT_LIST) &&
-        !model_.ClassAt(types_.At(unqualified).entity).aggregate &&
-        !model_.ClassAt(types_.At(unqualified).entity).constructors.empty())
+    const ClassEntity& class_entity =
+        model_.ClassAt(types_.At(unqualified).entity);
+    const AstId value_identifier = FindIdentifier(declarator);
+    const std::size_t after_declarator = value_identifier == 0 ? 0 :
+        arena_.At(value_identifier).last;
+    const bool copy_list_initialization = value_kind == AST_BRACED_INIT_LIST &&
+        after_declarator < tokens_.size() &&
+        tokens_[after_declarator].IsSimple(OP_ASS);
+    if (!class_entity.aggregate && !class_entity.constructors.empty())
     {
+      std::vector<AstId> arguments = arena_.At(value).children;
+      bool copy_initialization = false;
+      bool list_initialization = false;
+      if (value_kind == AST_PAREN_INITIALIZER)
+        ;
+      else if (value_kind == AST_BRACED_INIT_LIST)
+      {
+        copy_initialization = copy_list_initialization;
+        list_initialization = true;
+      }
+      else
+      {
+        arguments.assign(1, value);
+        copy_initialization = true;
+      }
       AddConstructorActionWithArguments(
-          variable, scope, type, binding, arena_.At(value).children);
+          variable, scope, type, binding, arguments, copy_initialization,
+          list_initialization);
       return;
     }
-    if (value_kind == AST_BRACED_INIT_LIST &&
-        !model_.ClassAt(types_.At(unqualified).entity).aggregate)
+    if (value_kind == AST_BRACED_INIT_LIST && !class_entity.aggregate)
       throw std::runtime_error("class is not an aggregate");
     if (value_kind == AST_PAREN_INITIALIZER)
       throw std::runtime_error("class has no viable constructor");
@@ -693,6 +744,8 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   const QualifiedName declared_name = NodeName(identifier);
   ScopeId target_scope = ResolveDeclarationScope(scope, identifier, name);
   const bool is_friend = SequenceHasKeyword(specifiers, KW_FRIEND);
+  ClassEntityId friend_owner = 0;
+  const bool has_friend_owner = model_.ClassForScope(scope, friend_owner);
   if (is_friend && !declared_name.Qualified())
     target_scope = EnclosingNamespace(scope);
   const ScopeId type_scope = is_friend ? scope : target_scope;
@@ -714,7 +767,8 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
       HasConstFunctionQualifier(declarator),
       HasVolatileFunctionQualifier(declarator),
       SequenceHasKeyword(specifiers, KW_STATIC),
-      IsNoThrowDeclarator(declarator, target_scope), default_arguments);
+      IsNoThrowDeclarator(declarator, target_scope), default_arguments,
+      SequenceHasKeyword(specifiers, KW_EXPLICIT));
   ClassEntityId member_class = 0;
   const bool is_member = model_.ClassForScope(target_scope, member_class) &&
       model_.FunctionAt(function).is_member;
@@ -726,9 +780,12 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   model_.FunctionAt(function).in_class_definition = is_friend ||
       (is_member &&
        (scope == target_scope || SequenceHasKeyword(specifiers, KW_INLINE)));
-  if (is_friend && !declared_name.Qualified() &&
-      model_.ClassForScope(scope, member_class))
+  if (is_friend && has_friend_owner)
   {
+    std::vector<FunctionEntityId>& friends = model_.ClassAt(
+        friend_owner).friend_functions;
+    if (std::find(friends.begin(), friends.end(), function) == friends.end())
+      friends.push_back(function);
     bool had_visible_declaration = false;
     std::vector<BindingId> visible;
     model_.DirectBindings(target_scope, name, LOOKUP_FUNCTIONS, visible);
@@ -738,9 +795,12 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
     for (std::size_t i = 0; i < visible.size(); ++i)
       if (visible[i] != binding)
         had_visible_declaration = true;
-    if (!had_visible_declaration) {
+    if (!declared_name.Qualified() && !had_visible_declaration) {
       model_.BindingAt(binding).hidden_friend = true;
-      model_.ClassAt(member_class).hidden_friends.push_back(binding);
+      std::vector<BindingId>& hidden = model_.ClassAt(
+          friend_owner).hidden_friends;
+      if (std::find(hidden.begin(), hidden.end(), binding) == hidden.end())
+        hidden.push_back(binding);
     }
   }
   SemaId function_node = 0;
@@ -760,6 +820,7 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   }
   const ScopeId function_scope = model_.CreateScope(
       SCOPE_FUNCTION, name, is_friend ? scope : target_scope);
+  model_.ScopeAt(function_scope).function_entity = function;
   if (function_node != 0)
     MapSemanticScope(function_scope, function_node);
 
@@ -842,6 +903,9 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
   const AstId declarator = FindChild(node, AST_DECLARATOR);
   if (declarator == 0)
     throw std::runtime_error("special member has no declarator");
+  const AstId member_specifiers = FindChild(node, AST_MEMBER_SPECIFIERS);
+  const bool explicit_constructor = member_specifiers != 0 &&
+      SequenceHasKeyword(member_specifiers, KW_EXPLICIT);
   const AstId identifier = FindIdentifier(declarator);
   const std::string spelling = identifier == 0 ? std::string() :
       arena_.At(identifier).text;
@@ -882,7 +946,8 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
   const FunctionEntityId function = DeclareFunction(
       scope, name, declared_type, definition, binding, member_const,
       member_volatile,
-      false, IsNoThrowDeclarator(declarator, scope), defaults);
+      false, IsNoThrowDeclarator(declarator, scope), defaults,
+      explicit_constructor);
   if (binding == 0)
     throw std::runtime_error("special member has no binding");
 
@@ -920,6 +985,7 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
 
   const ScopeId function_scope = model_.CreateScope(
       SCOPE_FUNCTION, name, scope);
+  model_.ScopeAt(function_scope).function_entity = function;
   MapSemanticScope(function_scope, function_node);
   const TypeNode& canonical = types_.At(
       types_.Unqualified(model_.FunctionAt(function).type));
@@ -958,7 +1024,8 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
 }
 
 FunctionEntityId ScopeBuilder::ResolveConstructor(
-    TypeId type, const std::vector<SemaId>& arguments, ScopeId scope)
+    TypeId type, const std::vector<SemaId>& arguments, ScopeId scope,
+    bool copy_initialization)
 {
   const TypeId class_type = types_.Unqualified(type);
   if (types_.Kind(class_type) != TYPE_CLASS)
@@ -973,7 +1040,6 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
       return EnsureAggregateConstructor(class_type, arguments);
     throw std::runtime_error("class has no viable constructor");
   }
-
   std::vector<BindingId> declared;
   model_.DirectBindings(owner.class_scope,
                         model_.ScopeAt(owner.class_scope).name,
@@ -986,6 +1052,9 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
         model_.FunctionAt(binding.function).special_member !=
             SPECIAL_MEMBER_CONSTRUCTOR ||
         model_.FunctionAt(binding.function).deleted)
+      continue;
+    if (copy_initialization &&
+        model_.FunctionAt(binding.function).explicit_constructor)
       continue;
     candidates.push_back(declared[i]);
   }
@@ -1074,7 +1143,6 @@ FunctionEntityId ScopeBuilder::EnsureAggregateConstructor(
   model_.BindingAt(binding).function = constructor;
   model_.BindingAt(binding).access = ACCESS_PUBLIC;
   owner.constructors.push_back(constructor);
-
   if (EmitsSemantics())
   {
     const SemaId function_node = MakeDetachedSemantic(
@@ -1083,6 +1151,7 @@ FunctionEntityId ScopeBuilder::EnsureAggregateConstructor(
     DeferSemantic(function_node);
     const ScopeId function_scope = model_.CreateScope(
         SCOPE_FUNCTION, name, owner.class_scope);
+    model_.ScopeAt(function_scope).function_entity = constructor;
     const SemaId this_parameter = tree_->Make(SEMA_PARAMETER);
     SemaNode& this_node = tree_->At(this_parameter);
     this_node.scope = function_scope;
@@ -1238,22 +1307,24 @@ void ScopeBuilder::BuildMemberInitializers(AstId initializer,
 
 void ScopeBuilder::AddConstructorActionWithArguments(
     SemaId variable, ScopeId scope, TypeId type, BindingId binding,
-    const std::vector<AstId>& argument_nodes)
+    const std::vector<AstId>& argument_nodes, bool copy_initialization,
+    bool list_initialization)
 {
   if (!EmitsSemantics())
     return;
   std::vector<SemaId> arguments;
   for (std::size_t i = 0; i < argument_nodes.size(); ++i)
     arguments.push_back(expression_.Analyze(argument_nodes[i], scope));
-  const FunctionEntityId constructor = ResolveConstructor(type, arguments,
-                                                           scope);
+  const FunctionEntityId constructor = ResolveConstructor(
+      type, arguments, scope, copy_initialization);
   const FunctionEntity& function = model_.FunctionAt(constructor);
   const TypeNode& callable = types_.At(types_.Unqualified(function.type));
   std::vector<SemaId> converted;
   converted.reserve(callable.parameters.size());
   for (std::size_t i = 0; i < arguments.size(); ++i)
     converted.push_back(expression_.Initialize(arguments[i],
-                                               callable.parameters[i + 1]));
+                                               callable.parameters[i + 1],
+                                               false, list_initialization));
   for (std::size_t parameter = arguments.size() + 1;
        parameter < callable.parameters.size(); ++parameter)
   {
@@ -1463,6 +1534,10 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
       const BindingId injected_id = model_.AddBinding(
           scope, member.name, member.kind, member.type);
       Binding& injected = model_.BindingAt(injected_id);
+      injected.access = member.access;
+      injected.declaring_class = member.declaring_class;
+      injected.static_member = member.static_member;
+      injected.field_index = member.field_index;
       injected.has_const_value = member.has_const_value;
       injected.const_value = member.const_value;
       model_.ClassAt(entity).injected_members.push_back(injected_id);
@@ -2344,6 +2419,7 @@ FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
     DeferSemantic(function_node);
     const ScopeId function_scope = model_.CreateScope(
         SCOPE_FUNCTION, name, owner.class_scope);
+    model_.ScopeAt(function_scope).function_entity = constructor;
     const SemaId this_parameter = tree_->Make(SEMA_PARAMETER);
     SemaNode& parameter = tree_->At(this_parameter);
     parameter.scope = function_scope;
@@ -2396,7 +2472,6 @@ FunctionEntityId ScopeBuilder::EnsureDestructor(TypeId type)
       owner.class_scope, name, BINDING_FUNCTION, destructor_type);
   model_.BindingAt(binding).function = destructor;
   owner.destructor = destructor;
-
   if (EmitsSemantics())
   {
     const SemaId function_node = MakeDetachedSemantic(
@@ -2405,6 +2480,7 @@ FunctionEntityId ScopeBuilder::EnsureDestructor(TypeId type)
     DeferSemantic(function_node);
     const ScopeId function_scope = model_.CreateScope(
         SCOPE_FUNCTION, name, owner.class_scope);
+    model_.ScopeAt(function_scope).function_entity = destructor;
     const SemaId this_parameter = tree_->Make(SEMA_PARAMETER);
     SemaNode& parameter = tree_->At(this_parameter);
     parameter.scope = function_scope;
@@ -2685,6 +2761,7 @@ void ScopeBuilder::EmitTemplateInstances()
         function.type, instance.binding, instance.function);
     const ScopeId function_scope = model_.CreateScope(
         SCOPE_FUNCTION, function.name, function.scope);
+    model_.ScopeAt(function_scope).function_entity = instance.function;
     const TypeNode& type = types_.At(types_.Unqualified(function.type));
     for (std::size_t parameter = 0; parameter < type.parameters.size();
          ++parameter)
@@ -2716,7 +2793,8 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
                                                bool internal_linkage,
                                                bool noexcept_qualifier,
                                                const vector<AstId>&
-                                                   default_arguments)
+                                                   default_arguments,
+                                               bool explicit_constructor)
 {
   const TypeId unqualified = types_.Unqualified(declared_type);
   if (types_.Kind(unqualified) != TYPE_FUNCTION)
@@ -2841,6 +2919,8 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
       entity.c_linkage = entity.c_linkage || c_linkage_depth_ != 0;
       entity.noexcept_qualifier = entity.noexcept_qualifier ||
           noexcept_qualifier;
+      entity.explicit_constructor = entity.explicit_constructor ||
+          explicit_constructor;
       if (entity.default_arguments.size() < canonical_parameters.size())
         entity.default_arguments.resize(canonical_parameters.size(), 0);
       for (std::size_t i = 0; i < canonical_defaults.size() &&
@@ -2850,6 +2930,7 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
       binding = model_.AddBinding(scope, name, BINDING_FUNCTION,
                                   declared_type);
       model_.BindingAt(binding).function = prior.function;
+      model_.BindingAt(binding).declaring_class = is_member ? member_class : 0;
       model_.BindingAt(binding).access = member_access_;
       model_.BindingAt(binding).static_member = static_member;
       model_.BindingAt(binding).internal_linkage = entity.internal_linkage;
@@ -2876,9 +2957,11 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     entity.member_volatile = member_volatile;
   }
   model_.FunctionAt(function).noexcept_qualifier = noexcept_qualifier;
+  model_.FunctionAt(function).explicit_constructor = explicit_constructor;
   model_.FunctionAt(function).default_arguments = canonical_defaults;
   binding = model_.AddBinding(scope, name, BINDING_FUNCTION, declared_type);
   model_.BindingAt(binding).function = function;
+  model_.BindingAt(binding).declaring_class = is_member ? member_class : 0;
   model_.BindingAt(binding).access = member_access_;
   model_.BindingAt(binding).static_member = static_member;
   model_.BindingAt(binding).internal_linkage = effective_internal_linkage;

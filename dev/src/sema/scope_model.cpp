@@ -4,7 +4,8 @@
 #include <stdexcept>
 
 Binding::Binding()
-    : kind(BINDING_VARIABLE), type(0), scope(0), namespace_scope(0),
+    : kind(BINDING_VARIABLE), type(0), scope(0), declaring_class(0),
+      namespace_scope(0),
       function(0), object_binding(0),
       internal_linkage(false), c_linkage(false), extern_declaration(false),
       hidden_friend(false), noexcept_qualifier(false), access(ACCESS_PUBLIC),
@@ -15,7 +16,7 @@ Binding::Binding()
 }
 
 Scope::Scope()
-    : kind(SCOPE_NAMESPACE), parent(0), class_entity(0),
+    : kind(SCOPE_NAMESPACE), parent(0), class_entity(0), function_entity(0),
       inline_namespace(false), unnamed_namespace(false)
 {
 }
@@ -41,7 +42,7 @@ FunctionEntity::FunctionEntity()
       is_template(false), internal_linkage(false), c_linkage(false),
       noexcept_qualifier(false), special_member(SPECIAL_MEMBER_NONE),
       body(0), ctor_initializer(0), parameter_names(), defaulted(false),
-      deleted(false),
+      deleted(false), explicit_constructor(false),
       static_member(false), in_class_definition(false), synthesized(false),
       default_semantic_arguments(), default_member_initializers(),
       defined(false)
@@ -408,11 +409,16 @@ const ClassField* SemaModel::FieldFor(BindingId binding) const
   const Binding& value = bindings_[binding];
   if (value.field_index == kNoFieldIndex || value.scope >= scopes_.size())
     return 0;
-  const Scope& owner = scopes_[value.scope];
-  if (owner.kind != SCOPE_CLASS || owner.class_entity == 0 ||
-      owner.class_entity >= classes_.size())
+  const Scope& owner_scope = scopes_[value.scope];
+  ClassEntityId owner = value.declaring_class;
+  if (owner == 0) {
+    if (owner_scope.kind != SCOPE_CLASS || owner_scope.class_entity == 0)
+      return 0;
+    owner = owner_scope.class_entity;
+  }
+  if (owner >= classes_.size())
     return 0;
-  const ClassEntity& entity = classes_[owner.class_entity];
+  const ClassEntity& entity = classes_[owner];
   return value.field_index < entity.fields.size() ?
       &entity.fields[value.field_index] : 0;
 }
@@ -440,6 +446,193 @@ bool SemaModel::IsDerivedFrom(ClassEntityId derived, ClassEntityId base) const
     }
   }
   return false;
+}
+
+ClassEntityId SemaModel::DeclaringClass(BindingId binding) const
+{
+  if (binding == 0 || binding >= bindings_.size())
+    return 0;
+  const Binding& value = bindings_[binding];
+  if (value.declaring_class != 0)
+    return value.declaring_class;
+  if (value.kind == BINDING_FUNCTION && value.function != 0 &&
+      value.function < functions_.size())
+    return functions_[value.function].member_class;
+  ScopeId scope = value.scope;
+  while (scope < scopes_.size())
+  {
+    const Scope& owner = scopes_[scope];
+    if (owner.kind == SCOPE_CLASS && owner.class_entity != 0)
+      return owner.class_entity;
+    if (scope == GlobalScope())
+      break;
+    scope = owner.parent;
+  }
+  return 0;
+}
+
+FunctionEntityId SemaModel::ContextFunction(ScopeId scope) const
+{
+  while (scope < scopes_.size())
+  {
+    const Scope& owner = scopes_[scope];
+    if (owner.kind == SCOPE_FUNCTION && owner.function_entity != 0)
+      return owner.function_entity;
+    if (scope == GlobalScope())
+      break;
+    scope = owner.parent;
+  }
+  return 0;
+}
+
+void SemaModel::ContextClasses(
+    ScopeId scope, std::vector<ClassEntityId>& result) const
+{
+  result.clear();
+  while (scope < scopes_.size())
+  {
+    const Scope& owner = scopes_[scope];
+    if (owner.kind == SCOPE_CLASS && owner.class_entity != 0 &&
+        std::find(result.begin(), result.end(), owner.class_entity) ==
+            result.end())
+      result.push_back(owner.class_entity);
+    if (scope == GlobalScope())
+      break;
+    scope = owner.parent;
+  }
+}
+
+bool SemaModel::IsNestedClassOf(ClassEntityId nested,
+                                ClassEntityId enclosing) const
+{
+  if (nested == 0 || enclosing == 0 || nested >= classes_.size() ||
+      enclosing >= classes_.size())
+    return false;
+  if (nested == enclosing)
+    return true;
+  ScopeId scope = classes_[nested].class_scope;
+  while (scope < scopes_.size())
+  {
+    if (scope == GlobalScope())
+      break;
+    scope = scopes_[scope].parent;
+    if (scope < scopes_.size() && scopes_[scope].kind == SCOPE_CLASS &&
+        scopes_[scope].class_entity == enclosing)
+      return true;
+  }
+  return false;
+}
+
+bool SemaModel::IsFriendClass(ClassEntityId owner,
+                              ClassEntityId context) const
+{
+  if (owner == 0 || context == 0 || owner >= classes_.size() ||
+      context >= classes_.size())
+    return false;
+  const std::vector<ClassEntityId>& friends = classes_[owner].friend_classes;
+  for (std::size_t i = 0; i < friends.size(); ++i)
+    if (IsNestedClassOf(context, friends[i]))
+      return true;
+  return false;
+}
+
+bool SemaModel::IsFriendFunction(ClassEntityId owner,
+                                  FunctionEntityId context) const
+{
+  if (owner == 0 || context == 0 || owner >= classes_.size())
+    return false;
+  const std::vector<FunctionEntityId>& friends =
+      classes_[owner].friend_functions;
+  return std::find(friends.begin(), friends.end(), context) != friends.end();
+}
+
+bool SemaModel::ContextCanAccess(ClassEntityId owner, AccessKind access,
+                                 ScopeId context) const
+{
+  if (owner == 0 || owner >= classes_.size())
+    return false;
+  std::vector<ClassEntityId> classes;
+  ContextClasses(context, classes);
+  const FunctionEntityId function = ContextFunction(context);
+  for (std::size_t i = 0; i < classes.size(); ++i)
+  {
+    const ClassEntityId candidate = classes[i];
+    if (candidate == owner || IsNestedClassOf(candidate, owner) ||
+        IsFriendClass(owner, candidate) ||
+        (access == ACCESS_PROTECTED && IsDerivedFrom(candidate, owner)))
+      return true;
+  }
+  if (IsFriendFunction(owner, function))
+    return true;
+
+  // A friend of an intermediate derived class can use a protected member
+  // inherited through that class.  It does not gain access to the base's
+  // private members, so this relation is deliberately restricted to
+  // protected access.
+  if (access == ACCESS_PROTECTED)
+    for (ClassEntityId candidate = 1; candidate < classes_.size(); ++candidate)
+    {
+      if (candidate != owner && !IsDerivedFrom(candidate, owner))
+        continue;
+      bool friend_class = false;
+      for (std::size_t i = 0; i < classes.size(); ++i)
+        if (IsFriendClass(candidate, classes[i]))
+          friend_class = true;
+      if (friend_class || IsFriendFunction(candidate, function))
+        return true;
+    }
+  return false;
+}
+
+bool SemaModel::IsAccessible(BindingId binding, ScopeId context) const
+{
+  if (binding == 0 || binding >= bindings_.size())
+    return false;
+  const Binding& value = bindings_[binding];
+  if (value.access == ACCESS_PUBLIC)
+    return true;
+  const ClassEntityId owner = DeclaringClass(binding);
+  return owner != 0 && ContextCanAccess(owner, value.access, context);
+}
+
+bool SemaModel::IsBaseEdgeAccessible(ClassEntityId owner, AccessKind access,
+                                     ScopeId context) const
+{
+  return access == ACCESS_PUBLIC || ContextCanAccess(owner, access, context);
+}
+
+bool SemaModel::FindAccessibleBasePath(
+    ClassEntityId current, ClassEntityId target, ScopeId context,
+    std::vector<ClassEntityId>& visited) const
+{
+  if (current == target)
+    return true;
+  if (current == 0 || current >= classes_.size() ||
+      std::find(visited.begin(), visited.end(), current) != visited.end())
+    return false;
+  visited.push_back(current);
+  const ClassEntity& owner = classes_[current];
+  for (std::size_t i = 0; i < owner.bases.size(); ++i)
+  {
+    const ClassBase& base = owner.bases[i];
+    if (!IsBaseEdgeAccessible(current, base.access, context))
+      continue;
+    if (FindAccessibleBasePath(base.entity, target, context, visited))
+      return true;
+  }
+  return false;
+}
+
+bool SemaModel::IsBaseAccessible(ClassEntityId derived, ClassEntityId base,
+                                  ScopeId context) const
+{
+  if (derived == 0 || base == 0 || derived >= classes_.size() ||
+      base >= classes_.size())
+    return false;
+  if (derived == base)
+    return true;
+  std::vector<ClassEntityId> visited;
+  return FindAccessibleBasePath(derived, base, context, visited);
 }
 
 void SemaModel::CollectClassMember(

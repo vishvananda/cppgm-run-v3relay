@@ -819,8 +819,19 @@ AstId Pa10Parser::parse_statement()
 			is_kind(PA6_IDENTIFIER_TOKEN, pos_ + 5) &&
 			is_simple(OP_RPAREN, pos_ + 6) &&
 			is_simple(OP_LPAREN, pos_ + 7);
+		// A qualified class name followed by a call is declaration-shaped in
+		// the grammar, but it is an expression when the final component names
+		// a static member function.  Keep the tentative expression available
+		// for semantic lookup; a real type-name declaration still falls back
+		// transactionally below when this parse cannot form a call.
+		const bool qualified_type_call =
+			binding != 0 &&
+			(*binding == BIND_TYPE || *binding == BIND_TEMPLATE) &&
+			is_simple(OP_COLON2, pos_ + 1) &&
+			is_kind(PA6_IDENTIFIER_TOKEN, pos_ + 2) &&
+			is_simple(OP_LPAREN, pos_ + 3);
 		if (is_kind(PA6_IDENTIFIER_TOKEN) &&
-			(binding == 0 || *binding == BIND_NAMESPACE) &&
+			(binding == 0 || *binding == BIND_NAMESPACE || qualified_type_call) &&
 			!qualified_pointer_declaration)
 		{
 			const Mark expression_mark = mark();

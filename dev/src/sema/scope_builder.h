@@ -56,8 +56,9 @@ public:
   // declares none.  Expression analysis and declarations share this one
   // selection so temporaries and named objects agree.
   FunctionEntityId ResolveConstructor(TypeId type,
-                                      const std::vector<SemaId>& arguments,
-                                      ScopeId scope);
+                                       const std::vector<SemaId>& arguments,
+                                       ScopeId scope,
+                                       bool copy_initialization = false);
 
 private:
   struct ParameterInfo
@@ -160,7 +161,9 @@ private:
                             BindingId binding, AstId declarator);
   void AddConstructorActionWithArguments(
       SemaId variable, ScopeId scope, TypeId type, BindingId binding,
-      const std::vector<AstId>& arguments);
+      const std::vector<AstId>& arguments,
+      bool copy_initialization = false,
+      bool list_initialization = false);
   void BuildMemberInitializers(AstId initializer, ScopeId function_scope,
                                SemaId function_node,
                                FunctionEntityId owner);
@@ -234,7 +237,8 @@ private:
                                    bool internal_linkage = false,
                                    bool noexcept_qualifier = false,
                                    const std::vector<AstId>& default_arguments =
-                                       std::vector<AstId>());
+                                       std::vector<AstId>(),
+                                   bool explicit_constructor = false);
   SemaId MakeDetachedSemantic(SemaKind kind, ScopeId scope, TypeId type,
                               BindingId binding, FunctionEntityId function);
   TypeId SubstituteTemplateType(TypeId type, const TemplateBindings& values);

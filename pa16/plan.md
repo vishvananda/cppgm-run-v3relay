@@ -236,7 +236,7 @@ comes from the intended check.
 | CP4a aggregate and bit-field initialization/lowering (completed) | local class aggregates, brace elision, nested arrays and string members, reference-member storage, complete-class deferred analysis, pack-state layout, anonymous aliases, and bit-field declaration/read/increment lowering | 149/243 pa16 tests pass (94 failures, down from 101) but eight CP3-passing fixtures regressed (hidden-friend bodies, defaulted constructor, global class array); through-pa15 is 1139/1139; file audit passes with five nonfatal warnings |
 | review 1 (completed; `audit.md`) | CP4a regressions restored; recursive special-member synthesis; class-model ownership of destructor triviality and field records; bounded class completion; lowering projection helpers; global class-array elements | 157/243 (86 failures); no fixture that passed at CP3 or CP4a fails; through-pa15 1139/1139; file audit passes with four warnings; probes linear |
 | CP4b.1 placement-new semantic/lowering (completed) | placement-new allocation overloads, placement arguments, class construction at the returned address, and aggregate-brace constructor calls | 159/243 (84 failures, down from 86); through-pa15 1139/1139; file audit passes |
-| CP4b.2 copy/list diagnostics and access completion (active) | explicit-constructor rejection, narrowing, anonymous storage, and the remaining private/protected/incomplete-reference paths | pending |
+| CP4b.2 copy/list diagnostics and access completion (completed) | explicit-constructor rejection, narrowing, anonymous storage, and the remaining private/protected/incomplete-reference paths | 169/243 pa16 tests pass (74 failures, down from 84); through-pa15 remains 1139/1139; file audit passes |
 | CP5 audit and cleanup | architecture audit (`audit.md`), performance evidence, dead-path removal | through-pa16 clean; probe timings recorded |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
@@ -521,50 +521,37 @@ changes; `make test-report-through-pa15` is 1139/1139; and
 `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src` passes with
 four nonfatal pre-existing header warnings.
 
-## Active Checkpoint: CP4b.2 — copy/list diagnostics and access completion
+## Completed Checkpoint: CP4b.2 — copy/list diagnostics and access completion
 
-Goal: finish copy/list initialization and narrowing diagnostics, anonymous
-member storage, and the remaining private/protected and incomplete-reference
-access paths on top of CP4b.1.
+The semantic model now records declaring classes, friend relations, function
+contexts, and explicit constructors.  Copy-list construction excludes
+explicit constructors; direct-list and ordinary copy initialization retain
+their distinct overload rules; list conversions diagnose floating/integral
+narrowing; and access checks cover private/protected members, base paths,
+nested classes, friends, and using-declarations.  Inherited field metadata is
+lowered through one canonical non-virtual base displacement, including
+transitive zero-offset bases.  Qualified type calls in block statements are
+parsed as calls when the declaration form is not viable.
+
+Evidence (2026-09-02): focused access, constructor, narrowing, nested-class,
+friend, using-declaration, and inherited-member witnesses pass.  The required
+`make test-pa16` run is 169/243 (74 failures, down from 84) with unchanged
+coverage; `make test-report-through-pa15` is 1139/1139.  The pa16 file audit
+passes with four pre-existing header warnings.  The specified probe measured
+wide 0.06s/18008KB and doubled 0.13s/29668KB; deep 0.00s/6208KB and doubled
+0.01s/6984KB; exits 0.02s/10128KB and doubled 0.04s/15528KB.
+
+## Active Checkpoint: CP5 — audit and cleanup
+
+Goal: finish the remaining pa16 semantic and LowIR gaps, remove dead paths,
+and close the architecture audit while preserving the through-pa16 gate.
 
 ### Implementation Packet
 
-- `dev/src/sema/expr_sema.cpp`, `scope_builder.cpp`, and `conversions.cpp`:
-  own copy/list initialization, explicit-constructor and narrowing rules,
-  anonymous member lookup, and access checking for private/protected bases
-  and members.
-- `dev/src/lower/lowir_expr.cpp`, `lowir_program.cpp`, and
-  `lowir_symbols.cpp`: lower anonymous-member projections and finish any
-  remaining global/static aggregate paths.
-- Focus on the remaining `200-*` initialization/access failures, the
-  private/protected watch-list, and the `spec/200-*` list-initialization
-  witnesses. Preserve through-PA15 and the file audit; do not edit fixtures
-  or `.ref` files.
-
-Failure map after CP4b.1 (84): 24 LowIR shape mismatches (`400-*`
-bit-field reads/increments and aggregate init, `300-alignas-*` layouts,
-`300-thread-local-synthetic-symbol-family-isolation`, `300-adl-*` source
-point and parent climbing, `300-synthesized-array-member-lifecycle`,
-`300-static-member-aggregate-array-dynamic-init`,
-`200-nested-braced-member-aggregate-init`, `200-const-subobject-member-
-call`, `200-derived-pointer-member-init`); 7 EXIT_FAILURE fixtures accepted
-(`100-bad-member-function`, `100-private-method-bad`, `200-private-base-
-static-cast-bad`, `200-protected-member-typedef-access-bad`, `200-copy-
-list-init-explicit-ctor-bad`, `300-under-aligned-class-bad`, `spec/200-
-list-init-narrowing-bad`); 7 parse gaps (`struct B::D : B`, member and
-out-of-class `alignas`, `p->~I()`, trailing-return members); 6 `unknown
-name` (nested class reaching enclosing members, `Base::` qualified calls);
-9 unknown type names through inherited and out-of-line typedefs; 5
-initializer conversions (derived-to-base references, string literal to
-`void*` rejection, reference members); 4 static-member lvalues (`&X::m`,
-static object members); 4 scalar conversions (`operator nullptr_t`,
-enum bit-fields); 3 implicit-`this` outside a member (static thread-local
-members); 2 `sizeof` of incomplete referents; the
-rest singletons.  Work the groups in this order: access control and
-narrowing (the watch-list), parser gaps, inherited typedef lookup, static
-member lvalues, then the shape mismatches with their `.compare.diff`.
-
-Regression rule from review 1: after each focused loop, diff the failing
-set against the previous commit's set (`comm -13 old new`), not just the
-count; CP4a's count hid eight regressions.  Check any change to class
-completion order against `make test-pa11 test-pa12` and through-pa15.
+- Own the remaining failure groups in `dev/src/sema`, `dev/src/lower`, and
+  `dev/src/parser` through canonical model data and bounded completion/lowering
+  paths; do not edit fixtures or `.ref` files.
+- Re-run the failure-set comparison after each focused loop, then require
+  `make test-report-through-pa16`, the pa16 file audit, and the packet probe.
+- Record the architecture findings and final evidence in `audit.md` before
+  declaring the stage complete.

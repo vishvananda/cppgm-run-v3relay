@@ -89,6 +89,10 @@ struct Binding
   BindingKind kind;
   TypeId type;
   ScopeId scope; // owning declaration scope
+  // Canonical class that owns a member binding.  This remains the original
+  // declaring class when a member is found through inheritance or imported
+  // by a using-declaration.
+  ClassEntityId declaring_class;
   ScopeId namespace_scope; // BINDING_NAMESPACE: the nominated namespace
   FunctionEntityId function; // BINDING_FUNCTION: canonical function entity
   BindingId object_binding; // injected member: implicit anonymous-union object
@@ -146,6 +150,7 @@ struct Scope
   std::string name; // printed after the scope kind; empty for blocks and template scopes
   ScopeId parent;
   ClassEntityId class_entity; // SCOPE_CLASS: the class whose members it holds
+  FunctionEntityId function_entity; // SCOPE_FUNCTION: the body owner
   bool inline_namespace;
   bool unnamed_namespace;
   std::vector<BindingId> bindings;
@@ -190,6 +195,10 @@ struct ClassEntity
   // ADL, even though their bindings live in that class's enclosing
   // namespace.  This is the canonical hidden-friend association set.
   std::vector<BindingId> hidden_friends;
+  // Access-control relations are stored on the class that grants access;
+  // friend declarations themselves may be declared in a different scope.
+  std::vector<ClassEntityId> friend_classes;
+  std::vector<FunctionEntityId> friend_functions;
   bool layout_complete;
   // Lifetime facts are fixed with the layout: whether default construction
   // and destruction of a complete object have any runtime effect, counting
@@ -238,6 +247,7 @@ struct FunctionEntity
   std::vector<std::string> parameter_names;
   bool defaulted;
   bool deleted;
+  bool explicit_constructor;
   bool static_member;
   bool in_class_definition;
   bool synthesized;
@@ -319,6 +329,12 @@ public:
   // such as overload ranking and LowIR use this query instead of comparing
   // class type spellings.
   bool IsDerivedFrom(ClassEntityId derived, ClassEntityId base) const;
+  // Access checks consume the same declaration ownership and class graph as
+  // lookup.  `context` is the current semantic scope, not the declaration
+  // scope of the member being used.
+  bool IsAccessible(BindingId binding, ScopeId context) const;
+  bool IsBaseAccessible(ClassEntityId derived, ClassEntityId base,
+                        ScopeId context) const;
   // Class member lookup applies ordinary hiding at each class level, then
   // searches bases.  The result may contain an overload set or an ambiguity.
   void LookupMember(ClassEntityId entity, const std::string& name,
@@ -399,6 +415,20 @@ private:
       ScopeId scope, const std::string& name, unsigned filter,
       std::vector<ScopeId>& visited,
       std::vector<BindingId>& result) const;
+  ClassEntityId DeclaringClass(BindingId binding) const;
+  FunctionEntityId ContextFunction(ScopeId scope) const;
+  void ContextClasses(ScopeId scope,
+                      std::vector<ClassEntityId>& result) const;
+  bool IsNestedClassOf(ClassEntityId nested, ClassEntityId enclosing) const;
+  bool IsFriendClass(ClassEntityId owner, ClassEntityId context) const;
+  bool IsFriendFunction(ClassEntityId owner, FunctionEntityId context) const;
+  bool ContextCanAccess(ClassEntityId owner, AccessKind access,
+                        ScopeId context) const;
+  bool IsBaseEdgeAccessible(ClassEntityId owner, AccessKind access,
+                            ScopeId context) const;
+  bool FindAccessibleBasePath(ClassEntityId current, ClassEntityId target,
+                              ScopeId context,
+                              std::vector<ClassEntityId>& visited) const;
 
   static const ScopeId kNoScope = static_cast<ScopeId>(-1);
 
