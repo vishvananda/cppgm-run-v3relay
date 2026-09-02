@@ -117,6 +117,59 @@ std::string operator_code(const std::string & name)
   throw std::logic_error("unknown ABI operator terminal '" + name + "'");
 }
 
+void append_qualifier_codes(const std::vector<AbiFunctionQualifier> & qualifiers,
+                            std::string * result)
+{
+  bool has_volatile = false;
+  bool has_const = false;
+  bool has_lvalue_ref = false;
+  bool has_rvalue_ref = false;
+  for(std::size_t i = 0; i < qualifiers.size(); ++i) {
+    has_volatile = has_volatile ||
+      qualifiers[i] == ABI_FUNCTION_QUALIFIER_VOLATILE;
+    has_const = has_const || qualifiers[i] == ABI_FUNCTION_QUALIFIER_CONST;
+    has_lvalue_ref = has_lvalue_ref ||
+      qualifiers[i] == ABI_FUNCTION_QUALIFIER_LVALUE_REFERENCE;
+    has_rvalue_ref = has_rvalue_ref ||
+      qualifiers[i] == ABI_FUNCTION_QUALIFIER_RVALUE_REFERENCE;
+  }
+  if(has_volatile) *result += "V";
+  if(has_const) *result += "K";
+  if(has_lvalue_ref) *result += "R";
+  if(has_rvalue_ref) *result += "O";
+}
+
+std::string local_discriminator_suffix(const std::string & discriminator)
+{
+  if(discriminator.empty() || discriminator == "-") {
+    return std::string();
+  }
+  unsigned long long value = 0;
+  std::istringstream input(discriminator);
+  if(!(input >> value) || !input.eof()) {
+    throw std::logic_error("invalid ABI local discriminator '" +
+      discriminator + "'");
+  }
+  return value == 0 ? std::string() : "_" + std::to_string(value - 1);
+}
+
+AbiFunctionRecord owned_terminal_record(const std::string & terminal)
+{
+  AbiFunctionRecord record;
+  if(terminal == "operator-call" || terminal == "call") {
+    record.kind = ABI_FUNCTION_RECORD_OPERATOR_TERMINAL;
+    record.terminal = "call";
+  } else if(terminal.compare(0, 12, "constructor-") == 0 ||
+            terminal.compare(0, 10, "destructor-") == 0) {
+    record.kind = ABI_FUNCTION_RECORD_TERMINAL;
+    record.terminal = terminal;
+  } else {
+    record.kind = ABI_FUNCTION_RECORD_TERMINAL_SOURCE;
+    record.terminal = terminal;
+  }
+  return record;
+}
+
 bool needs_nested_name(const std::vector<std::string> & components)
 {
   if(components.size() == 1) return false;
@@ -246,6 +299,9 @@ std::string Mangler::mangle_function_name(
   std::vector<AbiFunctionQualifier> qualifiers;
   std::vector<std::string> tags;
   std::vector<std::string> template_prefixes;
+  const AbiFunctionRecord * local_context = 0;
+  const AbiFunctionRecord * lambda_context = 0;
+  const AbiFunctionRecord * namespace_lambda_context = 0;
   bool standard = false;
   std::string standard_substitution;
   if(has_template_encoding) *has_template_encoding = false;
@@ -279,6 +335,15 @@ std::string Mangler::mangle_function_name(
         template_prefixes.push_back(record.substitution);
       }
       break;
+    case ABI_FUNCTION_RECORD_LOCAL_CONTEXT:
+      local_context = &record;
+      break;
+    case ABI_FUNCTION_RECORD_LAMBDA_CONTEXT:
+      lambda_context = &record;
+      break;
+    case ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT:
+      namespace_lambda_context = &record;
+      break;
     case ABI_FUNCTION_RECORD_QUALIFIER:
       qualifiers.insert(qualifiers.end(), record.qualifiers.begin(),
                         record.qualifiers.end());
@@ -298,6 +363,11 @@ std::string Mangler::mangle_function_name(
     default:
       break;
     }
+  }
+
+  if(local_context || lambda_context || namespace_lambda_context) {
+    return mangle_context_function_name(records, template_arguments,
+                                        has_template_encoding);
   }
 
   // The source-level "operator" component and the dash component are
@@ -400,6 +470,121 @@ std::string Mangler::mangle_function_name(
   }
   if(nested) result += "E";
   return result;
+}
+
+std::string Mangler::mangle_context(const std::string & ref)
+{
+  const AbiDefinitionRecord * record = definition(ref);
+  if(!record || record->kind != ABI_DEFINITION_CONTEXT) {
+    throw std::logic_error("unknown ABI context '" + ref + "'");
+  }
+  if(record->context.kind == ABI_CONTEXT_RAW) {
+    return record->context.fragment;
+  }
+  AbiFunctionShape shape;
+  shape.target = record->context.function;
+  const std::string encoding = mangle_function(shape);
+  if(encoding.compare(0, 2, "_Z") != 0) {
+    throw std::logic_error("ABI context function is not Itanium-mangled");
+  }
+  return "Z" + encoding.substr(2) + "E";
+}
+
+std::string Mangler::mangle_local_discriminator(
+  const std::string & discriminator) const
+{
+  return local_discriminator_suffix(discriminator);
+}
+
+std::string Mangler::mangle_context_function_name(
+  const std::vector<AbiFunctionRecord> & records,
+  std::vector<std::string> * template_arguments,
+  bool * has_template_encoding)
+{
+  const AbiFunctionRecord * context = 0;
+  const AbiFunctionRecord * terminal = 0;
+  std::vector<AbiFunctionQualifier> qualifiers;
+  std::vector<std::string> tags;
+  std::vector<std::string> template_prefixes;
+  enum ContextKind { CONTEXT_LOCAL, CONTEXT_LAMBDA, CONTEXT_NAMESPACE_LAMBDA };
+  ContextKind context_kind = CONTEXT_LOCAL;
+  std::size_t context_count = 0;
+  if(has_template_encoding) *has_template_encoding = false;
+
+  for(std::size_t i = 0; i < records.size(); ++i) {
+    const AbiFunctionRecord & record = records[i];
+    if(record.kind == ABI_FUNCTION_RECORD_LOCAL_CONTEXT ||
+       record.kind == ABI_FUNCTION_RECORD_LAMBDA_CONTEXT ||
+       record.kind == ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT) {
+      ++context_count;
+      context = &record;
+      context_kind = record.kind == ABI_FUNCTION_RECORD_LOCAL_CONTEXT ?
+        CONTEXT_LOCAL : record.kind == ABI_FUNCTION_RECORD_LAMBDA_CONTEXT ?
+        CONTEXT_LAMBDA : CONTEXT_NAMESPACE_LAMBDA;
+    } else if(record.kind == ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_ARGUMENT) {
+      if(template_arguments) template_arguments->push_back(record.substitution);
+      if(has_template_encoding) *has_template_encoding = true;
+    } else if(record.kind == ABI_FUNCTION_RECORD_FUNCTION_TEMPLATE_PREFIX) {
+      if(!is_dash(record.substitution)) template_prefixes.push_back(record.substitution);
+    } else if(record.kind == ABI_FUNCTION_RECORD_QUALIFIER) {
+      qualifiers.insert(qualifiers.end(), record.qualifiers.begin(),
+                        record.qualifiers.end());
+    } else if(record.kind == ABI_FUNCTION_RECORD_ABI_TAG) {
+      tags.push_back(record.name);
+    } else if(record.kind == ABI_FUNCTION_RECORD_TERMINAL_SOURCE ||
+              record.kind == ABI_FUNCTION_RECORD_TERMINAL ||
+              record.kind == ABI_FUNCTION_RECORD_OPERATOR_TERMINAL ||
+              record.kind == ABI_FUNCTION_RECORD_CONVERSION_TERMINAL) {
+      if(terminal) throw std::logic_error("multiple ABI function terminals");
+      terminal = &record;
+    }
+  }
+  if(context_count != 1 || !context) {
+    throw std::logic_error("ABI function needs exactly one local context");
+  }
+
+  std::string result;
+  if(context_kind == CONTEXT_NAMESPACE_LAMBDA) {
+    result = "N";
+    append_qualifier_codes(qualifiers, &result);
+    for(std::size_t i = 0; i < context->namespace_qualifiers.size(); ++i) {
+      result += source_name(context->namespace_qualifiers[i]);
+    }
+    result += source_name(context->source_name);
+  } else {
+    result = mangle_context(context->context_ref);
+    result += "N";
+    append_qualifier_codes(qualifiers, &result);
+    if(context_kind == CONTEXT_LOCAL) {
+      result += source_name(context->source_name);
+      result += local_discriminator_suffix(context->discriminator);
+    } else {
+      const std::string discriminator = context->discriminator.empty() ?
+        context->source_name : context->discriminator;
+      result += "Ul";
+      if(context->types.empty()) {
+        result += "v";
+      } else {
+        for(std::size_t i = 0; i < context->types.size(); ++i) {
+          result += mangle_type(context->types[i]);
+        }
+      }
+      result += "E" + discriminator + "_";
+    }
+  }
+  if(terminal) {
+    result += mangle_function_terminal(*terminal);
+  } else {
+    result += "cl";
+  }
+  if(!tags.empty()) result += mangle_tag_list(tags);
+  for(std::size_t i = 0; i < template_prefixes.size(); ++i) {
+    substitutions_.add(template_prefixes[i]);
+  }
+  if(template_arguments && !template_arguments->empty()) {
+    result += mangle_template_args(*template_arguments);
+  }
+  return result + "E";
 }
 
 std::string Mangler::mangle_path_name(
@@ -592,6 +777,32 @@ std::string Mangler::mangle_function_encoding(const AbiFunctionShape & shape)
   return result;
 }
 
+std::string Mangler::mangle_owned_function(const AbiFunctionShape & shape)
+{
+  AbiFunctionShape owned = shape;
+  owned.target.kind = ABI_FUNCTION_TARGET_ENCODING;
+  AbiFunctionRecord context;
+  if(shape.target.kind == ABI_FUNCTION_TARGET_LOCAL) {
+    context.kind = ABI_FUNCTION_RECORD_LOCAL_CONTEXT;
+    context.context_ref = shape.target.context_ref;
+    context.source_name = shape.target.source_name;
+    context.discriminator = shape.target.discriminator;
+  } else if(shape.target.kind == ABI_FUNCTION_TARGET_LAMBDA) {
+    context.kind = ABI_FUNCTION_RECORD_LAMBDA_CONTEXT;
+    context.context_ref = shape.target.context_ref;
+    context.discriminator = shape.target.discriminator;
+    context.types = shape.target.signature_parameter_types;
+  } else {
+    context.kind = ABI_FUNCTION_RECORD_NAMESPACE_LAMBDA_CONTEXT;
+    context.source_name = shape.target.source_name;
+    context.namespace_qualifiers = shape.target.namespace_qualifiers;
+  }
+  owned.records.insert(owned.records.begin(), context);
+  owned.records.insert(owned.records.begin() + 1,
+                       owned_terminal_record(shape.target.terminal));
+  return mangle_function_encoding(owned);
+}
+
 std::string Mangler::mangle_function(const AbiFunctionShape & shape)
 {
   if(shape.target.kind == ABI_FUNCTION_TARGET_PATH) {
@@ -599,6 +810,11 @@ std::string Mangler::mangle_function(const AbiFunctionShape & shape)
   }
   if(shape.target.kind == ABI_FUNCTION_TARGET_ENCODING) {
     return mangle_function_encoding(shape);
+  }
+  if(shape.target.kind == ABI_FUNCTION_TARGET_LOCAL ||
+     shape.target.kind == ABI_FUNCTION_TARGET_LAMBDA ||
+     shape.target.kind == ABI_FUNCTION_TARGET_NAMESPACE_LAMBDA) {
+    return mangle_owned_function(shape);
   }
   throw std::logic_error("unsupported function target");
 }

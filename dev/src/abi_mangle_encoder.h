@@ -69,6 +69,14 @@ private:
   std::string mangle_internal_name(const std::string & qualified_name);
   std::string mangle_function_path(const AbiFunctionShape & shape);
   std::string mangle_function_encoding(const AbiFunctionShape & shape);
+  std::string mangle_owned_function(const AbiFunctionShape & shape);
+  std::string mangle_context(const std::string & ref);
+  std::string mangle_local_discriminator(
+    const std::string & discriminator) const;
+  std::string mangle_context_function_name(
+    const std::vector<AbiFunctionRecord> & records,
+    std::vector<std::string> * template_arguments,
+    bool * has_template_encoding);
   std::string mangle_path_name(
     const AbiFunctionTarget & target,
     const std::vector<AbiFunctionRecord> & records,

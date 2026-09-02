@@ -283,8 +283,13 @@ static tables built at runtime per call, no per-case reparsing.
   stage total is 85/111 (failures 74 → 26).  `make
   test-report-through-pa13` remains clean at 919/919 and the pa14 file audit
   passes with three non-fatal structural warnings.
-- CP3 — local-name contexts (`function`/`raw`), local types, lambda closures
-  and their call operators sharing the substitution table: ≥ 93/111.
+- CP3 (complete) — local-name contexts (`function`/`raw`), local types, lambda
+  closures, namespace lambdas, and their call operators share the substitution
+  table.  The ten packet fixtures plus the adjacent namespace-lambda fixture
+  pass; the stage is 96/111 (failures 26 → 15).  `make
+  test-report-through-pa13` remains clean at 919/919 and the pa14 file audit
+  passes with the same three non-fatal warnings.  The remaining failures are
+  the planned CP4 dependent-expression boundary.
 - CP4 — dependent expressions, decltype, type traits, entity-reference
   expressions, `member-template-entity`: 111/111, through-pa14 clean.
 - CP5 — architecture audit and cleanup: one key authority, one function
@@ -411,24 +416,26 @@ non-local 200-level functions/operators/thunks, the CP2 300-level cases, and
 the four listed 600-level cases. Preserve the CP1 pass set and ensure every
 later fixture still parses before its unsupported encoder boundary.
 
-## Active Checkpoint: CP3 — Local-name contexts and lambdas
+## Active Checkpoint: CP4 — Dependent expressions and member-template entities
 
-Goal: lower local-name contexts, local types, lambda closures, and their call
-operators through the same function/name substitution state while preserving
-the 85/111 CP2 result and all earlier PAs.
+Goal: lower dependent expressions, decltype types, and member-template entity
+arguments through the existing type/argument substitution state while
+preserving the 96/111 CP3 result and all earlier PAs.
 
 ### Implementation Packet
 
 Files/symbols:
 
-- `dev/src/abi_mangle.h` and `dev/src/abi_mangle_encoder.h`: extend the
-  function shape for context ownership and local-name discriminators.
-- `dev/src/abi_mangle_encode.cpp`: emit raw/function contexts, local names,
-  lambda call operators, and their shared substitution order.
-- `dev/src/abi_mangle_types.cpp`: lower local, lambda, and namespace-lambda
-  type candidates without changing CP2 ordering.
+- `dev/src/abi_mangle.h` and `dev/src/abi_mangle_encoder.h`: preserve one
+  structural key authority for expression, decltype, and entity candidates.
+- `dev/src/abi_mangle_types.cpp`: implement `mangle_expression_impl`,
+  decltype and member-template type lowering, dependent template arguments,
+  entity-reference expressions, and their shared substitution order.
+- `dev/src/abi_mangle_encode.cpp`: integrate only the target/function paths
+  needed by those existing type and argument candidates; keep one function
+  emitter.
 
-Fixture group: the 10 CP3 cases in the failure map—seven 200-level
-local/lambda cases and the three 600-level function-template local-argument
-cases. Keep all 48 CP2 cases green and let CP4 dependent-expression fixtures
-fail only at their unsupported boundary.
+Fixture group: the 18 CP4 cases in the failure map—13 `500-*` expression
+fixtures, `400-dependent-alias-type-id`, and the four `300-*` internal/entity
+and member-template fixtures.  Keep all 96 currently passing cases green and
+finish with `make test-pa14` at 111/111.

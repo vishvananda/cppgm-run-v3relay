@@ -954,11 +954,17 @@ AbiFactRecord parse_function_record_words(const Words & words)
       }
       return record;
     }
-    require_words(words, 4, "local context record");
-    function.context_ref = words[1];
-    function.source_name = words[2];
-    function.discriminator = words[3];
-    std::size_t next = 4;
+    if(form == "local-context") {
+      require_words(words, 4, "local context record");
+      function.context_ref = words[1];
+      function.source_name = words[2];
+      function.discriminator = words[3];
+    } else {
+      require_words(words, 3, "lambda context record");
+      function.context_ref = words[1];
+      function.discriminator = words[2];
+    }
+    std::size_t next = form == "local-context" ? 4 : 3;
     while(next < words.size()) {
       const ParsedType signature = parse_type_at(words, next);
       function.types.push_back(signature.type);
@@ -1487,10 +1493,11 @@ std::string serialize_function_record(const AbiFunctionRecord & function)
   }
   if(function.kind == ABI_FUNCTION_RECORD_LOCAL_CONTEXT ||
      function.kind == ABI_FUNCTION_RECORD_LAMBDA_CONTEXT) {
-    const std::string prefix = function.kind == ABI_FUNCTION_RECORD_LOCAL_CONTEXT ?
-      "local-context " : "lambda-context ";
-    std::string line = prefix + function.context_ref + " " + function.source_name +
-      " " + function.discriminator;
+    const bool local = function.kind == ABI_FUNCTION_RECORD_LOCAL_CONTEXT;
+    const std::string prefix = local ? "local-context " : "lambda-context ";
+    std::string line = prefix + function.context_ref + " " +
+      (local ? function.source_name + " " + function.discriminator :
+       function.discriminator);
     for(std::size_t i = 0; i < function.types.size(); ++i) {
       append_word(&line, serialize_type(function.types[i]));
     }

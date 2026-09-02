@@ -34,6 +34,11 @@ std::string base_key(const std::string & prefix, const std::string & value)
   return prefix + "(" + value + ")";
 }
 
+std::string source_name(const std::string & name)
+{
+  return std::to_string(name.size()) + name;
+}
+
 std::string tags_key(const std::vector<std::string> & tags)
 {
   std::vector<std::string> sorted = tags;
@@ -315,13 +320,24 @@ std::string Mangler::key_of_type_impl(const AbiType & input,
   }
   case ABI_TYPE_DECLTYPE_EXPRESSION:
     return "DT(" + expression_key_ref(input.expression_ref, depth + 1) + ")";
-  case ABI_TYPE_LAMBDA_CLOSURE:
-    return "lambda:" + input.context_ref + ":" + input.discriminator;
+  case ABI_TYPE_LAMBDA_CLOSURE: {
+    std::string key = "lambda:" + input.context_ref + ":" +
+      input.discriminator;
+    for(std::size_t i = 0; i < input.types.size(); ++i) {
+      key += ":" + key_of_type_impl(input.types[i], depth + 1);
+    }
+    return key;
+  }
   case ABI_TYPE_LOCAL_TYPE:
     return "local:" + input.context_ref + ":" + input.name + ":" +
       input.discriminator;
-  case ABI_TYPE_NAMESPACE_LAMBDA:
-    return "namespace-lambda:" + input.name;
+  case ABI_TYPE_NAMESPACE_LAMBDA: {
+    std::string key = "namespace-lambda:" + input.name;
+    for(std::size_t i = 0; i < input.namespace_qualifiers.size(); ++i) {
+      key += ":" + input.namespace_qualifiers[i];
+    }
+    return key;
+  }
   }
   throw std::logic_error("unknown ABI type kind");
 }
@@ -680,10 +696,43 @@ std::string Mangler::mangle_type_impl(const AbiType & input, std::size_t depth)
     throw std::logic_error("invalid cv ABI type");
   case ABI_TYPE_DECLTYPE_EXPRESSION:
     throw std::logic_error("unsupported target");
-  case ABI_TYPE_LAMBDA_CLOSURE:
-  case ABI_TYPE_LOCAL_TYPE:
-  case ABI_TYPE_NAMESPACE_LAMBDA:
-    throw std::logic_error("unsupported target");
+  case ABI_TYPE_LAMBDA_CLOSURE: {
+    const std::string key = key_of_type_impl(input, depth + 1);
+    std::string spelling;
+    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
+    std::string result = mangle_context(input.context_ref) + "Ul";
+    if(input.types.empty()) {
+      result += "v";
+    } else {
+      for(std::size_t i = 0; i < input.types.size(); ++i) {
+        result += mangle_type(input.types[i]);
+      }
+    }
+    result += "E" + input.discriminator + "_";
+    substitutions_.add(key);
+    return result;
+  }
+  case ABI_TYPE_LOCAL_TYPE: {
+    const std::string key = key_of_type_impl(input, depth + 1);
+    std::string spelling;
+    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
+    const std::string result = mangle_context(input.context_ref) +
+      source_name(input.name) + mangle_local_discriminator(input.discriminator);
+    substitutions_.add(key);
+    return result;
+  }
+  case ABI_TYPE_NAMESPACE_LAMBDA: {
+    const std::string key = key_of_type_impl(input, depth + 1);
+    std::string spelling;
+    if(lookup_substitution(&substitutions_, key, &spelling)) return spelling;
+    std::string result = "N";
+    for(std::size_t i = 0; i < input.namespace_qualifiers.size(); ++i) {
+      result += source_name(input.namespace_qualifiers[i]);
+    }
+    result += source_name(input.name) + "E";
+    substitutions_.add(key);
+    return result;
+  }
   }
   throw std::logic_error("unknown ABI type kind");
 }
