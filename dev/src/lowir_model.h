@@ -18,9 +18,7 @@ namespace lowir_model {
 
 struct ParseError : std::runtime_error
 {
-  explicit ParseError(const std::string & message)
-    : std::runtime_error(message)
-  {}
+  explicit ParseError(const std::string & message) : std::runtime_error(message) {}
 };
 
 struct LowType
@@ -45,33 +43,22 @@ struct LowTypeInfo
   std::size_t alignment = 0;
   bool signed_integer = false;
 
-  bool valid() const
-  {
-    return kind != LTI_INVALID;
-  }
-
-  bool integer() const
-  {
-    return kind == LTI_INTEGER;
-  }
-
-  bool floating() const
-  {
-    return kind == LTI_FLOAT;
-  }
-
-  bool pointer() const
-  {
-    return kind == LTI_POINTER;
-  }
-
-  bool object() const
-  {
-    return kind == LTI_OBJECT;
-  }
+  bool valid() const { return kind != LTI_INVALID; }
+  bool integer() const { return kind == LTI_INTEGER; }
+  bool floating() const { return kind == LTI_FLOAT; }
+  bool pointer() const { return kind == LTI_POINTER; }
+  bool object() const { return kind == LTI_OBJECT; }
 };
 
 LowTypeInfo describe_low_type(const LowType & type);
+
+struct Instruction;
+
+// The type of the temporary an instruction defines.  `addr`, `index`,
+// `stack_alloc` and `va_start` produce pointers and `cmp` produces a canonical
+// `i64` truth value whatever its operand comparison type; every other
+// instruction defines its written type.
+LowType instruction_result_type(const Instruction & instruction);
 
 struct Operand
 {
@@ -249,10 +236,7 @@ struct InstructionDebugLocation
   std::size_t line = 0;
   std::size_t column = 0;
 
-  bool present() const
-  {
-    return !file.empty() && line != 0 && column != 0;
-  }
+  bool present() const { return !file.empty() && line != 0 && column != 0; }
 };
 
 struct GlobalDeclaration

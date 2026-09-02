@@ -2,9 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -13,7 +11,6 @@
 namespace {
 
 using lowir_model::Function;
-using lowir_model::FunctionDeclaration;
 using lowir_model::Instruction;
 using lowir_model::LowType;
 using lowir_model::LowTypeInfo;
@@ -21,32 +18,61 @@ using lowir_model::Operand;
 using lowir_model::Parameter;
 using lowir_model::Program;
 
-bool is_wide(const LowType & type)
+// Width facts.  Every size, alignment and operand-width decision derives from
+// `describe_low_type`; the helpers below only phrase that table for CY86.
+
+bool is_f80(const LowTypeInfo & info)
 {
-  const LowTypeInfo info = lowir_model::describe_low_type(type);
-  return (info.floating() && type.text == "f80") || info.object();
+  return info.floating() && info.bits == 80;
 }
 
-std::size_t value_size(const LowType & type)
+// Instructions without a type (jumps, fences, bulk copies) carry an empty
+// spelling; they are never f80 or wide.
+bool is_f80(const LowType & type)
 {
-  const LowTypeInfo info = lowir_model::describe_low_type(type);
-  if(type.text == "f80") return 16;
-  if(info.object()) return (info.bytes + 7) & ~static_cast<std::size_t>(7);
-  return 8;
+  return !type.text.empty() && is_f80(lowir_model::describe_low_type(type));
+}
+
+// Wide values (`f80` and direct objects) live in memory and cross call
+// boundaries by address; everything else is one 64-bit register.
+bool is_wide(const LowTypeInfo & info)
+{
+  return info.object() || is_f80(info);
+}
+
+bool is_wide(const LowType & type)
+{
+  return !type.text.empty() && is_wide(lowir_model::describe_low_type(type));
+}
+
+std::size_t value_size(const LowTypeInfo & info)
+{
+  return is_wide(info) ? (info.bytes + 7) & ~static_cast<std::size_t>(7) : 8;
+}
+
+std::string width_suffix(const LowTypeInfo & info)
+{
+  if(info.integer() || info.floating()) {
+    if(info.bits <= 8) return "8";
+    if(info.bits <= 16) return "16";
+    if(info.bits <= 32) return "32";
+  }
+  return "64";
+}
+
+std::string width_suffix(const LowType & type)
+{
+  return width_suffix(lowir_model::describe_low_type(type));
 }
 
 std::string number(std::size_t value)
 {
-  std::ostringstream out;
-  out << value;
-  return out.str();
+  return std::to_string(value);
 }
 
 std::string signed_number(long long value)
 {
-  std::ostringstream out;
-  out << value;
-  return out.str();
+  return std::to_string(value);
 }
 
 std::string strip_sigil(const std::string & name)
@@ -64,41 +90,30 @@ std::string global_label(const std::string & name)
   return "g__" + strip_sigil(name);
 }
 
-std::string memory(const std::string & base, long long offset)
+// A CY86 memory operand: a base register plus a signed displacement.
+struct Address
 {
-  std::string effective_base = base;
-  char * end = 0;
-  if(base.size() > 2 && base.compare(0, 2, "bp") == 0) {
-    const long long base_offset = std::strtoll(base.c_str() + 2,
-                                               &end, 10);
-    if(end != 0 && *end == '\0') {
-      effective_base = "bp";
-      offset += base_offset;
-    }
-  }
-  if(offset == 0) return "[" + effective_base + "]";
-  if(offset > 0) return "[" + effective_base + "+" + signed_number(offset) + "]";
-  return "[" + effective_base + signed_number(offset) + "]";
-}
+  const char * base;
+  long long offset;
 
-std::string local_memory(long long offset)
-{
-  return memory("bp", offset);
-}
+  Address(const char * base_register, long long displacement = 0)
+    : base(base_register), offset(displacement)
+  {}
 
-std::string width_suffix(const LowType & type)
-{
-  const LowTypeInfo info = lowir_model::describe_low_type(type);
-  if(type.text == "f32") return "32";
-  if(type.text == "f64") return "64";
-  if(info.pointer()) return "64";
-  if(info.integer()) {
-    if(info.bits <= 8) return "8";
-    if(info.bits <= 16) return "16";
-    if(info.bits <= 32) return "32";
-    return "64";
+  Address plus(long long delta) const
+  {
+    return Address(base, offset + delta);
   }
-  return "64";
+};
+
+std::string memory(const Address & address)
+{
+  std::string text = "[";
+  text += address.base;
+  if(address.offset > 0) text += "+";
+  if(address.offset != 0) text += signed_number(address.offset);
+  text += "]";
+  return text;
 }
 
 std::string literal_text(const Operand & operand)
@@ -106,87 +121,70 @@ std::string literal_text(const Operand & operand)
   return operand.text == "nullptr" ? "0" : operand.text;
 }
 
-LowType result_type(const Instruction & instruction)
-{
-  if(instruction.kind == Instruction::IK_ADDR ||
-     instruction.kind == Instruction::IK_INDEX ||
-     instruction.kind == Instruction::IK_STACK_ALLOC ||
-     instruction.kind == Instruction::IK_VA_START) {
-    LowType type;
-    type.text = "ptr";
-    return type;
-  }
-  if(instruction.kind == Instruction::IK_CMP) {
-    LowType type;
-    type.text = "i64";
-    return type;
-  }
-  return instruction.type;
-}
-
 class Cy86Writer
 {
 public:
   void instruction(const std::string & op, const std::string & operands)
   {
-    out_ << "\t" << op;
-    if(!operands.empty()) out_ << " " << operands;
-    out_ << ";\n";
+    out_ += '\t';
+    out_ += op;
+    if(!operands.empty()) {
+      out_ += ' ';
+      out_ += operands;
+    }
+    out_ += ";\n";
   }
 
   void label(const std::string & name)
   {
-    out_ << name << ":\n";
+    out_ += name;
+    out_ += ":\n";
   }
 
   void blank()
   {
-    out_ << "\n";
+    out_ += '\n';
   }
 
-  std::string str() const
+  std::string take()
   {
-    return out_.str();
+    return std::move(out_);
   }
 
 private:
-  std::ostringstream out_;
+  std::string out_;
 };
 
 struct ValueInfo
 {
   long long offset = 0;
   LowType type;
+  LowTypeInfo info;
 };
 
-struct AbiParameter
-{
-  std::string name;
-  LowType type;
-};
-
+// Frame layout of one function: parameters (preceded by the hidden result
+// pointer of a wide return), slots, then temporaries in definition order,
+// each at a negative offset from `bp`; wide instructions add scratch areas
+// below the locals.
 struct FrameLayout
 {
   std::unordered_map<std::string, ValueInfo> values;
-  std::vector<AbiParameter> abi_params;
+  std::vector<std::string> abi_params;
   std::size_t local_size = 0;
   std::size_t frame_size = 0;
   bool has_scratch = false;
   std::string hidden_result;
 };
 
-bool type_is_f80(const LowType & type)
-{
-  return type.text == "f80";
-}
-
 bool instruction_needs_scratch(const Instruction & instruction)
 {
   if(instruction.kind == Instruction::IK_CONVERT) return true;
-  if(type_is_f80(instruction.type) || type_is_f80(instruction.source_type) ||
-     type_is_f80(instruction.call_return_type)) return true;
+  if(is_f80(instruction.type) || is_f80(instruction.source_type) ||
+     is_f80(instruction.call_return_type)) {
+    return true;
+  }
   for(std::size_t i = 0; i < instruction.call_params.size(); ++i) {
-    if(type_is_f80(instruction.call_params[i].type)) return true;
+    if(is_f80(instruction.call_params[i].type)) return true;
   }
   return false;
 }
@@ -194,11 +192,11 @@ bool instruction_needs_scratch(const Instruction & instruction)
 void add_value(FrameLayout & layout, const std::string & name,
                const LowType & type, std::size_t & used)
 {
-  const std::size_t size = value_size(type);
-  used += size;
   ValueInfo value;
-  value.offset = -static_cast<long long>(used);
   value.type = type;
+  value.info = lowir_model::describe_low_type(type);
+  used += value_size(value.info);
+  value.offset = -static_cast<long long>(used);
   layout.values[name] = value;
 }
 
@@ -210,12 +208,11 @@ FrameLayout build_frame(const Function & function)
     layout.hidden_result = "%__cppgm_hidden_result";
     LowType pointer;
     pointer.text = "ptr";
-    layout.abi_params.push_back(AbiParameter{layout.hidden_result, pointer});
+    layout.abi_params.push_back(layout.hidden_result);
     add_value(layout, layout.hidden_result, pointer, used);
   }
   for(std::size_t i = 0; i < function.params.size(); ++i) {
-    layout.abi_params.push_back(AbiParameter{function.params[i].name,
-                                              function.params[i].type});
+    layout.abi_params.push_back(function.params[i].name);
     add_value(layout, function.params[i].name, function.params[i].type, used);
     if(is_wide(function.params[i].type)) layout.has_scratch = true;
   }
@@ -227,7 +224,8 @@ FrameLayout build_frame(const Function & function)
       const Instruction & instruction = function.blocks[i].instructions[j];
       if(!instruction.dest.empty() &&
          layout.values.find(instruction.dest) == layout.values.end()) {
-        add_value(layout, instruction.dest, result_type(instruction), used);
+        add_value(layout, instruction.dest,
+                  lowir_model::instruction_result_type(instruction), used);
       }
       if(instruction_needs_scratch(instruction)) layout.has_scratch = true;
     }
@@ -244,41 +242,24 @@ public:
     : program_(program), facts_(facts)
   {}
 
-  const Function * definition(const std::string & name) const
+  const Program & program() const
   {
-    const std::unordered_map<std::string, LowirProgramFacts::SymbolRef>::const_iterator found =
-      facts_.symbols.find(name);
-    if(found == facts_.symbols.end() ||
-       found->second.kind != LowirProgramFacts::SymbolRef::DEF_FUNCTION) return 0;
-    return &program_.functions[found->second.index];
+    return program_;
   }
 
-  const FunctionDeclaration * declaration(const std::string & name) const
+  const LowirProgramFacts & facts() const
   {
-    const std::unordered_map<std::string, LowirProgramFacts::SymbolRef>::const_iterator found =
-      facts_.symbols.find(name);
-    if(found == facts_.symbols.end() ||
-       found->second.kind != LowirProgramFacts::SymbolRef::DECL_FUNCTION) return 0;
-    return &program_.function_declarations[found->second.index];
+    return facts_;
   }
 
-  bool is_function(const std::string & name) const
+  std::string symbol_label(const std::string & name) const
   {
-    const std::unordered_map<std::string, LowirProgramFacts::SymbolRef>::const_iterator found =
-      facts_.symbols.find(name);
-    if(found == facts_.symbols.end()) return false;
-    return found->second.kind == LowirProgramFacts::SymbolRef::DECL_FUNCTION ||
-           found->second.kind == LowirProgramFacts::SymbolRef::DEF_FUNCTION;
+    return facts_.is_function(name) ? function_label(name) : global_label(name);
   }
 
   std::string next_label(const std::string & prefix)
   {
     return prefix + number(label_counter_++);
-  }
-
-  const Program & program() const
-  {
-    return program_;
   }
 
 private:
@@ -297,7 +278,7 @@ public:
   FunctionEmitter(const Function & function, CodegenContext & context,
                   Cy86Writer & writer)
     : function_(function), context_(context), writer_(writer),
-      layout_(build_frame(function))
+      layout_(build_frame(function)), label_prefix_(function_label(function.name))
   {}
 
   void emit()
@@ -317,6 +298,7 @@ private:
   CodegenContext & context_;
   Cy86Writer & writer_;
   FrameLayout layout_;
+  std::string label_prefix_;
 
   const ValueInfo & value(const std::string & name) const
   {
@@ -330,58 +312,57 @@ private:
 
   std::string block_label(const std::string & name) const
   {
-    return function_label(function_.name) + "__" + strip_sigil(name);
+    return label_prefix_ + "__" + strip_sigil(name);
   }
 
   std::string epilogue_label() const
   {
-    return function_label(function_.name) + "__epilogue";
+    return label_prefix_ + "__epilogue";
   }
 
-  std::string parameter_register(std::size_t index) const
+  static std::string parameter_register(std::size_t index)
   {
     static const char * const names[] = { "x", "y", "z", "t" };
     return index < 4 ? names[index] : "x";
   }
 
-  std::string scratch_memory(std::size_t area, std::size_t offset = 0) const
+  // Scratch areas SA, SB, SC below the locals; each holds one 16-byte value.
+  Address scratch(std::size_t area) const
   {
-    return memory(scratch_base(area), static_cast<long long>(offset));
+    return Address("bp", -static_cast<long long>(layout_.local_size + 16 * (area + 1)));
   }
 
-  std::string scratch_base(std::size_t area) const
+  static Address local(const ValueInfo & value)
   {
-    const long long offset = -static_cast<long long>(layout_.local_size +
-                                                     16 * (area + 1));
-    return "bp" + signed_number(offset);
+    return Address("bp", value.offset);
   }
 
-  static std::string local_base(long long offset)
+  // Register `r` <- address of a local value (`isub64 r64 bp N`).
+  void load_local_address(const ValueInfo & value, const std::string & base)
   {
-    return "bp" + signed_number(offset);
+    writer_.instruction("isub64", base + "64 bp " +
+                        number(static_cast<std::size_t>(-value.offset)));
   }
 
-  void pad_f80(const std::string & base)
+  void pad_f80(const Address & target)
   {
     writer_.instruction("move64", "z64 0");
-    writer_.instruction("move32", memory(base, 10) + " z32");
-    writer_.instruction("move16", memory(base, 14) + " z16");
+    writer_.instruction("move32", memory(target.plus(10)) + " z32");
+    writer_.instruction("move16", memory(target.plus(14)) + " z16");
   }
 
-  void copy_memory(const std::string & source, const std::string & target,
-                   std::size_t bytes)
+  void copy_memory(const Address & source, const Address & target, std::size_t bytes)
   {
     for(std::size_t offset = 0; offset < bytes; offset += 8) {
-      writer_.instruction("move64", "z64 " + memory(source,
-                                                       static_cast<long long>(offset)));
-      writer_.instruction("move64", memory(target,
-                                            static_cast<long long>(offset)) + " z64");
+      const long long delta = static_cast<long long>(offset);
+      writer_.instruction("move64", "z64 " + memory(source.plus(delta)));
+      writer_.instruction("move64", memory(target.plus(delta)) + " z64");
     }
   }
 
   void emit_prologue()
   {
-    writer_.label(function_label(function_.name));
+    writer_.label(label_prefix_);
     writer_.instruction("isub64", "sp sp 8");
     writer_.instruction("move64", "[sp] bp");
     writer_.instruction("move64", "bp sp");
@@ -389,44 +370,38 @@ private:
       writer_.instruction("isub64", "sp sp " + number(layout_.frame_size));
     }
     for(std::size_t i = 0; i < layout_.abi_params.size(); ++i) {
-      emit_parameter_spill(i, layout_.abi_params[i]);
+      emit_parameter_spill(i, value(layout_.abi_params[i]));
     }
   }
 
-  void emit_parameter_spill(std::size_t index, const AbiParameter & parameter)
+  // Register parameters arrive in x, y, z, t; later ones on the caller's
+  // stack above the saved bp and return address.  Wide parameters arrive as
+  // pointers and are copied into their local storage.
+  void emit_parameter_spill(std::size_t index, const ValueInfo & target)
   {
-    if(is_wide(parameter.type)) {
-      emit_wide_parameter_spill(index, parameter);
+    if(is_wide(target.info)) {
+      if(index < 4) {
+        writer_.instruction("move64", "x64 " + parameter_register(index) + "64");
+      } else {
+        writer_.instruction("move64", "x64 " + memory(incoming_argument(index)));
+      }
+      copy_memory(Address("x64"), local(target), value_size(target.info));
       return;
     }
-    const ValueInfo & target = value(parameter.name);
     if(index < 4) {
-      writer_.instruction("move64", local_memory(target.offset) + " " +
+      writer_.instruction("move64", memory(local(target)) + " " +
                           parameter_register(index) + "64");
     } else {
-      const long long stack_offset = 16 + static_cast<long long>((index - 4) * 8);
-      writer_.instruction("move64", "x64 " + memory("bp", stack_offset));
-      writer_.instruction("move64", local_memory(target.offset) + " x64");
+      writer_.instruction("move64", "x64 " + memory(incoming_argument(index)));
+      writer_.instruction("move64", memory(local(target)) + " x64");
     }
   }
 
-  void emit_wide_parameter_spill(std::size_t index,
-                                 const AbiParameter & parameter)
+  // Stack argument k (the fifth and later) sits above the saved bp and the
+  // return address.
+  static Address incoming_argument(std::size_t index)
   {
-    const ValueInfo & target = value(parameter.name);
-    if(index < 4) {
-      writer_.instruction("move64", "x64 " + parameter_register(index) + "64");
-    } else {
-      const long long stack_offset = 16 + static_cast<long long>((index - 4) * 8);
-      writer_.instruction("move64", "x64 " + memory("bp", stack_offset));
-    }
-    const std::size_t size = value_size(parameter.type);
-    for(std::size_t offset = 0; offset < size; offset += 8) {
-      writer_.instruction("move64", "z64 " +
-                          memory("x64", static_cast<long long>(offset)));
-      writer_.instruction("move64", local_memory(target.offset +
-                          static_cast<long long>(offset)) + " z64");
-    }
+    return Address("bp", 16 + static_cast<long long>((index - 4) * 8));
   }
 
   void emit_epilogue()
@@ -438,73 +413,70 @@ private:
     writer_.instruction("ret", "");
   }
 
+  // The type an argument operand carries when no parameter type is known.
   std::string operand_type_name(const Operand & operand,
                                 const std::string & fallback) const
   {
     if(operand.kind == Operand::OP_TEMP || operand.kind == Operand::OP_SLOT) {
       return value(operand.text).type.text;
     }
-    if(operand.kind == Operand::OP_GLOBAL && context_.is_function(operand.text)) {
+    if(operand.kind == Operand::OP_GLOBAL && context_.facts().is_function(operand.text)) {
       return "ptr";
     }
     if(!operand.literal_type.text.empty()) return operand.literal_type.text;
     return fallback;
   }
 
+  // Register `base` <- the operand as a value: a scalar temporary is read at
+  // `type`'s width (its own width when `type` is empty), a slot, wide
+  // temporary or symbol yields its address, a literal is moved verbatim.
   void load_value(const Operand & operand, const LowType & type,
                   const std::string & base)
   {
     if(operand.kind == Operand::OP_TEMP) {
       const ValueInfo & source = value(operand.text);
-      if(type_is_f80(source.type)) {
-        writer_.instruction("isub64", base + "64 bp " +
-                            number(static_cast<std::size_t>(-source.offset)));
-      } else {
-        const LowType & effective = type.text.empty() ? source.type : type;
-        const std::string suffix = width_suffix(effective);
-        if(suffix == "8" || suffix == "16") {
-          writer_.instruction("move64", base + "64 0");
-        }
-        writer_.instruction("move" + suffix,
-                            base + suffix + " " + local_memory(source.offset));
+      if(is_f80(source.info)) {
+        load_local_address(source, base);
+        return;
       }
+      const std::string suffix = type.text.empty() ? width_suffix(source.info) :
+                                                     width_suffix(type);
+      if(suffix == "8" || suffix == "16") {
+        writer_.instruction("move64", base + "64 0");
+      }
+      writer_.instruction("move" + suffix,
+                          base + suffix + " " + memory(local(source)));
       return;
     }
     if(operand.kind == Operand::OP_SLOT) {
-      const ValueInfo & source = value(operand.text);
-      writer_.instruction("isub64", base + "64 bp " +
-                          number(static_cast<std::size_t>(-source.offset)));
+      load_local_address(value(operand.text), base);
       return;
     }
     if(operand.kind == Operand::OP_GLOBAL) {
-      writer_.instruction("move64", base + "64 " +
-                          (context_.is_function(operand.text) ?
-                           function_label(operand.text) : global_label(operand.text)));
+      writer_.instruction("move64", base + "64 " + context_.symbol_label(operand.text));
       return;
     }
     const std::string suffix = type.text == "f32" ? "32" : "64";
-    writer_.instruction("move" + suffix, base + suffix + " " +
-                        literal_text(operand));
+    writer_.instruction("move" + suffix, base + suffix + " " + literal_text(operand));
   }
 
+  // Register `base` <- the address of the operand's storage.
   void load_address(const Operand & operand, const std::string & base)
   {
     if(operand.kind == Operand::OP_GLOBAL) {
-      writer_.instruction("move64", base + "64 " +
-                          (context_.is_function(operand.text) ?
-                           function_label(operand.text) : global_label(operand.text)));
+      writer_.instruction("move64", base + "64 " + context_.symbol_label(operand.text));
     } else if(operand.kind == Operand::OP_TEMP || operand.kind == Operand::OP_SLOT) {
-      const ValueInfo & source = value(operand.text);
-      writer_.instruction("isub64", base + "64 bp " +
-                          number(static_cast<std::size_t>(-source.offset)));
+      load_local_address(value(operand.text), base);
     } else {
       load_value(operand, LowType(), base);
     }
   }
 
+  // Register `base` <- the address an operand designates as storage: a
+  // scalar temporary holds a pointer value, anything else is addressed.
   void load_storage_address(const Operand & operand, const std::string & base)
   {
-    if(operand.kind == Operand::OP_TEMP && !is_wide(value(operand.text).type)) {
+    if(operand.kind == Operand::OP_TEMP && !is_wide(value(operand.text).info)) {
       LowType pointer;
       pointer.text = "ptr";
       load_value(operand, pointer, base);
@@ -515,36 +487,18 @@ private:
 
   void stage_f80_operand(const Operand & operand, std::size_t area)
   {
-    const std::string scratch = scratch_base(area);
     if(operand.kind == Operand::OP_FLOAT) {
-      writer_.instruction("move80", scratch_memory(area) + " " +
-                          literal_text(operand));
-      pad_f80(scratch);
+      writer_.instruction("move80", memory(scratch(area)) + " " + literal_text(operand));
+      pad_f80(scratch(area));
       return;
     }
     load_address(operand, "x");
-    copy_memory("x64", scratch, 16);
+    copy_memory(Address("x64"), scratch(area), 16);
   }
 
-  void stage_f80_storage(const Operand & operand, std::size_t area)
+  void store_wide_from_scratch(const std::string & destination, std::size_t area)
   {
-    const std::string scratch = scratch_base(area);
-    load_storage_address(operand, "x");
-    copy_memory("x64", scratch, 16);
-  }
-
-  void store_wide_from_scratch(const std::string & destination,
-                               const std::string & source)
-  {
-    const ValueInfo & target = value(destination);
-    copy_memory(source, local_base(target.offset), 16);
-  }
-
-  void store_wide_operand(const Operand & destination, const std::string & source,
-                          std::size_t bytes)
-  {
-    load_storage_address(destination, "y");
-    copy_memory(source, "y64", bytes);
+    copy_memory(scratch(area), local(value(destination)), 16);
   }
 
   void copy_wide_operand_to_value(const Operand & source,
@@ -552,32 +506,31 @@ private:
                                   const LowType & type)
   {
     const ValueInfo & target = value(destination);
-    if(source.kind == Operand::OP_FLOAT && type_is_f80(type)) {
+    if(source.kind == Operand::OP_FLOAT && is_f80(type)) {
       stage_f80_operand(source, 0);
-      copy_memory(scratch_base(0), local_base(target.offset), 16);
+      copy_memory(scratch(0), local(target), 16);
       return;
     }
     load_address(source, "x");
-    copy_memory("x64", local_base(target.offset), value_size(type));
+    copy_memory(Address("x64"), local(target), value_size(target.info));
   }
 
   void store_result(const std::string & destination, const LowType & type,
                     const std::string & base)
   {
     const ValueInfo & target = value(destination);
-    if(is_wide(target.type)) {
-      throw std::runtime_error("wide result is outside the scalar CY86 checkpoint");
+    if(is_wide(target.info)) {
+      throw std::runtime_error("scalar store into wide LowIR value " + destination);
     }
     const std::string suffix = width_suffix(type);
-    writer_.instruction("move" + suffix,
-                        local_memory(target.offset) + " " + base + suffix);
+    writer_.instruction("move" + suffix, memory(local(target)) + " " + base + suffix);
   }
 
   void emit_const(const Instruction & instruction)
   {
-    if(type_is_f80(instruction.type)) {
+    if(is_f80(instruction.type)) {
       stage_f80_operand(instruction.first, 0);
-      store_wide_from_scratch(instruction.dest, scratch_base(0));
+      store_wide_from_scratch(instruction.dest, 0);
       return;
     }
     load_value(instruction.first, instruction.type, "x");
@@ -603,36 +556,34 @@ private:
 
   void emit_load(const Instruction & instruction)
   {
-    if(is_wide(instruction.type)) {
-      if(type_is_f80(instruction.type)) {
-        stage_f80_storage(instruction.first, 0);
-        store_wide_from_scratch(instruction.dest, scratch_base(0));
-      } else {
-        const ValueInfo & target = value(instruction.dest);
+    const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
+    if(is_wide(info)) {
+      if(is_f80(info)) {
         load_storage_address(instruction.first, "x");
-        copy_memory("x64", local_base(target.offset),
-                    value_size(instruction.type));
+        copy_memory(Address("x64"), scratch(0), 16);
+        store_wide_from_scratch(instruction.dest, 0);
+      } else {
+        load_storage_address(instruction.first, "x");
+        copy_memory(Address("x64"), local(value(instruction.dest)), value_size(info));
       }
       return;
     }
-    const std::string suffix = width_suffix(instruction.type);
+    const std::string suffix = width_suffix(info);
     if(instruction.first.kind == Operand::OP_GLOBAL) {
       writer_.instruction("move" + suffix,
                           "x" + suffix + " [" + global_label(instruction.first.text) + "]");
     } else if(instruction.first.kind == Operand::OP_SLOT) {
       writer_.instruction("move" + suffix,
-                          "x" + suffix + " " + local_memory(value(instruction.first.text).offset));
+                          "x" + suffix + " " + memory(local(value(instruction.first.text))));
     } else {
       load_value(instruction.first, LowType(), "x");
-      writer_.instruction("move" + suffix,
-                          "x" + suffix + " [x64]");
+      writer_.instruction("move" + suffix, "x" + suffix + " [x64]");
+      // A 32-bit signed load through a pointer temporary is sign-extended
+      // in the register before it is stored (pinned CY86 shape).
       if(instruction.type.text == "i32" && instruction.first.kind == Operand::OP_TEMP) {
-        const ValueInfo & source = value(instruction.first.text);
-        if(source.type.text == "ptr" || lowir_model::describe_low_type(source.type).object()) {
-          writer_.instruction("move8", "t8 32");
-          writer_.instruction("lshift64", "x64 x64 t8");
-          writer_.instruction("srshift64", "x64 x64 t8");
-        }
+        writer_.instruction("move8", "t8 32");
+        writer_.instruction("lshift64", "x64 x64 t8");
+        writer_.instruction("srshift64", "x64 x64 t8");
       }
     }
     store_result(instruction.dest, instruction.type, "x");
@@ -640,46 +591,47 @@ private:
 
   void emit_store(const Instruction & instruction)
   {
-    if(is_wide(instruction.type)) {
-      if(type_is_f80(instruction.type)) {
+    const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
+    if(is_wide(info)) {
+      if(is_f80(info)) {
         stage_f80_operand(instruction.first, 0);
-        store_wide_operand(instruction.second, scratch_base(0), 16);
+        load_storage_address(instruction.second, "y");
+        copy_memory(scratch(0), Address("y64"), 16);
       } else {
         load_address(instruction.first, "x");
-        store_wide_operand(instruction.second, "x64",
-                           value_size(instruction.type));
+        load_storage_address(instruction.second, "y");
+        copy_memory(Address("x64"), Address("y64"), value_size(info));
       }
       return;
     }
-    const std::string suffix = width_suffix(instruction.type);
+    const std::string suffix = width_suffix(info);
     load_value(instruction.first, instruction.type, "x");
     if(instruction.second.kind == Operand::OP_GLOBAL) {
       writer_.instruction("move" + suffix,
                           "[" + global_label(instruction.second.text) + "] x" + suffix);
     } else if(instruction.second.kind == Operand::OP_SLOT) {
       writer_.instruction("move" + suffix,
-                          local_memory(value(instruction.second.text).offset) + " x" + suffix);
+                          memory(local(value(instruction.second.text))) + " x" + suffix);
     } else {
       load_value(instruction.second, LowType(), "y");
-      writer_.instruction("move" + suffix,
-                          "[y64] x" + suffix);
+      writer_.instruction("move" + suffix, "[y64] x" + suffix);
     }
   }
 
   void emit_binary(const Instruction & instruction)
   {
-    if(type_is_f80(instruction.type)) {
+    const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
+    if(is_f80(info)) {
       stage_f80_operand(instruction.first, 0);
       stage_f80_operand(instruction.second, 1);
       writer_.instruction("f" + instruction.op + "80",
-                          scratch_memory(2) + " " + scratch_memory(0) +
-                          " " + scratch_memory(1));
-      pad_f80(scratch_base(2));
-      store_wide_from_scratch(instruction.dest, scratch_base(2));
+                          memory(scratch(2)) + " " + memory(scratch(0)) +
+                          " " + memory(scratch(1)));
+      pad_f80(scratch(2));
+      store_wide_from_scratch(instruction.dest, 2);
       return;
     }
-    const std::string suffix = width_suffix(instruction.type);
-    const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
+    const std::string suffix = width_suffix(info);
     load_value(instruction.first, instruction.type, "y");
     load_value(instruction.second, instruction.type, "x");
     if(instruction.op == "shl" || instruction.op == "shr" ||
@@ -697,7 +649,7 @@ private:
     store_result(instruction.dest, instruction.type, "x");
   }
 
-  std::string binary_opcode(const std::string & op) const
+  static std::string binary_opcode(const std::string & op)
   {
     if(op == "add") return "iadd";
     if(op == "sub") return "isub";
@@ -712,35 +664,29 @@ private:
     return "f" + op;
   }
 
+  // Every comparison materializes a canonical i64 truth value.
   void emit_compare(const Instruction & instruction)
   {
-    if(type_is_f80(instruction.type)) {
+    const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
+    if(is_f80(info)) {
       stage_f80_operand(instruction.first, 0);
       stage_f80_operand(instruction.second, 1);
       writer_.instruction("f" + instruction.op + "80", "z8 " +
-                          scratch_memory(0) + " " + scratch_memory(1));
-      writer_.instruction("move64", "x64 0");
-      writer_.instruction("move8", "x8 z8");
-      LowType result;
-      result.text = "i64";
-      store_result(instruction.dest, result, "x");
-      return;
+                          memory(scratch(0)) + " " + memory(scratch(1)));
+    } else {
+      const std::string suffix = width_suffix(info);
+      load_value(instruction.first, instruction.type, "y");
+      load_value(instruction.second, instruction.type, "x");
+      writer_.instruction((info.floating() ? "f" + instruction.op :
+                           compare_opcode(instruction.op)) + suffix,
+                          "z8 y" + suffix + " x" + suffix);
     }
-    const std::string suffix = width_suffix(instruction.type);
-    const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
-    load_value(instruction.first, instruction.type, "y");
-    load_value(instruction.second, instruction.type, "x");
-    writer_.instruction((info.floating() ? "f" + instruction.op :
-                         compare_opcode(instruction.op)) + suffix,
-                        "z8 y" + suffix + " x" + suffix);
     writer_.instruction("move64", "x64 0");
     writer_.instruction("move8", "x8 z8");
-    LowType result;
-    result.text = "i64";
-    store_result(instruction.dest, result, "x");
+    store_result(instruction.dest, lowir_model::instruction_result_type(instruction), "x");
   }
 
-  std::string compare_opcode(const std::string & op) const
+  static std::string compare_opcode(const std::string & op)
   {
     if(op == "eq") return "ieq";
     if(op == "ne") return "ine";
@@ -757,46 +703,41 @@ private:
 
   void emit_unary(const Instruction & instruction)
   {
-    if(type_is_f80(instruction.type)) {
+    if(is_f80(instruction.type)) {
       if(instruction.op != "neg") {
-        throw std::runtime_error("unsupported floating unary operation");
+        throw std::runtime_error("unsupported f80 unary operation " + instruction.op);
       }
       stage_f80_operand(instruction.first, 0);
-      writer_.instruction("move80", scratch_memory(1) + " 0.0L");
-      pad_f80(scratch_base(1));
-      writer_.instruction("fsub80", scratch_memory(2) + " " +
-                          scratch_memory(1) + " " + scratch_memory(0));
-      pad_f80(scratch_base(2));
-      store_wide_from_scratch(instruction.dest, scratch_base(2));
+      writer_.instruction("move80", memory(scratch(1)) + " 0.0L");
+      pad_f80(scratch(1));
+      writer_.instruction("fsub80", memory(scratch(2)) + " " +
+                          memory(scratch(1)) + " " + memory(scratch(0)));
+      pad_f80(scratch(2));
+      store_wide_from_scratch(instruction.dest, 2);
       return;
     }
     const std::string suffix = width_suffix(instruction.type);
-    if(instruction.op == "decay") {
-      load_value(instruction.first, instruction.type, "x");
-    } else if(instruction.op == "neg") {
-      load_value(instruction.first, instruction.type, "x");
+    load_value(instruction.first, instruction.type, "x");
+    if(instruction.op == "neg") {
       writer_.instruction("move" + suffix, "y" + suffix + " 0");
       writer_.instruction("isub" + suffix,
                           "x" + suffix + " y" + suffix + " x" + suffix);
     } else if(instruction.op == "not") {
-      load_value(instruction.first, instruction.type, "x");
       writer_.instruction("ieq64", "z8 x64 0");
       writer_.instruction("move64", "x64 0");
       writer_.instruction("move8", "x8 z8");
     } else if(instruction.op == "bitnot") {
-      load_value(instruction.first, instruction.type, "x");
-      writer_.instruction("not" + suffix,
-                          "x" + suffix + " x" + suffix);
+      writer_.instruction("not" + suffix, "x" + suffix + " x" + suffix);
     } else if(instruction.op == "bswap") {
-      load_value(instruction.first, instruction.type, "x");
-      writer_.instruction("bswap" + suffix,
-                          "x" + suffix + " x" + suffix);
-    } else {
-      throw std::runtime_error("unsupported unary operation");
+      writer_.instruction("bswap" + suffix, "x" + suffix + " x" + suffix);
+    } else if(instruction.op != "decay") {
+      throw std::runtime_error("unsupported unary operation " + instruction.op);
     }
     store_result(instruction.dest, instruction.type, "x");
   }
 
+  // Integer/float conversions go through an f80 staging area: the source is
+  // widened into SA, then narrowed from SA into the destination.
   void emit_convert(const Instruction & instruction)
   {
     if(instruction.op == "zext" || instruction.op == "sext" ||
@@ -814,48 +755,25 @@ private:
 
     const LowTypeInfo source = lowir_model::describe_low_type(instruction.source_type);
     const LowTypeInfo destination = lowir_model::describe_low_type(instruction.type);
-    if(source.floating()) {
-      if(type_is_f80(instruction.source_type)) {
-        stage_f80_operand(instruction.first, 0);
-      } else {
-        load_value(instruction.first, instruction.source_type, "x");
-        writer_.instruction(instruction.source_type.text + "convf80",
-                            scratch_memory(0) + " x" + width_suffix(instruction.source_type));
-        pad_f80(scratch_base(0));
-      }
+    if(is_f80(source)) {
+      stage_f80_operand(instruction.first, 0);
     } else {
       load_value(instruction.first, instruction.source_type, "x");
-      const bool unsigned_source = instruction.op == "uitofp";
-      writer_.instruction(std::string(unsigned_source ? "u" : "s") +
-                          number(source.bits) + "convf80",
-                          scratch_memory(0) + " x" + width_suffix(instruction.source_type));
-      pad_f80(scratch_base(0));
+      const std::string widen = source.floating() ? instruction.source_type.text :
+        std::string(instruction.op == "uitofp" ? "u" : "s") + number(source.bits);
+      writer_.instruction(widen + "convf80",
+                          memory(scratch(0)) + " x" + width_suffix(source));
+      pad_f80(scratch(0));
     }
 
-    if(destination.floating()) {
-      if(type_is_f80(instruction.type)) {
-        store_wide_from_scratch(instruction.dest, scratch_base(0));
-      } else {
-        const ValueInfo & target = value(instruction.dest);
-        writer_.instruction("f80conv" + instruction.type.text,
-                            local_memory(target.offset) + " " + scratch_memory(0));
-      }
-    } else {
-      const ValueInfo & target = value(instruction.dest);
-      const bool unsigned_destination = instruction.op == "fptoui";
-      writer_.instruction("f80conv" +
-                          std::string(unsigned_destination ? "u" : "s") +
-                          number(destination.bits),
-                          local_memory(target.offset) + " " + scratch_memory(0));
+    if(is_f80(destination)) {
+      store_wide_from_scratch(instruction.dest, 0);
+      return;
     }
-  }
-
-  std::size_t index_element_size(const LowType & type) const
-  {
-    const LowTypeInfo info = lowir_model::describe_low_type(type);
-    if(info.object()) return info.bytes;
-    if(type.text == "f80") return 16;
-    return info.bytes;
+    const std::string narrow = destination.floating() ? instruction.type.text :
+      std::string(instruction.op == "fptoui" ? "u" : "s") + number(destination.bits);
+    writer_.instruction("f80conv" + narrow,
+                        memory(local(value(instruction.dest))) + " " + memory(scratch(0)));
   }
 
   void emit_index(const Instruction & instruction)
@@ -864,34 +782,22 @@ private:
     LowType index_type;
     index_type.text = "i64";
     load_value(instruction.second, index_type, "x");
-    const std::size_t element_size = index_element_size(instruction.type);
+    const std::size_t element_size = lowir_model::describe_low_type(instruction.type).bytes;
     if(element_size != 1) {
       writer_.instruction("move64", "z64 " + number(element_size));
       writer_.instruction("smul64", "x64 x64 z64");
     }
     writer_.instruction("iadd64", "x64 y64 x64");
-    LowType pointer;
-    pointer.text = "ptr";
-    store_result(instruction.dest, pointer, "x");
-  }
-
-  void load_bulk_pointer(const Operand & operand, const std::string & base)
-  {
-    if((operand.kind == Operand::OP_TEMP || operand.kind == Operand::OP_SLOT) &&
-       is_wide(value(operand.text).type)) {
-      load_address(operand, base);
-    } else {
-      load_value(operand, LowType(), base);
-    }
+    store_result(instruction.dest, lowir_model::instruction_result_type(instruction), "x");
   }
 
   void emit_copyobj(const Instruction & instruction)
   {
-    load_bulk_pointer(instruction.second, "x");
-    load_bulk_pointer(instruction.first, "y");
+    load_storage_address(instruction.second, "x");
+    load_storage_address(instruction.first, "y");
     for(std::size_t offset = 0; offset < instruction.byte_count; offset += 8) {
-      writer_.instruction("move64", "z64 " + memory("y64", 0));
-      writer_.instruction("move64", memory("x64", 0) + " z64");
+      writer_.instruction("move64", "z64 [y64]");
+      writer_.instruction("move64", "[x64] z64");
       if(offset + 8 < instruction.byte_count) {
         writer_.instruction("iadd64", "x64 x64 8");
         writer_.instruction("iadd64", "y64 y64 8");
@@ -901,125 +807,106 @@ private:
 
   void emit_zeroinit(const Instruction & instruction)
   {
-    load_bulk_pointer(instruction.first, "x");
+    load_storage_address(instruction.first, "x");
     writer_.instruction("move64", "z64 0");
     for(std::size_t offset = 0; offset < instruction.byte_count; offset += 8) {
-      writer_.instruction("move64", memory("x64", 0) + " z64");
+      writer_.instruction("move64", "[x64] z64");
       if(offset + 8 < instruction.byte_count) {
         writer_.instruction("iadd64", "x64 x64 8");
       }
     }
   }
 
+  // The parameter list a call binds against: its explicit signature, else the
+  // callee's definition or declaration.
   const std::vector<Parameter> * call_parameters(const Instruction & instruction) const
   {
     if(instruction.has_call_signature) return &instruction.call_params;
-    const Function * definition = context_.definition(instruction.first.text);
-    if(definition != 0) return &definition->params;
-    const FunctionDeclaration * declaration = context_.declaration(instruction.first.text);
-    if(declaration != 0) return &declaration->params;
-    return 0;
+    return context_.facts().callee_parameters(context_.program(), instruction.first.text);
   }
 
-  LowType call_parameter_type(const Instruction & instruction,
-                              std::size_t index) const
+  LowType call_parameter_type(const std::vector<Parameter> * parameters,
+                              const Operand & argument, std::size_t index) const
   {
-    const std::vector<Parameter> * parameters = call_parameters(instruction);
-    if(parameters != 0 && index < parameters->size()) {
-      return (*parameters)[index].type;
-    }
-    if(index < instruction.args.size()) {
-      LowType type;
-      type.text = operand_type_name(instruction.args[index], "i64");
-      return type;
-    }
     LowType type;
-    type.text = "i64";
+    if(parameters != 0 && index < parameters->size()) return (*parameters)[index].type;
+    type.text = operand_type_name(argument, "i64");
     return type;
   }
 
-  bool call_argument_is_address(const Instruction & instruction,
-                                std::size_t index) const
+  bool argument_is_address(const Operand & operand, const LowType & expected) const
   {
-    const LowType expected = call_parameter_type(instruction, index);
     if(is_wide(expected)) return true;
-    if(index >= instruction.args.size()) return false;
-    const Operand & operand = instruction.args[index];
     return operand.kind == Operand::OP_SLOT ||
-           ((operand.kind == Operand::OP_TEMP) && is_wide(value(operand.text).type));
+           (operand.kind == Operand::OP_TEMP && is_wide(value(operand.text).info));
   }
 
-  void emit_call_argument(const Instruction & instruction, std::size_t index,
+  // Register `target` <- one call argument: wide values, slots and wide
+  // temporaries pass their address; scalars pass the value.
+  void emit_call_argument(const Operand & operand, const LowType & expected,
                           const std::string & target)
   {
-    const LowType expected = call_parameter_type(instruction, index);
-    const Operand & operand = instruction.args[index];
-    if(call_argument_is_address(instruction, index)) {
-      if(operand.kind == Operand::OP_FLOAT && type_is_f80(expected)) {
-        stage_f80_operand(operand, 0);
-        writer_.instruction("isub64", "x64 bp " +
-                            number(layout_.local_size + 16));
-      } else {
-        load_address(operand, "x");
-      }
-      writer_.instruction("move64", target + "64 x64");
-    } else {
+    if(!argument_is_address(operand, expected)) {
       load_value(operand, expected, target);
+      return;
     }
+    if(operand.kind == Operand::OP_FLOAT && is_f80(expected)) {
+      stage_f80_operand(operand, 0);
+      writer_.instruction("isub64", "x64 bp " + number(layout_.local_size + 16));
+    } else {
+      load_address(operand, "x");
+    }
+    writer_.instruction("move64", target + "64 x64");
   }
 
+  // Register `target` <- where the callee writes a wide result: the
+  // destination temporary, or scratch SA when the result is discarded.
   void emit_hidden_result_argument(const Instruction & instruction,
                                    const std::string & target)
   {
     if(!instruction.dest.empty()) {
-      Operand destination;
-      destination.kind = Operand::OP_TEMP;
-      destination.text = instruction.dest;
-      load_address(destination, "x");
+      load_local_address(value(instruction.dest), "x");
     } else {
-      writer_.instruction("isub64", "x64 bp " +
-                          number(layout_.local_size + 16));
+      writer_.instruction("isub64", "x64 bp " + number(layout_.local_size + 16));
     }
     writer_.instruction("move64", target + "64 x64");
   }
 
   void emit_call(const Instruction & instruction)
   {
+    const std::vector<Parameter> * parameters = call_parameters(instruction);
     const bool indirect = instruction.first.kind != Operand::OP_GLOBAL;
-    const std::size_t argument_count = instruction.args.size();
     const bool hidden_result = is_wide(instruction.type);
-    const std::size_t abi_argument_count = argument_count +
+    const std::size_t abi_argument_count = instruction.args.size() +
                                             (hidden_result ? 1 : 0);
     const std::size_t stack_bytes = abi_argument_count > 4 ?
       (abi_argument_count - 4) * 8 : 0;
     if(indirect) {
       load_value(instruction.first, LowType(), "x");
       writer_.instruction("isub64", "sp sp " + number(stack_bytes + 8));
-      writer_.instruction("move64", memory("sp",
-                          static_cast<long long>(stack_bytes)) + " x64");
+      writer_.instruction("move64", memory(Address("sp", static_cast<long long>(stack_bytes))) + " x64");
     } else if(stack_bytes != 0) {
-      writer_.instruction("isub64", "sp sp " +
-                          number(stack_bytes));
+      writer_.instruction("isub64", "sp sp " + number(stack_bytes));
     }
     for(std::size_t abi_index = 0; abi_index < abi_argument_count; ++abi_index) {
       const bool in_registers = abi_index < 4;
       const std::string target = in_registers ? parameter_register(abi_index) : "x";
       if(hidden_result && abi_index == 0) {
         emit_hidden_result_argument(instruction, target);
-      } else {
-        const std::size_t argument_index = abi_index - (hidden_result ? 1 : 0);
-        if(!in_registers) {
-          emit_call_argument(instruction, argument_index, target);
-          const long long offset = static_cast<long long>((abi_index - 4) * 8);
-          writer_.instruction("move64", memory("sp", offset) + " 0");
-          writer_.instruction("move64", memory("sp", offset) + " x64");
-        } else {
-          emit_call_argument(instruction, argument_index, target);
-        }
+        continue;
+      }
+      const std::size_t argument_index = abi_index - (hidden_result ? 1 : 0);
+      const Operand & argument = instruction.args[argument_index];
+      emit_call_argument(argument, call_parameter_type(parameters, argument, argument_index),
+                         target);
+      if(!in_registers) {
+        const Address outgoing("sp", static_cast<long long>((abi_index - 4) * 8));
+        writer_.instruction("move64", memory(outgoing) + " 0");
+        writer_.instruction("move64", memory(outgoing) + " x64");
       }
     }
     if(indirect) {
-      writer_.instruction("call", memory("sp", static_cast<long long>(stack_bytes)));
+      writer_.instruction("call", memory(Address("sp", static_cast<long long>(stack_bytes))));
       writer_.instruction("iadd64", "sp sp " + number(stack_bytes + 8));
     } else {
       writer_.instruction("call", function_label(instruction.first.text));
@@ -1036,8 +923,7 @@ private:
   {
     const std::string suffix = width_suffix(instruction.type);
     load_value(instruction.first, LowType(), "y");
-    writer_.instruction("move" + suffix,
-                        "x" + suffix + " [y64]");
+    writer_.instruction("move" + suffix, "x" + suffix + " [y64]");
     store_result(instruction.dest, instruction.type, "x");
   }
 
@@ -1046,8 +932,7 @@ private:
     const std::string suffix = width_suffix(instruction.type);
     load_value(instruction.second, LowType(), "y");
     load_value(instruction.first, instruction.type, "x");
-    writer_.instruction("move" + suffix,
-                        "[y64] x" + suffix);
+    writer_.instruction("move" + suffix, "[y64] x" + suffix);
   }
 
   void emit_atomic_exchange(const Instruction & instruction)
@@ -1116,12 +1001,13 @@ private:
     for(std::size_t i = 0; i < instruction.args.size(); i += 2) {
       load_value(instruction.args[i], selector, "t");
       writer_.instruction("ieq64", "z8 x64 t64");
-      writer_.instruction("jumpif", "z8 " +
-                          block_label(instruction.args[i + 1].text));
+      writer_.instruction("jumpif", "z8 " + block_label(instruction.args[i + 1].text));
     }
     writer_.instruction("jump", block_label(instruction.second.text));
   }
 
+  // Push a handler record {previous top, handler, bp, sp after pop} onto the
+  // stack and make it the exception top.
   void emit_eh_push(const Instruction & instruction)
   {
     writer_.instruction("isub64", "sp sp 32");
@@ -1146,6 +1032,7 @@ private:
     writer_.instruction("iadd64", "sp sp 32");
   }
 
+  // Pop the top handler record and transfer to it, or terminate when none.
   void emit_eh_dispatch()
   {
     const std::string handler = context_.next_label("__eh_handler__");
@@ -1169,21 +1056,22 @@ private:
 
   void emit_return(const Instruction & instruction)
   {
-    if(is_wide(instruction.type)) {
+    const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
+    if(is_wide(info)) {
       if(layout_.hidden_result.empty()) {
         throw std::runtime_error("wide return is missing its hidden result pointer");
       }
       const ValueInfo & hidden = value(layout_.hidden_result);
-      if(type_is_f80(instruction.type)) {
+      if(is_f80(info)) {
         stage_f80_operand(instruction.first, 0);
-        writer_.instruction("move64", "x64 " + local_memory(hidden.offset));
-        copy_memory(scratch_base(0), "x64", 16);
+        writer_.instruction("move64", "x64 " + memory(local(hidden)));
+        copy_memory(scratch(0), Address("x64"), 16);
       } else {
         load_address(instruction.first, "x");
-        writer_.instruction("move64", "y64 " + local_memory(hidden.offset));
-        copy_memory("x64", "y64", value_size(instruction.type));
+        writer_.instruction("move64", "y64 " + memory(local(hidden)));
+        copy_memory(Address("x64"), Address("y64"), value_size(info));
       }
-    } else if(instruction.type.text != "void") {
+    } else if(info.kind != LowTypeInfo::LTI_VOID) {
       load_value(instruction.first, instruction.type, "x");
     }
     writer_.instruction("jump", epilogue_label());
@@ -1241,7 +1129,7 @@ private:
         break;
       case Instruction::IK_RETURN: emit_return(instruction); break;
       default:
-        throw std::runtime_error("unsupported LowIR instruction in scalar CY86 checkpoint");
+        throw std::runtime_error("LowIR instruction outside the PA13 CY86 adapter contract");
     }
   }
 };
@@ -1265,9 +1153,10 @@ void emit_start(const Program & program, const LowirProgramFacts & facts,
   writer.instruction("syscall1", "t64 60 x64");
 }
 
-void emit_f80_data(const Operand & operand, Cy86Writer & writer)
+// An f80 datum is its ten extended-precision bytes padded to sixteen: the
+// low eight as one data64, the next two as one data16, then six zero bytes.
+void emit_f80_data(long double value, Cy86Writer & writer)
 {
-  const long double value = std::strtold(operand.text.c_str(), 0);
   unsigned char bytes[sizeof(long double)] = {};
   std::memcpy(bytes, &value, sizeof(value));
   std::int64_t low = 0;
@@ -1281,43 +1170,36 @@ void emit_f80_data(const Operand & operand, Cy86Writer & writer)
   }
 }
 
-void emit_f80_zero_data(Cy86Writer & writer)
+std::string address_initializer(const CodegenContext & context,
+                                const std::string & symbol, long long addend)
 {
-  writer.instruction("data64", "0");
-  writer.instruction("data16", "0");
-  for(std::size_t i = 0; i < 6; ++i) {
-    writer.instruction("data8", "0");
-  }
+  std::string text = context.symbol_label(symbol);
+  if(addend > 0) text += "+";
+  if(addend != 0) text += signed_number(addend);
+  return text;
 }
 
 void emit_global_scalar(const lowir_model::GlobalDefinition & global,
                         const CodegenContext & context, Cy86Writer & writer)
 {
   writer.label(global_label(global.name));
-  if(type_is_f80(global.type)) {
-    if(global.init_kind == lowir_model::GlobalDefinition::INIT_ZERO) {
-      emit_f80_zero_data(writer);
-    } else {
-      emit_f80_data(global.init_operand, writer);
-    }
+  if(is_f80(global.type)) {
+    emit_f80_data(global.init_kind == lowir_model::GlobalDefinition::INIT_ZERO ?
+                  0.0L : global.init_operand.float_value, writer);
     return;
   }
   if(global.init_kind == lowir_model::GlobalDefinition::INIT_ZERO) {
-    const std::string suffix = width_suffix(global.type);
-    writer.instruction("data" + suffix, "0");
+    writer.instruction("data" + width_suffix(global.type), "0");
   } else if(global.init_kind == lowir_model::GlobalDefinition::INIT_ADDR) {
-    const std::string target = context.is_function(global.init_operand.text) ?
-      function_label(global.init_operand.text) : global_label(global.init_operand.text);
-    writer.instruction("data64", target +
-                       (global.addr_addend == 0 ? std::string() :
-                        (global.addr_addend > 0 ? "+" : "") +
-                        signed_number(global.addr_addend)));
+    writer.instruction("data64", address_initializer(context, global.init_operand.text,
+                                                     global.addr_addend));
   } else {
     writer.instruction("data" + width_suffix(global.type),
                        literal_text(global.init_operand));
   }
 }
 
+// Structured data: each item is padded up to its natural alignment.
 void emit_global_structured(const lowir_model::GlobalDefinition & global,
                             const CodegenContext & context, Cy86Writer & writer)
 {
@@ -1333,29 +1215,19 @@ void emit_global_structured(const lowir_model::GlobalDefinition & global,
       continue;
     }
     const LowTypeInfo info = lowir_model::describe_low_type(item.type);
-    const std::size_t alignment = info.alignment;
-    const std::size_t padding = alignment == 0 ? 0 :
-      (alignment - (offset % alignment)) % alignment;
+    const std::size_t padding = info.alignment == 0 ? 0 :
+      (info.alignment - (offset % info.alignment)) % info.alignment;
     for(std::size_t j = 0; j < padding; ++j) {
       writer.instruction("data8", "0");
     }
     offset += padding;
     if(item.kind == lowir_model::GlobalDefinition::DataItem::ITEM_ADDR) {
-      const std::string target = context.is_function(item.symbol) ?
-        function_label(item.symbol) : global_label(item.symbol);
-      writer.instruction("data64", target +
-                         (item.addr_addend == 0 ? std::string() :
-                          (item.addr_addend > 0 ? "+" : "") +
-                          signed_number(item.addr_addend)));
-    } else if(type_is_f80(item.type)) {
-      if(item.kind == lowir_model::GlobalDefinition::DataItem::ITEM_ZERO) {
-        emit_f80_zero_data(writer);
-      } else {
-        emit_f80_data(item.literal_operand, writer);
-      }
+      writer.instruction("data64", address_initializer(context, item.symbol,
+                                                       item.addr_addend));
+    } else if(is_f80(info)) {
+      emit_f80_data(item.literal_operand.float_value, writer);
     } else {
-      writer.instruction("data" + width_suffix(item.type),
-                         literal_text(item.literal_operand));
+      writer.instruction("data" + width_suffix(info), literal_text(item.literal_operand));
     }
     offset += info.bytes;
   }
@@ -1410,5 +1282,5 @@ std::string EmitCy86Program(const lowir_model::Program & program,
     writer.blank();
     emit_eh_globals(writer);
   }
-  return writer.str();
+  return writer.take();
 }

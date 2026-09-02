@@ -1,7 +1,6 @@
 #include "lowir_validate.h"
 
 #include <cstddef>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -13,6 +12,7 @@ using lowir_model::Block;
 using lowir_model::Function;
 using lowir_model::FunctionBoundaryMetadata;
 using lowir_model::FunctionDeclaration;
+using lowir_model::GlobalDeclaration;
 using lowir_model::GlobalDefinition;
 using lowir_model::Instruction;
 using lowir_model::LowType;
@@ -23,15 +23,57 @@ using lowir_model::ParameterMetadata;
 using lowir_model::Program;
 using lowir_model::SymbolMetadata;
 
-struct SymbolIndex
+// Read-only view of the top-level symbols through the published facts table,
+// so validation and emission resolve `@name` through the same authority.
+struct SymbolTable
 {
-  std::unordered_set<std::string> symbols;
-  std::unordered_set<std::string> globals;
-  std::unordered_set<std::string> functions;
-  std::unordered_set<std::string> thread_local_globals;
-  std::unordered_map<std::string, LowType> global_types;
-  std::unordered_map<std::string, const Function *> function_definitions;
-  std::unordered_map<std::string, const FunctionDeclaration *> function_declarations;
+  const Program & program;
+  const LowirProgramFacts & facts;
+
+  bool has(const std::string & name) const
+  {
+    return facts.find(name) != 0;
+  }
+
+  bool has_global(const std::string & name) const
+  {
+    return facts.is_global(name);
+  }
+
+  bool has_function(const std::string & name) const
+  {
+    return facts.is_function(name);
+  }
+
+  bool thread_local_global(const std::string & name) const
+  {
+    const LowirProgramFacts::SymbolRef * ref = facts.find(name);
+    if(ref == 0) return false;
+    if(ref->kind == LowirProgramFacts::SymbolRef::DECL_GLOBAL) {
+      return program.global_declarations[ref->index].storage == lowir_model::GSM_THREAD_LOCAL;
+    }
+    if(ref->kind == LowirProgramFacts::SymbolRef::DEF_GLOBAL) {
+      return program.globals[ref->index].storage == lowir_model::GSM_THREAD_LOCAL;
+    }
+    return false;
+  }
+
+  // The declared scalar type of a global, or null when the global is untyped
+  // (a bare declaration or a structured definition) or not a global.
+  const LowType * global_type(const std::string & name) const
+  {
+    const LowirProgramFacts::SymbolRef * ref = facts.find(name);
+    if(ref == 0) return 0;
+    if(ref->kind == LowirProgramFacts::SymbolRef::DECL_GLOBAL) {
+      const GlobalDeclaration & declaration = program.global_declarations[ref->index];
+      return declaration.has_type ? &declaration.type : 0;
+    }
+    if(ref->kind == LowirProgramFacts::SymbolRef::DEF_GLOBAL) {
+      const GlobalDefinition & global = program.globals[ref->index];
+      return global.structured ? 0 : &global.type;
+    }
+    return 0;
+  }
 };
 
 struct FunctionEnvironment
@@ -40,11 +82,6 @@ struct FunctionEnvironment
   std::unordered_map<std::string, LowType> slots;
   std::unordered_set<std::string> blocks;
 };
-
-bool target_is_thread_local(const SymbolIndex & index, const std::string & name);
-void validate_operand_references_for_instruction(const Instruction & instruction,
-                                                 const SymbolIndex & index,
-                                                 const FunctionEnvironment & environment);
 
 void fail(const std::string & message)
 {
@@ -75,56 +112,48 @@ bool is_terminator(Instruction::Kind kind)
          kind == Instruction::IK_THROW || kind == Instruction::IK_RESUME;
 }
 
-bool has_global(const SymbolIndex & index, const std::string & name)
+bool is_eh_instruction(Instruction::Kind kind)
 {
-  return index.globals.find(name) != index.globals.end();
+  return kind == Instruction::IK_EH_TRY || kind == Instruction::IK_EH_CLEANUP ||
+         kind == Instruction::IK_EH_CLEANUP_CLAUSE || kind == Instruction::IK_EH_CATCH ||
+         kind == Instruction::IK_EH_FILTER || kind == Instruction::IK_EH_CATCH_ALL ||
+         kind == Instruction::IK_EH_END || kind == Instruction::IK_THROW ||
+         kind == Instruction::IK_EXCEPTION || kind == Instruction::IK_EXCEPTION_SELECTOR ||
+         kind == Instruction::IK_RESUME;
 }
 
-bool has_function(const SymbolIndex & index, const std::string & name)
+void record_symbol(LowirProgramFacts & facts, const std::string & name,
+                   LowirProgramFacts::SymbolRef::Kind kind, std::size_t index)
 {
-  return index.functions.find(name) != index.functions.end();
-}
-
-void record_symbol(SymbolIndex & index, const std::string & name, bool global)
-{
-  if(!index.symbols.insert(name).second) {
+  LowirProgramFacts::SymbolRef ref;
+  ref.kind = kind;
+  ref.index = index;
+  if(!facts.symbols.insert(std::make_pair(name, ref)).second) {
     fail("duplicate top-level symbol " + name);
   }
-  if(global) index.globals.insert(name);
-  else index.functions.insert(name);
 }
 
-void index_top_level_symbols(const Program & program, SymbolIndex & index)
+void index_top_level_symbols(const Program & program, LowirProgramFacts & facts)
 {
   for(std::size_t i = 0; i < program.global_declarations.size(); ++i) {
-    const lowir_model::GlobalDeclaration & declaration = program.global_declarations[i];
-    record_symbol(index, declaration.name, true);
-    if(declaration.has_type) index.global_types[declaration.name] = declaration.type;
-    if(declaration.storage == lowir_model::GSM_THREAD_LOCAL) {
-      index.thread_local_globals.insert(declaration.name);
-    }
+    record_symbol(facts, program.global_declarations[i].name,
+                  LowirProgramFacts::SymbolRef::DECL_GLOBAL, i);
   }
   for(std::size_t i = 0; i < program.globals.size(); ++i) {
-    const GlobalDefinition & global = program.globals[i];
-    record_symbol(index, global.name, true);
-    if(!global.structured) index.global_types[global.name] = global.type;
-    if(global.storage == lowir_model::GSM_THREAD_LOCAL) {
-      index.thread_local_globals.insert(global.name);
-    }
+    record_symbol(facts, program.globals[i].name,
+                  LowirProgramFacts::SymbolRef::DEF_GLOBAL, i);
   }
   for(std::size_t i = 0; i < program.function_declarations.size(); ++i) {
-    const FunctionDeclaration & declaration = program.function_declarations[i];
-    record_symbol(index, declaration.name, false);
-    index.function_declarations[declaration.name] = &declaration;
+    record_symbol(facts, program.function_declarations[i].name,
+                  LowirProgramFacts::SymbolRef::DECL_FUNCTION, i);
   }
   for(std::size_t i = 0; i < program.functions.size(); ++i) {
-    const Function & function = program.functions[i];
-    record_symbol(index, function.name, false);
-    index.function_definitions[function.name] = &function;
+    record_symbol(facts, program.functions[i].name,
+                  LowirProgramFacts::SymbolRef::DEF_FUNCTION, i);
   }
 }
 
-void validate_aliases(const Program & program, const SymbolIndex & index)
+void validate_aliases(const Program & program, const SymbolTable & symbols)
 {
   std::unordered_set<std::string> aliases;
   for(std::size_t i = 0; i < program.object_aliases.size(); ++i) {
@@ -132,13 +161,26 @@ void validate_aliases(const Program & program, const SymbolIndex & index)
     if(!aliases.insert(alias.object_symbol).second) {
       fail("duplicate object alias " + alias.object_symbol);
     }
-    if(index.symbols.find(alias.target) == index.symbols.end()) {
+    if(!symbols.has(alias.target)) {
       fail("object alias target is undefined");
     }
   }
 }
 
-void validate_tls_metadata(const Program & program, const SymbolIndex & index)
+void validate_tls_wrapper(const SymbolMetadata & metadata, const SymbolTable & symbols,
+                          std::unordered_set<std::string> & wrappers)
+{
+  if(metadata.tls_for_symbol.empty()) return;
+  if(!symbols.has_global(metadata.tls_for_symbol) ||
+     !symbols.thread_local_global(metadata.tls_for_symbol)) {
+    fail("tls_for target is not thread-local");
+  }
+  if(!wrappers.insert(metadata.tls_for_symbol).second) {
+    fail("duplicate thread-local wrapper");
+  }
+}
+
+void validate_tls_metadata(const Program & program, const SymbolTable & symbols)
 {
   std::unordered_set<std::string> wrappers;
   for(std::size_t i = 0; i < program.global_declarations.size(); ++i) {
@@ -152,32 +194,11 @@ void validate_tls_metadata(const Program & program, const SymbolIndex & index)
     }
   }
   for(std::size_t i = 0; i < program.function_declarations.size(); ++i) {
-    const SymbolMetadata & metadata = program.function_declarations[i].metadata;
-    if(metadata.tls_for_symbol.empty()) continue;
-    if(!has_global(index, metadata.tls_for_symbol)) {
-      fail("tls_for does not name a global");
-    }
-    const std::string & target = metadata.tls_for_symbol;
-    const bool thread_local_global = target_is_thread_local(index, target);
-    if(!thread_local_global) fail("tls_for target is not thread-local");
-    if(!wrappers.insert(target).second) fail("duplicate thread-local wrapper");
+    validate_tls_wrapper(program.function_declarations[i].metadata, symbols, wrappers);
   }
   for(std::size_t i = 0; i < program.functions.size(); ++i) {
-    const SymbolMetadata & metadata = program.functions[i].metadata;
-    if(metadata.tls_for_symbol.empty()) continue;
-    if(!has_global(index, metadata.tls_for_symbol) ||
-       !target_is_thread_local(index, metadata.tls_for_symbol)) {
-      fail("tls_for target is not thread-local");
-    }
-    if(!wrappers.insert(metadata.tls_for_symbol).second) {
-      fail("duplicate thread-local wrapper");
-    }
+    validate_tls_wrapper(program.functions[i].metadata, symbols, wrappers);
   }
-}
-
-bool target_is_thread_local(const SymbolIndex & index, const std::string & name)
-{
-  return index.thread_local_globals.find(name) != index.thread_local_globals.end();
 }
 
 void count_role(int & count, const char * role)
@@ -201,7 +222,6 @@ void validate_roles(const Program & program, LowirProgramFacts & facts)
     }
     if(role == lowir_model::SR_ENTRY) {
       count_role(entry_count, "entry");
-      facts.entry_function = function.name;
       facts.entry = static_cast<int>(i);
     } else if(role == lowir_model::SR_INIT) {
       count_role(init_count, "init");
@@ -212,39 +232,6 @@ void validate_roles(const Program & program, LowirProgramFacts & facts)
     }
   }
   if(entry_count != 1) fail("LowIR program needs exactly one entry function");
-}
-
-void ValidateTopLevelSymbols(const Program & program, SymbolIndex & index,
-                             LowirProgramFacts & facts)
-{
-  index_top_level_symbols(program, index);
-  for(std::size_t i = 0; i < program.global_declarations.size(); ++i) {
-    LowirProgramFacts::SymbolRef ref;
-    ref.kind = LowirProgramFacts::SymbolRef::DECL_GLOBAL;
-    ref.index = i;
-    facts.symbols[program.global_declarations[i].name] = ref;
-  }
-  for(std::size_t i = 0; i < program.globals.size(); ++i) {
-    LowirProgramFacts::SymbolRef ref;
-    ref.kind = LowirProgramFacts::SymbolRef::DEF_GLOBAL;
-    ref.index = i;
-    facts.symbols[program.globals[i].name] = ref;
-  }
-  for(std::size_t i = 0; i < program.function_declarations.size(); ++i) {
-    LowirProgramFacts::SymbolRef ref;
-    ref.kind = LowirProgramFacts::SymbolRef::DECL_FUNCTION;
-    ref.index = i;
-    facts.symbols[program.function_declarations[i].name] = ref;
-  }
-  for(std::size_t i = 0; i < program.functions.size(); ++i) {
-    LowirProgramFacts::SymbolRef ref;
-    ref.kind = LowirProgramFacts::SymbolRef::DEF_FUNCTION;
-    ref.index = i;
-    facts.symbols[program.functions[i].name] = ref;
-  }
-  validate_aliases(program, index);
-  validate_tls_metadata(program, index);
-  validate_roles(program, facts);
 }
 
 bool function_role(lowir_model::SymbolRole role)
@@ -363,24 +350,20 @@ void ValidateMetadata(const Program & program)
 }
 
 void validate_global_initializer(const GlobalDefinition & global,
-                                const SymbolIndex & index)
+                                const SymbolTable & symbols)
 {
   const LowTypeInfo info = lowir_model::describe_low_type(global.type);
   if(!info.valid() || info.kind == LowTypeInfo::LTI_VOID) {
     fail("global definition has an invalid type");
   }
-  if(global.init_kind == GlobalDefinition::INIT_ADDR) {
-    if(!info.pointer() || index.symbols.find(global.init_operand.text) == index.symbols.end()) {
-      fail("global address initializer is invalid");
-    }
-  } else if(global.init_kind == GlobalDefinition::INIT_INTEGER &&
-            global.init_operand.literal_type.text != global.type.text) {
-    fail("global initializer type mismatch");
+  if(global.init_kind == GlobalDefinition::INIT_ADDR &&
+     (!info.pointer() || !symbols.has(global.init_operand.text))) {
+    fail("global address initializer is invalid");
   }
 }
 
 void validate_structured_global(const GlobalDefinition & global,
-                                const SymbolIndex & index)
+                                const SymbolTable & symbols)
 {
   if(global.data_items.empty()) fail("structured global is empty");
   for(std::size_t i = 0; i < global.data_items.size(); ++i) {
@@ -393,33 +376,30 @@ void validate_structured_global(const GlobalDefinition & global,
     if(!info.valid() || info.kind == LowTypeInfo::LTI_VOID || info.object()) {
       fail("invalid structured global item type");
     }
-    if(item.kind == GlobalDefinition::DataItem::ITEM_ADDR) {
-      if(!info.pointer() || index.symbols.find(item.symbol) == index.symbols.end()) {
-        fail("structured global address initializer is invalid");
-      }
-    } else if(item.literal_operand.literal_type.text != item.type.text) {
-      fail("structured global initializer type mismatch");
+    if(item.kind == GlobalDefinition::DataItem::ITEM_ADDR &&
+       (!info.pointer() || !symbols.has(item.symbol))) {
+      fail("structured global address initializer is invalid");
     }
   }
 }
 
-void ValidateGlobals(const Program & program, const SymbolIndex & index)
+void ValidateGlobals(const Program & program, const SymbolTable & symbols)
 {
   for(std::size_t i = 0; i < program.global_declarations.size(); ++i) {
-    const lowir_model::GlobalDeclaration & declaration = program.global_declarations[i];
+    const GlobalDeclaration & declaration = program.global_declarations[i];
     if(declaration.has_type && !is_known(declaration.type)) {
       fail("invalid global declaration type");
     }
   }
   for(std::size_t i = 0; i < program.globals.size(); ++i) {
     const GlobalDefinition & global = program.globals[i];
-    if(global.structured) validate_structured_global(global, index);
-    else validate_global_initializer(global, index);
+    if(global.structured) validate_structured_global(global, symbols);
+    else validate_global_initializer(global, symbols);
   }
 }
 
 void validate_operand_reference(const Operand & operand,
-                                const SymbolIndex & index,
+                                const SymbolTable & symbols,
                                 const FunctionEnvironment & environment)
 {
   if(operand.kind == Operand::OP_TEMP &&
@@ -430,8 +410,7 @@ void validate_operand_reference(const Operand & operand,
      environment.slots.find(operand.text) == environment.slots.end()) {
     fail("use of undefined slot " + operand.text);
   }
-  if(operand.kind == Operand::OP_GLOBAL &&
-     index.symbols.find(operand.text) == index.symbols.end()) {
+  if(operand.kind == Operand::OP_GLOBAL && !symbols.has(operand.text)) {
     fail("use of undefined global/function " + operand.text);
   }
   if(operand.kind == Operand::OP_LABEL) {
@@ -439,43 +418,32 @@ void validate_operand_reference(const Operand & operand,
   }
 }
 
-LowType operand_type(const Operand & operand, const SymbolIndex & index,
+// The type an operand carries in a value position.  Literals in value
+// positions are untyped and take the widest integer or floating type.
+LowType operand_type(const Operand & operand, const SymbolTable & symbols,
                      const FunctionEnvironment & environment)
 {
-  validate_operand_reference(operand, index, environment);
+  validate_operand_reference(operand, symbols, environment);
   if(operand.kind == Operand::OP_TEMP) return environment.temporaries.at(operand.text);
   if(operand.kind == Operand::OP_SLOT) return environment.slots.at(operand.text);
   if(operand.kind == Operand::OP_GLOBAL) {
-    if(has_function(index, operand.text)) return make_type("ptr");
-    const std::unordered_map<std::string, LowType>::const_iterator found =
-      index.global_types.find(operand.text);
-    return found == index.global_types.end() ? LowType() : found->second;
+    if(symbols.has_function(operand.text)) return make_type("ptr");
+    const LowType * type = symbols.global_type(operand.text);
+    return type == 0 ? LowType() : *type;
   }
-  if(operand.kind == Operand::OP_INTEGER) {
-    return operand.literal_type.text.empty() ? make_type("i64") : operand.literal_type;
-  }
-  if(operand.kind == Operand::OP_FLOAT) {
-    return operand.literal_type.text.empty() ? make_type("f64") : operand.literal_type;
-  }
+  if(operand.kind == Operand::OP_INTEGER) return make_type("i64");
+  if(operand.kind == Operand::OP_FLOAT) return make_type("f64");
   return LowType();
-}
-
-bool is_null_pointer_literal(const Operand & operand)
-{
-  return operand.kind == Operand::OP_INTEGER &&
-         (operand.text == "nullptr" || operand.text == "0");
 }
 
 bool compatible(const LowType & expected, const LowType & actual,
                 const Operand & operand, bool slot_is_address)
 {
-  if((operand.kind == Operand::OP_INTEGER || operand.kind == Operand::OP_FLOAT) &&
-     operand.literal_type.text.empty()) {
+  if(operand.kind == Operand::OP_INTEGER || operand.kind == Operand::OP_FLOAT) {
     return true;
   }
   if(!is_known(actual) || expected.text.empty()) return true;
   if(expected.text == actual.text) return true;
-  if(expected.text == "ptr" && is_null_pointer_literal(operand)) return true;
   if(expected.text == "ptr" && operand.kind == Operand::OP_SLOT && slot_is_address) {
     return true;
   }
@@ -483,59 +451,41 @@ bool compatible(const LowType & expected, const LowType & actual,
 }
 
 void check_value_type(const Operand & operand, const LowType & expected,
-                     const SymbolIndex & index, const FunctionEnvironment & environment,
+                     const SymbolTable & symbols, const FunctionEnvironment & environment,
                      bool slot_is_address = false)
 {
-  const LowType actual = operand_type(operand, index, environment);
+  const LowType actual = operand_type(operand, symbols, environment);
   if(!compatible(expected, actual, operand, slot_is_address)) {
     fail("LowIR operand type mismatch");
   }
 }
 
-void check_pointer_value(const Operand & operand, const SymbolIndex & index,
+void check_pointer_value(const Operand & operand, const SymbolTable & symbols,
                         const FunctionEnvironment & environment)
 {
-  validate_operand_reference(operand, index, environment);
+  validate_operand_reference(operand, symbols, environment);
   if(operand.kind == Operand::OP_SLOT) return;
-  const LowType actual = operand_type(operand, index, environment);
-  if(!actual.text.empty() && !is_type(actual, "ptr") && !lowir_model::describe_low_type(actual).object()) {
+  const LowType actual = operand_type(operand, symbols, environment);
+  if(!actual.text.empty() && !is_type(actual, "ptr") &&
+     !lowir_model::describe_low_type(actual).object()) {
     fail("expected a pointer-valued operand");
   }
 }
 
 void check_storage(const Operand & operand, const LowType & stored_type,
-                   const SymbolIndex & index, const FunctionEnvironment & environment)
+                   const SymbolTable & symbols, const FunctionEnvironment & environment)
 {
-  validate_operand_reference(operand, index, environment);
+  validate_operand_reference(operand, symbols, environment);
   if(operand.kind == Operand::OP_SLOT) {
-    check_value_type(operand, stored_type, index, environment);
+    check_value_type(operand, stored_type, symbols, environment);
   } else if(operand.kind == Operand::OP_GLOBAL) {
-    if(!has_global(index, operand.text)) fail("function is not storage");
-    const std::unordered_map<std::string, LowType>::const_iterator found =
-      index.global_types.find(operand.text);
-    if(found != index.global_types.end() && found->second.text != stored_type.text) {
+    if(!symbols.has_global(operand.text)) fail("function is not storage");
+    const LowType * type = symbols.global_type(operand.text);
+    if(type != 0 && type->text != stored_type.text) {
       fail("global storage type mismatch");
     }
   } else {
-    check_pointer_value(operand, index, environment);
-  }
-}
-
-LowType instruction_result_type(const Instruction & instruction)
-{
-  switch(instruction.kind) {
-    case Instruction::IK_ADDR:
-    case Instruction::IK_INDEX:
-    case Instruction::IK_STACK_ALLOC:
-      return make_type("ptr");
-    case Instruction::IK_CMP:
-      return make_type("i64");
-    case Instruction::IK_CALL:
-      return instruction.type;
-    case Instruction::IK_VA_START:
-      return make_type("ptr");
-    default:
-      return instruction.type;
+    check_pointer_value(operand, symbols, environment);
   }
 }
 
@@ -561,7 +511,7 @@ void collect_temporary_definitions(const Function & function,
       const Instruction & instruction = function.blocks[i].instructions[j];
       if(instruction.dest.empty()) continue;
       if(!environment.temporaries.insert(std::make_pair(
-             instruction.dest, instruction_result_type(instruction))).second) {
+             instruction.dest, lowir_model::instruction_result_type(instruction))).second) {
         fail("duplicate temporary definition");
       }
     }
@@ -570,7 +520,8 @@ void collect_temporary_definitions(const Function & function,
 
 void validate_target(const Operand & operand, const FunctionEnvironment & environment)
 {
-  if(operand.kind != Operand::OP_LABEL || environment.blocks.find(operand.text) == environment.blocks.end()) {
+  if(operand.kind != Operand::OP_LABEL ||
+     environment.blocks.find(operand.text) == environment.blocks.end()) {
     fail("undefined block target");
   }
 }
@@ -603,7 +554,7 @@ void validate_span(const Instruction & instruction)
   }
 }
 
-void validate_unary(const Instruction & instruction, const SymbolIndex & index,
+void validate_unary(const Instruction & instruction, const SymbolTable & symbols,
                     const FunctionEnvironment & environment)
 {
   const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
@@ -619,7 +570,7 @@ void validate_unary(const Instruction & instruction, const SymbolIndex & index,
   } else {
     fail("unknown unary operation");
   }
-  check_value_type(instruction.first, instruction.type, index, environment);
+  check_value_type(instruction.first, instruction.type, symbols, environment);
 }
 
 bool valid_integer_binary(const std::string & op)
@@ -635,7 +586,7 @@ bool valid_float_binary(const std::string & op)
   return op == "add" || op == "sub" || op == "mul" || op == "div";
 }
 
-void validate_binary(const Instruction & instruction, const SymbolIndex & index,
+void validate_binary(const Instruction & instruction, const SymbolTable & symbols,
                      const FunctionEnvironment & environment)
 {
   const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
@@ -646,8 +597,8 @@ void validate_binary(const Instruction & instruction, const SymbolIndex & index,
   } else {
     fail("binary operation needs a numeric type");
   }
-  check_value_type(instruction.first, instruction.type, index, environment);
-  check_value_type(instruction.second, instruction.type, index, environment);
+  check_value_type(instruction.first, instruction.type, symbols, environment);
+  check_value_type(instruction.second, instruction.type, symbols, environment);
 }
 
 bool valid_compare(const std::string & op)
@@ -656,7 +607,7 @@ bool valid_compare(const std::string & op)
          op == "ge" || op == "ult" || op == "ule" || op == "ugt" || op == "uge";
 }
 
-void validate_compare(const Instruction & instruction, const SymbolIndex & index,
+void validate_compare(const Instruction & instruction, const SymbolTable & symbols,
                       const FunctionEnvironment & environment)
 {
   const LowTypeInfo info = lowir_model::describe_low_type(instruction.type);
@@ -665,11 +616,11 @@ void validate_compare(const Instruction & instruction, const SymbolIndex & index
   if(info.pointer() && instruction.op != "eq" && instruction.op != "ne") {
     fail("ordered pointer comparison is not supported");
   }
-  check_value_type(instruction.first, instruction.type, index, environment);
-  check_value_type(instruction.second, instruction.type, index, environment);
+  check_value_type(instruction.first, instruction.type, symbols, environment);
+  check_value_type(instruction.second, instruction.type, symbols, environment);
 }
 
-void validate_conversion(const Instruction & instruction, const SymbolIndex & index,
+void validate_conversion(const Instruction & instruction, const SymbolTable & symbols,
                          const FunctionEnvironment & environment)
 {
   const LowTypeInfo dst = lowir_model::describe_low_type(instruction.type);
@@ -689,24 +640,20 @@ void validate_conversion(const Instruction & instruction, const SymbolIndex & in
     valid = dst.integer() && src.floating();
   }
   if(!valid) fail("invalid LowIR conversion");
-  check_value_type(instruction.first, instruction.source_type, index, environment);
+  check_value_type(instruction.first, instruction.source_type, symbols, environment);
 }
 
-void validate_call(const Instruction & instruction, const SymbolIndex & index,
+void validate_call(const Instruction & instruction, const SymbolTable & symbols,
                    const FunctionEnvironment & environment, bool assigned)
 {
   const FunctionDeclaration * declaration = 0;
   const Function * definition = 0;
   if(instruction.first.kind == Operand::OP_GLOBAL) {
-    if(!has_function(index, instruction.first.text)) fail("call target is not a function");
-    const std::unordered_map<std::string, const FunctionDeclaration *>::const_iterator d =
-      index.function_declarations.find(instruction.first.text);
-    const std::unordered_map<std::string, const Function *>::const_iterator f =
-      index.function_definitions.find(instruction.first.text);
-    if(d != index.function_declarations.end()) declaration = d->second;
-    if(f != index.function_definitions.end()) definition = f->second;
+    if(!symbols.has_function(instruction.first.text)) fail("call target is not a function");
+    declaration = symbols.facts.function_declaration(symbols.program, instruction.first.text);
+    definition = symbols.facts.function_definition(symbols.program, instruction.first.text);
   } else {
-    check_pointer_value(instruction.first, index, environment);
+    check_pointer_value(instruction.first, symbols, environment);
     if(!instruction.has_call_signature) fail("indirect call needs an explicit signature");
   }
 
@@ -742,47 +689,47 @@ void validate_call(const Instruction & instruction, const SymbolIndex & index,
     fail("call argument count mismatch");
   }
   for(std::size_t i = 0; i < params->size(); ++i) {
-    check_value_type(instruction.args[i], (*params)[i].type, index, environment, true);
+    check_value_type(instruction.args[i], (*params)[i].type, symbols, environment, true);
   }
 }
 
-void validate_memory_instruction(const Instruction & instruction, const SymbolIndex & index,
+void validate_memory_instruction(const Instruction & instruction, const SymbolTable & symbols,
                                  const FunctionEnvironment & environment)
 {
   switch(instruction.kind) {
     case Instruction::IK_LOAD:
-      check_storage(instruction.first, instruction.type, index, environment);
+      check_storage(instruction.first, instruction.type, symbols, environment);
       break;
     case Instruction::IK_ATOMIC_LOAD:
-      check_pointer_value(instruction.first, index, environment);
+      check_pointer_value(instruction.first, symbols, environment);
       break;
     case Instruction::IK_STORE:
-      check_value_type(instruction.first, instruction.type, index, environment);
-      check_storage(instruction.second, instruction.type, index, environment);
+      check_value_type(instruction.first, instruction.type, symbols, environment);
+      check_storage(instruction.second, instruction.type, symbols, environment);
       break;
     case Instruction::IK_ATOMIC_STORE:
-      check_value_type(instruction.first, instruction.type, index, environment);
-      check_pointer_value(instruction.second, index, environment);
+      check_value_type(instruction.first, instruction.type, symbols, environment);
+      check_pointer_value(instruction.second, symbols, environment);
       break;
     case Instruction::IK_ATOMIC_EXCHANGE:
     case Instruction::IK_ATOMIC_ADD_FETCH:
-      check_pointer_value(instruction.first, index, environment);
-      check_value_type(instruction.second, instruction.type, index, environment);
+      check_pointer_value(instruction.first, symbols, environment);
+      check_value_type(instruction.second, instruction.type, symbols, environment);
       break;
     case Instruction::IK_ATOMIC_COMPARE_EXCHANGE:
-      check_pointer_value(instruction.first, index, environment);
-      check_pointer_value(instruction.second, index, environment);
-      check_value_type(instruction.third, instruction.type, index, environment);
+      check_pointer_value(instruction.first, symbols, environment);
+      check_pointer_value(instruction.second, symbols, environment);
+      check_value_type(instruction.third, instruction.type, symbols, environment);
       break;
     case Instruction::IK_INDEX:
-      check_pointer_value(instruction.first, index, environment);
-      check_value_type(instruction.second, make_type("i64"), index, environment);
+      check_pointer_value(instruction.first, symbols, environment);
+      check_value_type(instruction.second, make_type("i64"), symbols, environment);
       break;
     case Instruction::IK_COPYOBJ:
       validate_span(instruction);
-      check_pointer_value(instruction.second, index, environment);
+      check_pointer_value(instruction.second, symbols, environment);
       {
-        const LowType source = operand_type(instruction.first, index, environment);
+        const LowType source = operand_type(instruction.first, symbols, environment);
         const LowTypeInfo source_info = lowir_model::describe_low_type(source);
         if(source_info.object()) {
           if(source_info.bytes != instruction.byte_count ||
@@ -790,13 +737,13 @@ void validate_memory_instruction(const Instruction & instruction, const SymbolIn
             fail("object copy span does not match source object");
           }
         } else {
-          check_pointer_value(instruction.first, index, environment);
+          check_pointer_value(instruction.first, symbols, environment);
         }
       }
       break;
     case Instruction::IK_ZEROINIT:
       validate_span(instruction);
-      check_pointer_value(instruction.first, index, environment);
+      check_pointer_value(instruction.first, symbols, environment);
       break;
     default:
       break;
@@ -804,41 +751,32 @@ void validate_memory_instruction(const Instruction & instruction, const SymbolIn
 }
 
 void validate_misc_instruction(const Instruction & instruction, const Function & function,
-                               const SymbolIndex & index, const FunctionEnvironment & environment)
+                               const SymbolTable & symbols, const FunctionEnvironment & environment)
 {
   switch(instruction.kind) {
     case Instruction::IK_CONST:
       if(instruction.type.text == "void") fail("void constant");
-      if(instruction.first.literal_type.text != instruction.type.text) {
-        fail("constant type mismatch");
-      }
       break;
     case Instruction::IK_COPY:
-      check_value_type(instruction.first, instruction.type, index, environment);
+      check_value_type(instruction.first, instruction.type, symbols, environment);
       break;
     case Instruction::IK_ADDR:
-      if(instruction.first.kind == Operand::OP_GLOBAL) {
-        if(index.symbols.find(instruction.first.text) == index.symbols.end()) {
-          fail("address of undefined symbol");
-        }
-      } else {
-        validate_operand_reference(instruction.first, index, environment);
-      }
+      validate_operand_reference(instruction.first, symbols, environment);
       break;
     case Instruction::IK_UNARY:
-      validate_unary(instruction, index, environment);
+      validate_unary(instruction, symbols, environment);
       break;
     case Instruction::IK_BINARY:
-      validate_binary(instruction, index, environment);
+      validate_binary(instruction, symbols, environment);
       break;
     case Instruction::IK_CMP:
-      validate_compare(instruction, index, environment);
+      validate_compare(instruction, symbols, environment);
       break;
     case Instruction::IK_CONVERT:
-      validate_conversion(instruction, index, environment);
+      validate_conversion(instruction, symbols, environment);
       break;
     case Instruction::IK_CALL:
-      validate_call(instruction, index, environment, !instruction.dest.empty());
+      validate_call(instruction, symbols, environment, !instruction.dest.empty());
       break;
     case Instruction::IK_EXCEPTION:
     case Instruction::IK_EXCEPTION_SELECTOR:
@@ -848,22 +786,20 @@ void validate_misc_instruction(const Instruction & instruction, const Function &
       if(instruction.byte_count == 0) fail("stack allocation size must be positive");
       break;
     case Instruction::IK_VA_START:
-      check_pointer_value(instruction.first, index, environment);
-      break;
     case Instruction::IK_VA_ARG:
-      check_pointer_value(instruction.first, index, environment);
+      check_pointer_value(instruction.first, symbols, environment);
       break;
     case Instruction::IK_THROW:
       if(instruction.type.text == "void") fail("cannot throw void");
-      check_value_type(instruction.first, instruction.type, index, environment);
+      check_value_type(instruction.first, instruction.type, symbols, environment);
       break;
     case Instruction::IK_BRANCH:
-      check_value_type(instruction.first, make_type("i64"), index, environment);
+      check_value_type(instruction.first, make_type("i64"), symbols, environment);
       break;
     case Instruction::IK_SWITCH:
-      check_value_type(instruction.first, make_type("i64"), index, environment);
+      check_value_type(instruction.first, make_type("i64"), symbols, environment);
       for(std::size_t i = 0; i < instruction.args.size(); i += 2) {
-        check_value_type(instruction.args[i], make_type("i64"), index, environment);
+        check_value_type(instruction.args[i], make_type("i64"), symbols, environment);
       }
       break;
     case Instruction::IK_RETURN:
@@ -872,7 +808,7 @@ void validate_misc_instruction(const Instruction & instruction, const Function &
         if(!instruction.first.text.empty()) fail("void return has a value");
       } else {
         if(instruction.first.text.empty()) fail("non-void return has no value");
-        check_value_type(instruction.first, function.return_type, index, environment);
+        check_value_type(instruction.first, function.return_type, symbols, environment);
       }
       break;
     default:
@@ -880,32 +816,37 @@ void validate_misc_instruction(const Instruction & instruction, const Function &
   }
 }
 
-void ValidateInstructionTypes(const Instruction & instruction, const Function & function,
-                             const SymbolIndex & index, const FunctionEnvironment & environment)
-{
-  validate_operand_references_for_instruction(instruction, index, environment);
-  validate_memory_instruction(instruction, index, environment);
-  validate_misc_instruction(instruction, function, index, environment);
-}
-
+// Every value operand must name a defined temporary, slot or top-level symbol,
+// including the operands of instructions that carry no type constraint.
 void validate_operand_references_for_instruction(const Instruction & instruction,
-                                                 const SymbolIndex & index,
+                                                 const SymbolTable & symbols,
                                                  const FunctionEnvironment & environment)
 {
   const Operand * operands[] = { &instruction.first, &instruction.second, &instruction.third };
   for(std::size_t i = 0; i < sizeof(operands) / sizeof(operands[0]); ++i) {
     if(!operands[i]->text.empty() && operands[i]->kind != Operand::OP_LABEL) {
-      validate_operand_reference(*operands[i], index, environment);
+      validate_operand_reference(*operands[i], symbols, environment);
     }
   }
   for(std::size_t i = 0; i < instruction.args.size(); ++i) {
     if(instruction.args[i].kind != Operand::OP_LABEL) {
-      validate_operand_reference(instruction.args[i], index, environment);
+      validate_operand_reference(instruction.args[i], symbols, environment);
     }
   }
 }
 
-void ValidateFunctionBody(const Function & function, const SymbolIndex & index)
+void ValidateInstruction(const Instruction & instruction, const Function & function,
+                         const SymbolTable & symbols, const FunctionEnvironment & environment)
+{
+  validate_operand_references_for_instruction(instruction, symbols, environment);
+  validate_memory_instruction(instruction, symbols, environment);
+  validate_misc_instruction(instruction, function, symbols, environment);
+  validate_control_flow(instruction, environment);
+  validate_debug_location(instruction.debug_location);
+}
+
+void ValidateFunctionBody(const Function & function, const SymbolTable & symbols,
+                          LowirProgramFacts & facts)
 {
   if(function.blocks.empty()) fail("function has no blocks");
   FunctionEnvironment environment;
@@ -917,37 +858,11 @@ void ValidateFunctionBody(const Function & function, const SymbolIndex & index)
     for(std::size_t j = 0; j < block.instructions.size(); ++j) {
       const Instruction & instruction = block.instructions[j];
       if(terminated) fail("instruction appears after a terminator");
-      ValidateInstructionTypes(instruction, function, index, environment);
-      validate_control_flow(instruction, environment);
-      validate_debug_location(instruction.debug_location);
+      ValidateInstruction(instruction, function, symbols, environment);
       if(is_terminator(instruction.kind)) terminated = true;
+      if(is_eh_instruction(instruction.kind)) facts.uses_eh = true;
     }
     if(!terminated) fail("block does not end in a terminator");
-  }
-}
-
-bool is_eh_instruction(Instruction::Kind kind)
-{
-  return kind == Instruction::IK_EH_TRY || kind == Instruction::IK_EH_CLEANUP ||
-         kind == Instruction::IK_EH_CLEANUP_CLAUSE || kind == Instruction::IK_EH_CATCH ||
-         kind == Instruction::IK_EH_FILTER || kind == Instruction::IK_EH_CATCH_ALL ||
-         kind == Instruction::IK_EH_END || kind == Instruction::IK_THROW ||
-         kind == Instruction::IK_EXCEPTION || kind == Instruction::IK_EXCEPTION_SELECTOR ||
-         kind == Instruction::IK_RESUME;
-}
-
-void collect_eh_fact(const Program & program, LowirProgramFacts & facts)
-{
-  for(std::size_t i = 0; i < program.functions.size(); ++i) {
-    const std::vector< Block > & blocks = program.functions[i].blocks;
-    for(std::size_t j = 0; j < blocks.size(); ++j) {
-      for(std::size_t k = 0; k < blocks[j].instructions.size(); ++k) {
-        if(is_eh_instruction(blocks[j].instructions[k].kind)) {
-          facts.uses_eh = true;
-          return;
-        }
-      }
-    }
   }
 }
 
@@ -956,19 +871,15 @@ void collect_eh_fact(const Program & program, LowirProgramFacts & facts)
 LowirProgramFacts ValidateLowirProgram(const lowir_model::Program & program)
 {
   LowirProgramFacts facts;
-  facts.global_declaration_count = program.global_declarations.size();
-  facts.global_definition_count = program.globals.size();
-  facts.function_declaration_count = program.function_declarations.size();
-  facts.function_definition_count = program.functions.size();
-  facts.alias_count = program.object_aliases.size();
-
-  SymbolIndex index;
-  ValidateTopLevelSymbols(program, index, facts);
+  index_top_level_symbols(program, facts);
+  const SymbolTable symbols = { program, facts };
+  validate_aliases(program, symbols);
+  validate_tls_metadata(program, symbols);
+  validate_roles(program, facts);
   ValidateMetadata(program);
-  ValidateGlobals(program, index);
+  ValidateGlobals(program, symbols);
   for(std::size_t i = 0; i < program.functions.size(); ++i) {
-    ValidateFunctionBody(program.functions[i], index);
+    ValidateFunctionBody(program.functions[i], symbols, facts);
   }
-  collect_eh_fact(program, facts);
   return facts;
 }

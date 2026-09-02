@@ -67,15 +67,6 @@ void parse_output_invocation(const vector<string> & args,
   srcfiles.assign(args.begin() + 2, args.end());
 }
 
-lowir_model::LowirProgram parse_and_validate(const vector<string> & srcfiles,
-                                             LowirProgramFacts & facts)
-{
-  const lowir_model::LowirProgram program =
-    lowir_model::parse_lowir_program_files(srcfiles);
-  facts = ValidateLowirProgram(program);
-  return program;
-}
-
 int run_lowir2cy86_mode(const vector<string> & args)
 {
   if(has_batch_stdin_arg(args)) {
@@ -91,8 +82,9 @@ int run_lowir2cy86_mode(const vector<string> & args)
   vector<string> srcfiles;
   parse_output_invocation(args, outfile, srcfiles);
 
-  LowirProgramFacts facts;
-  const lowir_model::LowirProgram program = parse_and_validate(srcfiles, facts);
+  const lowir_model::LowirProgram program =
+    lowir_model::parse_lowir_program_files(srcfiles);
+  const LowirProgramFacts facts = ValidateLowirProgram(program);
   const string output = EmitCy86Program(program, facts);
   ofstream destination(outfile.c_str(), ios::out | ios::binary | ios::trunc);
   if(!destination) {

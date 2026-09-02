@@ -9,6 +9,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 
 namespace lowir_model {
 
@@ -124,14 +125,32 @@ LowTypeInfo describe_low_type(const LowType & type)
   throw ParseError("unknown or malformed LowIR type '" + text + "'");
 }
 
+LowType instruction_result_type(const Instruction & instruction)
+{
+  LowType type;
+  switch(instruction.kind) {
+    case Instruction::IK_ADDR:
+    case Instruction::IK_INDEX:
+    case Instruction::IK_STACK_ALLOC:
+    case Instruction::IK_VA_START:
+      type.text = "ptr";
+      return type;
+    case Instruction::IK_CMP:
+      type.text = "i64";
+      return type;
+    default:
+      return instruction.type;
+  }
+}
+
 class LowirLexer
 {
 public:
-  LowirLexer(const std::string & text, const std::string & source_name)
-    : text_(text), source_name_(source_name)
+  explicit LowirLexer(const std::string & text)
+    : text_(text)
   {}
 
-  LowirToken peek()
+  const LowirToken & peek()
   {
     if(!has_peek_) {
       peek_token_ = read_token();
@@ -142,9 +161,9 @@ public:
 
   LowirToken take()
   {
-    LowirToken token = peek();
+    peek();
     has_peek_ = false;
-    return token;
+    return std::move(peek_token_);
   }
 
 private:
@@ -231,7 +250,6 @@ private:
   }
 
   const std::string & text_;
-  std::string source_name_;
   std::size_t pos_ = 0;
   std::size_t line_ = 1;
   std::size_t column_ = 1;
@@ -243,7 +261,7 @@ class LowirParser
 {
 public:
   LowirParser(const std::string & text, const std::string & source_name)
-    : lexer_(text, source_name), source_name_(source_name)
+    : lexer_(text), source_name_(source_name)
   {}
 
   LowirProgram parse()
@@ -311,11 +329,11 @@ private:
 
   std::string parse_prefixed_name(char prefix, const std::string & what)
   {
-    const LowirToken token = take();
+    LowirToken token = take();
     if(!has_prefix(token.text, prefix)) {
       fail("expected " + what);
     }
-    return token.text;
+    return std::move(token.text);
   }
 
   std::string parse_global_name()
@@ -1038,19 +1056,17 @@ private:
     if(has_prefix(lexer_.peek().text, '%')) {
       instruction.dest = parse_temporary_name();
       expect("=");
-      instruction = parse_assigned_instruction(instruction.dest);
+      parse_assigned_instruction(instruction);
     } else {
-      instruction = parse_standalone_instruction();
+      parse_standalone_instruction(instruction);
     }
     instruction.debug_location = parse_debug_location();
     return instruction;
   }
 
-  Instruction parse_assigned_instruction(const std::string & dest)
+  void parse_assigned_instruction(Instruction & instruction)
   {
     const std::string opcode = take().text;
-    Instruction instruction;
-    instruction.dest = dest;
     if(opcode == "const") return parse_const(instruction);
     if(opcode == "copy") return parse_copy(instruction);
     if(opcode == "addr") return parse_addr(instruction);
@@ -1064,7 +1080,7 @@ private:
     if(opcode == "atomic_add_fetch") return parse_atomic_add_fetch(instruction);
     if(opcode == "atomic_exchange") return parse_atomic_exchange(instruction);
     if(opcode == "atomic_compare_exchange") return parse_atomic_compare_exchange(instruction);
-    if(opcode == "call") return parse_call(instruction, true);
+    if(opcode == "call") return parse_call(instruction);
     if(opcode == "exception") return parse_exception(instruction, Instruction::IK_EXCEPTION);
     if(opcode == "exception_selector") {
       return parse_exception(instruction, Instruction::IK_EXCEPTION_SELECTOR);
@@ -1073,61 +1089,55 @@ private:
     if(opcode == "va_start") return parse_va_start(instruction);
     if(opcode == "va_arg") return parse_va_arg(instruction);
     fail("unknown assigned LowIR instruction");
-    return instruction;
   }
 
-  Instruction parse_standalone_instruction()
+  void parse_standalone_instruction(Instruction & instruction)
   {
     const std::string opcode = take().text;
-    Instruction instruction;
     if(opcode == "store") return parse_store(instruction, Instruction::IK_STORE);
     if(opcode == "atomic_store") return parse_atomic_store(instruction);
     if(opcode == "atomic_thread_fence") return parse_fence(instruction, true);
     if(opcode == "atomic_signal_fence") return parse_fence(instruction, false);
-    if(opcode == "call") return parse_call(instruction, false);
+    if(opcode == "call") return parse_call(instruction);
     if(opcode == "copyobj") return parse_bulk(instruction, Instruction::IK_COPYOBJ);
     if(opcode == "zeroinit") return parse_bulk(instruction, Instruction::IK_ZEROINIT);
     if(opcode == "eh_try") return parse_handler(instruction, Instruction::IK_EH_TRY);
     if(opcode == "eh_cleanup") return parse_handler(instruction, Instruction::IK_EH_CLEANUP);
     if(opcode == "eh_catch") return parse_eh_catch(instruction);
     if(opcode == "eh_filter") return parse_eh_filter(instruction);
-    if(opcode == "eh_catch_all") { instruction.kind = Instruction::IK_EH_CATCH_ALL; return instruction; }
-    if(opcode == "eh_end") { instruction.kind = Instruction::IK_EH_END; return instruction; }
+    if(opcode == "eh_catch_all") { instruction.kind = Instruction::IK_EH_CATCH_ALL; return; }
+    if(opcode == "eh_end") { instruction.kind = Instruction::IK_EH_END; return; }
     if(opcode == "throw") return parse_throw(instruction);
-    if(opcode == "resume") { instruction.kind = Instruction::IK_RESUME; return instruction; }
+    if(opcode == "resume") { instruction.kind = Instruction::IK_RESUME; return; }
     if(opcode == "jump") return parse_jump(instruction);
     if(opcode == "branch") return parse_branch(instruction);
     if(opcode == "switch") return parse_switch(instruction);
     if(opcode == "return") return parse_return(instruction);
     fail("unknown LowIR instruction");
-    return instruction;
   }
 
-  Instruction parse_const(Instruction instruction)
+  void parse_const(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_CONST;
     instruction.type = parse_type();
     instruction.first = parse_scalar_literal(instruction.type);
-    return instruction;
   }
 
-  Instruction parse_copy(Instruction instruction)
+  void parse_copy(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_COPY;
     instruction.type = parse_type();
     instruction.first = parse_value();
-    return instruction;
   }
 
-  Instruction parse_addr(Instruction instruction)
+  void parse_addr(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_ADDR;
     instruction.type.text = "ptr";
     instruction.first = parse_addressable();
-    return instruction;
   }
 
-  Instruction parse_load(Instruction instruction, Instruction::Kind kind)
+  void parse_load(Instruction & instruction, Instruction::Kind kind)
   {
     instruction.kind = kind;
     instruction.type = parse_type();
@@ -1136,10 +1146,9 @@ private:
       expect(",");
       parse_memory_order();
     }
-    return instruction;
   }
 
-  Instruction parse_index(Instruction instruction)
+  void parse_index(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_INDEX;
     instruction.type = parse_type();
@@ -1147,19 +1156,17 @@ private:
     instruction.first = parse_value();
     expect(",");
     instruction.second = parse_value();
-    return instruction;
   }
 
-  Instruction parse_unary(Instruction instruction)
+  void parse_unary(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_UNARY;
     instruction.op = take().text;
     instruction.type = parse_type();
     instruction.first = parse_value();
-    return instruction;
   }
 
-  Instruction parse_binary(Instruction instruction)
+  void parse_binary(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_BINARY;
     instruction.op = take().text;
@@ -1167,10 +1174,9 @@ private:
     instruction.first = parse_value();
     expect(",");
     instruction.second = parse_value();
-    return instruction;
   }
 
-  Instruction parse_cmp(Instruction instruction)
+  void parse_cmp(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_CMP;
     instruction.op = take().text;
@@ -1178,20 +1184,18 @@ private:
     instruction.first = parse_value();
     expect(",");
     instruction.second = parse_value();
-    return instruction;
   }
 
-  Instruction parse_convert(Instruction instruction)
+  void parse_convert(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_CONVERT;
     instruction.op = take().text;
     instruction.type = parse_type();
     instruction.source_type = parse_type();
     instruction.first = parse_value();
-    return instruction;
   }
 
-  Instruction parse_atomic_add_fetch(Instruction instruction)
+  void parse_atomic_add_fetch(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_ATOMIC_ADD_FETCH;
     instruction.type = parse_type();
@@ -1200,10 +1204,9 @@ private:
     instruction.second = parse_value();
     expect(",");
     parse_memory_order();
-    return instruction;
   }
 
-  Instruction parse_atomic_exchange(Instruction instruction)
+  void parse_atomic_exchange(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_ATOMIC_EXCHANGE;
     instruction.type = parse_type();
@@ -1212,10 +1215,9 @@ private:
     instruction.second = parse_value();
     expect(",");
     parse_memory_order();
-    return instruction;
   }
 
-  Instruction parse_atomic_compare_exchange(Instruction instruction)
+  void parse_atomic_compare_exchange(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_ATOMIC_COMPARE_EXCHANGE;
     instruction.type = parse_type();
@@ -1228,51 +1230,45 @@ private:
     parse_memory_order();
     expect(",");
     parse_memory_order();
-    return instruction;
   }
 
-  Instruction parse_exception(Instruction instruction, Instruction::Kind kind)
+  void parse_exception(Instruction & instruction, Instruction::Kind kind)
   {
     instruction.kind = kind;
     instruction.type = parse_type();
-    return instruction;
   }
 
-  Instruction parse_stack_alloc(Instruction instruction)
+  void parse_stack_alloc(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_STACK_ALLOC;
     const long long size = parse_integer_literal();
     instruction.byte_count = size > 0 ? static_cast<std::size_t>(size) : 0;
     instruction.type.text = "ptr";
-    return instruction;
   }
 
-  Instruction parse_va_start(Instruction instruction)
+  void parse_va_start(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_VA_START;
     instruction.first = parse_value();
-    return instruction;
   }
 
-  Instruction parse_va_arg(Instruction instruction)
+  void parse_va_arg(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_VA_ARG;
     instruction.type = parse_type();
     instruction.first = parse_value();
-    return instruction;
   }
 
-  Instruction parse_store(Instruction instruction, Instruction::Kind kind)
+  void parse_store(Instruction & instruction, Instruction::Kind kind)
   {
     instruction.kind = kind;
     instruction.type = parse_type();
     instruction.first = parse_value();
     expect(",");
     instruction.second = parse_value();
-    return instruction;
   }
 
-  Instruction parse_atomic_store(Instruction instruction)
+  void parse_atomic_store(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_ATOMIC_STORE;
     instruction.type = parse_type();
@@ -1281,18 +1277,16 @@ private:
     instruction.second = parse_value();
     expect(",");
     parse_memory_order();
-    return instruction;
   }
 
-  Instruction parse_fence(Instruction instruction, bool thread)
+  void parse_fence(Instruction & instruction, bool thread)
   {
     instruction.kind = thread ? Instruction::IK_ATOMIC_THREAD_FENCE :
                                 Instruction::IK_ATOMIC_SIGNAL_FENCE;
     parse_memory_order();
-    return instruction;
   }
 
-  Instruction parse_call(Instruction instruction, bool assigned)
+  void parse_call(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_CALL;
     instruction.type = parse_type();
@@ -1311,10 +1305,6 @@ private:
       instruction.call_return_type = parse_type();
       apply_call_metadata(parse_metadata_blocks(), instruction.call_boundary);
     }
-    if(assigned && instruction.call_returns_void) {
-      /* The validator reports the boundary error; retain the parsed shape. */
-    }
-    return instruction;
   }
 
   std::vector<Operand> parse_argument_list()
@@ -1342,7 +1332,7 @@ private:
     }
   }
 
-  Instruction parse_bulk(Instruction instruction, Instruction::Kind kind)
+  void parse_bulk(Instruction & instruction, Instruction::Kind kind)
   {
     instruction.kind = kind;
     const std::pair<std::size_t, std::size_t> span = parse_span();
@@ -1353,26 +1343,23 @@ private:
       expect(",");
       instruction.second = parse_value();
     }
-    return instruction;
   }
 
-  Instruction parse_handler(Instruction instruction, Instruction::Kind kind)
+  void parse_handler(Instruction & instruction, Instruction::Kind kind)
   {
     instruction.kind = kind;
     instruction.first.kind = Operand::OP_LABEL;
     instruction.first.text = parse_block_name();
-    return instruction;
   }
 
-  Instruction parse_eh_catch(Instruction instruction)
+  void parse_eh_catch(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_EH_CATCH;
     instruction.first.kind = Operand::OP_GLOBAL;
     instruction.first.text = parse_global_name();
-    return instruction;
   }
 
-  Instruction parse_eh_filter(Instruction instruction)
+  void parse_eh_filter(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_EH_FILTER;
     if(has_prefix(lexer_.peek().text, '@')) {
@@ -1381,26 +1368,23 @@ private:
         instruction.args.push_back(parse_value());
       }
     }
-    return instruction;
   }
 
-  Instruction parse_throw(Instruction instruction)
+  void parse_throw(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_THROW;
     instruction.type = parse_type();
     instruction.first = parse_value();
-    return instruction;
   }
 
-  Instruction parse_jump(Instruction instruction)
+  void parse_jump(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_JUMP;
     instruction.first.kind = Operand::OP_LABEL;
     instruction.first.text = parse_block_name();
-    return instruction;
   }
 
-  Instruction parse_branch(Instruction instruction)
+  void parse_branch(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_BRANCH;
     instruction.first = parse_value();
@@ -1410,10 +1394,9 @@ private:
     expect(",");
     instruction.third.kind = Operand::OP_LABEL;
     instruction.third.text = parse_block_name();
-    return instruction;
   }
 
-  Instruction parse_switch(Instruction instruction)
+  void parse_switch(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_SWITCH;
     instruction.first = parse_value();
@@ -1428,17 +1411,15 @@ private:
       label.text = parse_block_name();
       instruction.args.push_back(label);
     }
-    return instruction;
   }
 
-  Instruction parse_return(Instruction instruction)
+  void parse_return(Instruction & instruction)
   {
     instruction.kind = Instruction::IK_RETURN;
     instruction.type = parse_type();
     if(instruction.type.text != "void" || value_starts_here()) {
       instruction.first = parse_value();
     }
-    return instruction;
   }
 
   bool value_starts_here()
