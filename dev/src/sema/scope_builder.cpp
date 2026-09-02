@@ -14,6 +14,12 @@ void ScopeBuilder::Build(AstId root)
     throw std::runtime_error("empty AST");
   if (arena_.At(root).kind != AST_TRANSLATION_UNIT)
     throw std::runtime_error("AST root is not a translation unit");
+  if (tree_ != 0)
+  {
+    semantic_root_ = tree_->Make(SEMA_TRANSLATION_UNIT);
+    tree_->SetRoot(semantic_root_);
+    MapSemanticScope(model_.GlobalScope(), semantic_root_);
+  }
   const vector<AstId>& children = arena_.At(root).children;
   for (std::size_t i = 0; i < children.size(); ++i)
     BuildNode(children[i], model_.GlobalScope());
@@ -33,6 +39,12 @@ void ScopeBuilder::BuildNode(AstId node, ScopeId scope)
   case AST_SIMPLE_DECLARATION: BuildSimpleDeclaration(node, scope); return;
   case AST_FUNCTION_DEFINITION: BuildFunctionDefinition(node, scope); return;
   case AST_ENUM_SPECIFIER: case AST_ENUM_DECLARATION:
+    if (tree_ != 0 && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
+    {
+      const SemaId declaration = MakeSemantic(SEMA_SIMPLE_DECLARATION, scope,
+                                               SemanticParent(scope));
+      (void)declaration;
+    }
     (void)BuildEnum(node, scope, string());
     return;
   case AST_CLASS_SPECIFIER:
@@ -123,6 +135,7 @@ void ScopeBuilder::BuildNamespace(AstId node, ScopeId scope)
   if (value.first == value.last)
   {
     target = model_.CreateScope(SCOPE_NAMESPACE, "<unnamed>", scope, is_inline);
+    model_.ScopeAt(target).unnamed_namespace = true;
     model_.AddUsingDirective(scope, target);
   }
   else
@@ -142,9 +155,31 @@ void ScopeBuilder::BuildNamespace(AstId node, ScopeId scope)
       model_.AddBinding(scope, name, BINDING_NAMESPACE, 0, target);
     }
   }
+  SemaId previous = 0;
+  if (tree_ != 0)
+  {
+    const std::map<ScopeId, SemaId>::const_iterator found =
+        semantic_scopes_.find(target);
+    if (found != semantic_scopes_.end())
+      previous = found->second;
+    BindingId namespace_binding = 0;
+    if (value.first != value.last)
+      namespace_binding = model_.DirectBinding(scope, IdentifierName(node),
+                                               LOOKUP_NAMESPACES);
+    const SemaId semantic = MakeSemantic(SEMA_NAMESPACE_DEFINITION, target,
+        SemanticParent(scope), 0, namespace_binding);
+    MapSemanticScope(target, semantic);
+  }
   for (std::size_t i = 0; i < value.children.size(); ++i)
     if (arena_.At(value.children[i]).kind != AST_INLINE)
       BuildNode(value.children[i], target);
+  if (tree_ != 0)
+  {
+    if (previous != 0)
+      MapSemanticScope(target, previous);
+    else
+      semantic_scopes_.erase(target);
+  }
 }
 
 void ScopeBuilder::BuildNamespaceAlias(AstId node, ScopeId scope)
@@ -179,6 +214,7 @@ void ScopeBuilder::BuildUsingDeclaration(AstId node, ScopeId scope)
   const Binding source = model_.BindingAt(target);
   Binding& imported = model_.BindingAt(model_.AddBinding(
       scope, name.Last(), source.kind, source.type));
+  imported.function = source.function;
   imported.has_const_value = source.has_const_value;
   imported.const_value = source.const_value;
 }
@@ -188,8 +224,11 @@ void ScopeBuilder::BuildAlias(AstId node, ScopeId scope)
   const AstId type_id = FindChild(node, AST_TYPE_ID);
   if (type_id == 0)
     throw std::runtime_error("alias has no type");
-  model_.AddBinding(scope, IdentifierName(node), BINDING_TYPE_ALIAS,
-                    BuildTypeId(type_id, scope));
+  const TypeId type = BuildTypeId(type_id, scope);
+  const BindingId binding = model_.AddBinding(
+      scope, IdentifierName(node), BINDING_TYPE_ALIAS, type);
+  if (tree_ != 0)
+    MakeSemantic(SEMA_TYPE_ALIAS, scope, SemanticParent(scope), type, binding);
 }
 
 void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
@@ -210,11 +249,19 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
   }
   const TypeId base = BuildSpecifierType(specifiers, scope, anonymous_name);
   if (list == 0)
+  {
+    if (tree_ != 0 && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
+      MakeSemantic(SEMA_SIMPLE_DECLARATION, scope, SemanticParent(scope));
     return;
+  }
 
   const bool is_typedef = SequenceHasKeyword(specifiers, KW_TYPEDEF);
   const bool is_constexpr = SequenceHasKeyword(specifiers, KW_CONSTEXPR);
   const vector<AstId>& items = arena_.At(list).children;
+  SemaId declaration_node = 0;
+  if (tree_ != 0 && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
+    declaration_node = MakeSemantic(SEMA_SIMPLE_DECLARATION, scope,
+                                    SemanticParent(scope));
   for (std::size_t i = 0; i < items.size(); ++i)
   {
     const AstId declarator = FindChild(items[i], AST_DECLARATOR);
@@ -225,15 +272,57 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
     string name;
     const ScopeId target_scope = ResolveDeclarationScope(
         scope, FindIdentifier(declarator), name);
+    const AstId initializer = FindChild(items[i], AST_INITIALIZER);
+    pending_array_bound_ = HasIncompleteArray(declarator) ?
+        InitializerBound(initializer) : 0;
     TypeId type = BuildDeclaratorType(declarator, base, target_scope);
+    pending_array_bound_ = 0;
     const bool is_function = types_.Kind(type) == TYPE_FUNCTION;
     // 7.1.5p9: a constexpr object is const.
     if (is_constexpr && !is_typedef && !is_function)
       type = types_.Cv(type, true);
     const BindingKind kind = is_typedef ? BINDING_TYPE_ALIAS :
         is_function ? BINDING_FUNCTION : BINDING_VARIABLE;
-    const BindingId binding = model_.AddBinding(target_scope, name, kind, type);
-    if (kind == BINDING_VARIABLE)
+    BindingId binding = 0;
+    if (is_function)
+    {
+      const FunctionEntityId function = DeclareFunction(
+          target_scope, name, type, false, binding);
+      if (tree_ != 0)
+        MakeSemantic(SEMA_FUNCTION_DECLARATION, target_scope,
+                     declaration_node != 0 ? declaration_node :
+                         SemanticParent(target_scope),
+                     model_.FunctionAt(function).type, binding, function);
+      continue;
+    }
+    binding = model_.AddBinding(target_scope, name, kind, type);
+    SemaId variable = 0;
+    if (tree_ != 0)
+    {
+      variable = MakeSemantic(is_typedef ? SEMA_TYPE_ALIAS : SEMA_VARIABLE,
+          target_scope, declaration_node != 0 ? declaration_node :
+              SemanticParent(target_scope), type, binding);
+      if (!is_typedef && initializer != 0)
+      {
+        const SemaId initialized = AnalyzeInitializer(initializer, target_scope,
+                                                       type);
+        if (is_constexpr)
+          InitializeExpression(initialized, type, true, true);
+        tree_->Append(variable, initialized);
+        long long value = 0;
+        if (is_constexpr && TryConstant(initialized, value))
+        {
+          Binding& stored = model_.BindingAt(binding);
+          stored.const_value = value;
+          stored.has_const_value = true;
+        }
+        else if (is_constexpr)
+          throw std::runtime_error("constexpr variable is not constant");
+      }
+      else if (is_constexpr)
+        throw std::runtime_error("constexpr variable has no initializer");
+    }
+    else if (kind == BINDING_VARIABLE)
       RecordConstantValue(binding, items[i], is_constexpr, target_scope);
   }
 }
@@ -281,9 +370,18 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   const TypeId type = BuildDeclaratorType(declarator, base, target_scope);
   if (types_.Kind(type) != TYPE_FUNCTION)
     throw std::runtime_error("function definition is not a function");
-  model_.AddBinding(target_scope, name, BINDING_FUNCTION, type);
+  BindingId binding = 0;
+  const FunctionEntityId function = DeclareFunction(
+      target_scope, name, type, true, binding);
+  SemaId function_node = 0;
+  if (tree_ != 0)
+    function_node = MakeSemantic(SEMA_FUNCTION_DEFINITION, target_scope,
+        SemanticParent(target_scope), model_.FunctionAt(function).type,
+        binding, function);
   const ScopeId function_scope = model_.CreateScope(
       SCOPE_FUNCTION, name, target_scope);
+  if (tree_ != 0)
+    MapSemanticScope(function_scope, function_node);
 
   const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
   if (clause != 0)
@@ -292,10 +390,22 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
     bool variadic = false;
     BuildParameters(clause, target_scope, parameters, variadic);
     for (std::size_t i = 0; i < parameters.size(); ++i)
-      model_.AddBinding(function_scope, parameters[i].name, BINDING_PARAMETER,
-                        parameters[i].type);
+    {
+      const BindingId parameter = model_.AddBinding(
+          function_scope, parameters[i].name, BINDING_PARAMETER,
+          parameters[i].type);
+      if (tree_ != 0)
+      {
+        const TypeNode& canonical = model_.Types().At(
+            model_.FunctionAt(function).type);
+        const TypeId parameter_type = i < canonical.parameters.size() ?
+            canonical.parameters[i] : parameters[i].type;
+        MakeSemantic(SEMA_PARAMETER, function_scope, function_node,
+                     parameter_type, parameter);
+      }
+    }
   }
-  (void)BuildCompound(body, function_scope);
+  (void)BuildCompound(body, function_scope, function, 0, 0, function_node);
 }
 
 void ScopeBuilder::BuildStaticAssert(AstId node, ScopeId scope)
@@ -312,33 +422,6 @@ void ScopeBuilder::BuildLinkage(AstId node, ScopeId scope)
   const vector<AstId>& children = arena_.At(node).children;
   for (std::size_t i = 0; i < children.size(); ++i)
     BuildNode(children[i], scope);
-}
-
-ScopeId ScopeBuilder::BuildCompound(AstId node, ScopeId parent)
-{
-  const ScopeId block = model_.CreateScope(SCOPE_BLOCK, string(), parent);
-  const vector<AstId>& children = arena_.At(node).children;
-  for (std::size_t i = 0; i < children.size(); ++i)
-    BuildStatement(children[i], block);
-  return block;
-}
-
-// Statements contribute declarations and nested blocks only.
-void ScopeBuilder::BuildStatement(AstId node, ScopeId scope)
-{
-  if (node == 0)
-    return;
-  const AstKind kind = arena_.At(node).kind;
-  if (IsDeclarationKind(kind))
-    BuildNode(node, scope);
-  else if (kind == AST_COMPOUND_STATEMENT)
-    (void)BuildCompound(node, scope);
-  else
-  {
-    const vector<AstId>& children = arena_.At(node).children;
-    for (std::size_t i = 0; i < children.size(); ++i)
-      BuildStatement(children[i], scope);
-  }
 }
 
 // Identity for a type declared without a name or declarator: the token
@@ -502,8 +585,16 @@ TypeId ScopeBuilder::BuildEnum(AstId node, ScopeId scope,
   {
     if (!definition)
       throw std::runtime_error("unnamed enum declaration");
-    name.components.push_back(anonymous_name.empty() ?
-                              AnonymousTypeName(node, "enum") : anonymous_name);
+    string generated = anonymous_name;
+    if (generated.empty() && tree_ != 0 &&
+        model_.ScopeAt(scope).kind == SCOPE_BLOCK)
+    {
+      std::ostringstream name_stream;
+      name_stream << "__anonymous_enum" << ++unnamed_local_enum_counter_;
+      generated = name_stream.str();
+    }
+    name.components.push_back(generated.empty() ?
+                              AnonymousTypeName(node, "enum") : generated);
   }
   if (!definition && !scoped && underlying_node == 0)
   {
@@ -726,4 +817,143 @@ bool ScopeBuilder::IsDeclarationKind(AstKind kind)
   default:
     return false;
   }
+}
+
+SemaId ScopeBuilder::SemanticParent(ScopeId scope, SemaId fallback) const
+{
+  if (tree_ == 0)
+    return 0;
+  for (ScopeId current = scope;; current = model_.ScopeAt(current).parent)
+  {
+    const std::map<ScopeId, SemaId>::const_iterator found =
+        semantic_scopes_.find(current);
+    if (found != semantic_scopes_.end())
+      return found->second;
+    if (current == model_.GlobalScope())
+      break;
+  }
+  return fallback != 0 ? fallback : semantic_root_;
+}
+
+SemaId ScopeBuilder::MakeSemantic(SemaKind kind, ScopeId scope,
+                                  SemaId parent, TypeId type,
+                                  BindingId binding,
+                                  FunctionEntityId function,
+                                  ValueCategory category, ETokenType op,
+                                  std::size_t first, std::size_t last)
+{
+  if (tree_ == 0)
+    return 0;
+  const SemaId result = tree_->Make(kind);
+  SemaNode& node = tree_->At(result);
+  node.scope = scope;
+  node.type = type;
+  node.binding = binding;
+  node.function = function;
+  node.category = category;
+  node.op = op;
+  node.first = first;
+  node.last = last;
+  if (parent == 0)
+    parent = SemanticParent(scope);
+  if (parent != 0)
+    tree_->Append(parent, result);
+  return result;
+}
+
+void ScopeBuilder::MapSemanticScope(ScopeId scope, SemaId node)
+{
+  if (tree_ != 0 && node != 0)
+    semantic_scopes_[scope] = node;
+}
+
+FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
+                                               const string& name,
+                                               TypeId declared_type,
+                                               bool definition,
+                                               BindingId& binding)
+{
+  const TypeId unqualified = types_.Unqualified(declared_type);
+  if (types_.Kind(unqualified) != TYPE_FUNCTION)
+    throw std::runtime_error("declaration is not a function");
+  // AdjustParameter may intern additional type nodes and reallocate the
+  // table, so keep the source function node by value while canonicalizing it.
+  const TypeNode declared = types_.At(unqualified);
+  vector<TypeId> parameters;
+  parameters.reserve(declared.parameters.size());
+  for (std::size_t i = 0; i < declared.parameters.size(); ++i)
+    parameters.push_back(types_.AdjustParameter(declared.parameters[i]));
+  const TypeId canonical = types_.Function(declared.result, parameters,
+                                           declared.variadic);
+
+  const Scope& owner = model_.ScopeAt(scope);
+  for (std::size_t i = 0; i < owner.bindings.size(); ++i)
+  {
+    const BindingId prior_id = owner.bindings[i];
+    const Binding& prior = model_.BindingAt(prior_id);
+    if (prior.name != name)
+      continue;
+    // A type-name and a function-name occupy distinct declaration spaces.
+    // Keep the type binding visible while allowing the function entity to be
+    // canonicalized independently.
+    if (prior.kind == BINDING_TYPE || prior.kind == BINDING_TYPE_ALIAS)
+      continue;
+    if (prior.kind != BINDING_FUNCTION || prior.function == 0)
+      throw std::runtime_error("function conflicts with an existing name");
+    const TypeNode& prior_type = types_.At(
+        model_.FunctionAt(prior.function).type);
+    const TypeNode& canonical_type = types_.At(canonical);
+    const bool same_parameters =
+        prior_type.parameters == canonical_type.parameters &&
+        prior_type.variadic == canonical_type.variadic;
+    if (same_parameters && model_.FunctionAt(prior.function).type != canonical)
+      throw std::runtime_error("function redeclaration changes return type");
+    if (model_.FunctionAt(prior.function).type == canonical)
+    {
+      FunctionEntity& entity = model_.FunctionAt(prior.function);
+      if (definition && entity.defined)
+        throw std::runtime_error("duplicate function definition");
+      if (definition)
+        entity.defined = true;
+      binding = model_.AddBinding(scope, name, BINDING_FUNCTION,
+                                  declared_type);
+      model_.BindingAt(binding).function = prior.function;
+      return prior.function;
+    }
+  }
+  const FunctionEntityId function = model_.CreateFunction(scope, name,
+                                                            canonical);
+  model_.FunctionAt(function).defined = definition;
+  binding = model_.AddBinding(scope, name, BINDING_FUNCTION, declared_type);
+  model_.BindingAt(binding).function = function;
+  return function;
+}
+
+bool ScopeBuilder::HasIncompleteArray(AstId declarator) const
+{
+  if (declarator == 0)
+    return false;
+  const AstNode& node = arena_.At(declarator);
+  if (node.kind == AST_ARRAY_SUFFIX && node.children.empty())
+    return true;
+  for (std::size_t i = 0; i < node.children.size(); ++i)
+    if (HasIncompleteArray(node.children[i]))
+      return true;
+  return false;
+}
+
+std::size_t ScopeBuilder::InitializerBound(AstId initializer) const
+{
+  if (initializer == 0)
+    return 0;
+  const AstNode& node = arena_.At(initializer);
+  if (node.kind == AST_INITIALIZER || node.kind == AST_PAREN_INITIALIZER)
+  {
+    if (node.children.size() != 1)
+      return 0;
+    return InitializerBound(node.children[0]);
+  }
+  if (node.kind == AST_BRACED_INIT_LIST)
+    return node.children.size();
+  return 0;
 }

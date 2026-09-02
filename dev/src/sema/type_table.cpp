@@ -323,6 +323,201 @@ TypeId TypeTable::Unqualified(TypeId id) const
   return id;
 }
 
+namespace
+{
+
+bool IsFloatingFundamental(EFundamentalType type)
+{
+  return type == FT_FLOAT || type == FT_DOUBLE || type == FT_LONG_DOUBLE;
+}
+
+} // namespace
+
+TypeId TypeTable::Decay(TypeId id)
+{
+  if (id == 0)
+    return 0;
+  const TypeNode& node = At(id);
+  if (node.kind == TYPE_REFERENCE)
+    return Decay(node.base);
+  if (node.kind == TYPE_ARRAY)
+    return Pointer(node.base);
+  if (node.kind == TYPE_FUNCTION)
+    return Pointer(id);
+  return Unqualified(id);
+}
+
+TypeId TypeTable::AdjustParameter(TypeId id)
+{
+  if (id == 0)
+    return 0;
+  const TypeNode& node = At(id);
+  if (node.kind == TYPE_ARRAY || node.kind == TYPE_FUNCTION)
+    return Decay(id);
+  return Unqualified(id);
+}
+
+TypeId TypeTable::Referent(TypeId id) const
+{
+  if (id == 0 || Kind(id) != TYPE_REFERENCE)
+    return 0;
+  return At(id).base;
+}
+
+bool TypeTable::IsIntegral(TypeId id) const
+{
+  if (id == 0)
+    return false;
+  id = Unqualified(id);
+  if (Kind(id) == TYPE_ENUM)
+    return true;
+  return Kind(id) == TYPE_FUNDAMENTAL &&
+      FundamentalIsIntegral(At(id).fundamental);
+}
+
+bool TypeTable::IsArithmetic(TypeId id) const
+{
+  if (id == 0)
+    return false;
+  id = Unqualified(id);
+  if (Kind(id) == TYPE_ENUM)
+    return true;
+  return Kind(id) == TYPE_FUNDAMENTAL &&
+      (FundamentalIsIntegral(At(id).fundamental) ||
+       IsFloatingFundamental(At(id).fundamental));
+}
+
+bool TypeTable::IsScalar(TypeId id) const
+{
+  if (id == 0)
+    return false;
+  id = Unqualified(id);
+  return IsArithmetic(id) || Kind(id) == TYPE_POINTER ||
+      (Kind(id) == TYPE_FUNDAMENTAL &&
+       At(id).fundamental == FT_NULLPTR_T);
+}
+
+bool TypeTable::IsPointer(TypeId id) const
+{
+  return id != 0 && Kind(Unqualified(id)) == TYPE_POINTER;
+}
+
+bool TypeTable::IsNullPointerType(TypeId id) const
+{
+  id = Unqualified(id);
+  return Kind(id) == TYPE_FUNDAMENTAL &&
+      At(id).fundamental == FT_NULLPTR_T;
+}
+
+TypeId TypeTable::Promote(TypeId id)
+{
+  if (id == 0)
+    return 0;
+  id = Unqualified(id);
+  if (Kind(id) == TYPE_ENUM)
+    return Promote(At(id).base);
+  if (Kind(id) != TYPE_FUNDAMENTAL)
+    return id;
+  const EFundamentalType fundamental = At(id).fundamental;
+  if (!FundamentalIsIntegral(fundamental))
+    return id;
+  if (fundamental == FT_BOOL || fundamental == FT_CHAR ||
+      fundamental == FT_SIGNED_CHAR || fundamental == FT_SHORT_INT ||
+      fundamental == FT_WCHAR_T || fundamental == FT_CHAR16_T ||
+      fundamental == FT_CHAR32_T)
+    return Fundamental(FT_INT);
+  if (fundamental == FT_UNSIGNED_CHAR ||
+      fundamental == FT_UNSIGNED_SHORT_INT)
+    return Fundamental(FT_INT);
+  return id;
+}
+
+TypeId TypeTable::UsualArithmetic(TypeId left, TypeId right)
+{
+  left = Promote(left);
+  right = Promote(right);
+  if (left == right)
+    return left;
+  const TypeNode& lhs = At(Unqualified(left));
+  const TypeNode& rhs = At(Unqualified(right));
+  if (lhs.kind != TYPE_FUNDAMENTAL || rhs.kind != TYPE_FUNDAMENTAL ||
+      !IsArithmetic(left) || !IsArithmetic(right))
+    return 0;
+  const EFundamentalType lf = lhs.fundamental;
+  const EFundamentalType rf = rhs.fundamental;
+  if (IsFloatingFundamental(lf) || IsFloatingFundamental(rf))
+  {
+    if (lf == FT_LONG_DOUBLE || rf == FT_LONG_DOUBLE)
+      return Fundamental(FT_LONG_DOUBLE);
+    if (lf == FT_DOUBLE || rf == FT_DOUBLE)
+      return Fundamental(FT_DOUBLE);
+    return Fundamental(FT_FLOAT);
+  }
+  const bool lu = FundamentalIsUnsigned(lf);
+  const bool ru = FundamentalIsUnsigned(rf);
+  const std::size_t ls = FundamentalSize(lf);
+  const std::size_t rs = FundamentalSize(rf);
+  if (lu == ru)
+    return FundamentalSize(lf) >= FundamentalSize(rf) ? left : right;
+  const EFundamentalType unsigned_type = lu ? lf : rf;
+  const EFundamentalType signed_type = lu ? rf : lf;
+  if (FundamentalSize(unsigned_type) >= FundamentalSize(signed_type))
+    return Fundamental(unsigned_type);
+  // On this target a signed type wider than the unsigned operand can
+  // represent all of its values; otherwise both operands convert to the
+  // corresponding unsigned type.
+  if (FundamentalSize(signed_type) > FundamentalSize(unsigned_type))
+    return Fundamental(signed_type);
+  (void)ls;
+  (void)rs;
+  switch (signed_type)
+  {
+  case FT_INT: return Fundamental(FT_UNSIGNED_INT);
+  case FT_LONG_INT: return Fundamental(FT_UNSIGNED_LONG_INT);
+  case FT_LONG_LONG_INT: return Fundamental(FT_UNSIGNED_LONG_LONG_INT);
+  default: return Fundamental(unsigned_type);
+  }
+}
+
+TypeId TypeTable::CompositePointer(TypeId left, TypeId right, bool& ok)
+{
+  ok = false;
+  left = Unqualified(left);
+  right = Unqualified(right);
+  if (Kind(left) != TYPE_POINTER || Kind(right) != TYPE_POINTER)
+    return 0;
+  const TypeId lp = At(left).base;
+  const TypeId rp = At(right).base;
+  TypeId lbase = Unqualified(lp);
+  TypeId rbase = Unqualified(rp);
+  bool lconst = false;
+  bool rconst = false;
+  if (Kind(lp) == TYPE_CV)
+    lconst = At(lp).is_const;
+  if (Kind(rp) == TYPE_CV)
+    rconst = At(rp).is_const;
+  if (lbase == rbase)
+  {
+    ok = true;
+    return Pointer(Cv(lbase, lconst || rconst));
+  }
+  if (Kind(lbase) == TYPE_FUNDAMENTAL &&
+      At(lbase).fundamental == FT_VOID &&
+      Kind(rbase) != TYPE_FUNCTION)
+  {
+    ok = true;
+    return Pointer(Cv(lbase, lconst || rconst));
+  }
+  if (Kind(rbase) == TYPE_FUNDAMENTAL &&
+      At(rbase).fundamental == FT_VOID &&
+      Kind(lbase) != TYPE_FUNCTION)
+  {
+    ok = true;
+    return Pointer(Cv(rbase, lconst || rconst));
+  }
+  return 0;
+}
+
 static const char* KeywordSpelling(TypeKeyword key)
 {
   switch (key)

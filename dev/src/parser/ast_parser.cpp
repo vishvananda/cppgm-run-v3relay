@@ -803,8 +803,24 @@ AstId Pa10Parser::parse_statement()
 	{
 		const BindKind* binding = is_kind(PA6_IDENTIFIER_TOKEN) ?
 			scopes_.Lookup(token(pos_).spelling) : 0;
+		// A qualified type followed by a parenthesized pointer declarator is
+		// a declaration even though the first component is a namespace.  The
+		// syntactic scope table intentionally does not duplicate namespace
+		// members, so recognize this unambiguous declarator shape before the
+		// declaration-vs-call fallback below.
+		const bool qualified_pointer_declaration =
+			binding != 0 && *binding == BIND_NAMESPACE &&
+			is_simple(OP_COLON2, pos_ + 1) &&
+			is_kind(PA6_IDENTIFIER_TOKEN, pos_ + 2) &&
+			is_simple(OP_LPAREN, pos_ + 3) &&
+			(is_simple(OP_STAR, pos_ + 4) || is_simple(OP_AMP, pos_ + 4) ||
+			 is_simple(OP_LAND, pos_ + 4)) &&
+			is_kind(PA6_IDENTIFIER_TOKEN, pos_ + 5) &&
+			is_simple(OP_RPAREN, pos_ + 6) &&
+			is_simple(OP_LPAREN, pos_ + 7);
 		if (is_kind(PA6_IDENTIFIER_TOKEN) &&
-			(binding == 0 || *binding == BIND_NAMESPACE))
+			(binding == 0 || *binding == BIND_NAMESPACE) &&
+			!qualified_pointer_declaration)
 		{
 			const Mark expression_mark = mark();
 			AstId expression = parse_expression();

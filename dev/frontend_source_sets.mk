@@ -27,7 +27,8 @@ FRONTEND_OBJ_BASENAMES_cy86 := preproc_host cy86_parse cy86_codegen x86_assemble
 FRONTEND_OBJ_BASENAMES_cppgm++ := preproc_host parser/ast_parser parser/ast_parser_decl \
 	parser/ast_parser_expr parser/ast_scope parser/ast_model parser/recog_token \
 	sema/type_table sema/qualified_name sema/scope_model sema/const_eval \
-	sema/scope_builder sema/type_builder sema/types_dump \
+	sema/sema_tree sema/conversions sema/expr_sema sema/scope_builder \
+	sema/type_builder sema/stmt_builder sema/semantics_dump sema/types_dump \
 	preproc_engine macro_replace ctrlexpr_eval pptoken_lexer posttoken_stream \
 	posttoken_tables unicode
 FRONTEND_OBJ_BASENAMES_lowiropt :=

@@ -19,6 +19,7 @@ typedef std::size_t ScopeId;
 typedef std::size_t BindingId;
 typedef std::size_t ClassEntityId;
 typedef std::size_t EnumEntityId;
+typedef std::size_t FunctionEntityId;
 
 enum ScopeKind
 {
@@ -61,7 +62,9 @@ struct Binding
   std::string name;
   BindingKind kind;
   TypeId type;
+  ScopeId scope; // owning declaration scope
   ScopeId namespace_scope; // BINDING_NAMESPACE: the nominated namespace
+  FunctionEntityId function; // BINDING_FUNCTION: canonical function entity
   bool has_const_value;
   long long const_value;
 
@@ -74,9 +77,18 @@ struct Scope
   std::string name; // printed after the scope kind; empty for blocks and template scopes
   ScopeId parent;
   bool inline_namespace;
+  bool unnamed_namespace;
   std::vector<BindingId> bindings;
   std::vector<ScopeId> children;
-  std::vector<ScopeId> using_directives;
+  struct UsingDirective
+  {
+    ScopeId nominated;
+    ScopeId apply_at;
+
+    UsingDirective(ScopeId nominated = 0, ScopeId apply_at = 0)
+        : nominated(nominated), apply_at(apply_at) {}
+  };
+  std::vector<UsingDirective> using_directives;
   // name -> bindings of that name in declaration order; built once the scope
   // holds more than kSmallScope bindings, empty before that.
   std::unordered_map<std::string, std::vector<BindingId> > index;
@@ -105,6 +117,16 @@ struct EnumEntity
   EnumEntity();
 };
 
+struct FunctionEntity
+{
+  ScopeId scope; // declaration scope, not the function body's block scope
+  std::string name;
+  TypeId type; // canonical function type with adjusted parameters
+  bool defined;
+
+  FunctionEntity();
+};
+
 class SemaModel
 {
 public:
@@ -131,6 +153,14 @@ public:
   // uses LOOKUP_TYPES, the qualifier position LOOKUP_QUALIFIER).
   BindingId LookupUnqualified(ScopeId scope, const std::string& name,
                               unsigned filter) const;
+  // Overload-aware forms.  The result is the complete set from the first
+  // lookup level that contains a match; a non-function in that set is kept so
+  // callers can enforce ordinary-name hiding before attempting a call.
+  void LookupSet(ScopeId scope, const std::string& name, unsigned filter,
+                 std::vector<BindingId>& result) const;
+  void LookupQualifiedSet(ScopeId scope, const QualifiedName& name,
+                          unsigned filter,
+                          std::vector<BindingId>& result) const;
   // Ordinary lookup of a type name: a later object, function, enumerator or
   // parameter of the same name hides the type (3.3.10p2).
   BindingId LookupTypeName(ScopeId scope, const std::string& name) const;
@@ -153,6 +183,10 @@ public:
   EnumEntityId CreateEnum(bool scoped, TypeId underlying);
   EnumEntity& EnumAt(EnumEntityId id);
   const EnumEntity& EnumAt(EnumEntityId id) const;
+  FunctionEntityId CreateFunction(ScopeId scope, const std::string& name,
+                                  TypeId type);
+  FunctionEntity& FunctionAt(FunctionEntityId id);
+  const FunctionEntity& FunctionAt(FunctionEntityId id) const;
   TypeTable& Types();
   const TypeTable& Types() const;
 
@@ -167,6 +201,13 @@ private:
   BindingId SearchUsingDirectives(ScopeId scope, const std::string& name,
                                   unsigned filter,
                                   std::vector<ScopeId>& visited) const;
+  void CollectDirect(ScopeId scope, const std::string& name,
+                     unsigned filter, std::vector<BindingId>& result) const;
+  void CollectNamespace(ScopeId scope, const std::string& name,
+                        unsigned filter, std::vector<ScopeId>& visited,
+                        std::vector<BindingId>& result) const;
+  static void AppendUnique(std::vector<BindingId>& result,
+                           BindingId binding);
   BindingId SearchMember(ScopeId scope, EntityId unscoped_enum,
                          const std::string& name, unsigned filter) const;
 
@@ -175,4 +216,5 @@ private:
   std::vector<Binding> bindings_;
   std::vector<ClassEntity> classes_;
   std::vector<EnumEntity> enums_;
+  std::vector<FunctionEntity> functions_;
 };

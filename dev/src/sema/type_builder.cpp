@@ -1,6 +1,8 @@
 // Specifier- and declarator-derived type construction for the ScopeBuilder.
 #include "sema/scope_builder.h"
 
+#include "sema/expr_sema.h"
+
 #include <stdexcept>
 
 using std::string;
@@ -9,8 +11,29 @@ using std::vector;
 ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens,
                            const AstArena& arena, SemaModel& model)
     : tokens_(tokens), arena_(arena), model_(model), types_(model.Types()),
-      const_eval_(tokens, arena, model, *this)
+      const_eval_(tokens, arena, model, *this), tree_(0), expression_(0),
+      semantic_root_(0),
+      pending_array_bound_(0), unnamed_local_enum_counter_(0),
+      unnamed_local_class_counter_(0)
 {
+}
+
+ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens,
+                           const AstArena& arena, SemaModel& model,
+                           SemaTree& tree)
+    : tokens_(tokens), arena_(arena), model_(model), types_(model.Types()),
+      const_eval_(tokens, arena, model, *this), tree_(&tree), expression_(0),
+      semantic_root_(0),
+      pending_array_bound_(0), unnamed_local_enum_counter_(0),
+      unnamed_local_class_counter_(0)
+{
+  expression_ = new ExpressionAnalyzer(tokens_, arena_, model_, tree,
+                                        *this);
+}
+
+ScopeBuilder::~ScopeBuilder()
+{
+  delete expression_;
 }
 
 TypeId ScopeBuilder::TypeOfTypeId(AstId type_id, ScopeId scope)
@@ -21,6 +44,49 @@ TypeId ScopeBuilder::TypeOfTypeId(AstId type_id, ScopeId scope)
 TypeId ScopeBuilder::TypeOfExpression(AstId expression, ScopeId scope)
 {
   return BuildExpressionType(expression, scope).type;
+}
+
+TypeId ScopeBuilder::TypeIdForSemantics(AstId type_id, ScopeId scope)
+{
+  return BuildTypeId(type_id, scope);
+}
+
+TypeId ScopeBuilder::DecltypeForSemantics(AstId expression, ScopeId scope)
+{
+  return BuildDecltype(expression, scope);
+}
+
+SemaId ScopeBuilder::AnalyzeExpression(AstId expression, ScopeId scope)
+{
+  if (expression_ == 0)
+    throw std::runtime_error("semantic expression analyzer is unavailable");
+  return expression_->Analyze(expression, scope);
+}
+
+SemaId ScopeBuilder::AnalyzeInitializer(AstId initializer, ScopeId scope,
+                                         TypeId target)
+{
+  if (expression_ == 0)
+    throw std::runtime_error("semantic expression analyzer is unavailable");
+  return expression_->AnalyzeInitializer(initializer, scope, target);
+}
+
+SemaId ScopeBuilder::InitializeExpression(SemaId expression, TypeId target,
+                                          bool variable,
+                                          bool constexpr_value,
+                                          bool condition,
+                                          bool return_value,
+                                          bool argument)
+{
+  if (expression_ == 0)
+    throw std::runtime_error("semantic expression analyzer is unavailable");
+  return expression_->Initialize(expression, target,
+      InitContext(variable, constexpr_value, condition, return_value, argument));
+}
+
+bool ScopeBuilder::TryConstant(SemaId expression, long long& value) const
+{
+  return expression_ != 0 && expression_->TryConstant(expression, value);
 }
 
 bool ScopeBuilder::IsIgnoredSpecifier(ETokenType token)
@@ -200,10 +266,15 @@ TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
     }
     else if (node.kind == AST_ARRAY_SUFFIX)
     {
+      long long bound = 0;
       if (node.children.empty() || node.children[0] == 0)
-        throw std::runtime_error("incomplete array type");
-      const long long bound = const_eval_.Evaluate(node.children[0],
-                                                   lookup_scope);
+      {
+        if (pending_array_bound_ == 0)
+          throw std::runtime_error("incomplete array type");
+        bound = static_cast<long long>(pending_array_bound_);
+      }
+      else
+        bound = const_eval_.Evaluate(node.children[0], lookup_scope);
       if (bound <= 0)
         throw std::runtime_error("array bound must be positive");
       result = types_.Array(result, static_cast<std::size_t>(bound));
@@ -348,6 +419,15 @@ ScopeBuilder::ExpressionType ScopeBuilder::BuildExpressionType(
 // lvalue reference to it.
 TypeId ScopeBuilder::BuildDecltype(AstId expression, ScopeId lookup_scope)
 {
+  if (expression_ != 0)
+  {
+    const SemaId analyzed = expression_->Analyze(expression, lookup_scope);
+    const SemaNode& semantic = tree_->At(analyzed);
+    if (arena_.At(expression).kind == AST_PARENTHESIZED_EXPRESSION &&
+        semantic.category == VC_LVALUE)
+      return types_.Reference(semantic.type, true);
+    return semantic.type;
+  }
   const ExpressionType operand = BuildExpressionType(expression, lookup_scope);
   if (operand.names_type)
     throw std::runtime_error("decltype operand names a type");

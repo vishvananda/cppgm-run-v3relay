@@ -46,6 +46,7 @@ struct Pa6Token
 	unsigned flags;
 	bool lit_scalar;
 	EFundamentalType lit_type;
+	std::size_t lit_count;
 	unsigned long long lit_value;
 
 	Pa6Token(Pa6TokenKind kind, const std::string& spelling,

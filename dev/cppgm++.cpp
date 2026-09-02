@@ -7,6 +7,7 @@
 #include "parser/ast_parser.h"
 #include "parser/recog_token.h"
 #include "sema/scope_builder.h"
+#include "sema/semantics_dump.h"
 #include "sema/types_dump.h"
 
 #include <cstdlib>
@@ -457,8 +458,35 @@ int run_emit_types_mode(const vector<string> & args)
 
 int run_emit_semantics_mode(const vector<string> & args)
 {
-  parse_source_output_invocation(args, false);
-  return run_unimplemented_mode("--emit-semantics", "PA12");
+  const SourceOutputInvocation invocation =
+      parse_source_output_invocation(args, false);
+  ofstream out(invocation.outfile.c_str());
+  if(!out) {
+    throw runtime_error("unable to open output file");
+  }
+
+  PrintHeader(out, invocation.inputs.size());
+  const PreprocBuildInfo build_info = PreprocHostBuildInfo();
+  for(size_t i = 0; i < invocation.inputs.size(); ++i) {
+    ostringstream discarded_preproc_output;
+    PreprocEngine preprocessor(discarded_preproc_output, PA5GetFileId,
+                               build_info);
+    Pa6TokenCollector collector;
+    preprocessor.RunSingleFile(invocation.inputs[i], collector);
+    AstArena arena;
+    Pa10Parser parser(collector.tokens, arena);
+    const AstId root = parser.ParseTranslationUnit();
+    if(root == 0) {
+      throw runtime_error("parse failed");
+    }
+    TypeTable types;
+    SemaModel model(types);
+    SemaTree tree;
+    ScopeBuilder builder(collector.tokens, arena, model, tree);
+    builder.Build(root);
+    PrintSemanticsUnit(out, i + 1, tree, model, collector.tokens);
+  }
+  return EXIT_SUCCESS;
 }
 
 int run_emit_lowir_mode(const vector<string> & args)

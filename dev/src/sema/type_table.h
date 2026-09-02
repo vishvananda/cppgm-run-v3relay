@@ -95,6 +95,20 @@ public:
   const TypeNode& At(TypeId id) const;
   TypeKind Kind(TypeId id) const;
   TypeId Unqualified(TypeId id) const; // strips top-level cv
+  // Standard conversion helpers shared by expression analysis and overload
+  // selection.  These intentionally operate on interned type identities so
+  // callers never need to reconstruct a derived type by spelling it.
+  TypeId Decay(TypeId id);
+  TypeId AdjustParameter(TypeId id);
+  TypeId Referent(TypeId id) const;
+  bool IsIntegral(TypeId id) const;
+  bool IsArithmetic(TypeId id) const;
+  bool IsScalar(TypeId id) const;
+  bool IsPointer(TypeId id) const;
+  bool IsNullPointerType(TypeId id) const;
+  TypeId Promote(TypeId id);
+  TypeId UsualArithmetic(TypeId left, TypeId right);
+  TypeId CompositePointer(TypeId left, TypeId right, bool& ok);
   void Spell(std::ostream& out, TypeId id) const;
   std::string Spell(TypeId id) const;
   std::size_t SizeOf(TypeId id) const;

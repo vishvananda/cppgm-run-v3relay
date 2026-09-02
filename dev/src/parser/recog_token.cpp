@@ -36,7 +36,7 @@ Pa6Token::Pa6Token(Pa6TokenKind token_kind, const string& token_spelling,
 	ETokenType token_type)
 	: kind(token_kind), simple_type(token_type), spelling(token_spelling),
 		flags(TokenFlags(token_kind, token_spelling)), lit_scalar(false),
-		lit_type(FT_INT), lit_value(0)
+		lit_type(FT_INT), lit_count(0), lit_value(0)
 {
 }
 
@@ -101,9 +101,12 @@ void Pa6TokenCollector::emit_literal(const string& source,
 }
 
 void Pa6TokenCollector::emit_literal_array(const string& source,
-	size_t, EFundamentalType, const void*, size_t)
+	size_t num_elements, EFundamentalType type, const void*, size_t)
 {
-	append_literal(source);
+	Pa6Token token(PA6_LITERAL_TOKEN, source);
+	token.lit_type = type;
+	token.lit_count = num_elements;
+	tokens.push_back(token);
 }
 
 void Pa6TokenCollector::emit_user_defined_literal_character(

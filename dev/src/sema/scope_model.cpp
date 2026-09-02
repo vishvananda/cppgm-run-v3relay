@@ -4,13 +4,15 @@
 #include <stdexcept>
 
 Binding::Binding()
-    : kind(BINDING_VARIABLE), type(0), namespace_scope(0),
+    : kind(BINDING_VARIABLE), type(0), scope(0), namespace_scope(0),
+      function(0),
       has_const_value(false), const_value(0)
 {
 }
 
 Scope::Scope()
-    : kind(SCOPE_NAMESPACE), parent(0), inline_namespace(false)
+    : kind(SCOPE_NAMESPACE), parent(0), inline_namespace(false),
+      unnamed_namespace(false)
 {
 }
 
@@ -24,8 +26,14 @@ EnumEntity::EnumEntity()
 {
 }
 
+FunctionEntity::FunctionEntity()
+    : scope(0), type(0), defined(false)
+{
+}
+
 SemaModel::SemaModel(TypeTable& types)
-    : types_(types), scopes_(1), bindings_(1), classes_(1), enums_(1)
+    : types_(types), scopes_(1), bindings_(1), classes_(1), enums_(1),
+      functions_(1)
 {
   scopes_[0].kind = SCOPE_NAMESPACE;
   scopes_[0].name = "<global>";
@@ -88,6 +96,7 @@ BindingId SemaModel::AddBinding(ScopeId scope, const std::string& name,
   binding.name = name;
   binding.kind = kind;
   binding.type = type;
+  binding.scope = scope;
   binding.namespace_scope = namespace_scope;
   bindings_.push_back(binding);
   const BindingId id = bindings_.size() - 1;
@@ -107,7 +116,31 @@ void SemaModel::AddUsingDirective(ScopeId scope, ScopeId target)
 {
   if (scope >= scopes_.size() || target >= scopes_.size())
     throw std::out_of_range("invalid using-directive scope");
-  scopes_[scope].using_directives.push_back(target);
+  // The directive participates in unqualified lookup at the nearest
+  // namespace that encloses both the directive and its nominated namespace.
+  // Storing that boundary keeps lookup independent of source-position scans.
+  ScopeId apply_at = scope;
+  while (scopes_[apply_at].kind != SCOPE_NAMESPACE)
+    apply_at = scopes_[apply_at].parent;
+  for (ScopeId candidate = apply_at;;
+       candidate = scopes_[candidate].parent)
+  {
+    ScopeId nominated = target;
+    while (nominated != candidate && nominated != GlobalScope())
+      nominated = scopes_[nominated].parent;
+    if (nominated == candidate)
+    {
+      apply_at = candidate;
+      break;
+    }
+    if (candidate == GlobalScope())
+    {
+      apply_at = GlobalScope();
+      break;
+    }
+  }
+  scopes_[scope].using_directives.push_back(
+      Scope::UsingDirective(target, apply_at));
 }
 
 Binding& SemaModel::BindingAt(BindingId id)
@@ -171,10 +204,11 @@ BindingId SemaModel::SearchUsingDirectives(ScopeId scope,
                                            unsigned filter,
                                            std::vector<ScopeId>& visited) const
 {
-  const std::vector<ScopeId>& directives = scopes_[scope].using_directives;
+  const std::vector<Scope::UsingDirective>& directives =
+      scopes_[scope].using_directives;
   for (std::size_t i = directives.size(); i != 0; --i)
   {
-    const BindingId found = SearchNamespace(directives[i - 1], name, filter,
+    const BindingId found = SearchNamespace(directives[i - 1].nominated, name, filter,
                                             visited);
     if (found != 0)
       return found;
@@ -220,6 +254,233 @@ BindingId SemaModel::SearchScope(ScopeId scope, const std::string& name,
   if (direct != 0)
     return direct;
   return SearchUsingDirectives(scope, name, filter, visited);
+}
+
+void SemaModel::AppendUnique(std::vector<BindingId>& result,
+                             BindingId binding)
+{
+  if (binding == 0)
+    return;
+  for (std::size_t i = 0; i < result.size(); ++i)
+    if (result[i] == binding)
+      return;
+  result.push_back(binding);
+}
+
+void SemaModel::CollectDirect(ScopeId scope, const std::string& name,
+                              unsigned filter,
+                              std::vector<BindingId>& result) const
+{
+  if (scope >= scopes_.size())
+    return;
+  const Scope& owner = scopes_[scope];
+  const std::vector<BindingId>* candidates = &owner.bindings;
+  if (!owner.index.empty())
+  {
+    const std::unordered_map<std::string, std::vector<BindingId> >::
+        const_iterator found = owner.index.find(name);
+    if (found == owner.index.end())
+      return;
+    candidates = &found->second;
+  }
+  for (std::size_t i = 0; i < candidates->size(); ++i)
+  {
+    const BindingId binding = (*candidates)[i];
+    if (bindings_[binding].name == name && Matches(bindings_[binding], filter))
+      AppendUnique(result, binding);
+  }
+}
+
+void SemaModel::CollectNamespace(ScopeId scope, const std::string& name,
+                                 unsigned filter,
+                                 std::vector<ScopeId>& visited,
+                                 std::vector<BindingId>& result) const
+{
+  if (scope >= scopes_.size() ||
+      std::find(visited.begin(), visited.end(), scope) != visited.end())
+    return;
+  visited.push_back(scope);
+
+  std::vector<BindingId> direct;
+  CollectDirect(scope, name, filter, direct);
+  if (!direct.empty())
+  {
+    for (std::size_t i = 0; i < direct.size(); ++i)
+      AppendUnique(result, direct[i]);
+    return;
+  }
+
+  const Scope& owner = scopes_[scope];
+  for (std::size_t i = 0; i < owner.children.size(); ++i)
+  {
+    const ScopeId child_id = owner.children[i];
+    const Scope& child = scopes_[child_id];
+    if (child.kind == SCOPE_NAMESPACE && child.inline_namespace)
+      CollectNamespace(child_id, name, filter, visited, result);
+  }
+  if (!result.empty())
+    return;
+  for (std::size_t i = 0; i < owner.using_directives.size(); ++i)
+    CollectNamespace(owner.using_directives[i].nominated, name, filter,
+                     visited, result);
+}
+
+void SemaModel::LookupSet(ScopeId scope, const std::string& name,
+                          unsigned filter,
+                          std::vector<BindingId>& result) const
+{
+  result.clear();
+  if (scope >= scopes_.size())
+    return;
+  std::vector<ScopeId> visited;
+  for (ScopeId current = scope;; current = scopes_[current].parent)
+  {
+    std::vector<BindingId> found;
+    if (scopes_[current].kind == SCOPE_NAMESPACE)
+      CollectNamespace(current, name, filter, visited, found);
+    else
+      CollectDirect(current, name, filter, found);
+    if (found.empty())
+    {
+      // A using-directive declared in a block is applied at its recorded
+      // namespace boundary.  The ordinary current-scope search remains for
+      // compatibility with the PA11 lookup API; this branch gives overload
+      // lookup the complete set at the same boundary.
+      const Scope& owner = scopes_[current];
+      for (std::size_t i = 0; i < owner.using_directives.size(); ++i)
+        if (owner.using_directives[i].apply_at == current)
+          CollectNamespace(owner.using_directives[i].nominated, name, filter,
+                           visited, found);
+    }
+    if (!found.empty())
+    {
+      result.swap(found);
+      return;
+    }
+    if (current == GlobalScope())
+      break;
+  }
+}
+
+void SemaModel::LookupQualifiedSet(ScopeId scope, const QualifiedName& name,
+                                   unsigned filter,
+                                   std::vector<BindingId>& result) const
+{
+  result.clear();
+  if (name.components.empty())
+    return;
+
+  ScopeId current = GlobalScope();
+  BindingId prefix_binding = 0;
+  std::size_t next = 0;
+  if (!name.global)
+  {
+    std::vector<BindingId> prefixes;
+    LookupSet(scope, name.components[0], LOOKUP_QUALIFIER, prefixes);
+    if (prefixes.empty())
+      return;
+    prefix_binding = prefixes.back();
+    next = 1;
+  }
+  for (; next < name.components.size(); ++next)
+  {
+    if (next != 0)
+    {
+      if (!NominatedScope(prefix_binding, current))
+        return;
+    }
+    std::vector<BindingId> found;
+    if (next + 1 == name.components.size())
+    {
+      std::vector<ScopeId> visited;
+      if (scopes_[current].kind == SCOPE_NAMESPACE)
+        CollectNamespace(current, name.components[next], filter, visited,
+                         found);
+      else
+      {
+        const TypeNode& prefix_type =
+            types_.At(types_.Unqualified(bindings_[prefix_binding].type));
+        const EntityId unscoped = prefix_type.kind == TYPE_ENUM &&
+            !prefix_type.scoped ? prefix_type.entity : 0;
+        const BindingId member = SearchMember(current, unscoped,
+                                              name.components[next], filter);
+        AppendUnique(found, member);
+      }
+    }
+    else
+    {
+      std::vector<ScopeId> visited;
+      if (scopes_[current].kind == SCOPE_NAMESPACE)
+        CollectNamespace(current, name.components[next], LOOKUP_QUALIFIER,
+                         visited, found);
+      else
+      {
+        const BindingId member = SearchMember(current, 0,
+                                              name.components[next],
+                                              LOOKUP_QUALIFIER);
+        AppendUnique(found, member);
+      }
+    }
+    if (found.empty())
+      return;
+    prefix_binding = found.back();
+  }
+  result.clear();
+  // The loop leaves prefix_binding at the final declaration.  Re-run the
+  // final lookup at its containing scope so all overloads, rather than only
+  // the qualifier used to reach it, are returned.
+  if (name.components.size() == 1 && !name.global)
+  {
+    result.push_back(prefix_binding);
+    return;
+  }
+
+  // Resolve the prefix immediately before the final component again.
+  current = GlobalScope();
+  next = 0;
+  if (!name.global)
+  {
+    std::vector<BindingId> prefixes;
+    LookupSet(scope, name.components[0], LOOKUP_QUALIFIER, prefixes);
+    if (prefixes.empty())
+      return;
+    prefix_binding = prefixes.back();
+    next = 1;
+  }
+  for (; next + 1 < name.components.size(); ++next)
+  {
+    if (next != 0 && !NominatedScope(prefix_binding, current))
+      return;
+    std::vector<BindingId> found;
+    std::vector<ScopeId> visited;
+    if (scopes_[current].kind == SCOPE_NAMESPACE)
+      CollectNamespace(current, name.components[next], LOOKUP_QUALIFIER,
+                       visited, found);
+    else
+      AppendUnique(found, SearchMember(current, 0,
+                                       name.components[next],
+                                       LOOKUP_QUALIFIER));
+    if (found.empty())
+      return;
+    prefix_binding = found.back();
+  }
+  if (name.components.size() == 1 && name.global)
+    current = GlobalScope();
+  else if (name.components.size() > 1 &&
+           !NominatedScope(prefix_binding, current))
+    return;
+  std::vector<ScopeId> visited;
+  if (scopes_[current].kind == SCOPE_NAMESPACE)
+    CollectNamespace(current, name.components.back(), filter, visited, result);
+  else
+  {
+    const TypeNode& prefix_type =
+        types_.At(types_.Unqualified(bindings_[prefix_binding].type));
+    const EntityId unscoped = prefix_type.kind == TYPE_ENUM &&
+        !prefix_type.scoped ? prefix_type.entity : 0;
+    AppendUnique(result, SearchMember(current, unscoped,
+                                      name.components.back(), filter));
+  }
 }
 
 BindingId SemaModel::LookupUnqualified(ScopeId scope, const std::string& name,
@@ -408,6 +669,34 @@ const EnumEntity& SemaModel::EnumAt(EnumEntityId id) const
   if (id == 0 || id >= enums_.size())
     throw std::out_of_range("invalid enum entity");
   return enums_[id];
+}
+
+FunctionEntityId SemaModel::CreateFunction(ScopeId scope,
+                                           const std::string& name,
+                                           TypeId type)
+{
+  if (scope >= scopes_.size() || type == 0)
+    throw std::out_of_range("invalid function entity");
+  FunctionEntity entity;
+  entity.scope = scope;
+  entity.name = name;
+  entity.type = type;
+  functions_.push_back(entity);
+  return functions_.size() - 1;
+}
+
+FunctionEntity& SemaModel::FunctionAt(FunctionEntityId id)
+{
+  if (id == 0 || id >= functions_.size())
+    throw std::out_of_range("invalid function entity");
+  return functions_[id];
+}
+
+const FunctionEntity& SemaModel::FunctionAt(FunctionEntityId id) const
+{
+  if (id == 0 || id >= functions_.size())
+    throw std::out_of_range("invalid function entity");
+  return functions_[id];
 }
 
 TypeTable& SemaModel::Types()

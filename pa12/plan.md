@@ -248,7 +248,7 @@ qualified lookup ignoring directives when the namespace declares the name.
 
 ## Failure Map
 
-Now: 0/166; every fixture fails only because `--emit-semantics` throws
+At CP1 start: 0/166; after CP1: 86/166.  The initial state below records
 `NotImplementedException`.  Existing front-end behaviour on the inputs:
 `--emit-ast` rejects 3 (`300-decltype-functional-cast`,
 `300-scoped-enum-functional-cast-integral`, `300-local-extern-function-
@@ -335,10 +335,11 @@ listed):
 
 - CP1 semantic tree, driver, declarations, statements, expressions without
   calls, conversions for initialization/return/assignment, function
-  entities, string-literal token facts — target ≈ 85/166 (56 byte-exact
-  successes + 15 true rejections + 14 rejections by "calls unsupported");
-  through-pa11 657/657 unchanged (PA11 dumps must be byte-identical after
-  the evaluator and expression-typing replacement).
+  entities, string-literal token facts — completed at 86/166 (56 packet
+  success fixtures byte-exact, CP1 rejection fixtures accepted, and calls
+  retained as the CP2 boundary).  `make test-report-through-pa11` is
+  657/657; the file audit passes; the 10k/20k/40k probe remains linear and
+  within the parser-only baseline.
 - CP2 calls, overload sets, ranking, target-directed selection, indirect
   calls, built-ins, decltype over calls — target ≈ 153/166.
 - CP3 parser functional casts and `::` statements, 7.3.4p2 directive
@@ -352,20 +353,20 @@ listed):
   presentation rendered on demand), bounded lookup and resolution, probe
   evidence; 166/166 and through-pa12 clean, file audit passing.
 
-## Active Checkpoint: CP1 — semantic tree, driver, declarations, statements, expressions without calls
+## Completed Checkpoint: CP1 — semantic tree, driver, declarations, statements, expressions without calls
 
-Goal: `--emit-semantics` produces byte-exact dumps for every fixture whose
-body contains no call expression, rejects the CP1 error fixtures, keeps
-through-pa11 at 657/657, and leaves calls throwing `runtime_error("call
-expressions: CP2")` so `100-bad-no-match` and the other call-bearing failure
-fixtures fail for the right reason later.
+Outcome: `--emit-semantics` now owns an append-only semantic tree and a
+canonical scope/type model for declarations, statements, conversions,
+constant propagation, function entities, and string-literal facts.  Calls
+still throw `runtime_error("call expressions: CP2")`, preserving the next
+semantic boundary.
 
-Progress proof: `make test-pa12` from 0/166 to about 85/166, with the 56
-success fixtures listed under CP1 in the failure map passing byte-exact;
-`make test-report-through-pa11` unchanged at 657/657 (the PA11 dumps are the
-regression oracle for the evaluator replacement).
+Evidence: `make test-pa12` reports 86/166 (80 remaining failures, all in the
+deferred call/class/front-end slices); the 56 CP1 success fixtures pass
+byte-exact; `make test-report-through-pa11` reports 657/657; and
+`perl scripts/cppgm_file_audit.pl --stage pa12 --paths dev/src` passes.
 
-### Implementation Packet
+### Completed Implementation Packet
 
 Files and symbols to create or change:
 
@@ -510,3 +511,25 @@ Known uncertainties:
 - The dump for `for (;;)` (empty init/condition/iteration), `return;` and an
   empty `expression-statement` has no fixture; print the node with no
   children.
+
+## Active Checkpoint: CP2 — call expressions, overload sets, and conversion ranking
+
+Goal: extend the existing semantic tree so direct, qualified, aliased,
+using-directed, indirect, built-in, variadic, and function-reference calls
+resolve canonical function entities and print callee/argument children;
+implement target-directed overload selection and the CP2 `decltype` call
+facts. Preserve the CP1 86/166 baseline and leave class-aware and parser-only
+fixtures for CP3/CP4.
+
+Implementation boundary: finish `ExpressionAnalyzer::AnalyzeCall` and its
+candidate/viability/ranking path using `SemaModel::LookupSet`/
+`LookupQualifiedSet` and `ConversionClassifier`; then connect call results,
+reference binding, array/function decay, null-pointer conversions, built-ins,
+and `BuildDecltype` to the existing dump. Start with
+`pa12/tests/spec/100-simple-call.t`, `pa12/tests/spec/100-overload-ranking.t`,
+`pa12/tests/general/200-using-directive-call.t`, and
+`pa12/tests/general/300-bad-ambiguous-overload.t`.
+
+Exit evidence: focused call fixtures and the full `make test-pa12` run,
+`make test-report-through-pa11`, and the pa12 file audit; target approximately
+153/166 without reducing the CP1 coverage or changing the probe shape.
