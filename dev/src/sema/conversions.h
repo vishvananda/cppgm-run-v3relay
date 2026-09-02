@@ -44,7 +44,6 @@ struct ImplicitConversion
   ReferenceBinding reference;
   bool rvalue_ref_to_rvalue;
   bool function_lvalue_to_lvalue_ref;
-  TypeId to;
 
   ImplicitConversion();
   bool Viable() const { return rank != RANK_NONE; }

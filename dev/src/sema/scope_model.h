@@ -8,13 +8,13 @@
 #include "sema/qualified_name.h"
 #include "sema/type_table.h"
 
-// The PA11 scope tree: scopes own bindings in declaration order and child
-// scopes in creation order (both are dump order); a per-scope name index
-// serves lookup once a scope grows past a handful of names.  Class and enum
-// entities carry the facts shared by all declarations of one type: the member
-// scope and whether a definition has been seen.  Every scope reachable through
-// a binding is derived on demand from the binding's kind and type, so no
-// binding holds a copy of a scope that may not exist yet.
+// The scope tree: scopes own bindings in declaration order and child scopes
+// in creation order (both are dump order); a per-scope name index serves
+// lookup once a scope grows past a handful of names.  Class, enum and
+// function entities carry the facts shared by all declarations of one
+// entity.  Every scope reachable through a binding is derived on demand from
+// the binding's kind and type, so no binding holds a copy of a scope that may
+// not exist yet.
 typedef std::size_t ScopeId;
 typedef std::size_t BindingId;
 typedef std::size_t ClassEntityId;
@@ -77,10 +77,15 @@ struct Scope
   ScopeKind kind;
   std::string name; // printed after the scope kind; empty for blocks and template scopes
   ScopeId parent;
+  ClassEntityId class_entity; // SCOPE_CLASS: the class whose members it holds
   bool inline_namespace;
   bool unnamed_namespace;
   std::vector<BindingId> bindings;
   std::vector<ScopeId> children;
+  std::vector<ScopeId> inline_namespaces; // 7.3.1p8: searched as members
+  // 7.3.4p2: a directive's names appear as if declared in the nearest
+  // enclosing namespace that contains both the directive and the nominated
+  // namespace; that namespace is recorded once when the directive is added.
   struct UsingDirective
   {
     ScopeId nominated;
@@ -102,8 +107,9 @@ struct ClassEntity
   ScopeId class_scope; // 0 until defined
   TypeId type; // canonical class type, 0 until declared
   FunctionEntityId default_constructor; // synthesized on first default-init
-  BindingId anonymous_storage; // bare anonymous union's synthesized object
-  std::vector<BindingId> injected_members; // bindings injected into its scope
+  // 9.5p5: members injected into the enclosing scope, each naming the
+  // synthesized object through Binding::object_binding.
+  std::vector<BindingId> injected_members;
   bool is_union;
   bool defined;
 
@@ -132,9 +138,8 @@ struct FunctionEntity
   ClassEntityId member_class;
   bool is_member;
   bool member_const;
-  bool is_constructor;
   bool is_template;
-  std::vector<std::string> template_parameters;
+  std::vector<TypeId> template_parameters; // TYPE_TEMPLATE_PARAM types, in order
   bool defined;
 
   FunctionEntity();
@@ -148,6 +153,8 @@ public:
   ScopeId GlobalScope() const;
   ScopeId CreateScope(ScopeKind kind, const std::string& name,
                       ScopeId parent, bool inline_namespace = false);
+  // A reopened namespace may become inline (7.3.1p2).
+  void MarkInlineNamespace(ScopeId scope);
   Scope& ScopeAt(ScopeId id);
   const Scope& ScopeAt(ScopeId id) const;
 
@@ -162,8 +169,13 @@ public:
   // filter; 0 when none.
   BindingId DirectBinding(ScopeId scope, const std::string& name,
                           unsigned filter = LOOKUP_ANY) const;
+  // Every binding of `name` declared directly in `scope` that passes the
+  // filter, in declaration order (appended to `result`).
+  void DirectBindings(ScopeId scope, const std::string& name,
+                      unsigned filter, std::vector<BindingId>& result) const;
   // 3.4.1 unqualified lookup restricted to the filter (elaborated lookup
-  // uses LOOKUP_TYPES, the qualifier position LOOKUP_QUALIFIER).
+  // uses LOOKUP_TYPES, the qualifier position LOOKUP_QUALIFIER): the latest
+  // declaration at the nearest level that declares the name.
   BindingId LookupUnqualified(ScopeId scope, const std::string& name,
                               unsigned filter) const;
   // Overload-aware forms.  The result is the complete set from the first
@@ -193,6 +205,8 @@ public:
   ClassEntityId CreateClass(bool is_union);
   ClassEntity& ClassAt(ClassEntityId id);
   const ClassEntity& ClassAt(ClassEntityId id) const;
+  // The class whose member scope `scope` is, looking through the
+  // template-parameter scopes of member templates; false for other scopes.
   bool ClassForScope(ScopeId scope, ClassEntityId& entity) const;
   EnumEntityId CreateEnum(bool scoped, TypeId underlying);
   EnumEntity& EnumAt(EnumEntityId id);
@@ -208,22 +222,35 @@ private:
   static const std::size_t kSmallScope = 8;
 
   static bool Matches(const Binding& binding, unsigned filter);
-  BindingId SearchScope(ScopeId scope, const std::string& name,
-                        unsigned filter, std::vector<ScopeId>& visited) const;
-  BindingId SearchNamespace(ScopeId scope, const std::string& name,
-                            unsigned filter, std::vector<ScopeId>& visited) const;
-  BindingId SearchUsingDirectives(ScopeId scope, const std::string& name,
-                                  unsigned filter,
-                                  std::vector<ScopeId>& visited) const;
-  void CollectDirect(ScopeId scope, const std::string& name,
-                     unsigned filter, std::vector<BindingId>& result) const;
+  // Single-result choice from one lookup level: its latest own declaration,
+  // else the first name the level sees through inline namespaces or
+  // using-directives.
+  BindingId Latest(const std::vector<BindingId>& found, ScopeId level) const;
+  // 3.4.3.2p2 qualified namespace search: the namespace's own names, then
+  // its inline namespaces, then the namespaces it nominates; each namespace
+  // is searched once per lookup.
   void CollectNamespace(ScopeId scope, const std::string& name,
                         unsigned filter, std::vector<ScopeId>& visited,
                         std::vector<BindingId>& result) const;
-  static void AppendUnique(std::vector<BindingId>& result,
-                           BindingId binding);
+  // 3.4.1 outward walk; returns the level that declared the name or
+  // kNoScope.  With `hide_types`, an object, function, enumerator or
+  // parameter declared at a level hides any type of that name (3.3.10p2).
+  ScopeId WalkUnqualified(ScopeId scope, const std::string& name,
+                          unsigned filter, bool hide_types,
+                          std::vector<BindingId>& result) const;
+  // 3.4.3: the scope named by every component before the last, plus the
+  // unscoped enumeration when that component names one.
+  bool ResolveQualifier(ScopeId scope, const QualifiedName& name,
+                        ScopeId& target, EntityId& unscoped_enum) const;
+  bool StepInto(BindingId prefix, ScopeId& target,
+                EntityId& unscoped_enum) const;
   BindingId SearchMember(ScopeId scope, EntityId unscoped_enum,
                          const std::string& name, unsigned filter) const;
+  void CollectMember(ScopeId scope, EntityId unscoped_enum,
+                     const std::string& name, unsigned filter,
+                     std::vector<BindingId>& result) const;
+
+  static const ScopeId kNoScope = static_cast<ScopeId>(-1);
 
   TypeTable& types_;
   std::vector<Scope> scopes_;

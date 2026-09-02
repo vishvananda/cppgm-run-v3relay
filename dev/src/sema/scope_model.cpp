@@ -11,14 +11,13 @@ Binding::Binding()
 }
 
 Scope::Scope()
-    : kind(SCOPE_NAMESPACE), parent(0), inline_namespace(false),
-      unnamed_namespace(false)
+    : kind(SCOPE_NAMESPACE), parent(0), class_entity(0),
+      inline_namespace(false), unnamed_namespace(false)
 {
 }
 
 ClassEntity::ClassEntity()
     : class_scope(0), type(0), default_constructor(0),
-      anonymous_storage(0),
       is_union(false), defined(false)
 {
 }
@@ -31,7 +30,7 @@ EnumEntity::EnumEntity()
 FunctionEntity::FunctionEntity()
     : scope(0), type(0), member_type(0), member_pointer_type(0),
       member_class(0), is_member(false), member_const(false),
-      is_constructor(false), is_template(false), defined(false)
+      is_template(false), defined(false)
 {
 }
 
@@ -61,7 +60,18 @@ ScopeId SemaModel::CreateScope(ScopeKind kind, const std::string& name,
   scopes_.push_back(scope);
   const ScopeId id = scopes_.size() - 1;
   scopes_[parent].children.push_back(id);
+  if (kind == SCOPE_NAMESPACE && inline_namespace)
+    scopes_[parent].inline_namespaces.push_back(id);
   return id;
+}
+
+void SemaModel::MarkInlineNamespace(ScopeId scope)
+{
+  Scope& value = ScopeAt(scope);
+  if (value.kind != SCOPE_NAMESPACE || value.inline_namespace)
+    return;
+  value.inline_namespace = true;
+  scopes_[value.parent].inline_namespaces.push_back(scope);
 }
 
 Scope& SemaModel::ScopeAt(ScopeId id)
@@ -120,9 +130,6 @@ void SemaModel::AddUsingDirective(ScopeId scope, ScopeId target)
 {
   if (scope >= scopes_.size() || target >= scopes_.size())
     throw std::out_of_range("invalid using-directive scope");
-  // The directive participates in unqualified lookup at the nearest
-  // namespace that encloses both the directive and its nominated namespace.
-  // Storing that boundary keeps lookup independent of source-position scans.
   ScopeId apply_at = scope;
   while (scopes_[apply_at].kind != SCOPE_NAMESPACE)
     apply_at = scopes_[apply_at].parent;
@@ -203,77 +210,9 @@ BindingId SemaModel::DirectBinding(ScopeId scope, const std::string& name,
   return 0;
 }
 
-BindingId SemaModel::SearchUsingDirectives(ScopeId scope,
-                                           const std::string& name,
-                                           unsigned filter,
-                                           std::vector<ScopeId>& visited) const
-{
-  const std::vector<Scope::UsingDirective>& directives =
-      scopes_[scope].using_directives;
-  for (std::size_t i = directives.size(); i != 0; --i)
-  {
-    const BindingId found = SearchNamespace(directives[i - 1].nominated, name, filter,
-                                            visited);
-    if (found != 0)
-      return found;
-  }
-  return 0;
-}
-
-// 3.4.3.2p2: a namespace's own names, then its inline namespaces (7.3.1p8),
-// then the namespaces it nominates; each namespace is searched once.
-BindingId SemaModel::SearchNamespace(ScopeId scope, const std::string& name,
-                                     unsigned filter,
-                                     std::vector<ScopeId>& visited) const
-{
-  if (std::find(visited.begin(), visited.end(), scope) != visited.end())
-    return 0;
-  visited.push_back(scope);
-
-  const BindingId direct = DirectBinding(scope, name, filter);
-  if (direct != 0)
-    return direct;
-  const Scope& value = scopes_[scope];
-  for (std::size_t i = 0; i < value.children.size(); ++i)
-  {
-    const Scope& child = scopes_[value.children[i]];
-    if (child.kind == SCOPE_NAMESPACE && child.inline_namespace)
-    {
-      const BindingId found = SearchNamespace(value.children[i], name, filter,
-                                              visited);
-      if (found != 0)
-        return found;
-    }
-  }
-  return SearchUsingDirectives(scope, name, filter, visited);
-}
-
-BindingId SemaModel::SearchScope(ScopeId scope, const std::string& name,
-                                 unsigned filter,
-                                 std::vector<ScopeId>& visited) const
-{
-  if (scopes_[scope].kind == SCOPE_NAMESPACE)
-    return SearchNamespace(scope, name, filter, visited);
-  const BindingId direct = DirectBinding(scope, name, filter);
-  if (direct != 0)
-    return direct;
-  return SearchUsingDirectives(scope, name, filter, visited);
-}
-
-void SemaModel::AppendUnique(std::vector<BindingId>& result,
-                             BindingId binding)
-{
-  if (binding == 0)
-    return;
-  for (std::size_t i = 0; i < result.size(); ++i)
-    if (result[i] == binding)
-      return;
-  result.push_back(binding);
-}
-
-void SemaModel::CollectDirect(ScopeId scope, const std::string& name,
-                              unsigned filter,
-                              std::vector<BindingId>& result) const
+void SemaModel::DirectBindings(ScopeId scope, const std::string& name,
+                               unsigned filter,
+                               std::vector<BindingId>& result) const
 {
   if (scope >= scopes_.size())
     return;
@@ -287,12 +226,23 @@ void SemaModel::CollectDirect(ScopeId scope, const std::string& name,
       return;
     candidates = &found->second;
   }
+  // Each binding belongs to one scope and a lookup visits a scope once, so
+  // the result never needs deduplication.
   for (std::size_t i = 0; i < candidates->size(); ++i)
   {
     const BindingId binding = (*candidates)[i];
     if (bindings_[binding].name == name && Matches(bindings_[binding], filter))
-      AppendUnique(result, binding);
+      result.push_back(binding);
   }
+}
+
+BindingId SemaModel::Latest(const std::vector<BindingId>& found,
+                            ScopeId level) const
+{
+  for (std::size_t i = found.size(); i != 0; --i)
+    if (bindings_[found[i - 1]].scope == level)
+      return found[i - 1];
+  return found.empty() ? 0 : found.front();
 }
 
 void SemaModel::CollectNamespace(ScopeId scope, const std::string& name,
@@ -305,241 +255,91 @@ void SemaModel::CollectNamespace(ScopeId scope, const std::string& name,
     return;
   visited.push_back(scope);
 
-  std::vector<BindingId> direct;
-  CollectDirect(scope, name, filter, direct);
-  if (!direct.empty())
-  {
-    for (std::size_t i = 0; i < direct.size(); ++i)
-      AppendUnique(result, direct[i]);
+  const std::size_t before = result.size();
+  DirectBindings(scope, name, filter, result);
+  if (result.size() != before)
     return;
-  }
 
   const Scope& owner = scopes_[scope];
-  for (std::size_t i = 0; i < owner.children.size(); ++i)
-  {
-    const ScopeId child_id = owner.children[i];
-    const Scope& child = scopes_[child_id];
-    if (child.kind == SCOPE_NAMESPACE && child.inline_namespace)
-      CollectNamespace(child_id, name, filter, visited, result);
-  }
-  if (!result.empty())
+  for (std::size_t i = 0; i < owner.inline_namespaces.size(); ++i)
+    CollectNamespace(owner.inline_namespaces[i], name, filter, visited,
+                     result);
+  if (result.size() != before)
     return;
   for (std::size_t i = 0; i < owner.using_directives.size(); ++i)
     CollectNamespace(owner.using_directives[i].nominated, name, filter,
                      visited, result);
 }
 
+ScopeId SemaModel::WalkUnqualified(ScopeId scope, const std::string& name,
+                                   unsigned filter, bool hide_types,
+                                   std::vector<BindingId>& result) const
+{
+  result.clear();
+  if (scope >= scopes_.size())
+    return kNoScope;
+  std::vector<ScopeId> visited;
+  // Directives passed on the way out; each applies once, at its namespace.
+  std::vector<Scope::UsingDirective> pending;
+  for (ScopeId current = scope;; current = scopes_[current].parent)
+  {
+    const Scope& owner = scopes_[current];
+    pending.insert(pending.end(), owner.using_directives.begin(),
+                   owner.using_directives.end());
+    if (hide_types)
+    {
+      const BindingId direct = DirectBinding(current, name, LOOKUP_ANY);
+      if (direct != 0 && bindings_[direct].kind != BINDING_NAMESPACE)
+      {
+        if (!Matches(bindings_[direct], filter))
+          return kNoScope;
+        result.push_back(direct);
+        return current;
+      }
+    }
+    DirectBindings(current, name, filter, result);
+    if (owner.kind == SCOPE_NAMESPACE)
+    {
+      // 7.3.1p8, 7.3.4p2: members of inline namespaces and of the namespaces
+      // whose directives apply here are members of this level.
+      visited.push_back(current);
+      for (std::size_t i = 0; i < owner.inline_namespaces.size(); ++i)
+        CollectNamespace(owner.inline_namespaces[i], name, filter, visited,
+                         result);
+      for (std::size_t i = 0; i < pending.size(); ++i)
+        if (pending[i].apply_at == current)
+          CollectNamespace(pending[i].nominated, name, filter, visited,
+                           result);
+    }
+    if (!result.empty())
+      return current;
+    if (current == GlobalScope())
+      break;
+  }
+  return kNoScope;
+}
+
 void SemaModel::LookupSet(ScopeId scope, const std::string& name,
                           unsigned filter,
                           std::vector<BindingId>& result) const
 {
-  result.clear();
-  if (scope >= scopes_.size())
-    return;
-  std::vector<ScopeId> visited;
-  for (ScopeId current = scope;; current = scopes_[current].parent)
-  {
-    std::vector<BindingId> found;
-    if (scopes_[current].kind == SCOPE_NAMESPACE)
-      CollectNamespace(current, name, filter, visited, found);
-    else
-      CollectDirect(current, name, filter, found);
-    if (found.empty())
-    {
-      // A using-directive declared in a block is applied at its recorded
-      // namespace boundary.  The ordinary current-scope search remains for
-      // compatibility with the PA11 lookup API; this branch gives overload
-      // lookup the complete set at the same boundary.
-      const Scope& owner = scopes_[current];
-      for (std::size_t i = 0; i < owner.using_directives.size(); ++i)
-        if (owner.using_directives[i].apply_at == current)
-          CollectNamespace(owner.using_directives[i].nominated, name, filter,
-                           visited, found);
-    }
-    if (!found.empty())
-    {
-      result.swap(found);
-      return;
-    }
-    if (current == GlobalScope())
-      break;
-  }
-}
-
-void SemaModel::LookupQualifiedSet(ScopeId scope, const QualifiedName& name,
-                                   unsigned filter,
-                                   std::vector<BindingId>& result) const
-{
-  result.clear();
-  if (name.components.empty())
-    return;
-
-  ScopeId current = GlobalScope();
-  BindingId prefix_binding = 0;
-  std::size_t next = 0;
-  if (!name.global)
-  {
-    std::vector<BindingId> prefixes;
-    LookupSet(scope, name.components[0], LOOKUP_QUALIFIER, prefixes);
-    if (prefixes.empty())
-      return;
-    prefix_binding = prefixes.back();
-    next = 1;
-  }
-  for (; next < name.components.size(); ++next)
-  {
-    if (next != 0)
-    {
-      if (!NominatedScope(prefix_binding, current))
-        return;
-    }
-    std::vector<BindingId> found;
-    if (next + 1 == name.components.size())
-    {
-      std::vector<ScopeId> visited;
-      if (scopes_[current].kind == SCOPE_NAMESPACE)
-        CollectNamespace(current, name.components[next], filter, visited,
-                         found);
-      else
-      {
-        const TypeNode& prefix_type =
-            types_.At(types_.Unqualified(bindings_[prefix_binding].type));
-        const EntityId unscoped = prefix_type.kind == TYPE_ENUM &&
-            !prefix_type.scoped ? prefix_type.entity : 0;
-        const BindingId member = SearchMember(current, unscoped,
-                                              name.components[next], filter);
-        AppendUnique(found, member);
-      }
-    }
-    else
-    {
-      std::vector<ScopeId> visited;
-      if (scopes_[current].kind == SCOPE_NAMESPACE)
-        CollectNamespace(current, name.components[next], LOOKUP_QUALIFIER,
-                         visited, found);
-      else
-      {
-        const BindingId member = SearchMember(current, 0,
-                                              name.components[next],
-                                              LOOKUP_QUALIFIER);
-        AppendUnique(found, member);
-      }
-    }
-    if (found.empty())
-      return;
-    prefix_binding = found.back();
-  }
-  result.clear();
-  // The loop leaves prefix_binding at the final declaration.  Re-run the
-  // final lookup at its containing scope so all overloads, rather than only
-  // the qualifier used to reach it, are returned.
-  if (name.components.size() == 1 && !name.global)
-  {
-    result.push_back(prefix_binding);
-    return;
-  }
-
-  // Resolve the prefix immediately before the final component again.
-  current = GlobalScope();
-  next = 0;
-  if (!name.global)
-  {
-    std::vector<BindingId> prefixes;
-    LookupSet(scope, name.components[0], LOOKUP_QUALIFIER, prefixes);
-    if (prefixes.empty())
-      return;
-    prefix_binding = prefixes.back();
-    next = 1;
-  }
-  for (; next + 1 < name.components.size(); ++next)
-  {
-    if (next != 0 && !NominatedScope(prefix_binding, current))
-      return;
-    std::vector<BindingId> found;
-    std::vector<ScopeId> visited;
-    if (scopes_[current].kind == SCOPE_NAMESPACE)
-      CollectNamespace(current, name.components[next], LOOKUP_QUALIFIER,
-                       visited, found);
-    else
-      AppendUnique(found, SearchMember(current, 0,
-                                       name.components[next],
-                                       LOOKUP_QUALIFIER));
-    if (found.empty())
-      return;
-    prefix_binding = found.back();
-  }
-  if (name.components.size() == 1 && name.global)
-    current = GlobalScope();
-  else if (name.components.size() > 1 &&
-           !NominatedScope(prefix_binding, current))
-    return;
-  std::vector<ScopeId> visited;
-  if (scopes_[current].kind == SCOPE_NAMESPACE)
-    CollectNamespace(current, name.components.back(), filter, visited, result);
-  else
-  {
-    const TypeNode& prefix_type =
-        types_.At(types_.Unqualified(bindings_[prefix_binding].type));
-    const EntityId unscoped = prefix_type.kind == TYPE_ENUM &&
-        !prefix_type.scoped ? prefix_type.entity : 0;
-    if (unscoped != 0)
-      AppendUnique(result, SearchMember(current, unscoped,
-                                        name.components.back(), filter));
-    else
-      CollectDirect(current, name.components.back(), filter, result);
-  }
+  (void)WalkUnqualified(scope, name, filter, false, result);
 }
 
 BindingId SemaModel::LookupUnqualified(ScopeId scope, const std::string& name,
                                        unsigned filter) const
 {
-  // A qualifier is resolved lexically before namespace using-directives are
-  // considered.  This matters when a block says `using namespace imported`
-  // but its enclosing namespace already owns a nearer `detail` namespace:
-  // `detail::name` must continue down the lexical namespace path.  Ordinary
-  // value lookup below retains the usual using-directive search behavior.
-  if (filter == LOOKUP_QUALIFIER)
-    for (ScopeId current = scope;; current = scopes_[current].parent)
-    {
-      const BindingId direct = DirectBinding(current, name, filter);
-      if (direct != 0)
-        return direct;
-      if (current == GlobalScope())
-        break;
-    }
-  std::vector<ScopeId> visited;
-  for (ScopeId current = scope;; current = scopes_[current].parent)
-  {
-    const BindingId found = SearchScope(current, name, filter, visited);
-    if (found != 0)
-      return found;
-    if (current == GlobalScope())
-      break;
-  }
-  return 0;
+  std::vector<BindingId> found;
+  const ScopeId level = WalkUnqualified(scope, name, filter, false, found);
+  return level == kNoScope ? 0 : Latest(found, level);
 }
 
 BindingId SemaModel::LookupTypeName(ScopeId scope, const std::string& name) const
 {
-  std::vector<ScopeId> visited;
-  for (ScopeId current = scope;; current = scopes_[current].parent)
-  {
-    const BindingId direct = DirectBinding(current, name);
-    if (direct != 0)
-    {
-      const BindingKind kind = bindings_[direct].kind;
-      if (kind == BINDING_TYPE || kind == BINDING_TYPE_ALIAS)
-        return direct;
-      if (kind != BINDING_NAMESPACE)
-        return 0;
-    }
-    const BindingId found = SearchScope(current, name, LOOKUP_TYPES, visited);
-    if (found != 0)
-      return found;
-    if (current == GlobalScope())
-      break;
-  }
-  return 0;
+  std::vector<BindingId> found;
+  const ScopeId level = WalkUnqualified(scope, name, LOOKUP_TYPES, true,
+                                        found);
+  return level == kNoScope ? 0 : Latest(found, level);
 }
 
 bool SemaModel::ScopeOfType(TypeId type, ScopeId& scope) const
@@ -578,12 +378,35 @@ bool SemaModel::NominatedScope(BindingId binding, ScopeId& scope) const
   return false;
 }
 
-// A member of a class or enum scope, or an enumerator of an unscoped
-// enumeration found among its declaring scope's names.
+bool SemaModel::StepInto(BindingId prefix, ScopeId& target,
+                         EntityId& unscoped_enum) const
+{
+  if (!NominatedScope(prefix, target))
+    return false;
+  unscoped_enum = 0;
+  const Binding& binding = bindings_[prefix];
+  if (binding.kind != BINDING_NAMESPACE)
+  {
+    const TypeNode& type = types_.At(types_.Unqualified(binding.type));
+    if (type.kind == TYPE_ENUM && !type.scoped)
+      unscoped_enum = type.entity;
+  }
+  return true;
+}
+
+// A member of a namespace, class or enum scope, or an enumerator of an
+// unscoped enumeration found among its declaring scope's names.
 BindingId SemaModel::SearchMember(ScopeId scope, EntityId unscoped_enum,
                                   const std::string& name,
                                   unsigned filter) const
 {
+  if (scopes_[scope].kind == SCOPE_NAMESPACE)
+  {
+    std::vector<ScopeId> visited;
+    std::vector<BindingId> found;
+    CollectNamespace(scope, name, filter, visited, found);
+    return Latest(found, scope);
+  }
   if (unscoped_enum == 0)
     return DirectBinding(scope, name, filter);
   const BindingId found = DirectBinding(scope, name,
@@ -594,47 +417,83 @@ BindingId SemaModel::SearchMember(ScopeId scope, EntityId unscoped_enum,
   return found;
 }
 
+void SemaModel::CollectMember(ScopeId scope, EntityId unscoped_enum,
+                              const std::string& name, unsigned filter,
+                              std::vector<BindingId>& result) const
+{
+  if (scopes_[scope].kind == SCOPE_NAMESPACE)
+  {
+    std::vector<ScopeId> visited;
+    CollectNamespace(scope, name, filter, visited, result);
+  }
+  else if (unscoped_enum != 0)
+  {
+    const BindingId enumerator = SearchMember(scope, unscoped_enum, name,
+                                              filter);
+    if (enumerator != 0)
+      result.push_back(enumerator);
+  }
+  else
+    DirectBindings(scope, name, filter, result);
+}
+
+bool SemaModel::ResolveQualifier(ScopeId scope, const QualifiedName& name,
+                                 ScopeId& target,
+                                 EntityId& unscoped_enum) const
+{
+  target = GlobalScope();
+  unscoped_enum = 0;
+  BindingId prefix = 0;
+  std::size_t next = 0;
+  if (!name.global)
+  {
+    prefix = LookupUnqualified(scope, name.components[0], LOOKUP_QUALIFIER);
+    if (prefix == 0)
+      return false;
+    next = 1;
+  }
+  for (; next + 1 < name.components.size(); ++next)
+  {
+    if (prefix != 0 && !StepInto(prefix, target, unscoped_enum))
+      return false;
+    prefix = SearchMember(target, unscoped_enum, name.components[next],
+                          LOOKUP_QUALIFIER);
+    if (prefix == 0)
+      return false;
+  }
+  return prefix == 0 || StepInto(prefix, target, unscoped_enum);
+}
+
 BindingId SemaModel::LookupQualified(ScopeId scope, const QualifiedName& name,
                                      unsigned filter) const
 {
   if (name.components.empty())
     return 0;
-  ScopeId current = GlobalScope();
+  if (!name.Qualified())
+    return LookupUnqualified(scope, name.components[0], filter);
+  ScopeId target = 0;
   EntityId unscoped_enum = 0;
-  std::size_t next = 0;
-  BindingId binding = 0;
-  if (!name.global)
+  if (!ResolveQualifier(scope, name, target, unscoped_enum))
+    return 0;
+  return SearchMember(target, unscoped_enum, name.Last(), filter);
+}
+
+void SemaModel::LookupQualifiedSet(ScopeId scope, const QualifiedName& name,
+                                   unsigned filter,
+                                   std::vector<BindingId>& result) const
+{
+  result.clear();
+  if (name.components.empty())
+    return;
+  if (!name.Qualified())
   {
-    binding = LookupUnqualified(scope, name.components[0], LOOKUP_QUALIFIER);
-    if (binding == 0)
-      return 0;
-    next = 1;
+    LookupSet(scope, name.components[0], filter, result);
+    return;
   }
-  std::vector<ScopeId> visited;
-  for (; next < name.components.size(); ++next)
-  {
-    if (next != 0)
-    {
-      // Step into the scope the previous component denotes.
-      if (!NominatedScope(binding, current))
-        return 0;
-      const Binding& prefix = bindings_[binding];
-      const TypeNode* type = prefix.kind == BINDING_NAMESPACE ? 0 :
-          &types_.At(types_.Unqualified(prefix.type));
-      unscoped_enum = type != 0 && type->kind == TYPE_ENUM && !type->scoped ?
-          type->entity : 0;
-      visited.clear();
-    }
-    const unsigned step_filter = next + 1 == name.components.size() ?
-        filter : LOOKUP_QUALIFIER;
-    binding = scopes_[current].kind == SCOPE_NAMESPACE ?
-        SearchNamespace(current, name.components[next], step_filter, visited) :
-        SearchMember(current, unscoped_enum, name.components[next],
-                     step_filter);
-    if (binding == 0)
-      return 0;
-  }
-  return Matches(bindings_[binding], filter) ? binding : 0;
+  ScopeId target = 0;
+  EntityId unscoped_enum = 0;
+  if (ResolveQualifier(scope, name, target, unscoped_enum))
+    CollectMember(target, unscoped_enum, name.Last(), filter, result);
 }
 
 BindingId SemaModel::Lookup(ScopeId scope, const QualifiedName& name,
@@ -673,20 +532,14 @@ bool SemaModel::ClassForScope(ScopeId scope, ClassEntityId& entity) const
 {
   if (scope >= scopes_.size())
     return false;
-  for (ScopeId current = scope;; current = scopes_[current].parent)
-  {
-    for (ClassEntityId candidate = 1; candidate < classes_.size();
-         ++candidate)
-      if (classes_[candidate].class_scope != 0 &&
-          classes_[candidate].class_scope == current)
-      {
-        entity = candidate;
-        return true;
-      }
-    if (current == GlobalScope())
-      break;
-  }
-  return false;
+  ScopeId current = scope;
+  while (scopes_[current].kind == SCOPE_TEMPLATE_PARAMETERS &&
+         current != GlobalScope())
+    current = scopes_[current].parent;
+  if (scopes_[current].kind != SCOPE_CLASS || scopes_[current].class_entity == 0)
+    return false;
+  entity = scopes_[current].class_entity;
+  return true;
 }
 
 EnumEntityId SemaModel::CreateEnum(bool scoped, TypeId underlying)

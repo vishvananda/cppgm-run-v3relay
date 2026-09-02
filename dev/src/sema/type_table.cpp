@@ -494,8 +494,6 @@ TypeId TypeTable::UsualArithmetic(TypeId left, TypeId right)
   }
   const bool lu = FundamentalIsUnsigned(lf);
   const bool ru = FundamentalIsUnsigned(rf);
-  const std::size_t ls = FundamentalSize(lf);
-  const std::size_t rs = FundamentalSize(rf);
   if (lu == ru)
     return FundamentalSize(lf) >= FundamentalSize(rf) ? left : right;
   const EFundamentalType unsigned_type = lu ? lf : rf;
@@ -507,8 +505,6 @@ TypeId TypeTable::UsualArithmetic(TypeId left, TypeId right)
   // corresponding unsigned type.
   if (FundamentalSize(signed_type) > FundamentalSize(unsigned_type))
     return Fundamental(signed_type);
-  (void)ls;
-  (void)rs;
   switch (signed_type)
   {
   case FT_INT: return Fundamental(FT_UNSIGNED_INT);

@@ -111,11 +111,9 @@ bool PointerToVoidCompatible(const TypeTable& types, TypeId source,
 
 ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
                                  ValueCategory source_category,
-                                 bool is_null_literal,
-                                 bool is_function_lvalue, TypeId target)
+                                 bool is_null_literal, TypeId target)
 {
   ImplicitConversion result;
-  result.to = target;
   if (source == 0 || target == 0)
     return result;
 
@@ -211,8 +209,6 @@ ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
     return result;
   }
 
-  const bool source_enum =
-      types.Kind(types.Unqualified(source_value)) == TYPE_ENUM;
   const bool target_enum =
       types.Kind(types.Unqualified(target)) == TYPE_ENUM;
   if (types.IsArithmetic(source_value) && types.IsArithmetic(target))
@@ -230,7 +226,6 @@ ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
         result.rank = RANK_CONVERSION;
         result.kind = CONV_INTEGRAL_CONVERSION;
       }
-      (void)source_enum;
       return result;
     }
     if (IsFloating(types, source_value) && IsFloating(types, target))
@@ -258,7 +253,6 @@ ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
     result.kind = CONV_BOOLEAN;
     return result;
   }
-  (void)is_function_lvalue;
   return ImplicitConversion();
 }
 
@@ -267,7 +261,7 @@ ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
 ImplicitConversion::ImplicitConversion()
     : rank(RANK_NONE), kind(CONV_IDENTITY), qualification(false),
       reference(REFERENCE_NONE), rvalue_ref_to_rvalue(false),
-      function_lvalue_to_lvalue_ref(false), to(0)
+      function_lvalue_to_lvalue_ref(false)
 {
 }
 
@@ -277,7 +271,6 @@ ImplicitConversion Classify(TypeTable& types, TypeId source,
                             bool is_function_lvalue, TypeId target)
 {
   ImplicitConversion result;
-  result.to = target;
   if (source == 0 || target == 0)
     return result;
 
@@ -343,21 +336,19 @@ ImplicitConversion Classify(TypeTable& types, TypeId source,
     if (drops_source_qualification)
       return result;
     ImplicitConversion converted = ClassifyValue(
-        types, source_value, source_category, is_null_literal,
-        is_function_lvalue, target_value);
+        types, source_value, source_category, is_null_literal, target_value);
     if (converted.Viable() &&
         (target_rvalue_reference || IsConst(types, target_value) ||
          IsVolatile(types, target_value)))
     {
       converted.reference = REFERENCE_TEMPORARY;
-      converted.to = target;
       converted.rvalue_ref_to_rvalue = target_rvalue_reference;
       return converted;
     }
     return result;
   }
   return ClassifyValue(types, source, source_category, is_null_literal,
-                       is_function_lvalue, target_value);
+                       target_value);
 }
 
 ConversionComparison Compare(const ImplicitConversion& left,

@@ -13,6 +13,8 @@ struct OverloadArgument
   ValueCategory category;
   bool is_null_literal;
   bool is_function_lvalue;
+  // An overloaded function name as an argument: the entities it may denote
+  // (13.4 selects among them per parameter type).
   std::vector<FunctionEntityId> function_candidates;
 
   OverloadArgument(TypeId type = 0, ValueCategory category = VC_PRVALUE,
@@ -22,25 +24,19 @@ struct OverloadArgument
         is_function_lvalue(is_function_lvalue) {}
 };
 
-struct OverloadSelection
-{
-  FunctionEntityId function;
-  std::vector<ImplicitConversion> conversions;
-
-  OverloadSelection() : function(0) {}
-};
-
-// Resolve one overload set.  The first lookup level has already been chosen
-// by SemaModel::LookupSet/LookupQualifiedSet; only function bindings in that
-// set participate, and repeated declarations of one entity are deduplicated.
-bool SelectBestOverload(const SemaModel& model, TypeTable& types,
-                        const std::vector<BindingId>& bindings,
-                        const std::vector<OverloadArgument>& arguments,
-                        OverloadSelection& selection);
+// Resolve one overload set (13.3.3).  The lookup level has already been
+// chosen by SemaModel::LookupSet/LookupQualifiedSet; only non-template
+// function bindings in that set participate, and repeated declarations of
+// one entity count once.  Returns 0 when no candidate is viable or no
+// candidate is better than every other.
+FunctionEntityId SelectBestOverload(
+    const SemaModel& model, TypeTable& types,
+    const std::vector<BindingId>& bindings,
+    const std::vector<OverloadArgument>& arguments);
 
 // Select the unique function entity denoted by an overloaded function name
 // when the surrounding initialization supplies a pointer/reference-to-
-// function target (13.4).
+// function or pointer-to-member-function target (13.4).
 bool SelectTargetFunction(const SemaModel& model, TypeTable& types,
                           const std::vector<BindingId>& bindings,
                           TypeId target, BindingId& binding,

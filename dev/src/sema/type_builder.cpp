@@ -1,8 +1,6 @@
 // Specifier- and declarator-derived type construction for the ScopeBuilder.
 #include "sema/scope_builder.h"
 
-#include "sema/expr_sema.h"
-
 #include <stdexcept>
 
 using std::string;
@@ -11,9 +9,9 @@ using std::vector;
 ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens,
                            const AstArena& arena, SemaModel& model)
     : tokens_(tokens), arena_(arena), model_(model), types_(model.Types()),
-      const_eval_(tokens, arena, model, *this), tree_(0), expression_(0),
-      semantic_root_(0),
-      pending_array_bound_(0), unnamed_local_enum_counter_(0),
+      tree_(0), scratch_tree_(),
+      expression_(tokens, arena, model, scratch_tree_, *this),
+      semantic_root_(0), unnamed_local_enum_counter_(0),
       unnamed_local_class_counter_(0), suppress_semantics_(false)
 {
 }
@@ -22,18 +20,11 @@ ScopeBuilder::ScopeBuilder(const vector<Pa6Token>& tokens,
                            const AstArena& arena, SemaModel& model,
                            SemaTree& tree)
     : tokens_(tokens), arena_(arena), model_(model), types_(model.Types()),
-      const_eval_(tokens, arena, model, *this), tree_(&tree), expression_(0),
-      semantic_root_(0),
-      pending_array_bound_(0), unnamed_local_enum_counter_(0),
+      tree_(&tree), scratch_tree_(),
+      expression_(tokens, arena, model, tree, *this),
+      semantic_root_(0), unnamed_local_enum_counter_(0),
       unnamed_local_class_counter_(0), suppress_semantics_(false)
 {
-  expression_ = new ExpressionAnalyzer(tokens_, arena_, model_, tree,
-                                        *this);
-}
-
-ScopeBuilder::~ScopeBuilder()
-{
-  delete expression_;
 }
 
 TypeId ScopeBuilder::TypeOfTypeId(AstId type_id, ScopeId scope)
@@ -41,52 +32,9 @@ TypeId ScopeBuilder::TypeOfTypeId(AstId type_id, ScopeId scope)
   return BuildTypeId(type_id, scope);
 }
 
-TypeId ScopeBuilder::TypeOfExpression(AstId expression, ScopeId scope)
-{
-  return BuildExpressionType(expression, scope).type;
-}
-
-TypeId ScopeBuilder::TypeIdForSemantics(AstId type_id, ScopeId scope)
-{
-  return BuildTypeId(type_id, scope);
-}
-
-TypeId ScopeBuilder::DecltypeForSemantics(AstId expression, ScopeId scope)
+TypeId ScopeBuilder::TypeOfDecltype(AstId expression, ScopeId scope)
 {
   return BuildDecltype(expression, scope);
-}
-
-SemaId ScopeBuilder::AnalyzeExpression(AstId expression, ScopeId scope)
-{
-  if (expression_ == 0)
-    throw std::runtime_error("semantic expression analyzer is unavailable");
-  return expression_->Analyze(expression, scope);
-}
-
-SemaId ScopeBuilder::AnalyzeInitializer(AstId initializer, ScopeId scope,
-                                         TypeId target)
-{
-  if (expression_ == 0)
-    throw std::runtime_error("semantic expression analyzer is unavailable");
-  return expression_->AnalyzeInitializer(initializer, scope, target);
-}
-
-SemaId ScopeBuilder::InitializeExpression(SemaId expression, TypeId target,
-                                          bool variable,
-                                          bool constexpr_value,
-                                          bool condition,
-                                          bool return_value,
-                                          bool argument)
-{
-  if (expression_ == 0)
-    throw std::runtime_error("semantic expression analyzer is unavailable");
-  return expression_->Initialize(expression, target,
-      InitContext(variable, constexpr_value, condition, return_value, argument));
-}
-
-bool ScopeBuilder::TryConstant(SemaId expression, long long& value) const
-{
-  return expression_ != 0 && expression_->TryConstant(expression, value);
 }
 
 bool ScopeBuilder::IsIgnoredSpecifier(ETokenType token)
@@ -268,7 +216,8 @@ TypeId ScopeBuilder::ApplyPrefix(TypeId base, const vector<AstId>& prefix)
 
 // Parameter clauses and array bounds, right to left onto the base (8.3).
 TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
-                                 ScopeId lookup_scope, bool parameter_context)
+                                 ScopeId lookup_scope, bool parameter_context,
+                                 std::size_t deduced_bound)
 {
   TypeId result = base;
   for (std::size_t i = suffix.size(); i != 0; --i)
@@ -297,12 +246,12 @@ TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
           result = types_.Pointer(result);
           continue;
         }
-        if (pending_array_bound_ == 0)
+        if (deduced_bound == 0)
           throw std::runtime_error("incomplete array type");
-        bound = static_cast<long long>(pending_array_bound_);
+        bound = static_cast<long long>(deduced_bound);
       }
       else
-        bound = const_eval_.Evaluate(node.children[0], lookup_scope);
+        bound = ConstantValue(node.children[0], lookup_scope);
       if (bound <= 0)
         throw std::runtime_error("array bound must be positive");
       result = types_.Array(result, static_cast<std::size_t>(bound));
@@ -321,7 +270,8 @@ TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
 // pointer to int).
 TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
                                          ScopeId lookup_scope,
-                                         bool parameter_context)
+                                         bool parameter_context,
+                                         std::size_t deduced_bound)
 {
   if (declarator == 0)
     return base;
@@ -359,7 +309,8 @@ TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
       suffix.push_back(child);
   }
   const TypeId declared = ApplySuffix(ApplyPrefix(base, prefix), suffix,
-                                      lookup_scope, parameter_context);
+                                      lookup_scope, parameter_context,
+                                      deduced_bound);
   TypeId result = declared;
   bool nested_function_const = false;
   for (std::size_t i = 0; i < suffix.size(); ++i)
@@ -411,8 +362,8 @@ TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
   const AstNode& inner = arena_.At(nested);
   if (inner.children.size() != 1)
     throw std::runtime_error("invalid nested declarator");
-  return BuildDeclaratorType(inner.children[0], result, lookup_scope,
-                             false);
+  return BuildDeclaratorType(inner.children[0], result, lookup_scope, false,
+                             deduced_bound);
 }
 
 void ScopeBuilder::BuildParameters(AstId clause, ScopeId lookup_scope,
@@ -451,80 +402,20 @@ void ScopeBuilder::BuildParameters(AstId clause, ScopeId lookup_scope,
     parameters.clear();
 }
 
-// Static type and value category of the operand forms PA11 supports.
-ScopeBuilder::ExpressionType ScopeBuilder::BuildExpressionType(
-    AstId expression, ScopeId lookup_scope)
-{
-  const AstNode& node = arena_.At(expression);
-  ExpressionType result;
-  result.type = 0;
-  result.lvalue = false;
-  result.names_type = false;
-  switch (node.kind)
-  {
-  case AST_PARENTHESIZED_EXPRESSION:
-    if (node.children.size() != 1)
-      throw std::runtime_error("invalid parenthesized expression");
-    return BuildExpressionType(node.children[0], lookup_scope);
-  case AST_ID_EXPRESSION: case AST_IDENTIFIER:
-  {
-    const BindingId binding = model_.Lookup(lookup_scope, NodeName(expression),
-                                           LOOKUP_ANY);
-    if (binding == 0 || model_.BindingAt(binding).type == 0)
-      throw std::runtime_error("unknown name in expression");
-    const Binding& value = model_.BindingAt(binding);
-    result.type = value.type;
-    result.names_type = value.kind == BINDING_TYPE ||
-        value.kind == BINDING_TYPE_ALIAS;
-    // 5.1.1p8: a name of a variable, parameter or function is an lvalue;
-    // an enumerator is a prvalue.
-    result.lvalue = value.kind == BINDING_VARIABLE ||
-        value.kind == BINDING_PARAMETER || value.kind == BINDING_FUNCTION;
-    return result;
-  }
-  case AST_LITERAL:
-    if (node.first >= tokens_.size() || !tokens_[node.first].lit_scalar)
-      throw std::runtime_error("unsupported literal operand");
-    result.type = types_.Fundamental(tokens_[node.first].lit_type);
-    return result;
-  case AST_KEYWORD_LITERAL:
-    result.type = types_.Fundamental(FT_BOOL);
-    return result;
-  case AST_CAST_EXPRESSION:
-    if (node.children.size() != 2)
-      throw std::runtime_error("invalid cast expression");
-    result.type = BuildTypeId(node.children[0], lookup_scope);
-    result.lvalue = types_.Kind(result.type) == TYPE_REFERENCE;
-    return result;
-  case AST_SIZEOF_EXPRESSION: case AST_TYPE_TRAIT_EXPRESSION:
-    // 5.3.3p6, 5.3.6p3: std::size_t, which is unsigned long on this target.
-    result.type = types_.Fundamental(FT_UNSIGNED_LONG_INT);
-    return result;
-  default:
-    throw std::runtime_error("unsupported expression operand");
-  }
-}
-
-// 7.1.6.2p4: decltype(id) is the declared type; decltype((lvalue)) is an
-// lvalue reference to it.
+// 7.1.6.2p4: decltype(id) is the declared type of the entity;
+// decltype((e)) is T& for an lvalue e and T&& for an xvalue.
 TypeId ScopeBuilder::BuildDecltype(AstId expression, ScopeId lookup_scope)
 {
-  if (expression_ != 0)
-  {
-    const SemaId analyzed = expression_->Analyze(expression, lookup_scope);
-    const SemaNode& semantic = tree_->At(analyzed);
-    if (arena_.At(expression).kind == AST_PARENTHESIZED_EXPRESSION &&
-        semantic.category == VC_LVALUE)
-      return types_.Reference(semantic.type, true);
-    return semantic.type;
-  }
-  const ExpressionType operand = BuildExpressionType(expression, lookup_scope);
-  if (operand.names_type)
-    throw std::runtime_error("decltype operand names a type");
-  const bool parenthesized =
-      arena_.At(expression).kind == AST_PARENTHESIZED_EXPRESSION;
-  if (parenthesized && operand.lvalue &&
-      types_.Kind(operand.type) != TYPE_REFERENCE)
-    return types_.Reference(operand.type, true);
-  return operand.type;
+  SemaTree& tree = Tree();
+  const std::size_t mark = tree.Mark();
+  const SemaId analyzed = expression_.Analyze(expression, lookup_scope);
+  const SemaNode& operand = expression_.Node(analyzed);
+  TypeId result = operand.type;
+  if (arena_.At(expression).kind != AST_PARENTHESIZED_EXPRESSION)
+    result = expression_.DeclaredType(analyzed);
+  else if (operand.category != VC_PRVALUE &&
+           types_.Kind(result) != TYPE_REFERENCE)
+    result = types_.Reference(result, operand.category == VC_LVALUE);
+  tree.Truncate(mark);
+  return result;
 }

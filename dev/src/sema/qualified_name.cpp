@@ -3,7 +3,7 @@
 #include <stdexcept>
 
 QualifiedName::QualifiedName()
-    : global(false)
+    : global(false), template_id(false), template_first(0), template_last(0)
 {
 }
 
@@ -46,64 +46,58 @@ std::string QualifiedName::Joined() const
 }
 
 QualifiedName ReadQualifiedName(const std::vector<Pa6Token>& tokens,
-                                std::size_t first, std::size_t last)
+                                std::size_t first, std::size_t last,
+                                bool allow_template_id)
 {
   QualifiedName result;
-  std::size_t i = first;
+  if (last > tokens.size())
+    last = tokens.size();
   bool expect_identifier = true;
-  while (i < last && i < tokens.size())
+  for (std::size_t i = first; i < last; ++i)
   {
     const Pa6Token& token = tokens[i];
     if (token.kind == PA6_IDENTIFIER_TOKEN && expect_identifier)
     {
-      std::string component = token.spelling;
-      ++i;
-      if (i < last && i < tokens.size() && tokens[i].IsSimple(OP_LT))
+      result.components.push_back(token.spelling);
+      expect_identifier = false;
+      if (i + 1 < last && tokens[i + 1].IsSimple(OP_LT))
       {
-        std::size_t depth = 0;
-        while (i < last && i < tokens.size())
+        if (!allow_template_id)
+          throw std::runtime_error("template-id is not supported here");
+        // Each half of a split `>>` closes one argument list (14.2p3).
+        std::size_t depth = 1;
+        std::size_t close = i + 2;
+        for (; close < last && depth != 0; ++close)
         {
-          const Pa6Token& argument = tokens[i];
-          if (argument.IsSimple(OP_LT))
-          {
+          if (tokens[close].IsSimple(OP_LT))
             ++depth;
-            component += '<';
-          }
-          else if (argument.IsSimple(OP_GT) || argument.IsRshiftPart())
-          {
-            if (depth == 0)
-              throw std::runtime_error("template name has unmatched >");
+          else if (tokens[close].IsSimple(OP_GT) || tokens[close].IsRshiftPart())
             --depth;
-            component += '>';
-          }
-          else
-            component += argument.spelling;
-          ++i;
-          if (depth == 0)
-            break;
         }
         if (depth != 0)
-          throw std::runtime_error("template name has an incomplete argument list");
+          throw std::runtime_error("template-id has an incomplete argument list");
+        if (close != last)
+          throw std::runtime_error("template-id is not supported as a qualifier");
+        result.template_id = true;
+        result.template_first = i + 2;
+        result.template_last = close - 1;
+        break;
       }
-      result.components.push_back(component);
-      expect_identifier = false;
       continue;
     }
     if (token.IsSimple(OP_COLON2) && expect_identifier && i == first)
     {
       result.global = true;
-      ++i;
       continue;
     }
     if (token.IsSimple(OP_COLON2) && !expect_identifier)
     {
       expect_identifier = true;
-      ++i;
-      if (i < last && i < tokens.size() && tokens[i].IsSimple(KW_TEMPLATE))
+      if (i + 1 < last && tokens[i + 1].IsSimple(KW_TEMPLATE))
         ++i;
       continue;
     }
-    throw std::runtime_error("unsupported name form in PA11");
+    throw std::runtime_error("unsupported name form");
   }
   if (expect_identifier && !(result.components.empty() && !result.global))
     throw std::runtime_error("qualified name ends with ::");

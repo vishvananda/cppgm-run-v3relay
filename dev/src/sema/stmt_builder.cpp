@@ -25,7 +25,7 @@ ScopeId ScopeBuilder::BuildCompound(AstId node, ScopeId parent,
 {
   const ScopeId block = model_.CreateScope(SCOPE_BLOCK, std::string(), parent);
   SemaId compound = semantic_parent;
-  if (tree_ != 0 && !suppress_semantics_)
+  if (EmitsSemantics())
   {
     compound = MakeSemantic(SEMA_COMPOUND_STATEMENT, block,
                             semantic_parent != 0 ? semantic_parent :
@@ -97,8 +97,8 @@ void ScopeBuilder::BuildConditionDeclaration(AstId node,
   {
     const SemaId variable = MakeSemantic(SEMA_VARIABLE, context.scope,
                                          condition, type, binding);
-    const SemaId initialized = AnalyzeInitializer(initializer, context.scope,
-                                                  type);
+    const SemaId initialized = expression_.AnalyzeInitializer(
+        initializer, context.scope, type);
     tree_->Append(variable, initialized);
   }
 }
@@ -122,7 +122,7 @@ void ScopeBuilder::BuildCondition(AstId node, const StatementContext& context,
   }
   if (tree_ == 0)
     return;
-  const SemaId expression = AnalyzeExpression(condition, context.scope);
+  const SemaId expression = expression_.Analyze(condition, context.scope);
   const SemaNode& value = tree_->At(expression);
   if (!switch_condition &&
       (!types_.IsScalar(value.type) ||
@@ -275,7 +275,7 @@ void ScopeBuilder::BuildForStatement(AstId node,
     const vector<AstId>& children = arena_.At(iteration).children;
     if (!children.empty())
     {
-      const SemaId expression = AnalyzeExpression(children[0], for_scope);
+      const SemaId expression = expression_.Analyze(children[0], for_scope);
       if (tree_ != 0)
         tree_->Append(iteration_node, expression);
     }
@@ -326,9 +326,9 @@ void ScopeBuilder::BuildCaseStatement(AstId node,
   if (tree_ != 0)
     statement = MakeSemantic(SEMA_CASE_STATEMENT, context.scope,
                              context.semantic_parent);
-  const SemaId label = AnalyzeExpression(children[0], context.scope);
+  const SemaId label = expression_.Analyze(children[0], context.scope);
   long long value = 0;
-  if (!TryConstant(label, value))
+  if (!expression_.TryConstant(label, value))
     throw std::runtime_error("case label is not constant");
   if (tree_ != 0)
     tree_->Append(statement, label);
@@ -355,43 +355,40 @@ void ScopeBuilder::BuildDefaultStatement(AstId node,
     BuildStatement(arena_.At(node).children[0], context);
 }
 
-void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
+// Without a semantic dump only the declarations inside statements matter:
+// block scopes, local types and constants.  Expressions are not analyzed.
+void ScopeBuilder::BuildDeclarationsOnly(AstId node, ScopeId scope)
 {
   if (node == 0)
     return;
   const AstKind kind = arena_.At(node).kind;
-  if (suppress_semantics_)
+  if (kind == AST_COMPOUND_STATEMENT)
+    (void)BuildCompound(node, scope);
+  else if (IsDeclarationKind(kind))
+    BuildNode(node, scope);
+  else
   {
-    if (kind == AST_COMPOUND_STATEMENT)
-      BuildCompound(node, context.scope, context.function,
-                    context.loop_depth, context.switch_depth);
-    else if (IsDeclarationKind(kind))
-      BuildNode(node, context.scope);
-    else
-    {
-      const vector<AstId>& children = arena_.At(node).children;
-      for (size_t i = 0; i < children.size(); ++i)
-        BuildStatement(children[i], context);
-    }
+    const vector<AstId>& children = arena_.At(node).children;
+    for (size_t i = 0; i < children.size(); ++i)
+      BuildDeclarationsOnly(children[i], scope);
+  }
+}
+
+void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
+{
+  if (node == 0)
+    return;
+  if (!EmitsSemantics())
+  {
+    BuildDeclarationsOnly(node, context.scope);
     return;
   }
+  const AstKind kind = arena_.At(node).kind;
   if (IsDeclarationKind(kind))
   {
     // The statement context owns the semantic placement, while the scope
     // passed to declaration analysis remains the lexical lookup scope.
     BuildNode(node, context.scope, context.semantic_parent);
-    return;
-  }
-  if (tree_ == 0)
-  {
-    if (kind == AST_COMPOUND_STATEMENT)
-      BuildCompound(node, context.scope);
-    else
-    {
-      const vector<AstId>& children = arena_.At(node).children;
-      for (size_t i = 0; i < children.size(); ++i)
-        BuildStatement(children[i], context);
-    }
     return;
   }
   switch (kind)
@@ -408,7 +405,7 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
                                context.semantic_parent);
     if (!arena_.At(node).children.empty())
     {
-      const SemaId expression = AnalyzeExpression(
+      const SemaId expression = expression_.Analyze(
           arena_.At(node).children[0], context.scope);
       if (tree_ != 0)
         tree_->Append(statement, expression);
@@ -437,8 +434,9 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
     {
       if (return_type == 0 || IsVoidType(types_, return_type))
         throw std::runtime_error("void function cannot return a value");
-      const SemaId expression = AnalyzeExpression(children[0], context.scope);
-      InitializeExpression(expression, return_type, false, false, false, true);
+      const SemaId expression = expression_.Analyze(children[0],
+                                                    context.scope);
+      expression_.Initialize(expression, return_type);
       if (tree_ != 0)
         tree_->Append(statement, expression);
     }

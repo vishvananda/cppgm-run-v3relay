@@ -1,50 +1,43 @@
 #pragma once
 
 #include <cstddef>
-#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "parser/ast_model.h"
 #include "parser/recog_token.h"
-#include "sema/const_eval.h"
+#include "sema/expr_sema.h"
 #include "sema/qualified_name.h"
 #include "sema/sema_tree.h"
 #include "sema/scope_model.h"
 
-class ExpressionAnalyzer;
-
 // Walks the PA10 AST once and populates the SemaModel: declaration
-// collection and scope ownership (scope_builder.cpp) and specifier- and
-// declarator-derived type construction (type_builder.cpp).  Names are read
-// from node token spans; nothing is recovered from dump text.  Unsupported
-// constructs throw, which the driver maps to EXIT_FAILURE.
-class ScopeBuilder : public ConstantOperandTypes
+// collection and scope ownership (scope_builder.cpp), specifier- and
+// declarator-derived type construction (type_builder.cpp) and statement
+// scopes (stmt_builder.cpp).  Every expression - an initializer, an array
+// bound, an enumerator value, a decltype or sizeof operand, a statement -
+// goes through the one ExpressionAnalyzer: with a dump tree (PA12) its nodes
+// form the semantic dump, otherwise they are transient facts read and
+// released.  Names are read from node token spans; nothing is recovered from
+// dump text.  Unsupported constructs throw, which the driver maps to
+// EXIT_FAILURE.
+class ScopeBuilder
 {
 public:
+  // Scope and type model only (--emit-types).
   ScopeBuilder(const std::vector<Pa6Token>& tokens, const AstArena& arena,
                SemaModel& model);
+  // Scope and type model plus the semantic dump tree (--emit-semantics).
   ScopeBuilder(const std::vector<Pa6Token>& tokens, const AstArena& arena,
                SemaModel& model, SemaTree& tree);
-  ~ScopeBuilder();
 
   void Build(AstId root);
 
-  // ConstantOperandTypes
+  // Type construction and template entities for the expression analyzer.
   TypeId TypeOfTypeId(AstId type_id, ScopeId scope);
-  TypeId TypeOfExpression(AstId expression, ScopeId scope);
-  TypeId TypeIdForSemantics(AstId type_id, ScopeId scope);
-  TypeId DecltypeForSemantics(AstId expression, ScopeId scope);
-  SemaId AnalyzeExpression(AstId expression, ScopeId scope);
-  SemaId AnalyzeInitializer(AstId initializer, ScopeId scope, TypeId target);
-  SemaId InitializeExpression(SemaId expression, TypeId target,
-                              bool variable = false, bool constexpr_value = false,
-                              bool condition = false, bool return_value = false,
-                              bool argument = false);
-  bool TryConstant(SemaId expression, long long& value) const;
-  bool IsSemantic() const { return tree_ != 0; }
-  SemaTree* SemanticTree() const { return tree_; }
-
+  TypeId TypeOfDecltype(AstId expression, ScopeId scope);
+  TypeId TypeForName(const QualifiedName& name, ScopeId scope) const;
   // Template entities are owned by the scope builder until a use supplies
   // concrete arguments.  Instances are interned here so overload resolution
   // and the deferred semantic dump observe the same function entity.
@@ -57,20 +50,12 @@ public:
                               const std::vector<TypeId>& arguments,
                               FunctionEntityId& function,
                               BindingId& binding);
-  TypeId TypeForName(const QualifiedName& name, ScopeId scope) const;
 
 private:
   struct ParameterInfo
   {
     std::string name;
     TypeId type;
-  };
-  // Static type of a decltype/sizeof operand and whether it is an lvalue.
-  struct ExpressionType
-  {
-    TypeId type;
-    bool lvalue;
-    bool names_type; // the operand is a type name, not an expression
   };
 
   struct StatementContext
@@ -88,6 +73,9 @@ private:
           switch_depth(switch_depth), semantic_parent(semantic_parent) {}
   };
 
+  // Template parameter type -> argument type, in parameter order.
+  typedef std::vector<std::pair<TypeId, TypeId> > TemplateBindings;
+
   // Declarations and scopes.
   void BuildNode(AstId node, ScopeId scope, SemaId semantic_parent = 0);
   void BuildTemplate(AstId node, ScopeId scope);
@@ -99,8 +87,8 @@ private:
   void BuildAlias(AstId node, ScopeId scope);
   void BuildSimpleDeclaration(AstId node, ScopeId scope,
                               SemaId semantic_parent = 0);
-  void RecordConstantValue(BindingId binding, AstId init_declarator,
-                           bool is_constexpr, ScopeId scope);
+  void BuildVariable(BindingId binding, AstId initializer, AstId declarator,
+                     ScopeId scope, SemaId variable, bool is_constexpr);
   void BuildFunctionDefinition(AstId node, ScopeId scope);
   void BuildStaticAssert(AstId node, ScopeId scope);
   void BuildLinkage(AstId node, ScopeId scope);
@@ -110,6 +98,7 @@ private:
                         unsigned switch_depth = 0,
                         SemaId semantic_parent = 0);
   void BuildStatement(AstId node, const StatementContext& context);
+  void BuildDeclarationsOnly(AstId node, ScopeId scope);
   void BuildBranch(AstId node, const StatementContext& context,
                    SemaId semantic_parent);
   void BuildCondition(AstId node, const StatementContext& context,
@@ -142,8 +131,7 @@ private:
   bool HasConstFunctionQualifier(AstId declarator) const;
   FunctionEntityId EnsureDefaultConstructor(TypeId type);
   void AddConstructorAction(SemaId variable, ScopeId scope, TypeId type,
-                            BindingId binding, AstId declarator,
-                            const std::string& object_name = std::string());
+                            BindingId binding, AstId declarator);
   void BuildAnonymousUnionStorage(AstId node, ScopeId scope,
                                   SemaId semantic_parent, TypeId type);
   void EmitDeferredSemantics();
@@ -159,17 +147,25 @@ private:
   TypeId BuildTypeNode(AstId node, ScopeId lookup_scope, bool in_declaration,
                        const std::string& anonymous_name);
   TypeId BuildTypeId(AstId node, ScopeId lookup_scope);
+  // `deduced_bound` completes an array declarator whose bound is omitted
+  // (8.5.1p4: the initializer's element count); 0 when there is none.
   TypeId BuildDeclaratorType(AstId declarator, TypeId base,
                              ScopeId lookup_scope,
-                             bool parameter_context = false);
+                             bool parameter_context = false,
+                             std::size_t deduced_bound = 0);
   TypeId ApplyPrefix(TypeId base, const std::vector<AstId>& prefix);
   TypeId ApplySuffix(TypeId base, const std::vector<AstId>& suffix,
-                     ScopeId lookup_scope, bool parameter_context);
+                     ScopeId lookup_scope, bool parameter_context,
+                     std::size_t deduced_bound);
   void BuildParameters(AstId clause, ScopeId lookup_scope,
                        std::vector<ParameterInfo>& parameters, bool& variadic);
   TypeId BuildDecltype(AstId expression, ScopeId lookup_scope);
-  ExpressionType BuildExpressionType(AstId expression, ScopeId lookup_scope);
   TypeId LookupType(ScopeId scope, const QualifiedName& name) const;
+  // 5.19 integral constant value; the analysis nodes are released.
+  long long ConstantValue(AstId expression, ScopeId scope);
+  // A const integral or enumeration object records a constant initializer
+  // value on its binding (5.19p2).
+  bool RecordsConstantValue(TypeId type) const;
 
   // AST access.
   AstId FindChild(AstId node, AstKind kind) const;
@@ -186,7 +182,9 @@ private:
   static bool IsIgnoredSpecifier(ETokenType token);
 
   // Semantic-tree helpers.  The scope model remains the source of truth for
-  // lookup; this map only records the nearest dump container for a scope.
+  // lookup; the dense scope table only records the nearest dump container.
+  SemaTree& Tree() { return tree_ != 0 ? *tree_ : scratch_tree_; }
+  bool EmitsSemantics() const { return tree_ != 0 && !suppress_semantics_; }
   SemaId SemanticParent(ScopeId scope, SemaId fallback = 0) const;
   SemaId MakeSemantic(SemaKind kind, ScopeId scope, SemaId parent,
                       TypeId type = 0, BindingId binding = 0,
@@ -201,12 +199,11 @@ private:
                                    bool member_const = false);
   SemaId MakeDetachedSemantic(SemaKind kind, ScopeId scope, TypeId type,
                               BindingId binding, FunctionEntityId function);
-  TypeId SubstituteTemplateType(TypeId type,
-                                const std::map<std::string, TypeId>& values);
+  TypeId SubstituteTemplateType(TypeId type, const TemplateBindings& values);
   bool DeduceTemplateType(TypeId pattern, TypeId argument,
-                          std::map<std::string, TypeId>& values) const;
+                          TemplateBindings& values) const;
   bool BuildTemplateInstance(FunctionEntityId template_function,
-                             const std::map<std::string, TypeId>& values,
+                             const TemplateBindings& values,
                              FunctionEntityId& function, BindingId& binding);
   bool HasIncompleteArray(AstId declarator) const;
   std::size_t InitializerBound(AstId initializer) const;
@@ -215,12 +212,11 @@ private:
   const AstArena& arena_;
   SemaModel& model_;
   TypeTable& types_;
-  ConstEvaluator const_eval_;
-  SemaTree* tree_;
-  ExpressionAnalyzer* expression_;
+  SemaTree* tree_; // the semantic dump tree; 0 when only the model is built
+  SemaTree scratch_tree_; // transient analyses when there is no dump tree
+  ExpressionAnalyzer expression_;
   SemaId semantic_root_;
-  std::map<ScopeId, SemaId> semantic_scopes_;
-  std::size_t pending_array_bound_;
+  std::vector<SemaId> semantic_scopes_; // indexed by ScopeId
   unsigned unnamed_local_enum_counter_;
   unsigned unnamed_local_class_counter_;
   bool suppress_semantics_;

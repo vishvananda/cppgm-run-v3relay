@@ -3,10 +3,9 @@
 #include <stdexcept>
 
 SemaNode::SemaNode()
-    : kind(SEMA_TRANSLATION_UNIT), category(VC_PRVALUE), type(0),
-      op(KW_AUTO), binding(0), function(0), scope(0), first(0), last(0),
-      has_value(false), value(0), first_child(0), last_child(0),
-      next_sibling(0)
+    : kind(SEMA_TRANSLATION_UNIT), category(VC_PRVALUE), op(KW_AUTO),
+      has_value(false), type(0), binding(0), function(0), scope(0), first(0),
+      last(0), value(0), first_child(0), last_child(0), next_sibling(0)
 {
 }
 
@@ -60,4 +59,16 @@ void SemaTree::SetRoot(SemaId root)
   if (root == 0 || root >= nodes_.size())
     throw std::out_of_range("invalid semantic root");
   root_ = root;
+}
+
+std::size_t SemaTree::Mark() const
+{
+  return nodes_.size();
+}
+
+void SemaTree::Truncate(std::size_t mark)
+{
+  if (mark == 0 || mark > nodes_.size() || root_ >= mark)
+    throw std::out_of_range("invalid semantic tree mark");
+  nodes_.resize(mark);
 }

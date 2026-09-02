@@ -1,8 +1,8 @@
 #include "sema/semantics_dump.h"
 
-#include <algorithm>
 #include <map>
 #include <ostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -79,9 +79,10 @@ const char* KindName(SemaKind kind)
   return "unknown";
 }
 
-string Span(const SemaNode& node, const vector<Pa6Token>& tokens)
+// Source spelling of a node's token span.
+void PrintSpan(std::ostream& out, const SemaNode& node,
+               const vector<Pa6Token>& tokens)
 {
-  string result;
   for (size_t i = node.first; i < node.last && i < tokens.size(); ++i)
   {
     const Pa6Token& token = tokens[i];
@@ -89,60 +90,62 @@ string Span(const SemaNode& node, const vector<Pa6Token>& tokens)
       break;
     if (token.kind == PA6_RSHIFT_1_TOKEN ||
         token.kind == PA6_RSHIFT_2_TOKEN)
-      result += '>';
+      out << '>';
     else
-      result += token.spelling;
+      out << token.spelling;
   }
-  return result;
 }
 
-string FunctionName(const SemaModel& model, FunctionEntityId function)
+// `A::B::f`: the named namespace and class scopes enclosing the entity.
+void PrintScopePrefix(std::ostream& out, const SemaModel& model,
+                      ScopeId scope)
+{
+  if (scope == model.GlobalScope())
+    return;
+  const Scope& owner = model.ScopeAt(scope);
+  PrintScopePrefix(out, model, owner.parent);
+  if ((owner.kind == SCOPE_NAMESPACE || owner.kind == SCOPE_CLASS) &&
+      !owner.unnamed_namespace && !owner.name.empty())
+    out << owner.name << "::";
+}
+
+void PrintFunctionName(std::ostream& out, const SemaModel& model,
+                       FunctionEntityId function)
 {
   if (function == 0)
-    return string();
+    return;
   const FunctionEntity& entity = model.FunctionAt(function);
-  vector<string> components;
-  for (ScopeId scope = entity.scope; scope != model.GlobalScope();
-       scope = model.ScopeAt(scope).parent)
-  {
-    const Scope& owner = model.ScopeAt(scope);
-    if ((owner.kind == SCOPE_NAMESPACE || owner.kind == SCOPE_CLASS) &&
-        !owner.unnamed_namespace && !owner.name.empty() &&
-        owner.name != "<unnamed>")
-      components.push_back(owner.name);
-  }
-  std::reverse(components.begin(), components.end());
-  string result;
-  for (size_t i = 0; i < components.size(); ++i)
-  {
-    if (!result.empty())
-      result += "::";
-    result += components[i];
-  }
-  if (!result.empty())
-    result += "::";
-  result += entity.name;
-  return result;
+  PrintScopePrefix(out, model, entity.scope);
+  out << entity.name;
 }
 
-string OperatorText(const SemaNode& node, const vector<Pa6Token>& tokens)
+// Spelling of an operator a synthesized node carries without a source token.
+const char* SynthesizedSpelling(ETokenType op)
 {
-  if (node.op == KW_AUTO)
-    return string();
+  switch (op)
+  {
+  case OP_AMP: return "&";
+  default: break;
+  }
+  throw std::runtime_error("synthesized operator has no spelling");
+}
+
+// `OP_PLUS:+`: the token kind and the source spelling of the operator.
+void PrintOperator(std::ostream& out, const SemaNode& node,
+                   const vector<Pa6Token>& tokens)
+{
   const std::map<ETokenType, string>::const_iterator found =
       TokenTypeToStringMap.find(node.op);
-  const string name = found == TokenTypeToStringMap.end() ? string() :
-      found->second;
+  out << (found == TokenTypeToStringMap.end() ? string() : found->second)
+      << ':';
   if (node.op == OP_LPAREN)
-    return name + ":";
+    return;
   if (node.op == OP_RSHIFT)
-    return name + ":>>";
-  if (!node.operator_spelling.empty())
-    return name + ":" + node.operator_spelling;
-  string spelling;
-  if (node.first < tokens.size())
-    spelling = tokens[node.first].spelling;
-  return name + ":" + spelling;
+    out << ">>";
+  else if (node.HasSpan())
+    out << tokens[node.first].spelling;
+  else
+    out << SynthesizedSpelling(node.op);
 }
 
 void PrintNode(std::ostream& out, const SemaTree& tree, const SemaModel& model,
@@ -158,33 +161,30 @@ void PrintNode(std::ostream& out, const SemaTree& tree, const SemaModel& model,
   case SEMA_NAMESPACE_DEFINITION:
   {
     const Scope& scope = model.ScopeAt(node.scope);
-    out << ' ' << ((scope.unnamed_namespace || scope.name == "<unnamed>") ?
-        "<unnamed>" : scope.name);
+    out << ' ' << (scope.unnamed_namespace ? "<unnamed>" : scope.name);
     break;
   }
-  case SEMA_TYPE_ALIAS: case SEMA_VARIABLE:
-  {
-    const Binding& binding = model.BindingAt(node.binding);
-    out << ' ' << binding.name << ' ';
+  case SEMA_TYPE_ALIAS: case SEMA_VARIABLE: case SEMA_PARAMETER:
+    out << ' ' << model.BindingAt(node.binding).name << ' ';
     model.Types().Spell(out, node.type);
     break;
-  }
   case SEMA_FUNCTION_DECLARATION: case SEMA_FUNCTION_DEFINITION:
-    out << ' ' << FunctionName(model, node.function) << ' ';
+  case SEMA_CALLEE:
+    out << ' ';
+    PrintFunctionName(out, model, node.function);
+    out << ' ';
     model.Types().Spell(out, node.type);
     break;
-  case SEMA_PARAMETER:
-  {
-    const Binding& binding = model.BindingAt(node.binding);
-    out << ' ' << binding.name << ' ';
-    model.Types().Spell(out, node.type);
-    break;
-  }
   case SEMA_ID_EXPRESSION:
+    // A synthesized name (the implicit anonymous-union object) has no span
+    // and prints the spelling of the binding it denotes.
     out << ' ' << Category(node.category) << ' ';
     model.Types().Spell(out, node.type);
-    out << ' ' << (node.expression_name.empty() ? Span(node, tokens) :
-        node.expression_name);
+    out << ' ';
+    if (node.HasSpan())
+      PrintSpan(out, node, tokens);
+    else
+      out << model.BindingAt(node.binding).name;
     break;
   case SEMA_LITERAL:
     out << ' ' << Category(node.category) << ' ';
@@ -194,24 +194,14 @@ void PrintNode(std::ostream& out, const SemaTree& tree, const SemaModel& model,
         model.BindingAt(node.binding).kind == BINDING_ENUMERATOR)
       out << node.value;
     else if (node.op != KW_AUTO)
-    {
-      const std::map<ETokenType, string>::const_iterator found =
-          TokenTypeToStringMap.find(node.op);
-      out << (found == TokenTypeToStringMap.end() ? string() : found->second)
-          << ':';
-      if (node.first < tokens.size())
-        out << tokens[node.first].spelling;
-    }
-    else if (node.first < node.last && node.first < tokens.size())
+      PrintOperator(out, node, tokens);
+    else if (node.HasSpan())
       out << tokens[node.first].spelling;
     else if (node.has_value)
       out << node.value;
     break;
-  case SEMA_CALLEE:
-    out << ' ' << FunctionName(model, node.function) << ' ';
-    model.Types().Spell(out, node.type);
-    break;
-  case SEMA_CALL:
+  case SEMA_CALL: case SEMA_CONDITIONAL: case SEMA_SUBSCRIPT:
+  case SEMA_SIZEOF: case SEMA_BRACED_INIT_LIST:
     out << ' ' << Category(node.category) << ' ';
     model.Types().Spell(out, node.type);
     break;
@@ -219,33 +209,29 @@ void PrintNode(std::ostream& out, const SemaTree& tree, const SemaModel& model,
   case SEMA_CAST:
     out << ' ' << Category(node.category) << ' ';
     model.Types().Spell(out, node.type);
-    if (node.kind == SEMA_ASSIGNMENT)
-      out << ' ' << OperatorText(node, tokens);
-    else
+    if (node.op != KW_AUTO)
     {
-      const string op = OperatorText(node, tokens);
-      if (!op.empty())
-        out << ' ' << op;
+      out << ' ';
+      PrintOperator(out, node, tokens);
     }
     break;
-  case SEMA_CONDITIONAL: case SEMA_SUBSCRIPT:
-  case SEMA_SIZEOF:
-    out << ' ' << Category(node.category) << ' ';
-    model.Types().Spell(out, node.type);
-    break;
   case SEMA_MEMBER:
+    // `OP_DOT:x` for an access expression; an injected anonymous-union
+    // member is named through its binding.
     out << ' ' << Category(node.category) << ' ';
     model.Types().Spell(out, node.type);
-    out << ' ' << (node.expression_name.empty() ?
-        OperatorText(node, tokens) : node.expression_name);
-    break;
-  case SEMA_BRACED_INIT_LIST:
-    out << ' ' << Category(node.category) << ' ';
-    model.Types().Spell(out, node.type);
+    out << ' ';
+    if (node.op != KW_AUTO)
+      PrintOperator(out, node, tokens);
+    else
+      out << model.BindingAt(node.binding).name;
     break;
   case SEMA_CONSTRUCTOR_ACTION:
     if (node.function != 0)
-      out << ' ' << FunctionName(model, node.function);
+    {
+      out << ' ';
+      PrintFunctionName(out, model, node.function);
+    }
     break;
   default:
     break;

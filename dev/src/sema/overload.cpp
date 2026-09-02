@@ -5,12 +5,7 @@
 namespace
 {
 
-bool Contains(const std::vector<FunctionEntityId>& values,
-              FunctionEntityId value)
-{
-  return std::find(values.begin(), values.end(), value) != values.end();
-}
-
+// 13.3.3p1: better on no argument worse and at least one strictly better.
 bool BetterThan(const std::vector<ImplicitConversion>& left,
                 const std::vector<ImplicitConversion>& right)
 {
@@ -26,6 +21,7 @@ bool BetterThan(const std::vector<ImplicitConversion>& left,
   return strict;
 }
 
+// Function type denoted by a pointer/reference-to-function target.
 bool TargetFunctionType(TypeTable& types, TypeId target, TypeId& function)
 {
   if (target == 0)
@@ -41,22 +37,33 @@ bool TargetFunctionType(TypeTable& types, TypeId target, TypeId& function)
   return true;
 }
 
-bool TargetMemberFunctionType(TypeTable& types, TypeId target,
-                              TypeId& member_class, TypeId& function)
+bool IsMemberFunctionPointer(TypeTable& types, TypeId target)
 {
   if (target == 0)
     return false;
   if (types.Kind(target) == TYPE_REFERENCE)
     target = types.Referent(target);
   target = types.Unqualified(target);
-  if (types.Kind(target) != TYPE_MEMBER_POINTER)
-    return false;
-  const TypeNode& member = types.At(target);
-  if (types.Kind(types.Unqualified(member.base)) != TYPE_FUNCTION)
-    return false;
-  member_class = member.member_class;
-  function = types.Unqualified(member.base);
-  return true;
+  return types.Kind(target) == TYPE_MEMBER_POINTER &&
+      types.Kind(types.Unqualified(types.At(target).base)) == TYPE_FUNCTION;
+}
+
+// 13.4 applied to one argument: the unique candidate whose type equals the
+// parameter's function type; 0 when none or several match.
+FunctionEntityId MatchFunctionArgument(
+    const SemaModel& model, const std::vector<FunctionEntityId>& candidates,
+    TypeId function_type)
+{
+  FunctionEntityId matched = 0;
+  for (std::size_t i = 0; i < candidates.size(); ++i)
+  {
+    if (model.FunctionAt(candidates[i]).type != function_type)
+      continue;
+    if (matched != 0)
+      return 0;
+    matched = candidates[i];
+  }
+  return matched;
 }
 
 } // namespace
@@ -86,10 +93,10 @@ bool CallableFunctionType(TypeTable& types, TypeId type,
   return false;
 }
 
-bool SelectBestOverload(const SemaModel& model, TypeTable& types,
-                        const std::vector<BindingId>& bindings,
-                        const std::vector<OverloadArgument>& arguments,
-                        OverloadSelection& selection)
+FunctionEntityId SelectBestOverload(
+    const SemaModel& model, TypeTable& types,
+    const std::vector<BindingId>& bindings,
+    const std::vector<OverloadArgument>& arguments)
 {
   struct Candidate
   {
@@ -97,18 +104,25 @@ bool SelectBestOverload(const SemaModel& model, TypeTable& types,
     std::vector<ImplicitConversion> conversions;
   };
 
-  std::vector<Candidate> viable;
-  std::vector<FunctionEntityId> seen;
+  // Redeclarations bind one entity several times; the candidate set holds
+  // each entity once (entity ids follow declaration order).
+  std::vector<FunctionEntityId> entities;
+  entities.reserve(bindings.size());
   for (std::size_t i = 0; i < bindings.size(); ++i)
   {
     const Binding& binding = model.BindingAt(bindings[i]);
-    if (binding.kind != BINDING_FUNCTION || binding.function == 0 ||
-        Contains(seen, binding.function) ||
-        model.FunctionAt(binding.function).is_template)
-      continue;
-    seen.push_back(binding.function);
+    if (binding.kind == BINDING_FUNCTION && binding.function != 0 &&
+        !model.FunctionAt(binding.function).is_template)
+      entities.push_back(binding.function);
+  }
+  std::sort(entities.begin(), entities.end());
+  entities.erase(std::unique(entities.begin(), entities.end()),
+                 entities.end());
 
-    const TypeId function_type = model.FunctionAt(binding.function).type;
+  std::vector<Candidate> viable;
+  for (std::size_t i = 0; i < entities.size(); ++i)
+  {
+    const TypeId function_type = model.FunctionAt(entities[i]).type;
     if (types.Kind(types.Unqualified(function_type)) != TYPE_FUNCTION)
       continue;
     const TypeNode& function = types.At(types.Unqualified(function_type));
@@ -117,7 +131,7 @@ bool SelectBestOverload(const SemaModel& model, TypeTable& types,
       continue;
 
     Candidate candidate;
-    candidate.function = binding.function;
+    candidate.function = entities[i];
     candidate.conversions.reserve(arguments.size());
     bool viable_candidate = true;
     for (std::size_t argument = 0; argument < arguments.size(); ++argument)
@@ -126,44 +140,32 @@ bool SelectBestOverload(const SemaModel& model, TypeTable& types,
       {
         ImplicitConversion ellipsis;
         ellipsis.rank = RANK_ELLIPSIS;
-        ellipsis.to = 0;
         candidate.conversions.push_back(ellipsis);
         continue;
       }
-      OverloadArgument source = arguments[argument];
+      const OverloadArgument& source = arguments[argument];
+      const TypeId parameter = function.parameters[argument];
+      TypeId source_type = source.type;
+      ValueCategory source_category = source.category;
+      bool function_lvalue = source.is_function_lvalue;
       TypeId target_function = 0;
       if (!source.function_candidates.empty() &&
-          TargetFunctionType(types, function.parameters[argument],
-                             target_function))
+          TargetFunctionType(types, parameter, target_function))
       {
-        FunctionEntityId matched = 0;
-        for (std::size_t candidate = 0;
-             candidate < source.function_candidates.size(); ++candidate)
-        {
-          const FunctionEntityId candidate_function =
-              source.function_candidates[candidate];
-          if (model.FunctionAt(candidate_function).type == target_function)
-          {
-            if (matched != 0)
-            {
-              viable_candidate = false;
-              break;
-            }
-            matched = candidate_function;
-          }
-        }
-        if (!viable_candidate || matched == 0)
+        const FunctionEntityId matched = MatchFunctionArgument(
+            model, source.function_candidates, target_function);
+        if (matched == 0)
         {
           viable_candidate = false;
           break;
         }
-        source.type = model.FunctionAt(matched).type;
-        source.category = VC_LVALUE;
-        source.is_function_lvalue = true;
+        source_type = model.FunctionAt(matched).type;
+        source_category = VC_LVALUE;
+        function_lvalue = true;
       }
       const ImplicitConversion conversion = Classify(
-          types, source.type, source.category, source.is_null_literal,
-          source.is_function_lvalue, function.parameters[argument]);
+          types, source_type, source_category, source.is_null_literal,
+          function_lvalue, parameter);
       if (!conversion.Viable())
       {
         viable_candidate = false;
@@ -176,27 +178,19 @@ bool SelectBestOverload(const SemaModel& model, TypeTable& types,
   }
 
   if (viable.empty())
-    return false;
+    return 0;
 
-  std::vector<std::size_t> best;
+  // 13.3.3p2 in two linear passes: a candidate no later candidate beats,
+  // then confirmation that it beats every other one.
+  std::size_t best = 0;
+  for (std::size_t i = 1; i < viable.size(); ++i)
+    if (BetterThan(viable[i].conversions, viable[best].conversions))
+      best = i;
   for (std::size_t i = 0; i < viable.size(); ++i)
-  {
-    bool dominated = false;
-    for (std::size_t j = 0; j < viable.size(); ++j)
-      if (i != j && BetterThan(viable[j].conversions,
-                               viable[i].conversions))
-      {
-        dominated = true;
-        break;
-      }
-    if (!dominated)
-      best.push_back(i);
-  }
-  if (best.size() != 1)
-    return false;
-  selection.function = viable[best[0]].function;
-  selection.conversions = viable[best[0]].conversions;
-  return true;
+    if (i != best &&
+        !BetterThan(viable[best].conversions, viable[i].conversions))
+      return 0;
+  return viable[best].function;
 }
 
 bool SelectTargetFunction(const SemaModel& model, TypeTable& types,
@@ -204,17 +198,14 @@ bool SelectTargetFunction(const SemaModel& model, TypeTable& types,
                           TypeId target, BindingId& binding,
                           FunctionEntityId& function)
 {
-  TypeId target_member_class = 0;
-  TypeId target_member_function = 0;
-  const bool member_target = TargetMemberFunctionType(
-      types, target, target_member_class, target_member_function);
-  (void)target_member_class;
-  (void)target_member_function;
+  const bool member_target = IsMemberFunctionPointer(types, target);
   TypeId target_function = 0;
   if (!member_target && !TargetFunctionType(types, target, target_function))
     return false;
+  const TypeId target_unqualified = types.Unqualified(
+      types.Kind(target) == TYPE_REFERENCE ? types.Referent(target) : target);
 
-  std::vector<FunctionEntityId> matches;
+  FunctionEntityId matched = 0;
   BindingId matched_binding = 0;
   for (std::size_t i = 0; i < bindings.size(); ++i)
   {
@@ -225,24 +216,20 @@ bool SelectTargetFunction(const SemaModel& model, TypeTable& types,
     const FunctionEntity& entity = model.FunctionAt(candidate.function);
     if (member_target)
     {
-      if (!entity.is_member || entity.member_class == 0 ||
-          !entity.member_type ||
-          entity.member_pointer_type == 0 ||
-          types.Unqualified(entity.member_pointer_type) !=
-              types.Unqualified(target))
+      if (!entity.is_member || entity.member_pointer_type == 0 ||
+          types.Unqualified(entity.member_pointer_type) != target_unqualified)
         continue;
     }
     else if (types.Unqualified(entity.type) != target_function)
       continue;
-    if (!Contains(matches, candidate.function))
-    {
-      matches.push_back(candidate.function);
-      matched_binding = bindings[i];
-    }
+    if (matched != 0 && matched != candidate.function)
+      return false;
+    matched = candidate.function;
+    matched_binding = bindings[i];
   }
-  if (matches.size() != 1)
+  if (matched == 0)
     return false;
   binding = matched_binding;
-  function = matches[0];
+  function = matched;
   return true;
 }

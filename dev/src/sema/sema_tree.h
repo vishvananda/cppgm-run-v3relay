@@ -1,16 +1,16 @@
 #pragma once
 
 #include <cstddef>
-#include <string>
 #include <vector>
 
 #include "posttoken_types.h"
 #include "sema/scope_model.h"
 
-// The semantic tree is an append-only, intrusive tree.  Spans and bindings
-// are kept as ids so the dump can recover source spellings and canonical
-// entities without duplicating strings on every expression node.
-typedef std::size_t SemaId;
+// The semantic tree is an append-only, intrusive tree of typed facts.  A node
+// records the type, value category, operator token, resolved binding or
+// function entity, and the token span it was analyzed from; every spelling
+// the dump prints is rendered from those identities at print time.
+typedef std::size_t SemaId; // 0 is the null node
 
 enum ValueCategory
 {
@@ -68,22 +68,21 @@ struct SemaNode
 {
   SemaKind kind;
   ValueCategory category;
+  ETokenType op; // operator or cast keyword; KW_AUTO when the node has none
+  bool has_value; // integral constant value folded bottom-up
   TypeId type;
-  ETokenType op;
-  std::string operator_spelling; // synthesized operators have no source token
-  std::string expression_name; // synthesized names have no source token span
   BindingId binding;
   FunctionEntityId function;
   ScopeId scope;
-  std::size_t first;
+  std::size_t first; // token span; empty for synthesized nodes
   std::size_t last;
-  bool has_value;
   long long value;
   SemaId first_child;
   SemaId last_child;
   SemaId next_sibling;
 
   SemaNode();
+  bool HasSpan() const { return first < last; }
 };
 
 class SemaTree
@@ -98,6 +97,12 @@ public:
 
   SemaId Root() const;
   void SetRoot(SemaId root);
+
+  // Nodes made for a transient analysis (an array bound, an enumerator
+  // value, a decltype operand) are released once their fact has been read:
+  // the caller takes a mark before the analysis and truncates back to it.
+  std::size_t Mark() const;
+  void Truncate(std::size_t mark);
 
 private:
   std::vector<SemaNode> nodes_;
