@@ -664,7 +664,7 @@ OverloadArgument ExpressionAnalyzer::MakeOperatorArgument(
   vector<SemaId> constructor_arguments(1, expression);
   try
   {
-    (void)builder_.ResolveConstructorForExpression(
+    (void)builder_.ResolveConstructor(
         class_type, constructor_arguments, scope);
   }
   catch (const std::runtime_error&)
@@ -687,7 +687,7 @@ SemaId ExpressionAnalyzer::BuildConstructorTemporary(
   if (types_.Kind(class_type) != TYPE_CLASS)
     throw std::runtime_error("constructor temporary target is not a class");
   const FunctionEntityId constructor =
-      builder_.ResolveConstructorForExpression(
+      builder_.ResolveConstructor(
           class_type, arguments, scope);
   const FunctionEntity& entity = model_.FunctionAt(constructor);
   const TypeNode& callable = types_.At(types_.Unqualified(entity.type));
@@ -1077,10 +1077,12 @@ SemaId ExpressionAnalyzer::AnalyzeUnary(AstId expression, ScopeId scope)
   case OP_AMP:
     if (info.category != VC_LVALUE && !info.is_function_lvalue)
       throw std::runtime_error("address-of requires an lvalue");
-    if (tree_.At(operand).kind == SEMA_MEMBER &&
-        tree_.At(operand).binding != 0 &&
-        model_.BindingAt(tree_.At(operand).binding).bit_field)
-      throw std::runtime_error("address-of a bit-field is invalid");
+    {
+      const ClassField* field = tree_.At(operand).kind == SEMA_MEMBER ?
+          model_.FieldFor(tree_.At(operand).binding) : 0;
+      if (field != 0 && field->bit_width != 0)
+        throw std::runtime_error("address-of a bit-field is invalid");
+    }
     if (info.is_function_lvalue && tree_.At(operand).function != 0 &&
         model_.FunctionAt(tree_.At(operand).function).is_member)
       result_type = model_.FunctionAt(tree_.At(operand).function).
@@ -1961,7 +1963,7 @@ SemaId ExpressionAnalyzer::AnalyzeFunctionalCast(
     for (size_t i = 0; i < args.size(); ++i)
       analyzed_arguments.push_back(Analyze(args[i], scope));
     const FunctionEntityId constructor =
-        builder_.ResolveConstructorForExpression(
+        builder_.ResolveConstructor(
             target, analyzed_arguments, scope);
     const FunctionEntity& entity = model_.FunctionAt(constructor);
     const TypeNode& callable = types_.At(types_.Unqualified(entity.type));
@@ -2090,14 +2092,10 @@ SemaId ExpressionAnalyzer::AnalyzeBraced(AstId expression, ScopeId scope,
     Append(result, Analyze(children[0], scope));
     return result;
   }
-  for (size_t i = 0; i < children.size(); ++i)
-  {
-    const SemaId child = arena_.At(children[i]).kind == AST_BRACED_INIT_LIST ?
-        AnalyzeBraced(children[i], scope, element) :
-        Analyze(children[i], scope);
-    Initialize(child, element);
-    Append(result, child);
-  }
+  size_t index = 0;
+  while (index < children.size())
+    Append(result, AnalyzeAggregateClause(children, children[index], scope,
+                                          element, index));
   return result;
 }
 

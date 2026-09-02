@@ -51,8 +51,13 @@ public:
                               const std::vector<TypeId>& arguments,
                               FunctionEntityId& function,
                               BindingId& binding);
-  FunctionEntityId ResolveConstructorForExpression(
-      TypeId type, const std::vector<SemaId>& arguments, ScopeId scope);
+  // 13.3.1.3: the constructor that direct-initializes `type` from the
+  // analyzed arguments; the synthesized default constructor when the class
+  // declares none.  Expression analysis and declarations share this one
+  // selection so temporaries and named objects agree.
+  FunctionEntityId ResolveConstructor(TypeId type,
+                                      const std::vector<SemaId>& arguments,
+                                      ScopeId scope);
 
 private:
   struct ParameterInfo
@@ -96,9 +101,13 @@ private:
                      ScopeId scope, SemaId variable, bool is_constexpr);
   void BuildFunctionDefinition(AstId node, ScopeId scope);
   void BuildSpecialMember(AstId node, ScopeId scope);
-  void BuildCompletedMemberInitializers(ClassEntityId entity);
-  void BuildCompletedMemberBodies(ClassEntityId entity);
-  void BuildDefaultMemberInitializers(ClassEntityId entity);
+  // 9.2p2 complete-class contexts, run once when the class body closes over
+  // the function definitions deferred since `first_pending`.
+  void CompleteClassMembers(ClassEntityId entity, std::size_t first_pending);
+  void BuildConstructorDefaults(FunctionEntityId constructor,
+                                SemaId function_node, ScopeId function_scope);
+  void EnsureSubobjectConstructors(ClassEntityId entity, SemaId function_node);
+  void EnsureSubobjectDestructors(ClassEntityId entity);
   void BuildInheritedConstructors(ClassEntityId derived,
                                   ClassEntityId base, ScopeId scope);
   void BuildStaticAssert(AstId node, ScopeId scope);
@@ -143,12 +152,8 @@ private:
   bool HasConstFunctionQualifier(AstId declarator) const;
   bool HasVolatileFunctionQualifier(AstId declarator) const;
   bool IsNoThrowDeclarator(AstId declarator, ScopeId scope);
-  bool HasNontrivialDestructor(ClassEntityId entity) const;
   FunctionEntityId EnsureDefaultConstructor(TypeId type);
   FunctionEntityId EnsureDestructor(TypeId type);
-  FunctionEntityId ResolveConstructor(TypeId type,
-                                      const std::vector<SemaId>& arguments,
-                                      ScopeId scope);
   void AddConstructorAction(SemaId variable, ScopeId scope, TypeId type,
                             BindingId binding, AstId declarator);
   void AddConstructorActionWithArguments(
@@ -308,20 +313,24 @@ private:
         : template_function(template_function), arguments(arguments),
           function(function), binding(binding), used(used) {}
   };
+  // A function defined inside a class body (member, constructor, or
+  // friend) whose body waits for the class to complete.  A zero body is a
+  // defaulted or inherited constructor that gets an empty compound.
   struct DeferredMemberBody
   {
     AstId body;
     ScopeId scope;
     FunctionEntityId function;
     SemaId function_node;
-    bool built;
 
     DeferredMemberBody(AstId body = 0, ScopeId scope = 0,
                        FunctionEntityId function = 0,
                        SemaId function_node = 0)
         : body(body), scope(scope), function(function),
-          function_node(function_node), built(false) {}
+          function_node(function_node) {}
   };
   std::vector<DeferredTemplateInstance> deferred_template_instances_;
+  // Stack discipline: a class body pushes its definitions and pops them at
+  // completion, so the vector never holds more than the open class bodies.
   std::vector<DeferredMemberBody> deferred_member_bodies_;
 };

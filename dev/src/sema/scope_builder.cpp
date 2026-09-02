@@ -356,7 +356,6 @@ void ScopeBuilder::BuildInheritedConstructors(ClassEntityId derived,
     const BindingId binding = model_.AddBinding(
         scope, name, BINDING_FUNCTION, function_type);
     model_.BindingAt(binding).function = inherited;
-    owner.constructor = inherited;
     owner.constructors.push_back(inherited);
 
     if (!EmitsSemantics())
@@ -397,8 +396,8 @@ void ScopeBuilder::BuildInheritedConstructors(ClassEntityId derived,
       MakeSemantic(SEMA_ID_EXPRESSION, function_scope, member,
                    inherited_type.parameters[parameter + 1],
                    parameter_bindings[parameter], 0, VC_LVALUE);
-    (void)MakeSemantic(SEMA_COMPOUND_STATEMENT, function_scope,
-                       function_node);
+    deferred_member_bodies_.push_back(DeferredMemberBody(
+        0, function_scope, inherited, function_node));
   }
   owner.inheriting_constructor_base = base;
 }
@@ -566,6 +565,8 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
         ClassField field(binding, type);
         field.access = member_access_;
         field.initializer = initializer;
+        model_.BindingAt(binding).field_index =
+            model_.ClassAt(member_class).fields.size();
         model_.ClassAt(member_class).fields.push_back(field);
       }
       if (model_.ScopeAt(target_scope).kind == SCOPE_NAMESPACE)
@@ -901,7 +902,6 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
   else
   {
     ClassEntity& owner = model_.ClassAt(member_class);
-    owner.constructor = function;
     if (std::find(owner.constructors.begin(), owner.constructors.end(),
                   function) == owner.constructors.end())
       owner.constructors.push_back(function);
@@ -952,25 +952,9 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
           canonical.parameters[i + 1]);
   model_.FunctionAt(function).default_semantic_arguments.swap(
       default_semantic_arguments);
-  if (model_.ScopeAt(scope).kind == SCOPE_CLASS) {
-    deferred_member_bodies_.push_back(DeferredMemberBody(
-        model_.FunctionAt(function).body, function_scope, function,
-        function_node));
-    return;
-  }
-  labels_.clear();
-  gotos_.clear();
-  initialized_locals_.clear();
-  jump_sequence_ = 0;
-  if (model_.FunctionAt(function).body != 0)
-    (void)BuildCompound(model_.FunctionAt(function).body, function_scope,
-                        function, 0, 0, function_node);
-  else
-    (void)MakeSemantic(SEMA_COMPOUND_STATEMENT, function_scope,
-                       function_node);
-  labels_.clear();
-  gotos_.clear();
-  initialized_locals_.clear();
+  deferred_member_bodies_.push_back(DeferredMemberBody(
+      model_.FunctionAt(function).body, function_scope, function,
+      function_node));
 }
 
 FunctionEntityId ScopeBuilder::ResolveConstructor(
@@ -988,18 +972,20 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
     throw std::runtime_error("class has no viable constructor");
   }
 
+  std::vector<BindingId> declared;
+  model_.DirectBindings(owner.class_scope,
+                        model_.ScopeAt(owner.class_scope).name,
+                        LOOKUP_FUNCTIONS, declared);
   std::vector<BindingId> candidates;
-  const std::vector<BindingId>& bindings =
-      model_.ScopeAt(owner.class_scope).bindings;
-  for (std::size_t i = 0; i < bindings.size(); ++i)
+  for (std::size_t i = 0; i < declared.size(); ++i)
   {
-    const Binding& binding = model_.BindingAt(bindings[i]);
-    if (binding.kind != BINDING_FUNCTION || binding.function == 0 ||
-        std::find(owner.constructors.begin(), owner.constructors.end(),
-                  binding.function) == owner.constructors.end() ||
+    const Binding& binding = model_.BindingAt(declared[i]);
+    if (binding.function == 0 ||
+        model_.FunctionAt(binding.function).special_member !=
+            SPECIAL_MEMBER_CONSTRUCTOR ||
         model_.FunctionAt(binding.function).deleted)
       continue;
-    candidates.push_back(bindings[i]);
+    candidates.push_back(declared[i]);
   }
   if (candidates.empty())
     throw std::runtime_error("class has only deleted constructors");
@@ -1025,12 +1011,6 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
     throw std::runtime_error("no viable constructor");
   (void)scope;
   return selected;
-}
-
-FunctionEntityId ScopeBuilder::ResolveConstructorForExpression(
-    TypeId type, const std::vector<SemaId>& arguments, ScopeId scope)
-{
-  return ResolveConstructor(type, arguments, scope);
 }
 
 void ScopeBuilder::BuildMemberInitializers(AstId initializer,
@@ -1348,6 +1328,7 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
 
   const AccessKind saved_access = member_access_;
   const ClassEntityId saved_class = current_class_;
+  const std::size_t first_pending = deferred_member_bodies_.size();
   member_access_ = key == TK_CLASS ? ACCESS_PRIVATE : ACCESS_PUBLIC;
   current_class_ = entity;
   for (std::size_t i = 0; i < value.children.size(); ++i)
@@ -1374,9 +1355,7 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
   member_access_ = saved_access;
   current_class_ = saved_class;
   CompleteClassLayout(entity);
-  BuildCompletedMemberInitializers(entity);
-  BuildCompletedMemberBodies(entity);
-  BuildDefaultMemberInitializers(entity);
+  CompleteClassMembers(entity, first_pending);
   if (injected_union)
   {
     const vector<BindingId> members = model_.ScopeAt(class_scope).bindings;
@@ -1392,109 +1371,6 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
     }
   }
   return type;
-}
-
-// Default member initializers are complete-class-context expressions
-// (9.2p2): a constructor declared before a later field still sees that field.
-// Analyze them after the whole class body has been collected, and retain the
-// resulting nodes on the constructor entity without adding synthetic nodes
-// to the PA12 source-shaped semantic dump.
-void ScopeBuilder::BuildDefaultMemberInitializers(ClassEntityId entity)
-{
-  if (!EmitsSemantics())
-    return;
-  const ClassEntity& owner = model_.ClassAt(entity);
-  for (std::size_t constructor_index = 0;
-       constructor_index < owner.constructors.size(); ++constructor_index) {
-    const FunctionEntityId constructor = owner.constructors[constructor_index];
-    const FunctionEntity& function = model_.FunctionAt(constructor);
-    if (function.deleted)
-      continue;
-    SemaId function_node = 0;
-    for (std::size_t i = 0; i < deferred_semantics_.size(); ++i) {
-      const SemaId candidate = deferred_semantics_[i];
-      if (candidate != 0 && tree_->At(candidate).function == constructor &&
-          tree_->At(candidate).kind == SEMA_FUNCTION_DEFINITION) {
-        function_node = candidate;
-        break;
-      }
-    }
-    if (function_node == 0)
-      continue;
-    ScopeId function_scope = 0;
-    for (SemaId child = tree_->At(function_node).first_child; child != 0;
-         child = tree_->At(child).next_sibling) {
-      if (tree_->At(child).kind == SEMA_COMPOUND_STATEMENT) {
-        function_scope = tree_->At(child).scope;
-        break;
-      }
-      if (tree_->At(child).kind == SEMA_PARAMETER && function_scope == 0)
-        function_scope = tree_->At(child).scope;
-    }
-    if (function_scope == 0)
-      continue;
-    std::vector<std::pair<BindingId, std::size_t> > defaults;
-    for (std::size_t field_index = 0; field_index < owner.fields.size();
-         ++field_index) {
-      const ClassField& field = owner.fields[field_index];
-      if (field.static_member || field.initializer == 0)
-        continue;
-      AstId source = field.initializer;
-      if (arena_.At(source).kind == AST_INITIALIZER &&
-          arena_.At(source).children.size() == 1)
-        source = arena_.At(source).children[0];
-      SemaId value = 0;
-      const TypeId field_unqualified = types_.Unqualified(field.type);
-      if (types_.Kind(field_unqualified) == TYPE_CLASS &&
-          arena_.At(source).kind == AST_CALL_EXPRESSION &&
-          !model_.ClassAt(types_.At(field_unqualified).entity).aggregate) {
-        const std::vector<AstId>& call_children = arena_.At(source).children;
-        if (call_children.size() != 2)
-          throw std::runtime_error("invalid default member constructor");
-        const std::vector<AstId>& argument_nodes =
-            arena_.At(call_children[1]).children;
-        std::vector<SemaId> arguments;
-        for (std::size_t argument = 0; argument < argument_nodes.size();
-             ++argument)
-          arguments.push_back(expression_.Analyze(argument_nodes[argument],
-                                                  function_scope));
-        const FunctionEntityId target_constructor = ResolveConstructor(
-            field.type, arguments, function_scope);
-        const FunctionEntity& constructor =
-            model_.FunctionAt(target_constructor);
-        const TypeNode& constructor_type = types_.At(types_.Unqualified(
-            constructor.type));
-        std::vector<SemaId> converted;
-        for (std::size_t argument = 0; argument < arguments.size();
-             ++argument)
-          converted.push_back(expression_.Initialize(
-              arguments[argument], constructor_type.parameters[argument + 1]));
-        for (std::size_t parameter = arguments.size() + 1;
-             parameter < constructor_type.parameters.size(); ++parameter) {
-          if (parameter >= constructor.default_arguments.size() ||
-              constructor.default_arguments[parameter] == 0)
-            throw std::runtime_error("missing default member constructor argument");
-          converted.push_back(expression_.AnalyzeInitializer(
-              constructor.default_arguments[parameter], constructor.scope,
-              constructor_type.parameters[parameter]));
-        }
-        value = tree_->Make(SEMA_MEMBER_INITIALIZER);
-        SemaNode& member = tree_->At(value);
-        member.scope = function_scope;
-        member.type = field.type;
-        member.binding = field.binding;
-        member.function = target_constructor;
-        member.category = VC_PRVALUE;
-        for (std::size_t argument = 0; argument < converted.size();
-             ++argument)
-          tree_->Append(value, converted[argument]);
-      } else
-        value = expression_.AnalyzeInitializer(field.initializer,
-                                               function_scope, field.type);
-      defaults.push_back(std::make_pair(field.binding, value));
-    }
-    model_.FunctionAt(constructor).default_member_initializers.swap(defaults);
-  }
 }
 
 namespace
@@ -1706,6 +1582,22 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
   for (std::size_t i = 0; i < value.bases.size(); ++i)
     if (!model_.ClassAt(value.bases[i].entity).trivial_default_constructor)
       value.trivial_default_constructor = false;
+  value.trivial_destructor = value.destructor == 0 ||
+      model_.FunctionAt(value.destructor).synthesized;
+  for (std::size_t i = 0; i < value.bases.size(); ++i)
+    if (!model_.ClassAt(value.bases[i].entity).trivial_destructor)
+      value.trivial_destructor = false;
+  for (std::size_t i = 0; i < value.fields.size(); ++i)
+  {
+    if (value.fields[i].static_member)
+      continue;
+    TypeId element = types_.Unqualified(value.fields[i].type);
+    while (types_.Kind(element) == TYPE_ARRAY)
+      element = types_.Unqualified(types_.At(element).base);
+    if (types_.Kind(element) == TYPE_CLASS &&
+        !model_.ClassAt(types_.At(element).entity).trivial_destructor)
+      value.trivial_destructor = false;
+  }
   types_.SetClassLayout(entity, size, alignment);
 }
 
@@ -2306,28 +2198,6 @@ void ScopeBuilder::CheckJumpTarget(unsigned source_sequence,
   }
 }
 
-bool ScopeBuilder::HasNontrivialDestructor(ClassEntityId entity) const
-{
-  const ClassEntity& owner = model_.ClassAt(entity);
-  if (owner.destructor != 0 &&
-      !model_.FunctionAt(owner.destructor).synthesized)
-    return true;
-  for (std::size_t i = 0; i < owner.bases.size(); ++i)
-    if (HasNontrivialDestructor(owner.bases[i].entity))
-      return true;
-  for (std::size_t i = 0; i < owner.fields.size(); ++i) {
-    if (owner.fields[i].static_member)
-      continue;
-    TypeId field_type = types_.Unqualified(owner.fields[i].type);
-    while (types_.Kind(field_type) == TYPE_ARRAY)
-      field_type = types_.Unqualified(types_.At(field_type).base);
-    if (types_.Kind(field_type) == TYPE_CLASS &&
-        HasNontrivialDestructor(types_.At(field_type).entity))
-      return true;
-  }
-  return false;
-}
-
 FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
 {
   const TypeId class_type = types_.Unqualified(type);
@@ -2366,7 +2236,6 @@ FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
       owner.class_scope, name, BINDING_FUNCTION, constructor_type);
   model_.BindingAt(binding).function = constructor;
   owner.default_constructor = constructor;
-  owner.constructor = constructor;
   owner.constructors.push_back(constructor);
 
   if (EmitsSemantics())
@@ -2387,8 +2256,9 @@ FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
     const SemaId body = MakeSemantic(SEMA_COMPOUND_STATEMENT,
                                      function_scope, function_node);
     MapSemanticScope(function_scope, body);
+    EnsureSubobjectConstructors(class_entity, function_node);
+    BuildConstructorDefaults(constructor, function_node, function_scope);
   }
-  BuildDefaultMemberInitializers(class_entity);
   return constructor;
 }
 
@@ -2403,8 +2273,9 @@ FunctionEntityId ScopeBuilder::EnsureDestructor(TypeId type)
     throw std::runtime_error("destructor requires a defined class");
   if (owner.destructor != 0)
     return owner.destructor;
-  if (!HasNontrivialDestructor(class_entity))
+  if (owner.trivial_destructor)
     return 0;
+  EnsureSubobjectDestructors(class_entity);
 
   const TypeId this_type = types_.Pointer(class_type);
   const std::vector<TypeId> parameters(1, this_type);
@@ -2488,13 +2359,12 @@ void ScopeBuilder::EmitDeferredSemantics()
 {
   if (tree_ == 0)
     return;
-  // Class bodies are completed before the enclosing translation unit is
-  // walked.  Replaying their definitions in reverse declaration order
-  // preserves the canonical LowIR order: callers and the most recently
-  // declared overload are encountered first, while the source tree remains
-  // the owner of every deferred node.
-  for (std::size_t i = deferred_semantics_.size(); i != 0; --i)
-    tree_->Append(semantic_root_, deferred_semantics_[i - 1]);
+  // Deferred definitions follow the unit in declaration order; the source
+  // tree owns every node.  LowIR definition order is free under the
+  // relaxed compare, and symbol naming orders by entity id, not by tree
+  // position.
+  for (std::size_t i = 0; i < deferred_semantics_.size(); ++i)
+    tree_->Append(semantic_root_, deferred_semantics_[i]);
 }
 
 namespace

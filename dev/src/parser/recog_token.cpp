@@ -74,9 +74,8 @@ void Pa6TokenCollector::emit_invalid(const string& source)
 
 void Pa6TokenCollector::append_token(const Pa6Token& token)
 {
-	Pa6Token stamped = token;
-	stamped.pack_alignment = active_pack_alignment_;
-	tokens.push_back(stamped);
+	tokens.push_back(token);
+	tokens.back().pack_alignment = active_pack_alignment_;
 }
 
 void Pa6TokenCollector::emit_pragma(const string& text)

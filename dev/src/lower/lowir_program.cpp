@@ -351,14 +351,9 @@ void Lowerer::LowerVariable(SemaId variable_node)
       if (constructor != 0 && !element_class.trivial_default_constructor) {
         const std::size_t bound = types_.At(unqualified).array_bound;
         for (std::size_t i = 0; i < bound; ++i) {
-          lowir_model::Instruction call;
-          call.kind = lowir_model::Instruction::IK_CALL;
-          call.type = VoidType();
-          call.call_return_type = VoidType();
-          call.call_returns_void = true;
-          call.first = GlobalOperand(FunctionSymbolName(constructor));
-          call.args.push_back(LowerArrayElementAddress(array, element, i));
-          Emit(call);
+          const std::string& symbol = FunctionSymbolName(constructor);
+          EmitVoidCall(symbol, std::vector<lowir_model::Operand>(
+              1, LowerArrayElementAddress(array, element, i)));
         }
       }
       RegisterLiveObject(variable.binding, declared);
@@ -503,63 +498,19 @@ lowir_model::Operand Lowerer::AggregateDestination(
   {
     if (types_.Kind(current) == TYPE_CLASS) {
       const ClassEntity& owner = model_.ClassAt(types_.At(current).entity);
-      TypeId next = 0;
-      for (std::size_t i = 0; i < owner.fields.size(); ++i)
-        if (!owner.fields[i].static_member && owner.fields[i].binding != 0 &&
-            owner.fields[i].offset == path[step]) {
-          next = owner.fields[i].type;
-          break;
-        }
-      if (next == 0)
+      if (path[step] >= owner.fields.size())
         Unsupported("an aggregate field path without metadata");
-      lowir_model::Instruction projection;
-      projection.kind = lowir_model::Instruction::IK_INDEX;
-      projection.dest = NewTemp();
-      projection.type = I8Type();
-      projection.index_projection =
-          types_.Kind(types_.Unqualified(next)) == TYPE_REFERENCE ?
-              lowir_model::IPK_REFERENCE_FIELD : lowir_model::IPK_FIELD;
-      projection.first = destination;
-      projection.second = Immediate(static_cast<long long>(path[step]));
-      Emit(projection);
-      destination = TempOperand(projection.dest);
-      current = types_.Unqualified(next);
+      const ClassField& field = owner.fields[path[step]];
+      destination = ProjectField(
+          destination, field.offset,
+          types_.Kind(types_.Unqualified(field.type)) == TYPE_REFERENCE ?
+              lowir_model::IPK_REFERENCE_FIELD : lowir_model::IPK_FIELD);
+      current = types_.Unqualified(field.type);
       continue;
     }
     if (types_.Kind(current) == TYPE_ARRAY) {
       const TypeId element = types_.At(current).base;
-      lowir_model::Instruction decay;
-      decay.kind = lowir_model::Instruction::IK_UNARY;
-      decay.dest = NewTemp();
-      decay.op = "decay";
-      decay.type = PtrType();
-      decay.first = destination;
-      Emit(decay);
-      lowir_model::Operand index = Immediate(
-          static_cast<long long>(path[step]));
-      const std::size_t element_size = types_.SizeOf(element);
-      const bool byte_element = types_.Kind(types_.Unqualified(element)) ==
-          TYPE_CLASS;
-      if (byte_element && element_size != 1) {
-        lowir_model::Instruction scale;
-        scale.kind = lowir_model::Instruction::IK_BINARY;
-        scale.dest = NewTemp();
-        scale.op = "mul";
-        scale.type = I64Type();
-        scale.first = index;
-        scale.second = Immediate(static_cast<long long>(element_size));
-        Emit(scale);
-        index = TempOperand(scale.dest);
-      }
-      lowir_model::Instruction projection;
-      projection.kind = lowir_model::Instruction::IK_INDEX;
-      projection.dest = NewTemp();
-      projection.type = byte_element ? I8Type() : LowTypeOf(element);
-      projection.index_projection = lowir_model::IPK_ARRAY_ELEMENT;
-      projection.first = TempOperand(decay.dest);
-      projection.second = index;
-      Emit(projection);
-      destination = TempOperand(projection.dest);
+      destination = ProjectArrayElement(destination, element, path[step]);
       current = types_.Unqualified(element);
       continue;
     }
@@ -586,21 +537,16 @@ void Lowerer::LowerAggregateConstructor(
       model_.FunctionAt(function).type));
   if (call_children.size() - 1 > callable.parameters.size() - 1)
     Unsupported("an aggregate constructor with too many arguments");
-  lowir_model::Instruction call;
-  call.kind = lowir_model::Instruction::IK_CALL;
-  call.type = VoidType();
-  call.call_return_type = VoidType();
-  call.call_returns_void = true;
-  call.first = GlobalOperand(FunctionSymbolName(function));
-  call.args.push_back(destination);
+  const std::string& symbol = FunctionSymbolName(function);
+  std::vector<lowir_model::Operand> arguments(1, destination);
   for (std::size_t i = 1; i < call_children.size(); ++i) {
     const TypeId parameter = callable.parameters[i];
-    call.args.push_back(types_.Kind(types_.Unqualified(parameter)) ==
+    arguments.push_back(types_.Kind(types_.Unqualified(parameter)) ==
         TYPE_REFERENCE ? LowerReferenceArgument(
             call_children[i], parameter).operand :
         LowerRValue(call_children[i], parameter).operand);
   }
-  Emit(call);
+  EmitVoidCall(symbol, arguments);
   (void)type;
 }
 
@@ -618,23 +564,18 @@ void Lowerer::LowerAggregateDefaultConstructor(
   if (model_.ClassAt(constructor.member_class).trivial_default_constructor)
     return;
   const TypeNode& callable = types_.At(types_.Unqualified(constructor.type));
-  lowir_model::Instruction call;
-  call.kind = lowir_model::Instruction::IK_CALL;
-  call.type = VoidType();
-  call.call_return_type = VoidType();
-  call.call_returns_void = true;
-  call.first = GlobalOperand(FunctionSymbolName(function));
-  call.args.push_back(destination);
+  const std::string& symbol = FunctionSymbolName(function);
+  std::vector<lowir_model::Operand> arguments(1, destination);
   for (std::size_t parameter = 1; parameter < callable.parameters.size();
        ++parameter) {
     if (parameter >= constructor.default_semantic_arguments.size() ||
         constructor.default_semantic_arguments[parameter] == 0)
       Unsupported("an aggregate default constructor argument");
-    call.args.push_back(LowerRValue(
+    arguments.push_back(LowerRValue(
         constructor.default_semantic_arguments[parameter],
         callable.parameters[parameter]).operand);
   }
-  Emit(call);
+  EmitVoidCall(symbol, arguments);
 }
 
 void Lowerer::LowerAggregateStringInitializer(
@@ -666,6 +607,9 @@ void Lowerer::LowerAggregateStringInitializer(
   }
 }
 
+// Aggregate initialization of a local object.  `path` is the subobject
+// route from the object: a field index at each class level and an element
+// index at each array level; every leaf projects afresh from the object.
 void Lowerer::LowerAggregateObjectInitializer(
     SemaId node, TypeId type, const Value& object,
     const std::vector<std::size_t>& path)
@@ -714,6 +658,9 @@ void Lowerer::LowerAggregateObjectInitializer(
   }
   if (types_.Kind(unqualified) != TYPE_CLASS)
     Unsupported("a non-class object aggregate initializer");
+  // A bit-field unit belongs to one class subobject; entering a subobject
+  // starts its units afresh.
+  initialized_bitfield_units_.clear();
   const ClassEntity& class_entity = model_.ClassAt(
       types_.At(unqualified).entity);
   std::size_t value_index = 0;
@@ -722,7 +669,7 @@ void Lowerer::LowerAggregateObjectInitializer(
     if (field.static_member || field.binding == 0)
       continue;
     std::vector<std::size_t> field_path(path);
-    field_path.push_back(field.offset);
+    field_path.push_back(i);
     const TypeId field_type = types_.Unqualified(field.type);
     const bool aggregate = types_.Kind(field_type) == TYPE_ARRAY ||
         (types_.Kind(field_type) == TYPE_CLASS &&
@@ -794,39 +741,7 @@ void Lowerer::LowerAggregateObjectInitializer(
 lowir_model::Operand Lowerer::LowerArrayElementAddress(
     const Value& array, TypeId element, std::size_t index)
 {
-  const Value address = AddressValue(array);
-  lowir_model::Instruction decay;
-  decay.kind = lowir_model::Instruction::IK_UNARY;
-  decay.dest = NewTemp();
-  decay.op = "decay";
-  decay.type = PtrType();
-  decay.first = address.operand;
-  Emit(decay);
-
-  lowir_model::Operand offset = Immediate(static_cast<long long>(index));
-  const std::size_t element_size = types_.SizeOf(element);
-  const bool byte_element = types_.Kind(types_.Unqualified(element)) ==
-      TYPE_CLASS;
-  if (byte_element && element_size != 1) {
-    lowir_model::Instruction scale;
-    scale.kind = lowir_model::Instruction::IK_BINARY;
-    scale.dest = NewTemp();
-    scale.op = "mul";
-    scale.type = I64Type();
-    scale.first = offset;
-    scale.second = Immediate(static_cast<long long>(element_size));
-    Emit(scale);
-    offset = TempOperand(scale.dest);
-  }
-  lowir_model::Instruction projection;
-  projection.kind = lowir_model::Instruction::IK_INDEX;
-  projection.dest = NewTemp();
-  projection.type = byte_element ? I8Type() : LowTypeOf(element);
-  projection.index_projection = lowir_model::IPK_ARRAY_ELEMENT;
-  projection.first = TempOperand(decay.dest);
-  projection.second = offset;
-  Emit(projection);
-  return TempOperand(projection.dest);
+  return ProjectArrayElement(AddressValue(array).operand, element, index);
 }
 
 void Lowerer::LowerAggregateZero(
@@ -834,6 +749,7 @@ void Lowerer::LowerAggregateZero(
 {
   const TypeId unqualified = types_.Unqualified(type);
   if (types_.Kind(unqualified) == TYPE_CLASS) {
+    initialized_bitfield_units_.clear();
     const ClassEntity& class_entity = model_.ClassAt(
         types_.At(unqualified).entity);
     for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
@@ -847,30 +763,23 @@ void Lowerer::LowerAggregateZero(
       if (bit_field && !preserve)
         encoded = EncodeBitField(field, field.type, ZeroOperand(field.type),
                                  field.type);
-      lowir_model::Instruction projection;
-      projection.kind = lowir_model::Instruction::IK_INDEX;
-      projection.dest = NewTemp();
-      projection.type = I8Type();
-      projection.index_projection = lowir_model::IPK_FIELD;
-      projection.first = destination;
-      projection.second = Immediate(static_cast<long long>(field.offset));
-      Emit(projection);
+      const lowir_model::Operand field_destination =
+          ProjectField(destination, field.offset);
       const TypeId field_type = types_.Unqualified(field.type);
       if (types_.Kind(field_type) == TYPE_CLASS ||
           types_.Kind(field_type) == TYPE_ARRAY)
-        LowerAggregateZero(field.type, TempOperand(projection.dest));
+        LowerAggregateZero(field.type, field_destination);
       else if (bit_field) {
         if (preserve)
-          StoreBitField(field, TempOperand(projection.dest), field.type,
+          StoreBitField(field, field_destination, field.type,
                         ZeroOperand(field.type), true, field.type);
         else
-          EmitStore(LowTypeOf(field.type), encoded,
-                    TempOperand(projection.dest));
+          EmitStore(LowTypeOf(field.type), encoded, field_destination);
         MarkBitFieldUnitInitialized(field);
       }
       else
         EmitStore(LowTypeOf(field.type), ZeroOperand(field.type),
-                  TempOperand(projection.dest));
+                  field_destination);
     }
     return;
   }
@@ -878,202 +787,67 @@ void Lowerer::LowerAggregateZero(
     const TypeId element = types_.At(unqualified).base;
     const std::size_t bound = types_.At(unqualified).array_bound;
     for (std::size_t i = 0; i < bound; ++i) {
-      lowir_model::Instruction decay;
-      decay.kind = lowir_model::Instruction::IK_UNARY;
-      decay.dest = NewTemp();
-      decay.op = "decay";
-      decay.type = PtrType();
-      decay.first = destination;
-      Emit(decay);
-      lowir_model::Operand offset = Immediate(static_cast<long long>(i));
-      const std::size_t element_size = types_.SizeOf(element);
-      const bool byte_element = types_.Kind(types_.Unqualified(element)) ==
-          TYPE_CLASS;
-      if (byte_element && element_size != 1) {
-        lowir_model::Instruction scale;
-        scale.kind = lowir_model::Instruction::IK_BINARY;
-        scale.dest = NewTemp();
-        scale.op = "mul";
-        scale.type = I64Type();
-        scale.first = offset;
-        scale.second = Immediate(static_cast<long long>(element_size));
-        Emit(scale);
-        offset = TempOperand(scale.dest);
-      }
-      lowir_model::Instruction projection;
-      projection.kind = lowir_model::Instruction::IK_INDEX;
-      projection.dest = NewTemp();
-      projection.type = byte_element ? I8Type() : LowTypeOf(element);
-      projection.index_projection = lowir_model::IPK_ARRAY_ELEMENT;
-      projection.first = TempOperand(decay.dest);
-      projection.second = offset;
-      Emit(projection);
+      const lowir_model::Operand element_destination =
+          ProjectArrayElement(destination, element, i);
       const TypeId element_unqualified = types_.Unqualified(element);
       if (types_.Kind(element_unqualified) == TYPE_CLASS ||
           types_.Kind(element_unqualified) == TYPE_ARRAY)
-        LowerAggregateZero(element, TempOperand(projection.dest));
+        LowerAggregateZero(element, element_destination);
       else
         EmitStore(LowTypeOf(element), ZeroOperand(element),
-                  TempOperand(projection.dest));
+                  element_destination);
     }
     return;
   }
   EmitStore(LowTypeOf(type), ZeroOperand(type), destination);
 }
 
-void Lowerer::LowerAggregateInitializer(
-    SemaId node, TypeId type, const lowir_model::Operand& destination)
-{
-  if (node == 0 || tree_.At(node).kind != SEMA_BRACED_INIT_LIST)
-    Unsupported("a non-braced aggregate initializer");
-  const TypeId unqualified = types_.Unqualified(type);
-  const std::vector<SemaId> values = Children(node);
-  if (types_.Kind(unqualified) == TYPE_CLASS) {
-    const ClassEntity& class_entity = model_.ClassAt(
-        types_.At(unqualified).entity);
-    std::size_t value_index = 0;
-    for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
-      const ClassField& field = class_entity.fields[i];
-      if (field.static_member || field.binding == 0)
-        continue;
-      const bool bit_field = field.bit_width != 0;
-      const bool preserve = bit_field &&
-          BitFieldUnitInitialized(field);
-      Value initialized_value;
-      if (value_index < values.size())
-        initialized_value = LowerRValue(values[value_index], field.type);
-      else {
-        initialized_value.type = field.type;
-        initialized_value.operand = ZeroOperand(field.type);
-      }
-      lowir_model::Operand encoded;
-      if (bit_field && !preserve)
-        encoded = EncodeBitField(field, initialized_value.type,
-                                 initialized_value.operand, field.type);
-      lowir_model::Instruction projection;
-      projection.kind = lowir_model::Instruction::IK_INDEX;
-      projection.dest = NewTemp();
-      projection.type = I8Type();
-      projection.index_projection = lowir_model::IPK_FIELD;
-      projection.first = destination;
-      projection.second = Immediate(static_cast<long long>(field.offset));
-      Emit(projection);
-      const lowir_model::Operand field_destination =
-          TempOperand(projection.dest);
-      const TypeId field_unqualified = types_.Unqualified(field.type);
-      if (bit_field) {
-        if (preserve) {
-          const lowir_model::Operand merged = MergeBitField(
-              field, field_destination, initialized_value.type,
-              initialized_value.operand, true, field.type);
-          lowir_model::Instruction final_projection;
-          final_projection.kind = lowir_model::Instruction::IK_INDEX;
-          final_projection.dest = NewTemp();
-          final_projection.type = I8Type();
-          final_projection.index_projection = lowir_model::IPK_FIELD;
-          final_projection.first = destination;
-          final_projection.second = Immediate(
-              static_cast<long long>(field.offset));
-          Emit(final_projection);
-          EmitStore(LowTypeOf(field.type), merged,
-                    TempOperand(final_projection.dest));
-        } else
-          EmitStore(LowTypeOf(field.type), encoded, field_destination);
-        MarkBitFieldUnitInitialized(field);
-      } else if (value_index >= values.size()) {
-        if (types_.Kind(field_unqualified) == TYPE_CLASS ||
-            types_.Kind(field_unqualified) == TYPE_ARRAY)
-          LowerAggregateZero(field.type, field_destination);
-        else
-          EmitStore(LowTypeOf(field.type), ZeroOperand(field.type),
-                    field_destination);
-      } else if (tree_.At(values[value_index]).kind ==
-                 SEMA_BRACED_INIT_LIST &&
-                 (types_.Kind(field_unqualified) == TYPE_CLASS ||
-                  types_.Kind(field_unqualified) == TYPE_ARRAY)) {
-        LowerAggregateInitializer(values[value_index], field.type,
-                                  field_destination);
-      } else {
-        EmitStore(LowTypeOf(field.type), initialized_value.operand,
-                  field_destination);
-      }
-      ++value_index;
-    }
-    return;
-  }
-  if (types_.Kind(unqualified) == TYPE_ARRAY) {
-    const TypeId element = types_.At(unqualified).base;
-    const std::size_t bound = types_.At(unqualified).array_bound;
-    for (std::size_t i = 0; i < bound; ++i) {
-      lowir_model::Instruction decay;
-      decay.kind = lowir_model::Instruction::IK_UNARY;
-      decay.dest = NewTemp();
-      decay.op = "decay";
-      decay.type = PtrType();
-      decay.first = destination;
-      Emit(decay);
-      lowir_model::Operand offset = Immediate(static_cast<long long>(i));
-      const std::size_t element_size = types_.SizeOf(element);
-      const bool byte_element = types_.Kind(types_.Unqualified(element)) ==
-          TYPE_CLASS;
-      if (byte_element && element_size != 1) {
-        lowir_model::Instruction scale;
-        scale.kind = lowir_model::Instruction::IK_BINARY;
-        scale.dest = NewTemp();
-        scale.op = "mul";
-        scale.type = I64Type();
-        scale.first = offset;
-        scale.second = Immediate(static_cast<long long>(element_size));
-        Emit(scale);
-        offset = TempOperand(scale.dest);
-      }
-      lowir_model::Instruction projection;
-      projection.kind = lowir_model::Instruction::IK_INDEX;
-      projection.dest = NewTemp();
-      projection.type = byte_element ? I8Type() : LowTypeOf(element);
-      projection.index_projection = lowir_model::IPK_ARRAY_ELEMENT;
-      projection.first = TempOperand(decay.dest);
-      projection.second = offset;
-      Emit(projection);
-      const lowir_model::Operand element_destination =
-          TempOperand(projection.dest);
-      if (i >= values.size()) {
-        const TypeId element_unqualified = types_.Unqualified(element);
-        if (types_.Kind(element_unqualified) == TYPE_CLASS ||
-            types_.Kind(element_unqualified) == TYPE_ARRAY)
-          LowerAggregateZero(element, element_destination);
-        else
-          EmitStore(LowTypeOf(element), ZeroOperand(element),
-                    element_destination);
-      } else if (tree_.At(values[i]).kind == SEMA_BRACED_INIT_LIST &&
-                 (types_.Kind(types_.Unqualified(element)) == TYPE_CLASS ||
-                  types_.Kind(types_.Unqualified(element)) == TYPE_ARRAY)) {
-        LowerAggregateInitializer(values[i], element,
-                                  element_destination);
-      } else {
-        EmitStore(LowTypeOf(element),
-                  LowerRValue(values[i], element).operand,
-                  element_destination);
-      }
-    }
-    return;
-  }
-  if (values.size() > 1)
-    Unsupported("a scalar aggregate with too many values");
-  EmitStore(LowTypeOf(type), values.empty() ? ZeroOperand(type) :
-            LowerRValue(values[0], type).operand, destination);
-}
-
 void Lowerer::LowerAggregateMemberInitializer(
-    SemaId node, TypeId type, BindingId binding, FunctionEntityId owner)
+    SemaId node, TypeId type, BindingId binding)
 {
   const std::vector<std::pair<bool, std::size_t> > path;
-  LowerAggregateMemberLeaves(node, type, type, binding, owner, path);
+  LowerAggregateMemberLeaves(node, type, type, binding, path);
+}
+
+// Address of one scalar leaf of a member's aggregate initializer.  Each
+// leaf projects afresh from `this` through the member and the route below
+// it: (false, field index) at class levels, (true, element) at array
+// levels.
+lowir_model::Operand Lowerer::MemberLeafDestination(
+    BindingId binding, TypeId root_type,
+    const std::vector<std::pair<bool, std::size_t> >& path)
+{
+  const ClassField* root = model_.FieldFor(binding);
+  if (root == 0)
+    Unsupported("an aggregate member without its root field");
+  lowir_model::Operand destination = ProjectField(LoadThis(), root->offset);
+  TypeId current = root_type;
+  for (std::size_t step = 0; step < path.size(); ++step) {
+    const TypeId current_unqualified = types_.Unqualified(current);
+    if (path[step].first) {
+      if (types_.Kind(current_unqualified) != TYPE_ARRAY)
+        Unsupported("an aggregate member array path");
+      const TypeId element = types_.At(current_unqualified).base;
+      destination = ProjectArrayElement(destination, element,
+                                        path[step].second);
+      current = element;
+    } else {
+      if (types_.Kind(current_unqualified) != TYPE_CLASS)
+        Unsupported("an aggregate member field path");
+      const ClassEntity& current_class = model_.ClassAt(
+          types_.At(current_unqualified).entity);
+      if (path[step].second >= current_class.fields.size())
+        Unsupported("an aggregate member field path metadata");
+      const ClassField& field = current_class.fields[path[step].second];
+      destination = ProjectField(destination, field.offset);
+      current = field.type;
+    }
+  }
+  return destination;
 }
 
 void Lowerer::LowerAggregateMemberLeaves(
     SemaId node, TypeId type, TypeId root_type, BindingId binding,
-    FunctionEntityId owner,
     const std::vector<std::pair<bool, std::size_t> >& path)
 {
   if (node == 0 || tree_.At(node).kind != SEMA_BRACED_INIT_LIST)
@@ -1089,259 +863,54 @@ void Lowerer::LowerAggregateMemberLeaves(
       if (field.static_member || field.binding == 0)
         continue;
       std::vector<std::pair<bool, std::size_t> > nested_path(path);
-      nested_path.push_back(std::make_pair(false, field.offset));
+      nested_path.push_back(std::make_pair(false, i));
       const TypeId field_unqualified = types_.Unqualified(field.type);
       if (value_index < values.size() &&
           tree_.At(values[value_index]).kind == SEMA_BRACED_INIT_LIST &&
           (types_.Kind(field_unqualified) == TYPE_CLASS ||
            types_.Kind(field_unqualified) == TYPE_ARRAY))
         LowerAggregateMemberLeaves(values[value_index], field.type, root_type,
-                                   binding, owner, nested_path);
+                                   binding, nested_path);
       else {
         const SemaId value = value_index < values.size() ?
             values[value_index] : 0;
-        lowir_model::Instruction load_this;
-        load_this.kind = lowir_model::Instruction::IK_LOAD;
-        load_this.dest = NewTemp();
-        load_this.type = PtrType();
-        load_this.first = SlotOperand("$this");
-        Emit(load_this);
-        lowir_model::Operand destination = TempOperand(load_this.dest);
-        const ClassEntity& owner_class = model_.ClassAt(
-            model_.FunctionAt(owner).member_class);
-        bool found_root = false;
-        for (std::size_t root_index = 0;
-             root_index < owner_class.fields.size(); ++root_index)
-          if (owner_class.fields[root_index].binding == binding) {
-            lowir_model::Instruction projection;
-            projection.kind = lowir_model::Instruction::IK_INDEX;
-            projection.dest = NewTemp();
-            projection.type = I8Type();
-            projection.index_projection = lowir_model::IPK_FIELD;
-            projection.first = destination;
-            projection.second = Immediate(static_cast<long long>(
-                owner_class.fields[root_index].offset));
-            Emit(projection);
-            destination = TempOperand(projection.dest);
-            found_root = true;
-            break;
-          }
-        if (!found_root)
-          Unsupported("an aggregate member without its root field");
-        TypeId current = root_type;
-        for (std::size_t step = 0; step < nested_path.size(); ++step) {
-          const bool array = nested_path[step].first;
-          const std::size_t offset = nested_path[step].second;
-          if (array) {
-            const TypeId current_unqualified = types_.Unqualified(current);
-            if (types_.Kind(current_unqualified) != TYPE_ARRAY)
-              Unsupported("an aggregate member array path");
-            const TypeId element = types_.At(current_unqualified).base;
-            lowir_model::Instruction decay;
-            decay.kind = lowir_model::Instruction::IK_UNARY;
-            decay.dest = NewTemp();
-            decay.op = "decay";
-            decay.type = PtrType();
-            decay.first = destination;
-            Emit(decay);
-            lowir_model::Operand index = Immediate(
-                static_cast<long long>(offset));
-            const std::size_t element_size = types_.SizeOf(element);
-            const bool byte_element = types_.Kind(
-                types_.Unqualified(element)) == TYPE_CLASS;
-            if (byte_element && element_size != 1) {
-              lowir_model::Instruction scale;
-              scale.kind = lowir_model::Instruction::IK_BINARY;
-              scale.dest = NewTemp();
-              scale.op = "mul";
-              scale.type = I64Type();
-              scale.first = index;
-              scale.second = Immediate(static_cast<long long>(element_size));
-              Emit(scale);
-              index = TempOperand(scale.dest);
-            }
-            lowir_model::Instruction projection;
-            projection.kind = lowir_model::Instruction::IK_INDEX;
-            projection.dest = NewTemp();
-            projection.type = byte_element ? I8Type() : LowTypeOf(element);
-            projection.index_projection = lowir_model::IPK_ARRAY_ELEMENT;
-            projection.first = TempOperand(decay.dest);
-            projection.second = index;
-            Emit(projection);
-            destination = TempOperand(projection.dest);
-            current = element;
-          } else {
-            const TypeId current_unqualified = types_.Unqualified(current);
-            if (types_.Kind(current_unqualified) != TYPE_CLASS)
-              Unsupported("an aggregate member field path");
-            const ClassEntity& current_class = model_.ClassAt(
-                types_.At(current_unqualified).entity);
-            TypeId next = 0;
-            for (std::size_t field_index = 0;
-                 field_index < current_class.fields.size(); ++field_index)
-              if (!current_class.fields[field_index].static_member &&
-                  current_class.fields[field_index].offset == offset) {
-                next = current_class.fields[field_index].type;
-                break;
-              }
-            if (next == 0)
-              Unsupported("an aggregate member field path metadata");
-            lowir_model::Instruction projection;
-            projection.kind = lowir_model::Instruction::IK_INDEX;
-            projection.dest = NewTemp();
-            projection.type = I8Type();
-            projection.index_projection = lowir_model::IPK_FIELD;
-            projection.first = destination;
-            projection.second = Immediate(static_cast<long long>(offset));
-            Emit(projection);
-            destination = TempOperand(projection.dest);
-            current = next;
-          }
-        }
-        if (value == 0)
-          EmitStore(LowTypeOf(field.type), ZeroOperand(field.type),
-                    destination);
-        else
-          EmitStore(LowTypeOf(field.type),
-                    LowerRValue(value, field.type).operand, destination);
+        const lowir_model::Operand destination = MemberLeafDestination(
+            binding, root_type, nested_path);
+        EmitStore(LowTypeOf(field.type),
+                  value == 0 ? ZeroOperand(field.type) :
+                      LowerRValue(value, field.type).operand,
+                  destination);
       }
       ++value_index;
     }
     return;
   }
   if (types_.Kind(unqualified) == TYPE_ARRAY) {
-    LowerAggregateMemberArrayLeaves(node, type, root_type, binding, owner,
-                                    path);
+    const TypeId element = types_.At(unqualified).base;
+    const std::size_t bound = types_.At(unqualified).array_bound;
+    for (std::size_t i = 0; i < bound; ++i) {
+      std::vector<std::pair<bool, std::size_t> > nested_path(path);
+      nested_path.push_back(std::make_pair(true, i));
+      const TypeId element_unqualified = types_.Unqualified(element);
+      if (i < values.size() &&
+          tree_.At(values[i]).kind == SEMA_BRACED_INIT_LIST &&
+          (types_.Kind(element_unqualified) == TYPE_CLASS ||
+           types_.Kind(element_unqualified) == TYPE_ARRAY))
+        LowerAggregateMemberLeaves(values[i], element, root_type, binding,
+                                   nested_path);
+      else {
+        const SemaId value = i < values.size() ? values[i] : 0;
+        const lowir_model::Operand destination = MemberLeafDestination(
+            binding, root_type, nested_path);
+        EmitStore(LowTypeOf(element),
+                  value == 0 ? ZeroOperand(element) :
+                      LowerRValue(value, element).operand,
+                  destination);
+      }
+    }
     return;
   }
   Unsupported("a scalar aggregate member initializer");
-}
-
-void Lowerer::LowerAggregateMemberArrayLeaves(
-    SemaId node, TypeId type, TypeId root_type, BindingId binding,
-    FunctionEntityId owner,
-    const std::vector<std::pair<bool, std::size_t> >& path)
-{
-  const std::vector<SemaId> values = Children(node);
-  const TypeId unqualified = types_.Unqualified(type);
-  const TypeId element = types_.At(unqualified).base;
-  const std::size_t bound = types_.At(unqualified).array_bound;
-  for (std::size_t i = 0; i < bound; ++i) {
-    std::vector<std::pair<bool, std::size_t> > nested_path(path);
-    nested_path.push_back(std::make_pair(true, i));
-    const TypeId element_unqualified = types_.Unqualified(element);
-    if (i < values.size() &&
-        tree_.At(values[i]).kind == SEMA_BRACED_INIT_LIST &&
-        (types_.Kind(element_unqualified) == TYPE_CLASS ||
-         types_.Kind(element_unqualified) == TYPE_ARRAY))
-      LowerAggregateMemberLeaves(values[i], element, root_type, binding, owner,
-                                 nested_path);
-    else {
-      const SemaId value = i < values.size() ? values[i] : 0;
-      lowir_model::Instruction load_this;
-      load_this.kind = lowir_model::Instruction::IK_LOAD;
-      load_this.dest = NewTemp();
-      load_this.type = PtrType();
-      load_this.first = SlotOperand("$this");
-      Emit(load_this);
-      lowir_model::Operand destination = TempOperand(load_this.dest);
-      const ClassEntity& owner_class = model_.ClassAt(
-          model_.FunctionAt(owner).member_class);
-      bool found_root = false;
-      for (std::size_t root_index = 0;
-           root_index < owner_class.fields.size(); ++root_index)
-        if (owner_class.fields[root_index].binding == binding) {
-          lowir_model::Instruction projection;
-          projection.kind = lowir_model::Instruction::IK_INDEX;
-          projection.dest = NewTemp();
-          projection.type = I8Type();
-          projection.index_projection = lowir_model::IPK_FIELD;
-          projection.first = destination;
-          projection.second = Immediate(static_cast<long long>(
-              owner_class.fields[root_index].offset));
-          Emit(projection);
-          destination = TempOperand(projection.dest);
-          found_root = true;
-          break;
-        }
-      if (!found_root)
-        Unsupported("an aggregate array member without its root field");
-      TypeId current = root_type;
-      for (std::size_t step = 0; step < nested_path.size(); ++step) {
-        const bool array_path = nested_path[step].first;
-        const std::size_t offset = nested_path[step].second;
-        const TypeId current_unqualified = types_.Unqualified(current);
-        if (array_path) {
-          if (types_.Kind(current_unqualified) != TYPE_ARRAY)
-            Unsupported("an aggregate array member path");
-          const TypeId path_element = types_.At(current_unqualified).base;
-          lowir_model::Instruction decay;
-          decay.kind = lowir_model::Instruction::IK_UNARY;
-          decay.dest = NewTemp();
-          decay.op = "decay";
-          decay.type = PtrType();
-          decay.first = destination;
-          Emit(decay);
-          lowir_model::Operand index = Immediate(
-              static_cast<long long>(offset));
-          const std::size_t element_size = types_.SizeOf(path_element);
-          const bool byte_element = types_.Kind(
-              types_.Unqualified(path_element)) == TYPE_CLASS;
-          if (byte_element && element_size != 1) {
-            lowir_model::Instruction scale;
-            scale.kind = lowir_model::Instruction::IK_BINARY;
-            scale.dest = NewTemp();
-            scale.op = "mul";
-            scale.type = I64Type();
-            scale.first = index;
-            scale.second = Immediate(static_cast<long long>(element_size));
-            Emit(scale);
-            index = TempOperand(scale.dest);
-          }
-          lowir_model::Instruction projection;
-          projection.kind = lowir_model::Instruction::IK_INDEX;
-          projection.dest = NewTemp();
-          projection.type = byte_element ? I8Type() : LowTypeOf(path_element);
-          projection.index_projection = lowir_model::IPK_ARRAY_ELEMENT;
-          projection.first = TempOperand(decay.dest);
-          projection.second = index;
-          Emit(projection);
-          destination = TempOperand(projection.dest);
-          current = path_element;
-        } else {
-          if (types_.Kind(current_unqualified) != TYPE_CLASS)
-            Unsupported("an aggregate array member field path");
-          const ClassEntity& current_class = model_.ClassAt(
-              types_.At(current_unqualified).entity);
-          TypeId next = 0;
-          for (std::size_t field_index = 0;
-               field_index < current_class.fields.size(); ++field_index)
-            if (!current_class.fields[field_index].static_member &&
-                current_class.fields[field_index].offset == offset) {
-              next = current_class.fields[field_index].type;
-              break;
-            }
-          if (next == 0)
-            Unsupported("an aggregate array member field metadata");
-          lowir_model::Instruction projection;
-          projection.kind = lowir_model::Instruction::IK_INDEX;
-          projection.dest = NewTemp();
-          projection.type = I8Type();
-          projection.index_projection = lowir_model::IPK_FIELD;
-          projection.first = destination;
-          projection.second = Immediate(static_cast<long long>(offset));
-          Emit(projection);
-          destination = TempOperand(projection.dest);
-          current = next;
-        }
-      }
-      if (value == 0)
-        EmitStore(LowTypeOf(element), ZeroOperand(element), destination);
-      else
-        EmitStore(LowTypeOf(element),
-                  LowerRValue(value, element).operand, destination);
-    }
-  }
 }
 
 void Lowerer::RegisterLiveObject(BindingId binding, TypeId type)
@@ -1360,30 +929,11 @@ void Lowerer::RegisterLiveObject(BindingId binding, TypeId type)
   }
 }
 
+// Whether destroying a complete object of the class has any effect; the
+// class model fixed this with the layout.
 bool Lowerer::NeedsDestructor(ClassEntityId entity) const
 {
-  const ClassEntity& owner = model_.ClassAt(entity);
-  if (owner.destructor != 0 &&
-      !model_.FunctionAt(owner.destructor).synthesized)
-    return true;
-  for (std::size_t i = 0; i < owner.bases.size(); ++i)
-    if (NeedsDestructor(owner.bases[i].entity))
-      return true;
-  for (std::size_t i = 0; i < owner.fields.size(); ++i) {
-    if (owner.fields[i].static_member || owner.fields[i].binding == 0)
-      continue;
-    const TypeId field_type = types_.Unqualified(owner.fields[i].type);
-    if (types_.Kind(field_type) == TYPE_CLASS &&
-        NeedsDestructor(types_.At(field_type).entity))
-      return true;
-    if (types_.Kind(field_type) == TYPE_ARRAY) {
-      const TypeId element = types_.Unqualified(types_.At(field_type).base);
-      if (types_.Kind(element) == TYPE_CLASS &&
-          NeedsDestructor(types_.At(element).entity))
-        return true;
-    }
-  }
-  return false;
+  return !model_.ClassAt(entity).trivial_destructor;
 }
 
 bool Lowerer::HasSubobjectDestructors(ClassEntityId entity) const
@@ -1395,16 +945,12 @@ bool Lowerer::HasSubobjectDestructors(ClassEntityId entity) const
   for (std::size_t i = 0; i < owner.fields.size(); ++i) {
     if (owner.fields[i].static_member || owner.fields[i].binding == 0)
       continue;
-    const TypeId field_type = types_.Unqualified(owner.fields[i].type);
-    if (types_.Kind(field_type) == TYPE_CLASS &&
-        NeedsDestructor(types_.At(field_type).entity))
+    TypeId element = types_.Unqualified(owner.fields[i].type);
+    while (types_.Kind(element) == TYPE_ARRAY)
+      element = types_.Unqualified(types_.At(element).base);
+    if (types_.Kind(element) == TYPE_CLASS &&
+        NeedsDestructor(types_.At(element).entity))
       return true;
-    if (types_.Kind(field_type) == TYPE_ARRAY) {
-      const TypeId element = types_.Unqualified(types_.At(field_type).base);
-      if (types_.Kind(element) == TYPE_CLASS &&
-          NeedsDestructor(types_.At(element).entity))
-        return true;
-    }
   }
   return false;
 }
@@ -1429,14 +975,9 @@ void Lowerer::EmitObjectDestructor(const LiveObject& object)
     array.operand = SlotOperand(SlotFor(object.binding));
     const std::size_t bound = types_.At(unqualified).array_bound;
     for (std::size_t i = 0; i < bound; ++i) {
-      lowir_model::Instruction call;
-      call.kind = lowir_model::Instruction::IK_CALL;
-      call.type = VoidType();
-      call.call_return_type = VoidType();
-      call.call_returns_void = true;
-      call.first = GlobalOperand(FunctionSymbolName(destructor));
-      call.args.push_back(LowerArrayElementAddress(array, element, i));
-      Emit(call);
+      const std::string& symbol = FunctionSymbolName(destructor);
+      EmitVoidCall(symbol, std::vector<lowir_model::Operand>(
+          1, LowerArrayElementAddress(array, element, i)));
     }
     return;
   }
@@ -1453,14 +994,9 @@ void Lowerer::EmitObjectDestructor(const LiveObject& object)
   value.type = object.type;
   value.lvalue = true;
   value.operand = SlotOperand(SlotFor(object.binding));
-  lowir_model::Instruction call;
-  call.kind = lowir_model::Instruction::IK_CALL;
-  call.type = VoidType();
-  call.call_return_type = VoidType();
-  call.call_returns_void = true;
-  call.first = GlobalOperand(FunctionSymbolName(destructor));
-  call.args.push_back(AddressValue(value).operand);
-  Emit(call);
+  const std::string& symbol = FunctionSymbolName(destructor);
+  EmitVoidCall(symbol, std::vector<lowir_model::Operand>(
+      1, AddressValue(value).operand));
 }
 
 void Lowerer::EmitScopeDestructors(ScopeId scope)
@@ -1549,47 +1085,21 @@ void Lowerer::EmitSubobjectDestructors(ClassEntityId entity)
         model_.ClassAt(types_.At(element).entity).destructor;
     if (destructor == 0)
       continue;
-    lowir_model::Instruction load_this;
-    load_this.kind = lowir_model::Instruction::IK_LOAD;
-    load_this.dest = NewTemp();
-    load_this.type = PtrType();
-    load_this.first = SlotOperand("$this");
-    Emit(load_this);
-    lowir_model::Instruction projection;
-    projection.kind = lowir_model::Instruction::IK_INDEX;
-    projection.dest = NewTemp();
-    projection.type = I8Type();
-    projection.index_projection = lowir_model::IPK_FIELD;
-    projection.first = TempOperand(load_this.dest);
-    projection.second = Immediate(static_cast<long long>(field.offset));
-    Emit(projection);
+    const lowir_model::Operand member = ProjectField(LoadThis(), field.offset);
     if (array) {
       Value subobject;
       subobject.type = field.type;
       subobject.lvalue = true;
-      subobject.operand = TempOperand(projection.dest);
+      subobject.operand = member;
       const std::size_t bound = types_.At(field_type).array_bound;
       for (std::size_t index = 0; index < bound; ++index) {
-        lowir_model::Instruction call;
-        call.kind = lowir_model::Instruction::IK_CALL;
-        call.type = VoidType();
-        call.call_return_type = VoidType();
-        call.call_returns_void = true;
-        call.first = GlobalOperand(FunctionSymbolName(destructor));
-        call.args.push_back(LowerArrayElementAddress(subobject, element,
-                                                     index));
-        Emit(call);
+        const std::string& symbol = FunctionSymbolName(destructor);
+        EmitVoidCall(symbol, std::vector<lowir_model::Operand>(
+            1, LowerArrayElementAddress(subobject, element, index)));
       }
-    } else {
-      lowir_model::Instruction call;
-      call.kind = lowir_model::Instruction::IK_CALL;
-      call.type = VoidType();
-      call.call_return_type = VoidType();
-      call.call_returns_void = true;
-      call.first = GlobalOperand(FunctionSymbolName(destructor));
-      call.args.push_back(TempOperand(projection.dest));
-      Emit(call);
-    }
+    } else
+      EmitVoidCall(FunctionSymbolName(destructor),
+                   std::vector<lowir_model::Operand>(1, member));
   }
   for (std::size_t i = owner.bases.size(); i != 0; --i) {
     const ClassBase& base = owner.bases[i - 1];
@@ -1599,28 +1109,10 @@ void Lowerer::EmitSubobjectDestructors(ClassEntityId entity)
         model_.ClassAt(base.entity).destructor;
     if (destructor == 0)
       continue;
-    lowir_model::Instruction load_this;
-    load_this.kind = lowir_model::Instruction::IK_LOAD;
-    load_this.dest = NewTemp();
-    load_this.type = PtrType();
-    load_this.first = SlotOperand("$this");
-    Emit(load_this);
-    lowir_model::Instruction projection;
-    projection.kind = lowir_model::Instruction::IK_INDEX;
-    projection.dest = NewTemp();
-    projection.type = I8Type();
-    projection.index_projection = lowir_model::IPK_BASE_SUBOBJECT;
-    projection.first = TempOperand(load_this.dest);
-    projection.second = Immediate(static_cast<long long>(base.offset));
-    Emit(projection);
-    lowir_model::Instruction call;
-    call.kind = lowir_model::Instruction::IK_CALL;
-    call.type = VoidType();
-    call.call_return_type = VoidType();
-    call.call_returns_void = true;
-    call.first = GlobalOperand(FunctionBaseSymbolName(destructor));
-    call.args.push_back(TempOperand(projection.dest));
-    Emit(call);
+    const lowir_model::Operand subobject = ProjectField(
+        LoadThis(), base.offset, lowir_model::IPK_BASE_SUBOBJECT);
+    EmitVoidCall(FunctionBaseSymbolName(destructor),
+                 std::vector<lowir_model::Operand>(1, subobject));
   }
 }
 
@@ -1686,9 +1178,8 @@ FunctionEntityId Lowerer::DefaultConstructor(ClassEntityId entity) const
 void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
 {
   const SemaNode& initializer = tree_.At(node);
-  const FunctionEntity& owner_function = model_.FunctionAt(owner);
   const ClassEntity& owner_class =
-      model_.ClassAt(owner_function.member_class);
+      model_.ClassAt(model_.FunctionAt(owner).member_class);
   const std::vector<SemaId> arguments = Children(node);
   const bool is_base = initializer.binding == 0 && initializer.function != 0;
   const bool aggregate_initializer = !is_base &&
@@ -1696,174 +1187,123 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
       tree_.At(arguments[0]).kind == SEMA_BRACED_INIT_LIST &&
       (types_.Kind(types_.Unqualified(initializer.type)) == TYPE_CLASS ||
        types_.Kind(types_.Unqualified(initializer.type)) == TYPE_ARRAY);
-  std::vector<lowir_model::Operand> lowered_arguments;
-  bool arguments_lowered = false;
-  ClassField member_field;
-  bool member_bit_field = false;
-  lowir_model::Operand encoded_bit_field;
-  if (!is_base && !aggregate_initializer) {
-    if (initializer.function != 0) {
-      const FunctionEntity& constructor =
-          model_.FunctionAt(initializer.function);
-      const TypeNode& type =
-          types_.At(types_.Unqualified(constructor.type));
-      for (std::size_t i = 0; i < arguments.size(); ++i) {
-        const std::size_t parameter = i + 1;
-        if (parameter >= type.parameters.size())
-          Unsupported("a mem-initializer with too many arguments");
-        if (types_.Kind(types_.Unqualified(type.parameters[parameter])) ==
-            TYPE_REFERENCE)
-          lowered_arguments.push_back(LowerReferenceArgument(
-              arguments[i], type.parameters[parameter]).operand);
-        else
-          lowered_arguments.push_back(LowerRValue(
-              arguments[i], type.parameters[parameter]).operand);
-      }
-    } else {
-      if (arguments.size() != 1)
-        Unsupported("a scalar mem-initializer with the wrong arity");
-      lowered_arguments.push_back(
-          LowerRValue(arguments[0], initializer.type).operand);
-    }
-    arguments_lowered = true;
-  }
   if (aggregate_initializer) {
     LowerAggregateMemberInitializer(arguments[0], initializer.type,
-                                    initializer.binding, owner);
+                                    initializer.binding);
     return;
   }
-  lowir_model::Instruction load_this;
-  load_this.kind = lowir_model::Instruction::IK_LOAD;
-  load_this.type = PtrType();
-  load_this.first = SlotOperand("$this");
+
+  // A member's arguments are evaluated before its address is formed; a
+  // base's after, as the fixtures spell the two forms.
+  std::vector<lowir_model::Operand> lowered_arguments;
+  const TypeNode* constructor_type = 0;
+  if (initializer.function != 0)
+    constructor_type = &types_.At(types_.Unqualified(
+        model_.FunctionAt(initializer.function).type));
+  const auto lower_arguments = [&]() {
+    if (constructor_type != 0) {
+      for (std::size_t i = 0; i < arguments.size(); ++i) {
+        const std::size_t parameter = i + 1;
+        if (parameter >= constructor_type->parameters.size())
+          Unsupported("a mem-initializer with too many arguments");
+        const TypeId parameter_type = constructor_type->parameters[parameter];
+        lowered_arguments.push_back(
+            types_.Kind(types_.Unqualified(parameter_type)) == TYPE_REFERENCE ?
+                LowerReferenceArgument(arguments[i], parameter_type).operand :
+                LowerRValue(arguments[i], parameter_type).operand);
+      }
+      return;
+    }
+    if (arguments.size() != 1)
+      Unsupported("a scalar mem-initializer with the wrong arity");
+    lowered_arguments.push_back(
+        LowerRValue(arguments[0], initializer.type).operand);
+  };
+  if (!is_base)
+    lower_arguments();
+
+  const ClassField* member_field = 0;
+  lowir_model::Operand encoded_bit_field;
+  bool preserve = false;
   lowir_model::Operand destination;
   if (is_base) {
-    load_this.dest = NewTemp();
-    destination = TempOperand(load_this.dest);
     const ClassEntityId target_entity = model_.FunctionAt(
         initializer.function).member_class;
     bool found = false;
     for (std::size_t i = 0; i < owner_class.bases.size(); ++i)
       if (owner_class.bases[i].entity == target_entity) {
-        Emit(load_this);
-        lowir_model::Instruction projection;
-        projection.kind = lowir_model::Instruction::IK_INDEX;
-        projection.dest = NewTemp();
-        projection.type = I8Type();
-        projection.index_projection = lowir_model::IPK_BASE_SUBOBJECT;
-        projection.first = destination;
-        projection.second = Immediate(static_cast<long long>(
-            owner_class.bases[i].offset));
-        Emit(projection);
-        destination = TempOperand(projection.dest);
+        destination = ProjectField(LoadThis(), owner_class.bases[i].offset,
+                                   lowir_model::IPK_BASE_SUBOBJECT);
         found = true;
         break;
       }
     if (!found)
       Unsupported("a base mem-initializer without layout metadata");
-  }
-  else {
-    ClassField field;
-    bool found = false;
-    for (std::size_t i = 0; i < owner_class.fields.size(); ++i)
-      if (owner_class.fields[i].binding == initializer.binding) {
-        field = owner_class.fields[i];
-        member_field = field;
-        found = true;
-        break;
-      }
-    if (!found)
+  } else {
+    member_field = model_.FieldFor(initializer.binding);
+    if (member_field == 0)
       Unsupported("a field mem-initializer without layout metadata");
-    member_bit_field = member_field.bit_width != 0;
-    if (member_bit_field && initializer.function == 0) {
-      const bool preserve = BitFieldUnitInitialized(member_field);
+    if (member_field->bit_width != 0 && initializer.function == 0) {
+      preserve = BitFieldUnitInitialized(*member_field);
       if (!preserve)
         encoded_bit_field = EncodeBitField(
-            member_field, initializer.type, lowered_arguments[0],
-            member_field.type);
+            *member_field, initializer.type, lowered_arguments[0],
+            member_field->type);
     }
-    load_this.dest = NewTemp();
-    destination = TempOperand(load_this.dest);
-    Emit(load_this);
-    lowir_model::Instruction projection;
-    projection.kind = lowir_model::Instruction::IK_INDEX;
-    projection.dest = NewTemp();
-    projection.type = I8Type();
-    projection.index_projection = lowir_model::IPK_FIELD;
-    projection.first = destination;
-    projection.second = Immediate(static_cast<long long>(field.offset));
-    Emit(projection);
-    destination = TempOperand(projection.dest);
+    destination = ProjectField(LoadThis(), member_field->offset);
   }
 
   if (initializer.function != 0) {
     const FunctionEntity& constructor = model_.FunctionAt(initializer.function);
     if (!is_base && constructor.synthesized && arguments.empty() &&
-        types_.SizeOf(initializer.type) == 8) {
-      lowir_model::Instruction zero;
-      zero.kind = lowir_model::Instruction::IK_STORE;
-      zero.type = I64Type();
-      zero.first = Immediate(0);
-      zero.second = destination;
-      Emit(zero);
-    }
-    const TypeNode& type = types_.At(types_.Unqualified(constructor.type));
-    lowir_model::Instruction call;
-    call.kind = lowir_model::Instruction::IK_CALL;
-    call.type = VoidType();
-    call.call_return_type = VoidType();
-    call.call_returns_void = true;
-    call.first = GlobalOperand(is_base ? FunctionBaseSymbolName(
-        initializer.function) : FunctionSymbolName(initializer.function));
-    call.args.push_back(destination);
-    if (!arguments_lowered) {
-      for (std::size_t i = 0; i < arguments.size(); ++i) {
-        const std::size_t parameter = i + 1;
-        if (parameter >= type.parameters.size())
-          Unsupported("a mem-initializer with too many arguments");
-        if (types_.Kind(types_.Unqualified(type.parameters[parameter])) ==
-            TYPE_REFERENCE)
-          lowered_arguments.push_back(LowerReferenceArgument(
-              arguments[i], type.parameters[parameter]).operand);
-        else
-          lowered_arguments.push_back(LowerRValue(
-              arguments[i], type.parameters[parameter]).operand);
-      }
-    }
-    call.args.insert(call.args.end(), lowered_arguments.begin(),
-                     lowered_arguments.end());
-    Emit(call);
+        types_.SizeOf(initializer.type) == 8)
+      EmitStore(I64Type(), Immediate(0), destination);
+    const std::string symbol = is_base ?
+        FunctionBaseSymbolName(initializer.function) :
+        FunctionSymbolName(initializer.function);
+    if (is_base)
+      lower_arguments();
+    std::vector<lowir_model::Operand> call_arguments(1, destination);
+    call_arguments.insert(call_arguments.end(), lowered_arguments.begin(),
+                          lowered_arguments.end());
+    EmitVoidCall(symbol, call_arguments);
     return;
   }
-  if (member_bit_field) {
-    const bool preserve = BitFieldUnitInitialized(member_field);
+  if (member_field->bit_width != 0) {
     if (preserve) {
       const lowir_model::Operand merged = MergeBitField(
-          member_field, destination, initializer.type, lowered_arguments[0],
-          true, member_field.type);
-      lowir_model::Instruction final_load_this;
-      final_load_this.kind = lowir_model::Instruction::IK_LOAD;
-      final_load_this.dest = NewTemp();
-      final_load_this.type = PtrType();
-      final_load_this.first = SlotOperand("$this");
-      Emit(final_load_this);
-      lowir_model::Instruction final_projection;
-      final_projection.kind = lowir_model::Instruction::IK_INDEX;
-      final_projection.dest = NewTemp();
-      final_projection.type = I8Type();
-      final_projection.index_projection = lowir_model::IPK_FIELD;
-      final_projection.first = TempOperand(final_load_this.dest);
-      final_projection.second = Immediate(
-          static_cast<long long>(member_field.offset));
-      Emit(final_projection);
-      EmitStore(LowTypeOf(member_field.type), merged,
-                TempOperand(final_projection.dest));
+          *member_field, destination, initializer.type, lowered_arguments[0],
+          true, member_field->type);
+      EmitStore(LowTypeOf(member_field->type), merged,
+                ProjectField(LoadThis(), member_field->offset));
     } else
-      EmitStore(LowTypeOf(member_field.type), encoded_bit_field, destination);
-    MarkBitFieldUnitInitialized(member_field);
+      EmitStore(LowTypeOf(member_field->type), encoded_bit_field,
+                destination);
+    MarkBitFieldUnitInitialized(*member_field);
     return;
   }
   EmitStore(LowTypeOf(initializer.type), lowered_arguments[0], destination);
+}
+
+// Arguments of an implicit default construction of a subobject: the
+// constructor's own defaults, already analyzed by sema.
+void Lowerer::EmitDefaultConstruction(FunctionEntityId constructor,
+                                      const std::string& symbol,
+                                      const lowir_model::Operand& destination)
+{
+  const FunctionEntity& entity = model_.FunctionAt(constructor);
+  const TypeNode& type = types_.At(types_.Unqualified(entity.type));
+  std::vector<lowir_model::Operand> arguments(1, destination);
+  for (std::size_t parameter = 1; parameter < type.parameters.size();
+       ++parameter) {
+    if (parameter >= entity.default_semantic_arguments.size() ||
+        entity.default_semantic_arguments[parameter] == 0)
+      Unsupported("a default constructor argument without semantics");
+    arguments.push_back(LowerRValue(
+        entity.default_semantic_arguments[parameter],
+        type.parameters[parameter]).operand);
+  }
+  EmitVoidCall(symbol, arguments);
 }
 
 void Lowerer::LowerConstructorInitializers(FunctionEntityId function,
@@ -1882,22 +1322,16 @@ void Lowerer::LowerConstructorInitializers(FunctionEntityId function,
             tree_.At(child).function).member_class);
     }
 
-  // Source order in a mem-initializer list does not control construction
-  // order: direct bases are initialized before fields.  Lower arguments in
-  // that order as well, so their side effects and projections agree with the
-  // object lifetime sequence.
-  for (std::size_t pass = 0; pass < 1; ++pass)
-    for (std::size_t i = 0; i < member_initializers.size(); ++i) {
-      const SemaNode& member = tree_.At(member_initializers[i]);
-      const bool is_base = member.binding == 0 && member.function != 0;
-      if ((pass == 0) != is_base)
-        continue;
+  // 12.6.2p10: direct bases are initialized before members, whatever the
+  // order of the mem-initializer-list.
+  for (std::size_t i = 0; i < member_initializers.size(); ++i) {
+    const SemaNode& member = tree_.At(member_initializers[i]);
+    if (member.binding == 0 && member.function != 0)
       LowerMemberInitializer(member_initializers[i], function);
-    }
+  }
 
-  // Synthesized and partially specified constructors perform the standard
-  // default initialization for each omitted direct subobject.  A trivial
-  // subobject has no call, but remains part of the canonical layout.
+  // Every omitted direct subobject is default-initialized; a trivial one
+  // has no call but keeps its place in the layout.
   for (std::size_t i = 0; i < owner.bases.size(); ++i) {
     const ClassBase& base = owner.bases[i];
     if (initialized_bases.count(base.entity) != 0)
@@ -1905,43 +1339,12 @@ void Lowerer::LowerConstructorInitializers(FunctionEntityId function,
     const FunctionEntityId constructor = DefaultConstructor(base.entity);
     if (constructor == 0)
       continue;
-    const ClassEntity& base_class = model_.ClassAt(base.entity);
-    if (base_class.trivial_default_constructor)
+    if (model_.ClassAt(base.entity).trivial_default_constructor)
       continue;
-    lowir_model::Instruction load_this;
-    load_this.kind = lowir_model::Instruction::IK_LOAD;
-    load_this.dest = NewTemp();
-    load_this.type = PtrType();
-    load_this.first = SlotOperand("$this");
-    Emit(load_this);
-    lowir_model::Instruction projection;
-    projection.kind = lowir_model::Instruction::IK_INDEX;
-    projection.dest = NewTemp();
-    projection.type = I8Type();
-    projection.index_projection = lowir_model::IPK_BASE_SUBOBJECT;
-    projection.first = TempOperand(load_this.dest);
-    projection.second = Immediate(static_cast<long long>(base.offset));
-    Emit(projection);
-    lowir_model::Instruction call;
-    call.kind = lowir_model::Instruction::IK_CALL;
-    call.type = VoidType();
-    call.call_return_type = VoidType();
-    call.call_returns_void = true;
-    call.first = GlobalOperand(FunctionBaseSymbolName(constructor));
-    call.args.push_back(TempOperand(projection.dest));
-    const FunctionEntity& constructor_entity = model_.FunctionAt(constructor);
-    const TypeNode& constructor_type = types_.At(types_.Unqualified(
-        constructor_entity.type));
-    for (std::size_t parameter = 1;
-         parameter < constructor_type.parameters.size(); ++parameter) {
-      if (parameter >= constructor_entity.default_semantic_arguments.size() ||
-          constructor_entity.default_semantic_arguments[parameter] == 0)
-        Unsupported("a default base constructor argument without semantics");
-      call.args.push_back(LowerRValue(
-          constructor_entity.default_semantic_arguments[parameter],
-          constructor_type.parameters[parameter]).operand);
-    }
-    Emit(call);
+    const lowir_model::Operand subobject = ProjectField(
+        LoadThis(), base.offset, lowir_model::IPK_BASE_SUBOBJECT);
+    EmitDefaultConstruction(constructor, FunctionBaseSymbolName(constructor),
+                            subobject);
   }
   for (std::size_t i = 0; i < owner.fields.size(); ++i) {
     const ClassField& field = owner.fields[i];
@@ -1974,24 +1377,11 @@ void Lowerer::LowerConstructorInitializers(FunctionEntityId function,
           (types_.Kind(field_type) == TYPE_CLASS ||
            types_.Kind(field_type) == TYPE_ARRAY)) {
         LowerAggregateMemberInitializer(default_initializer, field.type,
-                                        field.binding, function);
+                                        field.binding);
         continue;
       }
-      lowir_model::Instruction load_this;
-      load_this.kind = lowir_model::Instruction::IK_LOAD;
-      load_this.dest = NewTemp();
-      load_this.type = PtrType();
-      load_this.first = SlotOperand("$this");
-      Emit(load_this);
-      lowir_model::Instruction projection;
-      projection.kind = lowir_model::Instruction::IK_INDEX;
-      projection.dest = NewTemp();
-      projection.type = I8Type();
-      projection.index_projection = lowir_model::IPK_FIELD;
-      projection.first = TempOperand(load_this.dest);
-      projection.second = Immediate(static_cast<long long>(field.offset));
-      Emit(projection);
-      const lowir_model::Operand destination = TempOperand(projection.dest);
+      const lowir_model::Operand destination =
+          ProjectField(LoadThis(), field.offset);
       EmitStore(LowTypeOf(field.type),
                 LowerRValue(default_initializer, field.type).operand,
                 destination);
@@ -1999,47 +1389,16 @@ void Lowerer::LowerConstructorInitializers(FunctionEntityId function,
     }
     if (types_.Kind(field_type) != TYPE_CLASS)
       continue;
-    const ClassEntity& field_class = model_.ClassAt(types_.At(field_type).entity);
-    if (field_class.trivial_default_constructor)
+    if (model_.ClassAt(types_.At(field_type).entity)
+            .trivial_default_constructor)
       continue;
     const FunctionEntityId constructor = DefaultConstructor(
         types_.At(field_type).entity);
     if (constructor == 0)
       Unsupported("a member without a default constructor");
-    lowir_model::Instruction load_this;
-    load_this.kind = lowir_model::Instruction::IK_LOAD;
-    load_this.dest = NewTemp();
-    load_this.type = PtrType();
-    load_this.first = SlotOperand("$this");
-    Emit(load_this);
-    lowir_model::Instruction projection;
-    projection.kind = lowir_model::Instruction::IK_INDEX;
-    projection.dest = NewTemp();
-    projection.type = I8Type();
-    projection.index_projection = lowir_model::IPK_FIELD;
-    projection.first = TempOperand(load_this.dest);
-    projection.second = Immediate(static_cast<long long>(field.offset));
-    Emit(projection);
-    lowir_model::Instruction call;
-    call.kind = lowir_model::Instruction::IK_CALL;
-    call.type = VoidType();
-    call.call_return_type = VoidType();
-    call.call_returns_void = true;
-    call.first = GlobalOperand(FunctionSymbolName(constructor));
-    call.args.push_back(TempOperand(projection.dest));
-    const FunctionEntity& constructor_entity = model_.FunctionAt(constructor);
-    const TypeNode& constructor_type = types_.At(types_.Unqualified(
-        constructor_entity.type));
-    for (std::size_t parameter = 1;
-         parameter < constructor_type.parameters.size(); ++parameter) {
-      if (parameter >= constructor_entity.default_semantic_arguments.size() ||
-          constructor_entity.default_semantic_arguments[parameter] == 0)
-        Unsupported("a default member constructor argument without semantics");
-      call.args.push_back(LowerRValue(
-          constructor_entity.default_semantic_arguments[parameter],
-          constructor_type.parameters[parameter]).operand);
-    }
-    Emit(call);
+    const lowir_model::Operand member = ProjectField(LoadThis(), field.offset);
+    EmitDefaultConstruction(constructor, FunctionSymbolName(constructor),
+                            member);
   }
 }
 

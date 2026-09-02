@@ -12,21 +12,6 @@ namespace lowir_lowering {
 
 namespace {
 
-bool FindClassField(const SemaModel& model, ClassEntityId entity,
-                   BindingId binding, ClassField& field)
-{
-  if (entity == 0)
-    return false;
-  const ClassEntity& value = model.ClassAt(entity);
-  for (std::size_t i = 0; i < value.fields.size(); ++i)
-    if (value.fields[i].binding == binding)
-    {
-      field = value.fields[i];
-      return true;
-    }
-  return false;
-}
-
 bool FindBasePath(const SemaModel& model, ClassEntityId from,
                   ClassEntityId target, std::vector<ClassBase>& path,
                   std::vector<ClassEntityId>& visited)
@@ -68,14 +53,11 @@ bool Lowerer::FindBitField(SemaId node, ClassField& field) const
 {
   if (node == 0 || tree_.At(node).kind != SEMA_MEMBER)
     return false;
-  const BindingId binding = tree_.At(node).binding;
-  if (binding == 0 || !model_.BindingAt(binding).bit_field)
+  const ClassField* record = model_.FieldFor(tree_.At(node).binding);
+  if (record == 0 || record->bit_width == 0)
     return false;
-  const ScopeId scope = model_.BindingAt(binding).scope;
-  if (model_.ScopeAt(scope).kind != SCOPE_CLASS)
-    return false;
-  return FindClassField(model_, model_.ScopeAt(scope).class_entity, binding,
-                        field);
+  field = *record;
+  return true;
 }
 
 TypeId Lowerer::BitFieldValueType(const ClassField& field) const
@@ -271,23 +253,19 @@ Lowerer::Value Lowerer::ReadBitField(const Value& field_lvalue,
   return result;
 }
 
-std::string Lowerer::BitFieldUnitKey(const ClassField& field) const
-{
-  const BindingId binding = field.binding;
-  const ScopeId scope = binding == 0 ? 0 : model_.BindingAt(binding).scope;
-  return std::to_string(static_cast<unsigned long long>(scope)) + ":" +
-      std::to_string(static_cast<unsigned long long>(field.offset)) + ":" +
-      std::to_string(static_cast<unsigned long long>(types_.SizeOf(field.type)));
-}
-
 bool Lowerer::BitFieldUnitInitialized(const ClassField& field) const
 {
-  return initialized_bitfield_units_.count(BitFieldUnitKey(field)) != 0;
+  const ScopeId scope = field.binding == 0 ? 0 :
+      model_.BindingAt(field.binding).scope;
+  return initialized_bitfield_units_.count(
+      std::make_pair(scope, field.offset)) != 0;
 }
 
 void Lowerer::MarkBitFieldUnitInitialized(const ClassField& field)
 {
-  initialized_bitfield_units_.insert(BitFieldUnitKey(field));
+  const ScopeId scope = field.binding == 0 ? 0 :
+      model_.BindingAt(field.binding).scope;
+  initialized_bitfield_units_.insert(std::make_pair(scope, field.offset));
 }
 
 lowir_model::Operand Lowerer::ZeroOperand(TypeId type) const
@@ -431,18 +409,8 @@ Lowerer::Value Lowerer::Convert(Value value, TypeId target)
       if (!FindBasePath(model_, source_class, target_class, path, visited))
         Unsupported("a derived pointer without a base path");
       for (std::size_t i = 0; i < path.size(); ++i)
-      {
-        lowir_model::Instruction projection;
-        projection.kind = lowir_model::Instruction::IK_INDEX;
-        projection.dest = NewTemp();
-        projection.type = I8Type();
-        projection.index_projection = lowir_model::IPK_BASE_SUBOBJECT;
-        projection.first = value.operand;
-        projection.second = Immediate(
-            static_cast<long long>(path[i].offset));
-        Emit(projection);
-        value.operand = TempOperand(projection.dest);
-      }
+        value.operand = ProjectField(value.operand, path[i].offset,
+                                     lowir_model::IPK_BASE_SUBOBJECT);
       value.type = target;
       value.lvalue = false;
       return value;
@@ -687,6 +655,73 @@ Lowerer::Value Lowerer::AddressValue(const Value& lvalue)
   return result;
 }
 
+// The implicit object of a member function body: `this` is stored to its
+// slot on entry and reloaded at every use, as the fixtures spell it.
+lowir_model::Operand Lowerer::LoadThis()
+{
+  lowir_model::Instruction load;
+  load.kind = lowir_model::Instruction::IK_LOAD;
+  load.dest = NewTemp();
+  load.type = PtrType();
+  load.first = SlotOperand("$this");
+  Emit(load);
+  return TempOperand(load.dest);
+}
+
+lowir_model::Operand Lowerer::ProjectField(
+    const lowir_model::Operand& base, std::size_t offset,
+    lowir_model::IndexProjectionKind kind)
+{
+  lowir_model::Instruction projection;
+  projection.kind = lowir_model::Instruction::IK_INDEX;
+  projection.dest = NewTemp();
+  projection.type = I8Type();
+  projection.index_projection = kind;
+  projection.first = base;
+  projection.second = Immediate(static_cast<long long>(offset));
+  Emit(projection);
+  return TempOperand(projection.dest);
+}
+
+// Element `index` of the array at `array_address`: the array decays, and a
+// class element is reached by a byte offset scaled from its size.
+lowir_model::Operand Lowerer::ProjectArrayElement(
+    const lowir_model::Operand& array_address, TypeId element,
+    std::size_t index)
+{
+  lowir_model::Instruction decay;
+  decay.kind = lowir_model::Instruction::IK_UNARY;
+  decay.dest = NewTemp();
+  decay.op = "decay";
+  decay.type = PtrType();
+  decay.first = array_address;
+  Emit(decay);
+  lowir_model::Operand offset = Immediate(static_cast<long long>(index));
+  const std::size_t element_size = types_.SizeOf(element);
+  const bool byte_element =
+      types_.Kind(types_.Unqualified(element)) == TYPE_CLASS;
+  if (byte_element && element_size != 1) {
+    lowir_model::Instruction scale;
+    scale.kind = lowir_model::Instruction::IK_BINARY;
+    scale.dest = NewTemp();
+    scale.op = "mul";
+    scale.type = I64Type();
+    scale.first = offset;
+    scale.second = Immediate(static_cast<long long>(element_size));
+    Emit(scale);
+    offset = TempOperand(scale.dest);
+  }
+  lowir_model::Instruction projection;
+  projection.kind = lowir_model::Instruction::IK_INDEX;
+  projection.dest = NewTemp();
+  projection.type = byte_element ? I8Type() : LowTypeOf(element);
+  projection.index_projection = lowir_model::IPK_ARRAY_ELEMENT;
+  projection.first = TempOperand(decay.dest);
+  projection.second = offset;
+  Emit(projection);
+  return TempOperand(projection.dest);
+}
+
 // 5.16p4: both arms are lvalues of one type; the selected address is kept
 // in a pointer slot and the result is that object.
 Lowerer::Value Lowerer::LowerConditionalLValue(SemaId node)
@@ -805,13 +840,13 @@ Lowerer::Value Lowerer::LowerConstructorTemporary(SemaId node)
       constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
       constructor.member_class != 0 &&
       model_.ClassAt(constructor.member_class).trivial_default_constructor;
-  std::map<SemaId, std::string>::iterator slot = temporary_slots_.find(node);
-  if (slot == temporary_slots_.end())
-    slot = temporary_slots_.insert(std::make_pair(
-        node, NewGeneratedSlot(trivial_default ? "tmpobj" : "arg",
-                               LowTypeOf(value.type)))).first;
+  TemporaryObject& temporary = temporaries_[node];
+  if (temporary.slot.empty())
+    temporary.slot = NewGeneratedSlot(trivial_default ? "tmpobj" : "arg",
+                                      LowTypeOf(value.type));
 
-  if (constructed_temporaries_.insert(node).second) {
+  if (!temporary.constructed) {
+    temporary.constructed = true;
     const std::vector<SemaId> action_children = Children(node);
     if (action_children.size() != 1 ||
         tree_.At(action_children[0]).kind != SEMA_CALL)
@@ -826,9 +861,9 @@ Lowerer::Value Lowerer::LowerConstructorTemporary(SemaId node)
     Value object;
     object.type = value.type;
     object.lvalue = true;
-    object.operand = SlotOperand(slot->second);
+    object.operand = SlotOperand(temporary.slot);
     const lowir_model::Operand address = AddressValue(object).operand;
-    temporary_addresses_[node] = address;
+    temporary.address = address;
     lowir_model::Instruction call;
     call.kind = lowir_model::Instruction::IK_CALL;
     call.type = VoidType();
@@ -850,10 +885,7 @@ Lowerer::Value Lowerer::LowerConstructorTemporary(SemaId node)
   Value result;
   result.type = value.type;
   result.lvalue = true;
-  const std::map<SemaId, lowir_model::Operand>::const_iterator address =
-      temporary_addresses_.find(node);
-  result.operand = address == temporary_addresses_.end() ?
-      SlotOperand(slot->second) : address->second;
+  result.operand = temporary.address;
   return result;
 }
 
@@ -900,37 +932,23 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
     if (!FindBasePath(model_, object_entity, owner_entity, path, visited))
       Unsupported("a member whose class is unrelated to its object");
     for (std::size_t i = 0; i < path.size(); ++i)
-    {
-      lowir_model::Instruction projection;
-      projection.kind = lowir_model::Instruction::IK_INDEX;
-      projection.dest = NewTemp();
-      projection.type = I8Type();
-      projection.index_projection = lowir_model::IPK_BASE_SUBOBJECT;
-      projection.first = address.operand;
-      projection.second = Immediate(
-          static_cast<long long>(path[i].offset));
-      Emit(projection);
-      address.operand = TempOperand(projection.dest);
-    }
-    ClassField field;
-    if (!FindClassField(model_, owner_entity, value.binding, field))
+      address.operand = ProjectField(address.operand, path[i].offset,
+                                     lowir_model::IPK_BASE_SUBOBJECT);
+    const ClassField* field = model_.FieldFor(value.binding);
+    if (field == 0)
       Unsupported("a member without layout metadata");
-    lowir_model::Instruction projection;
-    projection.kind = lowir_model::Instruction::IK_INDEX;
-    projection.dest = NewTemp();
-    projection.type = I8Type();
-    projection.index_projection = types_.Kind(
-        types_.Unqualified(binding.type)) == TYPE_REFERENCE ?
-        lowir_model::IPK_REFERENCE_FIELD : lowir_model::IPK_FIELD;
-    projection.first = address.operand;
-    projection.second = Immediate(static_cast<long long>(field.offset));
-    Emit(projection);
-    if (types_.Kind(types_.Unqualified(binding.type)) == TYPE_REFERENCE) {
+    const bool reference_member =
+        types_.Kind(types_.Unqualified(binding.type)) == TYPE_REFERENCE;
+    const lowir_model::Operand member = ProjectField(
+        address.operand, field->offset,
+        reference_member ? lowir_model::IPK_REFERENCE_FIELD :
+                           lowir_model::IPK_FIELD);
+    if (reference_member) {
       lowir_model::Instruction referent;
       referent.kind = lowir_model::Instruction::IK_LOAD;
       referent.dest = NewTemp();
       referent.type = PtrType();
-      referent.first = TempOperand(projection.dest);
+      referent.first = member;
       Emit(referent);
       Value result;
       result.type = types_.Referent(binding.type);
@@ -941,7 +959,7 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
     Value result;
     result.type = ReferentType(value.type);
     result.lvalue = true;
-    result.operand = TempOperand(projection.dest);
+    result.operand = member;
     return result;
   }
   if (value.kind == SEMA_ID_EXPRESSION) {
@@ -1802,18 +1820,8 @@ void Lowerer::ProjectDerivedReference(Value& value, TypeId source,
     if (!FindBasePath(model_, source_class, target_class, path, visited))
       Unsupported("a derived reference without a base path");
     for (std::size_t i = 0; i < path.size(); ++i)
-    {
-      lowir_model::Instruction projection;
-      projection.kind = lowir_model::Instruction::IK_INDEX;
-      projection.dest = NewTemp();
-      projection.type = I8Type();
-      projection.index_projection = lowir_model::IPK_BASE_SUBOBJECT;
-      projection.first = value.operand;
-      projection.second = Immediate(
-          static_cast<long long>(path[i].offset));
-      Emit(projection);
-      value.operand = TempOperand(projection.dest);
-    }
+      value.operand = ProjectField(value.operand, path[i].offset,
+                                   lowir_model::IPK_BASE_SUBOBJECT);
   }
 }
 

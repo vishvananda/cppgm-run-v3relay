@@ -41,9 +41,7 @@ void Lowerer::ResetFunction(const std::string& name,
   block_labels_.clear();
   slot_names_.clear();
   slots_.clear();
-  temporary_slots_.clear();
-  temporary_addresses_.clear();
-  constructed_temporaries_.clear();
+  temporaries_.clear();
   initialized_bitfield_units_.clear();
   goto_labels_.clear();
   condition_labels_.clear();
@@ -239,6 +237,20 @@ void Lowerer::EmitStore(const lowir_model::LowType& type,
   store.first = value;
   store.second = destination;
   Emit(store);
+}
+
+void Lowerer::EmitVoidCall(
+    const std::string& symbol,
+    const std::vector<lowir_model::Operand>& arguments)
+{
+  lowir_model::Instruction call;
+  call.kind = lowir_model::Instruction::IK_CALL;
+  call.type = VoidType();
+  call.call_return_type = VoidType();
+  call.call_returns_void = true;
+  call.first = GlobalOperand(symbol);
+  call.args = arguments;
+  Emit(call);
 }
 
 void Lowerer::EmitReturn(const Value* value)

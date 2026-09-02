@@ -8,8 +8,8 @@ Binding::Binding()
       function(0), object_binding(0),
       internal_linkage(false), c_linkage(false), extern_declaration(false),
       hidden_friend(false), noexcept_qualifier(false), access(ACCESS_PUBLIC),
-      static_member(false),
-      bit_field(false), bit_width(0), redeclared_binding(0),
+      static_member(false), field_index(kNoFieldIndex),
+      redeclared_binding(0),
       has_const_value(false), const_value(0)
 {
 }
@@ -22,9 +22,9 @@ Scope::Scope()
 
 ClassEntity::ClassEntity()
     : class_scope(0), type(0), default_constructor(0),
-      size(0), alignment(1), requested_alignment(0), constructor(0),
+      size(0), alignment(1), requested_alignment(0),
       destructor(0), inheriting_constructor_base(0), layout_complete(false),
-      trivial_default_constructor(true),
+      trivial_default_constructor(true), trivial_destructor(true),
       aggregate(true), is_union(false), defined(false)
 {
 }
@@ -399,6 +399,22 @@ bool SemaModel::ScopeOfType(TypeId type, ScopeId& scope) const
     return true;
   }
   return false;
+}
+
+const ClassField* SemaModel::FieldFor(BindingId binding) const
+{
+  if (binding == 0 || binding >= bindings_.size())
+    return 0;
+  const Binding& value = bindings_[binding];
+  if (value.field_index == kNoFieldIndex || value.scope >= scopes_.size())
+    return 0;
+  const Scope& owner = scopes_[value.scope];
+  if (owner.kind != SCOPE_CLASS || owner.class_entity == 0 ||
+      owner.class_entity >= classes_.size())
+    return 0;
+  const ClassEntity& entity = classes_[owner.class_entity];
+  return value.field_index < entity.fields.size() ?
+      &entity.fields[value.field_index] : 0;
 }
 
 bool SemaModel::IsDerivedFrom(ClassEntityId derived, ClassEntityId base) const

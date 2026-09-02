@@ -73,7 +73,8 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    definitions through `ResolveDeclarationScope` (`YA::f`, `Outer::Buffer::
    Buffer`, `A::T* A::t`, member typedef return types).  9.2p2: member
    function bodies, default arguments and default member initializers are
-   queued and analyzed when the outermost class completes.  `SemaModel::
+   queued and analyzed when their class completes (the outermost-class rule
+   for nested classes is still open; see the CP4b failure map).  `SemaModel::
    LookupMember(entity, name, filter, result)` is the one base-chain lookup
    (own scope, then base; derived names hide base names; using-declarations
    re-expose) used by member access, implicit-this names, qualified names and
@@ -81,6 +82,22 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    context scope)`: 11.2 with friends and protected-through-derived) is one
    function called from member access, qualified names, base conversions
    and type lookups; it lands with the initialization checkpoint.
+   Review 1 fixed the ownership of two more facts: `ClassEntity::
+   trivial_destructor` is computed with the layout beside
+   `trivial_default_constructor` (no layer walks subobjects to ask), and a
+   member binding reaches its `ClassField` through `Binding::field_index`
+   / `SemaModel::FieldFor` (no `bit_field`/`bit_width` copies on the
+   binding, no field scans).  `sema/class_completion.cpp` owns 9.2p2: a
+   class body pushes every definition it contains (members, constructors,
+   hidden friends, inherited constructors) on a pending stack, and
+   completion pops that range in three passes: mem-initializers, bodies
+   (a bodyless `= default` or inherited constructor gets an empty
+   compound), default member initializers.  `EnsureDefaultConstructor` and
+   `EnsureDestructor` synthesize subobject special members recursively, and
+   completion ensures the ones a user-written constructor or destructor
+   needs (12.6.2p8, 12.4p8), so lowering never asks for an entity sema did
+   not create.  `ResolveConstructor` is the one public constructor
+   selection and takes its candidates from the class scope's name index.
 
 3. Expression semantics (`dev/src/sema/expr_sema.cpp`, `overload.cpp`).
    `this` (keyword literal → prvalue `cv X*`), unqualified names inside
@@ -147,7 +164,14 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    -> ptr [tls_for=@x]` (plus a wrapper for the guard); static data members
    are globals `@X__m` / `_ZN1X1mE`.  `dev/src/lowir_serialize.cpp` must
    learn `alias object` lines, `storage=thread_local` on globals, and the
-   `eh_try` / `eh_cleanup` / `eh_end` / `resume` instructions.
+   `eh_try` / `eh_cleanup` / `eh_end` / `resume` instructions.  Every
+   object projection is formed by `LoadThis`, `ProjectField` and
+   `ProjectArrayElement`, every lifetime call by `EmitVoidCall`; aggregate
+   paths carry field indices.  A braced element of a non-aggregate class
+   array at namespace scope is a constructor action: `FoldConstructorAction`
+   folds it into data when the constructor's body is empty and each
+   mem-initializer stores one parameter or constant (the fixture shape),
+   otherwise `@__cppgm_init` constructs the element in place.
 
 ## Failure map at CP1 (218 failing, 25 passing; 19 fixtures expect EXIT_FAILURE)
 
@@ -209,7 +233,8 @@ comes from the intended check.
 | CP1 class model, layout, members, methods (completed) | parser gaps; class-scope declarations accepted; layout and `sizeof`/`alignof`; `this`, member access, base-chain lookup, static members, implicit-object overloads; object slots, projections, method symbols/mangling, class globals as zero data | 55/243 pa16 tests pass (25/243 at start); through-pa15 remains 1139/1139; file audit passes |
 | CP2 constructors, destructors, lifetime (completed) | user/implicit/inheriting ctors and dtors, mem-initializers, default member initializers, subobject plans, demand-driven C1/C2/D1/D2 with aliases, local and array lifetime at every exit, namespace-scope init/fini, thread_local family, EH cleanup shapes, serializer additions | 97/243 pa16 tests pass (146 failures, down from 188); through-pa15 remains 1139/1139; file audit passes |
 | CP3 operator overloading and ADL (completed) | member/non-member/hidden-friend operators, ADL sets and source-point rules, built-in fallback, functors, subscript/call/increment operators, chained `<<`, enum operators, literal operator | 142/243 pa16 tests pass (101 failures, down from 146); focused operator/conversion set is 12/12; through-pa15 is 1139/1139; file audit passes |
-| CP4a aggregate and bit-field initialization/lowering (completed) | local class aggregates, brace elision, nested arrays and string members, reference-member storage, complete-class deferred analysis, pack-state layout, anonymous aliases, and bit-field declaration/read/increment lowering | 149/243 pa16 tests pass (94 failures, down from 101); focused boundary set is 12/15; through-pa15 is 1139/1139; file audit passes with five nonfatal warnings |
+| CP4a aggregate and bit-field initialization/lowering (completed) | local class aggregates, brace elision, nested arrays and string members, reference-member storage, complete-class deferred analysis, pack-state layout, anonymous aliases, and bit-field declaration/read/increment lowering | 149/243 pa16 tests pass (94 failures, down from 101) but eight CP3-passing fixtures regressed (hidden-friend bodies, defaulted constructor, global class array); through-pa15 is 1139/1139; file audit passes with five nonfatal warnings |
+| review 1 (completed; `audit.md`) | CP4a regressions restored; recursive special-member synthesis; class-model ownership of destructor triviality and field records; bounded class completion; lowering projection helpers; global class-array elements | 157/243 (86 failures); no fixture that passed at CP3 or CP4a fails; through-pa15 1139/1139; file audit passes with four warnings; probes linear |
 | CP4b copy/list diagnostics, placement new, and access completion | explicit-constructor rejection, narrowing, placement-new argument formation, anonymous storage, and the remaining private/protected/incomplete-reference paths | pending |
 | CP5 audit and cleanup | architecture audit (`audit.md`), performance evidence, dead-path removal | through-pa16 clean; probe timings recorded |
 
@@ -256,6 +281,17 @@ down from 101) with no coverage changes; the focused 15-test boundary set is
 12/15, with the three remaining results being exact LowIR ordering/shape
 comparisons in bit-field emission. `make test-report-through-pa15` is
 1139/1139, and the pa16 file audit passes with five nonfatal warnings.
+
+Review 1 evidence (2026-09-02, `audit.md`): diffing the CP4a failing set
+against a rebuilt CP3 executable showed eight regressions hidden by the net
+count; all pass again.  Nested implicit constructors and destructors are
+synthesized recursively (a member's member destructor now runs; a member's
+member constructor no longer aborts lowering).  `make test-pa16` is 157/243
+(86 failures), `make test-report-through-pa15` 1139/1139, the file audit
+passes with four warnings (the duplicate-block warning is resolved), and the
+plan's probes plus `many 8000/16000` (0.35/0.71 s) and `chain 300/600`
+(0.04/0.08 s) double per doubling.  Deliberate leftovers are listed in
+`audit.md` finding 9.
 
 ## Completed Checkpoint: CP1 — class model, layout, members, methods
 
@@ -487,3 +523,31 @@ incomplete-reference access paths on top of CP4a.
   the private/protected watch-list, placement-new fixtures, and the
   `spec/200-*` list-initialization witnesses. Preserve through-PA15 and the
   file audit; do not edit fixtures or `.ref` files.
+
+Failure map after review 1 (86): 24 LowIR shape mismatches (`400-*`
+bit-field reads/increments and aggregate init, `300-alignas-*` layouts,
+`300-thread-local-synthetic-symbol-family-isolation`, `300-adl-*` source
+point and parent climbing, `300-synthesized-array-member-lifecycle`,
+`300-static-member-aggregate-array-dynamic-init`,
+`200-nested-braced-member-aggregate-init`, `200-const-subobject-member-
+call`, `200-derived-pointer-member-init`); 7 EXIT_FAILURE fixtures accepted
+(`100-bad-member-function`, `100-private-method-bad`, `200-private-base-
+static-cast-bad`, `200-protected-member-typedef-access-bad`, `200-copy-
+list-init-explicit-ctor-bad`, `300-under-aligned-class-bad`, `spec/200-
+list-init-narrowing-bad`); 7 parse gaps (`struct B::D : B`, member and
+out-of-class `alignas`, `p->~I()`, trailing-return members); 6 `unknown
+name` (nested class reaching enclosing members, `Base::` qualified calls);
+9 unknown type names through inherited and out-of-line typedefs; 5
+initializer conversions (derived-to-base references, string literal to
+`void*` rejection, reference members); 4 static-member lvalues (`&X::m`,
+static object members); 4 scalar conversions (`operator nullptr_t`,
+enum bit-fields); 3 implicit-`this` outside a member (static thread-local
+members); 2 placement `new`; 2 `sizeof` of incomplete referents; the
+rest singletons.  Work the groups in this order: access control and
+narrowing (the watch-list), parser gaps, inherited typedef lookup, static
+member lvalues, then the shape mismatches with their `.compare.diff`.
+
+Regression rule from review 1: after each focused loop, diff the failing
+set against the previous commit's set (`comm -13 old new`), not just the
+count; CP4a's count hid eight regressions.  Check any change to class
+completion order against `make test-pa11 test-pa12` and through-pa15.

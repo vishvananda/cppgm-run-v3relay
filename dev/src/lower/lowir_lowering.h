@@ -141,11 +141,24 @@ private:
     SemaId expression;
     std::string symbol;
     std::size_t byte_offset;
+    std::size_t element_index; // constructor_action element of an array
     TypeId type;
     bool constructor_action;
 
     DynamicInitializer()
-        : expression(0), byte_offset(0), type(0), constructor_action(false) {}
+        : expression(0), byte_offset(0), element_index(0), type(0),
+          constructor_action(false) {}
+  };
+
+  // A class prvalue materialized by a constructor call in expression
+  // context: its slot, and once constructed, its address.
+  struct TemporaryObject
+  {
+    std::string slot;
+    lowir_model::Operand address;
+    bool constructed;
+
+    TemporaryObject() : constructed(false) {}
   };
 
   // Symbols.
@@ -167,6 +180,9 @@ private:
   void BuildGlobalDefinitions();
   bool ConstantGlobalItem(SemaId node, TypeId type,
                           lowir_model::GlobalDefinition::DataItem& item);
+  bool FoldConstructorAction(
+      SemaId action, TypeId class_type,
+      std::vector<lowir_model::GlobalDefinition::DataItem>& items);
   bool GlobalAddress(SemaId node, std::string& symbol, long long& addend);
   void BuildGlobalInitializers();
   void BuildGlobalFinalizers();
@@ -210,6 +226,8 @@ private:
   void EmitStore(const lowir_model::LowType& type,
                  const lowir_model::Operand& value,
                  const lowir_model::Operand& destination);
+  void EmitVoidCall(const std::string& symbol,
+                    const std::vector<lowir_model::Operand>& arguments);
   void EmitReturn(const Value* value);
 
   // Semantic traversal and slots.
@@ -234,6 +252,15 @@ private:
   void ProjectDerivedReference(Value& value, TypeId source, TypeId target);
   Value LoadValue(const Value& lvalue);
   Value AddressValue(const Value& lvalue);
+  // Object projections: every member, base-subobject and array-element
+  // address is formed here.
+  lowir_model::Operand LoadThis();
+  lowir_model::Operand ProjectField(
+      const lowir_model::Operand& base, std::size_t offset,
+      lowir_model::IndexProjectionKind kind = lowir_model::IPK_FIELD);
+  lowir_model::Operand ProjectArrayElement(
+      const lowir_model::Operand& array_address, TypeId element,
+      std::size_t index);
   Value Convert(Value value, TypeId target);
   Value ZeroValue(TypeId type);
   Value LowerBinary(SemaId node, TypeId expected);
@@ -268,7 +295,6 @@ private:
   Value LoadBitField(SemaId node, const ClassField& field);
   Value ReadBitField(const Value& field_lvalue,
                      const ClassField& field);
-  std::string BitFieldUnitKey(const ClassField& field) const;
   bool BitFieldUnitInitialized(const ClassField& field) const;
   void MarkBitFieldUnitInitialized(const ClassField& field);
   Value LowerConditional(SemaId node, TypeId expected);
@@ -331,20 +357,15 @@ private:
       TypeId type, const lowir_model::Operand& destination);
   lowir_model::Operand LowerArrayElementAddress(
       const Value& array, TypeId element, std::size_t index);
-  void LowerAggregateInitializer(SemaId node, TypeId type,
-                                 const lowir_model::Operand& destination);
   void LowerAggregateZero(TypeId type,
                           const lowir_model::Operand& destination);
   void LowerAggregateMemberInitializer(SemaId node, TypeId type,
-                                       BindingId binding,
-                                       FunctionEntityId owner);
+                                       BindingId binding);
   void LowerAggregateMemberLeaves(
       SemaId node, TypeId type, TypeId root_type, BindingId binding,
-      FunctionEntityId owner,
       const std::vector<std::pair<bool, std::size_t> >& path);
-  void LowerAggregateMemberArrayLeaves(
-      SemaId node, TypeId type, TypeId root_type, BindingId binding,
-      FunctionEntityId owner,
+  lowir_model::Operand MemberLeafDestination(
+      BindingId binding, TypeId root_type,
       const std::vector<std::pair<bool, std::size_t> >& path);
   void RegisterLiveObject(BindingId binding, TypeId type);
   void EmitObjectDestructor(const LiveObject& object);
@@ -360,6 +381,9 @@ private:
   void LowerConstructorInitializers(FunctionEntityId function,
                                     SemaId function_node);
   void LowerMemberInitializer(SemaId node, FunctionEntityId owner);
+  void EmitDefaultConstruction(FunctionEntityId constructor,
+                               const std::string& symbol,
+                               const lowir_model::Operand& destination);
   FunctionEntityId DefaultConstructor(ClassEntityId entity) const;
   void PushControl(const std::string& break_label,
                    const std::string& continue_label);
@@ -391,10 +415,10 @@ private:
   std::set<std::string> block_labels_;
   std::set<std::string> slot_names_;
   std::map<BindingId, std::string> slots_;
-  std::map<SemaId, std::string> temporary_slots_;
-  std::map<SemaId, lowir_model::Operand> temporary_addresses_;
-  std::set<SemaId> constructed_temporaries_;
-  std::set<std::string> initialized_bitfield_units_;
+  std::map<SemaId, TemporaryObject> temporaries_;
+  // Bit-field allocation units (class scope, unit offset) already written
+  // by the initialization in progress; later writes preserve neighbours.
+  std::set<std::pair<ScopeId, std::size_t> > initialized_bitfield_units_;
   std::vector<std::string> goto_labels_; // indexed by label ordinal
   std::map<SemaId, std::string> condition_labels_;
   const std::map<SemaId, std::string>* active_switch_labels_;

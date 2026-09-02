@@ -227,9 +227,9 @@ const Lowerer::GlobalSymbol* Lowerer::GlobalFor(BindingId id) const
 // joined with `::` at its API boundary.
 void Lowerer::NameSymbols()
 {
-  // Deferred class definitions are emitted in canonical reverse order, but
-  // overload suffixes are declaration-order facts.  Entity ids are assigned
-  // in that source order, so name from a sorted copy and emit from the
+  // Overload suffixes are declaration-order facts and entity ids are
+  // assigned in that order; deferred class members reach the tree after
+  // the unit's other functions, so name from a sorted copy and emit in the
   // semantic order retained by function_order_.
   std::vector<FunctionEntityId> naming_order = function_order_;
   std::sort(naming_order.begin(), naming_order.end());
@@ -598,6 +598,107 @@ bool Lowerer::ConstantGlobalItem(SemaId node, TypeId type,
   return true;
 }
 
+// A braced element of a non-aggregate class array names a constructor.
+// When that constructor's body is empty and each mem-initializer stores one
+// parameter or constant into a field, the element is constant data, which
+// is how the fixtures present it; anything else constructs the element at
+// startup.  The folded constructor is still odr-used by the element.
+bool Lowerer::FoldConstructorAction(
+    SemaId action, TypeId class_type,
+    std::vector<lowir_model::GlobalDefinition::DataItem>& items)
+{
+  typedef lowir_model::GlobalDefinition::DataItem DataItem;
+  const FunctionEntityId function = tree_.At(action).function;
+  const std::vector<SemaId> action_children = Children(action);
+  if (function == 0 || action_children.size() != 1 ||
+      tree_.At(action_children[0]).kind != SEMA_CALL)
+    return false;
+  const std::vector<SemaId> call_children = Children(action_children[0]);
+  const FunctionEntity& entity = model_.FunctionAt(function);
+  const ClassEntity& owner = model_.ClassAt(entity.member_class);
+  const std::map<FunctionEntityId, FunctionSymbol>::const_iterator found =
+      functions_.find(function);
+  if (found == functions_.end() || found->second.definition == 0 ||
+      !owner.bases.empty() || owner.is_union ||
+      !entity.default_member_initializers.empty())
+    return false;
+  const SemaId definition = found->second.definition;
+  const SemaId body = FunctionBody(definition);
+  if (body == 0 || tree_.At(body).first_child != 0)
+    return false;
+  std::vector<SemaId> parameters;
+  CollectParameters(definition, parameters);
+  std::map<BindingId, std::size_t> parameter_positions;
+  for (std::size_t i = 0; i < parameters.size(); ++i)
+    parameter_positions[tree_.At(parameters[i]).binding] = i;
+
+  std::vector<DataItem> field_items(owner.fields.size());
+  std::vector<bool> field_written(owner.fields.size(), false);
+  for (SemaId child = tree_.At(definition).first_child; child != 0;
+       child = tree_.At(child).next_sibling) {
+    const SemaNode& member = tree_.At(child);
+    if (member.kind != SEMA_MEMBER_INITIALIZER)
+      continue;
+    if (member.binding == 0 || member.function != 0)
+      return false;
+    const ClassField* field = model_.FieldFor(member.binding);
+    const std::size_t field_index = model_.BindingAt(member.binding).field_index;
+    if (field == 0 || field->bit_width != 0 || field_written[field_index] ||
+        types_.Kind(types_.Unqualified(field->type)) == TYPE_REFERENCE)
+      return false;
+    const std::vector<SemaId> arguments = Children(child);
+    if (arguments.size() != 1)
+      return false;
+    SemaId value = arguments[0];
+    const SemaNode& argument = tree_.At(value);
+    if (argument.kind == SEMA_ID_EXPRESSION && argument.binding != 0 &&
+        model_.BindingAt(argument.binding).kind == BINDING_PARAMETER) {
+      const std::map<BindingId, std::size_t>::const_iterator position =
+          parameter_positions.find(argument.binding);
+      // Parameter k of the constructor (`this` is 0) is call operand k
+      // (the callee is 0).
+      if (position == parameter_positions.end() || position->second == 0 ||
+          position->second >= call_children.size())
+        return false;
+      value = call_children[position->second];
+    }
+    if (!ConstantGlobalItem(value, field->type, field_items[field_index]))
+      return false;
+    field_written[field_index] = true;
+  }
+
+  const std::size_t element_size = types_.SizeOf(class_type);
+  std::size_t cursor = 0;
+  for (std::size_t i = 0; i < owner.fields.size(); ++i) {
+    const ClassField& field = owner.fields[i];
+    if (field.static_member || field.binding == 0)
+      continue;
+    if (field.offset > cursor) {
+      DataItem zero;
+      zero.kind = DataItem::ITEM_ZERO;
+      zero.zero_bytes = field.offset - cursor;
+      items.push_back(zero);
+    }
+    if (field_written[i])
+      items.push_back(field_items[i]);
+    else {
+      DataItem zero;
+      zero.kind = DataItem::ITEM_ZERO;
+      zero.zero_bytes = types_.SizeOf(field.type);
+      items.push_back(zero);
+    }
+    cursor = field.offset + types_.SizeOf(field.type);
+  }
+  if (cursor < element_size) {
+    DataItem zero;
+    zero.kind = DataItem::ITEM_ZERO;
+    zero.zero_bytes = element_size - cursor;
+    items.push_back(zero);
+  }
+  (void)FunctionSymbolName(function);
+  return true;
+}
+
 void Lowerer::BuildGlobalDefinitions()
 {
   typedef lowir_model::GlobalDefinition::DataItem DataItem;
@@ -660,23 +761,6 @@ void Lowerer::BuildGlobalDefinitions()
           const ClassEntity& class_entity = model_.ClassAt(
               types_.At(element_unqualified).entity);
           const std::vector<SemaId> values = Children(elements[index]);
-          // A class-braced element is represented in static data here, but
-          // it is still a use of the corresponding complete constructor.
-          // Keep that definition available for the object-model symbol set.
-          for (std::size_t constructor_index = 0;
-               constructor_index < class_entity.constructors.size();
-               ++constructor_index) {
-            const FunctionEntityId constructor =
-                class_entity.constructors[constructor_index];
-            const FunctionEntity& function = model_.FunctionAt(constructor);
-            const TypeNode& function_type =
-                types_.At(types_.Unqualified(function.type));
-            if (!function.deleted && function_type.parameters.size() ==
-                values.size() + 1) {
-              (void)FunctionSymbolName(constructor);
-              break;
-            }
-          }
           std::size_t value_index = 0;
           std::size_t cursor = 0;
           for (std::size_t field_index = 0;
@@ -722,6 +806,33 @@ void Lowerer::BuildGlobalDefinitions()
             zero.zero_bytes = element_size - cursor;
             global.data_items.push_back(zero);
           }
+          continue;
+        }
+        if (types_.Kind(element_unqualified) == TYPE_CLASS &&
+            tree_.At(elements[index]).kind == SEMA_CONSTRUCTOR_ACTION) {
+          std::vector<DataItem> folded;
+          if (FoldConstructorAction(elements[index], element_unqualified,
+                                    folded)) {
+            if (pending_zero != 0) {
+              DataItem zero;
+              zero.kind = DataItem::ITEM_ZERO;
+              zero.zero_bytes = pending_zero;
+              global.data_items.push_back(zero);
+              pending_zero = 0;
+            }
+            global.data_items.insert(global.data_items.end(),
+                                     folded.begin(), folded.end());
+            continue;
+          }
+          DynamicInitializer dynamic;
+          dynamic.expression = elements[index];
+          dynamic.symbol = symbol.name;
+          dynamic.byte_offset = index * element_size;
+          dynamic.element_index = index;
+          dynamic.type = element;
+          dynamic.constructor_action = true;
+          dynamic_initializers_.push_back(dynamic);
+          pending_zero += element_size;
           continue;
         }
         DataItem item;
@@ -825,8 +936,20 @@ void Lowerer::BuildGlobalInitializers()
   for (std::size_t i = 0; i < dynamic_initializers_.size(); ++i) {
     const DynamicInitializer& dynamic = dynamic_initializers_[i];
     if (dynamic.constructor_action) {
-      (void)LowerRValue(dynamic.expression,
-                        types_.Fundamental(FT_VOID));
+      if (tree_.At(dynamic.expression).kind == SEMA_CONSTRUCTOR_ACTION) {
+        // An array element constructed at startup, in place.
+        lowir_model::Instruction base;
+        base.kind = lowir_model::Instruction::IK_ADDR;
+        base.dest = NewTemp();
+        base.type = PtrType();
+        base.first = GlobalOperand(dynamic.symbol);
+        Emit(base);
+        LowerAggregateConstructor(
+            dynamic.expression, dynamic.type,
+            ProjectArrayElement(TempOperand(base.dest), dynamic.type,
+                                dynamic.element_index));
+      } else
+        (void)LowerRValue(dynamic.expression, types_.Fundamental(FT_VOID));
       continue;
     }
     const Value value = LowerRValue(dynamic.expression, dynamic.type);
@@ -898,28 +1021,18 @@ void Lowerer::BuildGlobalFinalizers()
       const std::size_t bound = types_.At(
           types_.Unqualified(object.type)).array_bound;
       for (std::size_t index = 0; index < bound; ++index) {
-        lowir_model::Instruction call;
-        call.kind = lowir_model::Instruction::IK_CALL;
-        call.type = VoidType();
-        call.call_return_type = VoidType();
-        call.call_returns_void = true;
-        call.first = GlobalOperand(FunctionSymbolName(destructor));
-        call.args.push_back(LowerArrayElementAddress(object, type, index));
-        Emit(call);
+        const std::string& symbol = FunctionSymbolName(destructor);
+        EmitVoidCall(symbol, std::vector<lowir_model::Operand>(
+            1, LowerArrayElementAddress(object, type, index)));
       }
     } else {
       Value object;
       object.type = model_.BindingAt(global.binding).type;
       object.lvalue = true;
       object.operand = GlobalOperand(global.name);
-      lowir_model::Instruction call;
-      call.kind = lowir_model::Instruction::IK_CALL;
-      call.type = VoidType();
-      call.call_return_type = VoidType();
-      call.call_returns_void = true;
-      call.first = GlobalOperand(FunctionSymbolName(destructor));
-      call.args.push_back(AddressValue(object).operand);
-      Emit(call);
+      const std::string& symbol = FunctionSymbolName(destructor);
+      EmitVoidCall(symbol, std::vector<lowir_model::Operand>(
+          1, AddressValue(object).operand));
     }
   }
   SuspendFiniFunction();

@@ -79,6 +79,8 @@ enum LookupFilter
   LOOKUP_QUALIFIER = LOOKUP_TYPES | LOOKUP_NAMESPACES
 };
 
+const std::size_t kNoFieldIndex = static_cast<std::size_t>(-1);
+
 struct Binding
 {
   // Printed spelling.  A qualified out-of-class enum definition keeps its
@@ -97,8 +99,9 @@ struct Binding
   bool noexcept_qualifier;
   AccessKind access;
   bool static_member;
-  bool bit_field;
-  unsigned bit_width;
+  // Non-static data member: index into the owning ClassEntity::fields, the
+  // one record of its layout and bit-field facts; kNoFieldIndex otherwise.
+  std::size_t field_index;
   // BINDING_VARIABLE at namespace scope: the first binding of the same
   // object when this declaration redeclares it (3.3.10); 0 when this is the
   // first declaration.  Consumers that need one symbol per object key on it.
@@ -181,7 +184,6 @@ struct ClassEntity
   std::size_t size;
   std::size_t alignment;
   std::size_t requested_alignment;
-  FunctionEntityId constructor;
   FunctionEntityId destructor;
   ClassEntityId inheriting_constructor_base;
   // Friend declarations are owned by their innermost enclosing class for
@@ -189,7 +191,12 @@ struct ClassEntity
   // namespace.  This is the canonical hidden-friend association set.
   std::vector<BindingId> hidden_friends;
   bool layout_complete;
+  // Lifetime facts are fixed with the layout: whether default construction
+  // and destruction of a complete object have any runtime effect, counting
+  // every base and member subobject.  Sema decides which special members to
+  // synthesize from these; lowering decides which calls to emit from them.
   bool trivial_default_constructor;
+  bool trivial_destructor;
   bool aggregate;
   bool is_union;
   bool defined;
@@ -305,6 +312,9 @@ public:
   bool NominatedScope(BindingId binding, ScopeId& scope) const;
   // Member scope of a class type or enumerator scope of an enum type.
   bool ScopeOfType(TypeId type, ScopeId& scope) const;
+  // Layout record of a non-static data member binding; 0 for any other
+  // binding.  Offset, bit-field width and access are read from it.
+  const ClassField* FieldFor(BindingId binding) const;
   // Inheritance is a semantic relation owned by the class graph.  Consumers
   // such as overload ranking and LowIR use this query instead of comparing
   // class type spellings.
