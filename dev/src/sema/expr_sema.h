@@ -77,6 +77,7 @@ private:
   SemaId AnalyzeCast(AstId expression, ScopeId scope);
   SemaId AnalyzeSizeof(AstId expression, ScopeId scope);
   SemaId AnalyzeCall(AstId expression, ScopeId scope);
+  SemaId AnalyzeNew(AstId expression, ScopeId scope);
   void ResolveCallCallee(AstId callee, ScopeId scope, CallResolution& result);
   SemaId TryFunctionalCast(AstId expression, AstId callee, AstId arguments,
                            ScopeId scope);

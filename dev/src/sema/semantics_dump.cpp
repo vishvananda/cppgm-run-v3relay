@@ -78,6 +78,7 @@ const char* KindName(SemaKind kind)
   case SEMA_MEMBER_INITIALIZER: return "member-initializer";
   case SEMA_LABELED_STATEMENT: return "labeled-statement";
   case SEMA_GOTO_STATEMENT: return "goto-statement";
+  case SEMA_NEW_EXPRESSION: return "new-expression";
   }
   return "unknown";
 }
@@ -205,6 +206,7 @@ void PrintNode(std::ostream& out, const SemaTree& tree, const SemaModel& model,
     break;
   case SEMA_CALL: case SEMA_CONDITIONAL: case SEMA_SUBSCRIPT:
   case SEMA_SIZEOF: case SEMA_BRACED_INIT_LIST:
+  case SEMA_NEW_EXPRESSION:
     out << ' ' << Category(node.category) << ' ';
     model.Types().Spell(out, node.type);
     break;

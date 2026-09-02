@@ -889,6 +889,80 @@ Lowerer::Value Lowerer::LowerConstructorTemporary(SemaId node)
   return result;
 }
 
+Lowerer::Value Lowerer::LowerNew(SemaId node, TypeId expected)
+{
+  const SemaNode& value = tree_.At(node);
+  const std::vector<SemaId> children = Children(node);
+  if (children.empty() || children.size() > 2)
+    Unsupported("this new-expression");
+
+  const TypeId object_type = PointerElementType(value.type);
+  if (object_type == 0)
+    Unsupported("a new-expression without an object type");
+  const Value allocation = LowerRValue(children[0], value.type);
+  Value result;
+  result.type = value.type;
+  result.operand = allocation.operand;
+  if (children.size() == 1)
+    return Convert(result, expected);
+
+  const SemaId initialization = children[1];
+  const TypeId object_unqualified = types_.Unqualified(object_type);
+  Value object;
+  object.type = object_type;
+  object.lvalue = true;
+  object.operand = allocation.operand;
+  if (types_.Kind(object_unqualified) == TYPE_CLASS &&
+      tree_.At(initialization).kind == SEMA_CONSTRUCTOR_ACTION) {
+    const SemaNode& action = tree_.At(initialization);
+    if (action.function == 0)
+      Unsupported("a new-expression constructor without a function");
+    const std::vector<SemaId> action_children = Children(initialization);
+    if (action_children.size() != 1 ||
+        tree_.At(action_children[0]).kind != SEMA_CALL)
+      Unsupported("this new-expression constructor action");
+    const std::vector<SemaId> call_children = Children(action_children[0]);
+    if (call_children.empty() ||
+        tree_.At(call_children[0]).kind != SEMA_CALLEE)
+      Unsupported("a new-expression constructor without a callee");
+    const FunctionEntity& constructor = model_.FunctionAt(action.function);
+    const TypeNode& callable = types_.At(types_.Unqualified(constructor.type));
+    if (call_children.size() - 1 > callable.parameters.size() - 1)
+      Unsupported("a new-expression constructor with too many arguments");
+    const bool trivial_default =
+        constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
+        constructor.member_class != 0 &&
+        model_.ClassAt(constructor.member_class).trivial_default_constructor;
+    // An aggregate constructor synthesized for a non-empty braced
+    // initializer is not the class's default construction.  It still has a
+    // call-shaped action even when the class itself has trivial default
+    // construction, so only elide the zero-argument form.
+    if (!trivial_default || call_children.size() != 1) {
+      std::vector<lowir_model::Operand> arguments;
+      arguments.reserve(call_children.size());
+      arguments.push_back(allocation.operand);
+      for (std::size_t i = 1; i < call_children.size(); ++i) {
+        const TypeId parameter = callable.parameters[i];
+        arguments.push_back(types_.Kind(types_.Unqualified(parameter)) ==
+            TYPE_REFERENCE ? LowerReferenceArgument(
+                call_children[i], parameter).operand :
+            LowerRValue(call_children[i], parameter).operand);
+      }
+      EmitVoidCall(FunctionSymbolName(action.function), arguments);
+    }
+  } else if (types_.Kind(object_unqualified) == TYPE_CLASS &&
+             tree_.At(initialization).kind == SEMA_BRACED_INIT_LIST) {
+    initialized_bitfield_units_.clear();
+    LowerAggregateObjectInitializer(initialization, object_type, object,
+                                    std::vector<std::size_t>());
+  } else {
+    const Value initialized = LowerRValue(initialization, object_type);
+    EmitStore(LowTypeOf(object_type), initialized.operand,
+              allocation.operand);
+  }
+  return Convert(result, expected);
+}
+
 Lowerer::Value Lowerer::LowerLValue(SemaId node)
 {
   if (node == 0)
@@ -1041,6 +1115,8 @@ Lowerer::Value Lowerer::LowerRValue(SemaId node, TypeId expected)
   switch (value.kind) {
   case SEMA_LITERAL:
     return LowerLiteral(node, value, expected);
+  case SEMA_NEW_EXPRESSION:
+    return LowerNew(node, expected);
   case SEMA_CONSTRUCTOR_ACTION:
     return LowerConstructorTemporary(node);
   case SEMA_ID_EXPRESSION: {

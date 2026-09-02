@@ -235,7 +235,8 @@ comes from the intended check.
 | CP3 operator overloading and ADL (completed) | member/non-member/hidden-friend operators, ADL sets and source-point rules, built-in fallback, functors, subscript/call/increment operators, chained `<<`, enum operators, literal operator | 142/243 pa16 tests pass (101 failures, down from 146); focused operator/conversion set is 12/12; through-pa15 is 1139/1139; file audit passes |
 | CP4a aggregate and bit-field initialization/lowering (completed) | local class aggregates, brace elision, nested arrays and string members, reference-member storage, complete-class deferred analysis, pack-state layout, anonymous aliases, and bit-field declaration/read/increment lowering | 149/243 pa16 tests pass (94 failures, down from 101) but eight CP3-passing fixtures regressed (hidden-friend bodies, defaulted constructor, global class array); through-pa15 is 1139/1139; file audit passes with five nonfatal warnings |
 | review 1 (completed; `audit.md`) | CP4a regressions restored; recursive special-member synthesis; class-model ownership of destructor triviality and field records; bounded class completion; lowering projection helpers; global class-array elements | 157/243 (86 failures); no fixture that passed at CP3 or CP4a fails; through-pa15 1139/1139; file audit passes with four warnings; probes linear |
-| CP4b copy/list diagnostics, placement new, and access completion | explicit-constructor rejection, narrowing, placement-new argument formation, anonymous storage, and the remaining private/protected/incomplete-reference paths | pending |
+| CP4b.1 placement-new semantic/lowering (completed) | placement-new allocation overloads, placement arguments, class construction at the returned address, and aggregate-brace constructor calls | 159/243 (84 failures, down from 86); through-pa15 1139/1139; file audit passes |
+| CP4b.2 copy/list diagnostics and access completion (active) | explicit-constructor rejection, narrowing, anonymous storage, and the remaining private/protected/incomplete-reference paths | pending |
 | CP5 audit and cleanup | architecture audit (`audit.md`), performance evidence, dead-path removal | through-pa16 clean; probe timings recorded |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
@@ -504,27 +505,43 @@ initialization and access rules while preserving the CP1–CP3 class, lifetime,
 and operator paths. The final `make test-pa16` run is 149/243, through-PA15 is
 1139/1139, and the pa16 file audit passes with five nonfatal warnings.
 
-## Active Checkpoint: CP4b — copy/list diagnostics, placement new, and access completion
+## Completed Checkpoint: CP4b.1 — placement-new semantic/lowering
 
-Goal: finish copy/list initialization and narrowing diagnostics, placement-new
-forms, anonymous member storage, and the remaining private/protected and
-incomplete-reference access paths on top of CP4a.
+Goal achieved: placement `new` now forms the allocation overload call from
+the synthesized object size plus placement arguments, constructs class objects
+at the returned pointer, and handles aggregate braced initialization through
+the same canonical constructor-action path.  The aggregate constructor is
+owned by the class model and lowered as a demand-driven special-member body,
+so the returned storage and the object lifetime share one address.
+
+Evidence (2026-09-02): the two focused placement-new fixtures pass, including
+the aggregate-brace case and its synthesized constructor body.  The final
+`make test-pa16` run is 159/243 (84 failures, down from 86) with no coverage
+changes; `make test-report-through-pa15` is 1139/1139; and
+`perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src` passes with
+four nonfatal pre-existing header warnings.
+
+## Active Checkpoint: CP4b.2 — copy/list diagnostics and access completion
+
+Goal: finish copy/list initialization and narrowing diagnostics, anonymous
+member storage, and the remaining private/protected and incomplete-reference
+access paths on top of CP4b.1.
 
 ### Implementation Packet
 
 - `dev/src/sema/expr_sema.cpp`, `scope_builder.cpp`, and `conversions.cpp`:
   own copy/list initialization, explicit-constructor and narrowing rules,
-  placement-new argument formation, anonymous member lookup, and access
-  checking for private/protected bases and members.
+  anonymous member lookup, and access checking for private/protected bases
+  and members.
 - `dev/src/lower/lowir_expr.cpp`, `lowir_program.cpp`, and
-  `lowir_symbols.cpp`: lower placement and anonymous-member projections and
-  finish any remaining global/static aggregate paths.
-- Focus on the remaining `200-*` initialization/access failures,
-  the private/protected watch-list, placement-new fixtures, and the
-  `spec/200-*` list-initialization witnesses. Preserve through-PA15 and the
-  file audit; do not edit fixtures or `.ref` files.
+  `lowir_symbols.cpp`: lower anonymous-member projections and finish any
+  remaining global/static aggregate paths.
+- Focus on the remaining `200-*` initialization/access failures, the
+  private/protected watch-list, and the `spec/200-*` list-initialization
+  witnesses. Preserve through-PA15 and the file audit; do not edit fixtures
+  or `.ref` files.
 
-Failure map after review 1 (86): 24 LowIR shape mismatches (`400-*`
+Failure map after CP4b.1 (84): 24 LowIR shape mismatches (`400-*`
 bit-field reads/increments and aggregate init, `300-alignas-*` layouts,
 `300-thread-local-synthetic-symbol-family-isolation`, `300-adl-*` source
 point and parent climbing, `300-synthesized-array-member-lifecycle`,
@@ -542,7 +559,7 @@ initializer conversions (derived-to-base references, string literal to
 `void*` rejection, reference members); 4 static-member lvalues (`&X::m`,
 static object members); 4 scalar conversions (`operator nullptr_t`,
 enum bit-fields); 3 implicit-`this` outside a member (static thread-local
-members); 2 placement `new`; 2 `sizeof` of incomplete referents; the
+members); 2 `sizeof` of incomplete referents; the
 rest singletons.  Work the groups in this order: access control and
 narrowing (the watch-list), parser gaps, inherited typedef lookup, static
 member lvalues, then the shape mismatches with their `.compare.diff`.

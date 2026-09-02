@@ -153,6 +153,8 @@ private:
   bool HasVolatileFunctionQualifier(AstId declarator) const;
   bool IsNoThrowDeclarator(AstId declarator, ScopeId scope);
   FunctionEntityId EnsureDefaultConstructor(TypeId type);
+  FunctionEntityId EnsureAggregateConstructor(
+      TypeId type, const std::vector<SemaId>& arguments);
   FunctionEntityId EnsureDestructor(TypeId type);
   void AddConstructorAction(SemaId variable, ScopeId scope, TypeId type,
                             BindingId binding, AstId declarator);

@@ -969,6 +969,8 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
   {
     if (arguments.empty())
       return EnsureDefaultConstructor(class_type);
+    if (owner.aggregate && !owner.is_union && owner.bases.empty())
+      return EnsureAggregateConstructor(class_type, arguments);
     throw std::runtime_error("class has no viable constructor");
   }
 
@@ -1011,6 +1013,102 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
     throw std::runtime_error("no viable constructor");
   (void)scope;
   return selected;
+}
+
+FunctionEntityId ScopeBuilder::EnsureAggregateConstructor(
+    TypeId type, const std::vector<SemaId>& arguments)
+{
+  const TypeId class_type = types_.Unqualified(type);
+  if (types_.Kind(class_type) != TYPE_CLASS)
+    throw std::runtime_error("aggregate constructor requires a class type");
+  const ClassEntityId class_entity = types_.At(class_type).entity;
+  ClassEntity& owner = model_.ClassAt(class_entity);
+  if (!owner.defined || owner.class_scope == 0 || !owner.aggregate ||
+      owner.is_union || !owner.bases.empty())
+    throw std::runtime_error("class is not an aggregate");
+
+  std::vector<std::size_t> fields;
+  for (std::size_t i = 0; i < owner.fields.size(); ++i)
+    if (!owner.fields[i].static_member && owner.fields[i].binding != 0)
+      fields.push_back(i);
+  if (arguments.size() > fields.size())
+    throw std::runtime_error("too many aggregate initializer elements");
+
+  std::vector<TypeId> member_parameters;
+  member_parameters.reserve(arguments.size());
+  for (std::size_t i = 0; i < arguments.size(); ++i)
+    member_parameters.push_back(owner.fields[fields[i]].type);
+  const TypeId this_type = types_.Pointer(class_type);
+  std::vector<TypeId> canonical_parameters(1, this_type);
+  canonical_parameters.insert(canonical_parameters.end(),
+                              member_parameters.begin(),
+                              member_parameters.end());
+  const TypeId constructor_type = types_.Function(
+      types_.Fundamental(FT_VOID), canonical_parameters);
+  for (std::size_t i = 0; i < owner.constructors.size(); ++i) {
+    const FunctionEntity& candidate =
+        model_.FunctionAt(owner.constructors[i]);
+    if (candidate.synthesized && candidate.special_member ==
+            SPECIAL_MEMBER_CONSTRUCTOR &&
+        candidate.type == constructor_type)
+      return owner.constructors[i];
+  }
+
+  const std::string name = model_.ScopeAt(owner.class_scope).name;
+  const FunctionEntityId constructor = model_.CreateFunction(
+      owner.class_scope, name, constructor_type);
+  FunctionEntity& function = model_.FunctionAt(constructor);
+  function.is_member = true;
+  function.member_class = class_entity;
+  function.member_type = types_.Function(types_.Fundamental(FT_VOID),
+                                         member_parameters);
+  function.member_pointer_type = types_.MemberPointer(
+      class_type, function.member_type);
+  function.special_member = SPECIAL_MEMBER_CONSTRUCTOR;
+  function.noexcept_qualifier = true;
+  function.in_class_definition = true;
+  function.synthesized = true;
+  function.defined = true;
+  const BindingId binding = model_.AddBinding(
+      owner.class_scope, name, BINDING_FUNCTION, constructor_type);
+  model_.BindingAt(binding).function = constructor;
+  model_.BindingAt(binding).access = ACCESS_PUBLIC;
+  owner.constructors.push_back(constructor);
+
+  if (EmitsSemantics())
+  {
+    const SemaId function_node = MakeDetachedSemantic(
+        SEMA_FUNCTION_DEFINITION, owner.class_scope, constructor_type,
+        binding, constructor);
+    DeferSemantic(function_node);
+    const ScopeId function_scope = model_.CreateScope(
+        SCOPE_FUNCTION, name, owner.class_scope);
+    const SemaId this_parameter = tree_->Make(SEMA_PARAMETER);
+    SemaNode& this_node = tree_->At(this_parameter);
+    this_node.scope = function_scope;
+    this_node.type = this_type;
+    this_node.binding = model_.AddBinding(
+        function_scope, "this", BINDING_PARAMETER, this_type);
+    tree_->Append(function_node, this_parameter);
+    for (std::size_t i = 0; i < fields.size() && i < arguments.size(); ++i)
+    {
+      const ClassField& field = owner.fields[fields[i]];
+      std::string parameter_name = model_.BindingAt(field.binding).name;
+      if (parameter_name.empty())
+        parameter_name = "__arg" + std::to_string(i);
+      const BindingId parameter = model_.AddBinding(
+          function_scope, parameter_name, BINDING_PARAMETER, field.type);
+      MakeSemantic(SEMA_PARAMETER, function_scope, function_node,
+                   field.type, parameter);
+      const SemaId initializer = MakeSemantic(
+          SEMA_MEMBER_INITIALIZER, function_scope, function_node,
+          field.type, field.binding);
+      MakeSemantic(SEMA_ID_EXPRESSION, function_scope, initializer,
+                   field.type, parameter, 0, VC_LVALUE);
+    }
+    MakeSemantic(SEMA_COMPOUND_STATEMENT, function_scope, function_node);
+  }
+  return constructor;
 }
 
 void ScopeBuilder::BuildMemberInitializers(AstId initializer,

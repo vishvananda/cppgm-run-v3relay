@@ -226,6 +226,7 @@ SemaId ExpressionAnalyzer::AnalyzeNode(AstId expression, ScopeId scope)
   case AST_SIZEOF_EXPRESSION: case AST_TYPE_TRAIT_EXPRESSION:
     return AnalyzeSizeof(expression, scope);
   case AST_CALL_EXPRESSION: return AnalyzeCall(expression, scope);
+  case AST_NEW_EXPRESSION: return AnalyzeNew(expression, scope);
   case AST_BRACED_INIT_LIST: return AnalyzeBraced(expression, scope, 0);
   default:
     throw std::runtime_error("unsupported expression in semantic analysis");
@@ -1948,6 +1949,140 @@ SemaId ExpressionAnalyzer::AnalyzeCall(AstId expression, ScopeId scope)
     Append(result, indirect_callee);
   for (size_t i = 0; i < converted_arguments.size(); ++i)
     Append(result, converted_arguments[i]);
+  return result;
+}
+
+SemaId ExpressionAnalyzer::AnalyzeNew(AstId expression, ScopeId scope)
+{
+  const vector<AstId>& children = arena_.At(expression).children;
+  size_t index = 0;
+  bool global_lookup = false;
+  if (index < children.size() &&
+      arena_.At(children[index]).kind == AST_GLOBAL_SCOPE) {
+    global_lookup = true;
+    ++index;
+  }
+
+  AstId placement = 0;
+  if (index < children.size() &&
+      arena_.At(children[index]).kind == AST_PLACEMENT) {
+    placement = children[index++];
+  }
+  if (index >= children.size() ||
+      arena_.At(children[index]).kind != AST_TYPE_ID)
+    throw std::runtime_error("new-expression has no type-id");
+  const AstId type_node = children[index++];
+  const TypeId allocated_type = builder_.TypeOfTypeId(type_node, scope);
+  if (allocated_type == 0 || types_.Kind(types_.Unqualified(allocated_type)) ==
+      TYPE_FUNCTION)
+    throw std::runtime_error("new-expression has an invalid allocation type");
+
+  AstId initializer = 0;
+  if (index < children.size()) {
+    initializer = children[index++];
+    if (arena_.At(initializer).kind != AST_INITIALIZER)
+      throw std::runtime_error("new-expression has an invalid initializer");
+    if (arena_.At(initializer).children.size() != 1)
+      throw std::runtime_error("new-expression has an invalid initializer");
+    initializer = arena_.At(initializer).children[0];
+  }
+  if (index != children.size())
+    throw std::runtime_error("new-expression has extra syntax");
+
+  // The allocation-size operand is an int-valued synthesized constant.  The
+  // selected operator new parameter performs the ordinary integral
+  // conversion, preserving the LowIR widening operation required by the
+  // target ABI.
+  const SemaId size = MakeExpression(
+      SEMA_LITERAL, 0, types_.Fundamental(FT_INT), VC_PRVALUE, scope);
+  tree_.At(size).has_value = true;
+  tree_.At(size).value = static_cast<long long>(types_.SizeOf(allocated_type));
+
+  vector<SemaId> allocation_arguments;
+  allocation_arguments.push_back(size);
+  if (placement != 0) {
+    const vector<AstId>& placement_children =
+        arena_.At(placement).children;
+    if (placement_children.size() != 1 ||
+        arena_.At(placement_children[0]).kind != AST_PAREN_ARGUMENT_LIST)
+      throw std::runtime_error("new-expression has invalid placement");
+    const vector<AstId>& arguments = arena_.At(placement_children[0]).children;
+    for (size_t i = 0; i < arguments.size(); ++i)
+      allocation_arguments.push_back(Analyze(arguments[i], scope));
+  }
+
+  vector<TypeId> allocation_types;
+  vector<OverloadArgument> overload_arguments;
+  allocation_types.reserve(allocation_arguments.size());
+  overload_arguments.reserve(allocation_arguments.size());
+  for (size_t i = 0; i < allocation_arguments.size(); ++i) {
+    const Info info = NodeInfo(allocation_arguments[i]);
+    allocation_types.push_back(info.type);
+    overload_arguments.push_back(OverloadArgument(
+        info.type, info.category, IsNullPointerConstant(allocation_arguments[i]),
+        info.is_function_lvalue));
+  }
+
+  const ScopeId lookup_scope = global_lookup ? model_.GlobalScope() : scope;
+  vector<BindingId> allocation_bindings;
+  model_.LookupCallSet(lookup_scope, "operatornew", allocation_types,
+                       allocation_bindings);
+  if (allocation_bindings.empty())
+    throw std::runtime_error("new-expression has no allocation function");
+  const FunctionEntityId allocation_function = SelectBestOverload(
+      model_, types_, allocation_bindings, overload_arguments, false);
+  if (allocation_function == 0)
+    throw std::runtime_error("new-expression has no viable allocation function");
+  const SemaId allocation = BuildResolvedCall(
+      0, scope, allocation_function, 0, allocation_arguments);
+
+  SemaId initialization = 0;
+  const TypeId class_type = types_.Unqualified(allocated_type);
+  if (types_.Kind(class_type) == TYPE_CLASS) {
+    vector<SemaId> constructor_arguments;
+    if (initializer != 0) {
+      const AstKind initializer_kind = arena_.At(initializer).kind;
+      if (initializer_kind != AST_PAREN_INITIALIZER &&
+          initializer_kind != AST_BRACED_INIT_LIST)
+        throw std::runtime_error("new-expression has an invalid initializer");
+      const vector<AstId>& arguments = arena_.At(initializer).children;
+      if (initializer_kind == AST_BRACED_INIT_LIST &&
+          model_.ClassAt(types_.At(class_type).entity).aggregate)
+      {
+        const SemaId aggregate =
+            AnalyzeBraced(initializer, scope, allocated_type);
+        constructor_arguments.reserve(tree_.At(aggregate).last_child == 0 ?
+                                      0 : arguments.size());
+        for (SemaId child = tree_.At(aggregate).first_child; child != 0;
+             child = tree_.At(child).next_sibling)
+          constructor_arguments.push_back(child);
+        initialization = BuildConstructorTemporary(
+            initializer, allocated_type, scope, constructor_arguments);
+      }
+      else {
+        constructor_arguments.reserve(arguments.size());
+        for (size_t i = 0; i < arguments.size(); ++i)
+          constructor_arguments.push_back(Analyze(arguments[i], scope));
+        initialization = BuildConstructorTemporary(
+            initializer, allocated_type, scope, constructor_arguments);
+      }
+    } else {
+      initialization = BuildConstructorTemporary(
+          0, allocated_type, scope, constructor_arguments);
+    }
+  } else if (initializer != 0) {
+    const vector<AstId>& arguments = arena_.At(initializer).children;
+    if (arguments.size() != 1)
+      throw std::runtime_error("scalar new-expression needs one initializer");
+    const SemaId value = Analyze(arguments[0], scope);
+    initialization = Initialize(value, allocated_type);
+  }
+
+  const SemaId result = MakeExpression(
+      SEMA_NEW_EXPRESSION, expression, types_.Pointer(allocated_type),
+      VC_PRVALUE, scope);
+  Append(result, allocation);
+  Append(result, initialization);
   return result;
 }
 

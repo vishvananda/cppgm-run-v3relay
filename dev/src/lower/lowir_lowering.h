@@ -242,6 +242,7 @@ private:
 
   // Expressions and conversions.
   Value LowerRValue(SemaId node, TypeId expected = 0);
+  Value LowerNew(SemaId node, TypeId expected);
   Value LowerLValue(SemaId node);
   Value LowerConstructorTemporary(SemaId node);
   Value LowerLiteral(SemaId node, const SemaNode& value, TypeId expected);
