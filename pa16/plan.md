@@ -237,7 +237,7 @@ comes from the intended check.
 | review 1 (completed; `audit.md`) | CP4a regressions restored; recursive special-member synthesis; class-model ownership of destructor triviality and field records; bounded class completion; lowering projection helpers; global class-array elements | 157/243 (86 failures); no fixture that passed at CP3 or CP4a fails; through-pa15 1139/1139; file audit passes with four warnings; probes linear |
 | CP4b.1 placement-new semantic/lowering (completed) | placement-new allocation overloads, placement arguments, class construction at the returned address, and aggregate-brace constructor calls | 159/243 (84 failures, down from 86); through-pa15 1139/1139; file audit passes |
 | CP4b.2 copy/list diagnostics and access completion (completed) | explicit-constructor rejection, narrowing, anonymous storage, and the remaining private/protected/incomplete-reference paths | 169/243 pa16 tests pass (74 failures, down from 84); through-pa15 remains 1139/1139; file audit passes |
-| CP5 audit and cleanup | architecture audit (`audit.md`), performance evidence, dead-path removal | through-pa16 clean; probe timings recorded |
+| CP5 audit and cleanup (completed) | static-member declaration identity, qualified/inherited lookup, global lvalue/address lowering, aggregate startup stores, and audit cleanup | 175/243 pa16 tests pass (68 failures, down from 74); packet 5/5; through-pa15 1139/1139; through-pa16 1314/1382; file audit passes with four pre-existing warnings |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -541,17 +541,50 @@ passes with four pre-existing header warnings.  The specified probe measured
 wide 0.06s/18008KB and doubled 0.13s/29668KB; deep 0.00s/6208KB and doubled
 0.01s/6984KB; exits 0.02s/10128KB and doubled 0.04s/15528KB.
 
-## Active Checkpoint: CP5 — audit and cleanup
+## Completed Checkpoint: CP5 — audit and cleanup
 
-Goal: finish the remaining pa16 semantic and LowIR gaps, remove dead paths,
-and close the architecture audit while preserving the through-pa16 gate.
+Goal achieved: static data-member declarations and out-of-class definitions
+now retain one canonical storage fact, inherited qualified static calls use
+the class member graph, and static member lvalues/addresses reach their
+global symbols.  Static/non-static member functions with the same source
+parameter list remain distinct by member signature and storage mode.  Dynamic
+class-array leaves carry an aggregate path into startup lowering, while a
+runtime class static aggregate is zero-initialized as one object before its
+source-ordered leaf stores.  Redeclaration matching and the new static-member
+matching helpers are isolated in `scope_builder_members.cpp`; the file audit
+limits remain intact.
+
+Evidence (2026-09-02): the five packet fixtures
+`200-inherited-static-member-qualified-call`,
+`200-static-nonstatic-same-pointer-signature`,
+`300-static-class-member-object-definition`,
+`300-static-const-member-address`, and
+`300-static-member-aggregate-array-dynamic-init` pass 5/5.  The final
+`make test-pa16` result is 175/243 (68 failures, down from 74) with unchanged
+coverage; `make test-report-through-pa15` is 1139/1139, and
+`make test-report-through-pa16` is 1314/1382 with only the current pa16
+failures.  The pa16 file audit passes with four pre-existing header warnings.
+The architecture findings and remaining failure ownership are recorded in
+`audit.md`.
+
+## Active Checkpoint: CP6 — thread-local and remaining static storage
+
+Goal: complete the remaining static-member lvalue/address cases and the
+thread-local symbol family through one canonical storage model, preserving
+the through-pa16 gate.
 
 ### Implementation Packet
 
-- Own the remaining failure groups in `dev/src/sema`, `dev/src/lower`, and
-  `dev/src/parser` through canonical model data and bounded completion/lowering
-  paths; do not edit fixtures or `.ref` files.
-- Re-run the failure-set comparison after each focused loop, then require
-  `make test-report-through-pa16`, the pa16 file audit, and the packet probe.
-- Record the architecture findings and final evidence in `audit.md` before
-  declaring the stage complete.
+- Own the remaining static/TLS failures in `dev/src/sema` and `dev/src/lower`
+  through `Binding`/`GlobalSymbol` storage facts and bounded symbol-family
+  construction; do not edit fixtures or `.ref` files.
+- Start with `100-static-member-object-access`,
+  `200-static-thread-local-member`,
+  `200-static-thread-local-member-object-call`,
+  `300-static-member-definition-private-nested-type`, and
+  `300-thread-local-synthetic-symbol-family-isolation`.
+- Re-run the focused failure-set comparison after each loop, then require
+  `make test-pa16`, `make test-report-through-pa16`, the pa16 file audit, and
+  the packet probe.
+- Record the storage ownership and final evidence in `audit.md` before
+  declaring the checkpoint complete.

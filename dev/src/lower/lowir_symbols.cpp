@@ -110,7 +110,9 @@ void Lowerer::CollectSymbols(SemaId node)
     }
   } else if (value.kind == SEMA_VARIABLE && value.binding != 0) {
     const Binding& binding = model_.BindingAt(value.binding);
-    if (model_.ScopeAt(binding.scope).kind == SCOPE_NAMESPACE) {
+    const Scope& declaration_scope = model_.ScopeAt(binding.scope);
+    if (declaration_scope.kind == SCOPE_NAMESPACE ||
+        (declaration_scope.kind == SCOPE_CLASS && binding.static_member)) {
       const BindingId canonical = CanonicalBinding(value.binding);
       GlobalSymbol& symbol = globals_[canonical];
       if (symbol.binding == 0) {
@@ -510,6 +512,14 @@ bool Lowerer::GlobalAddress(SemaId node, std::string& symbol,
     }
     return false;
   }
+  if (value.kind == SEMA_MEMBER && value.binding != 0 &&
+      model_.BindingAt(value.binding).static_member) {
+    const GlobalSymbol* global = GlobalFor(value.binding);
+    if (global == 0)
+      return false;
+    symbol = global->name;
+    return true;
+  }
   if (value.kind == SEMA_LITERAL && value.HasSpan() &&
       value.first < tokens_.size() &&
       tokens_[value.first].kind == PA6_LITERAL_TOKEN &&
@@ -743,6 +753,12 @@ void Lowerer::BuildGlobalDefinitions()
       if (!initializer.empty() &&
           tree_.At(initializer[0]).kind == SEMA_BRACED_INIT_LIST)
         elements = Children(initializer[0]);
+
+      if (TryBuildRuntimeClassAggregate(symbol, binding, element, elements,
+                                        global)) {
+        program_.globals.push_back(global);
+        continue;
+      }
       // Consecutive zero elements, whether written, missing, or awaiting a
       // startup store, merge into one zero run.
       std::size_t pending_zero = 0;
@@ -786,6 +802,10 @@ void Lowerer::BuildGlobalDefinitions()
               dynamic.symbol = symbol.name;
               dynamic.byte_offset = index * element_size + field.offset;
               dynamic.type = value_type;
+              dynamic.aggregate_type = binding.type;
+              dynamic.aggregate_path.push_back(index);
+              dynamic.aggregate_path.push_back(field_index);
+              dynamic.aggregate_subobject = true;
               dynamic_initializers_.push_back(dynamic);
               DataItem zero;
               zero.kind = DataItem::ITEM_ZERO;
@@ -926,6 +946,71 @@ void Lowerer::BuildGlobalDefinitions()
   }
 }
 
+bool Lowerer::TryBuildRuntimeClassAggregate(
+    const GlobalSymbol& symbol, const Binding& binding, TypeId element,
+    const std::vector<SemaId>& elements,
+    lowir_model::GlobalDefinition& global)
+{
+  typedef lowir_model::GlobalDefinition::DataItem DataItem;
+  if (!binding.static_member ||
+      model_.ScopeAt(binding.scope).kind != SCOPE_CLASS)
+    return false;
+  const TypeId element_unqualified = types_.Unqualified(element);
+  if (types_.Kind(element_unqualified) != TYPE_CLASS)
+    return false;
+  const ClassEntity& class_entity = model_.ClassAt(
+      types_.At(element_unqualified).entity);
+  bool has_dynamic_leaf = false;
+  for (std::size_t index = 0; index < elements.size(); ++index) {
+    if (tree_.At(elements[index]).kind != SEMA_BRACED_INIT_LIST)
+      return false;
+    const std::vector<SemaId> values = Children(elements[index]);
+    std::size_t value_index = 0;
+    for (std::size_t field_index = 0;
+         field_index < class_entity.fields.size(); ++field_index) {
+      const ClassField& field = class_entity.fields[field_index];
+      if (field.static_member || field.binding == 0)
+        continue;
+      if (value_index < values.size()) {
+        DataItem ignored;
+        if (!ConstantGlobalItem(values[value_index], field.type, ignored))
+          has_dynamic_leaf = true;
+        ++value_index;
+      }
+    }
+  }
+  if (!has_dynamic_leaf)
+    return false;
+
+  DataItem zero;
+  zero.kind = DataItem::ITEM_ZERO;
+  zero.zero_bytes = types_.SizeOf(binding.type);
+  global.data_items.push_back(zero);
+  for (std::size_t index = 0; index < elements.size(); ++index) {
+    const std::vector<SemaId> values = Children(elements[index]);
+    std::size_t value_index = 0;
+    for (std::size_t field_index = 0;
+         field_index < class_entity.fields.size(); ++field_index) {
+      const ClassField& field = class_entity.fields[field_index];
+      if (field.static_member || field.binding == 0)
+        continue;
+      if (value_index < values.size()) {
+        DynamicInitializer dynamic;
+        dynamic.expression = values[value_index];
+        dynamic.symbol = symbol.name;
+        dynamic.type = field.type;
+        dynamic.aggregate_type = binding.type;
+        dynamic.aggregate_path.push_back(index);
+        dynamic.aggregate_path.push_back(field_index);
+        dynamic.aggregate_subobject = true;
+        dynamic_initializers_.push_back(dynamic);
+        ++value_index;
+      }
+    }
+  }
+  return true;
+}
+
 // The program's startup initializer stores every non-constant initializer
 // in declaration order, unit by unit.
 void Lowerer::BuildGlobalInitializers()
@@ -954,6 +1039,15 @@ void Lowerer::BuildGlobalInitializers()
     }
     const Value value = LowerRValue(dynamic.expression, dynamic.type);
     lowir_model::Operand destination = GlobalOperand(dynamic.symbol);
+    if (dynamic.aggregate_subobject) {
+      Value aggregate;
+      aggregate.type = dynamic.aggregate_type;
+      aggregate.lvalue = true;
+      aggregate.operand = destination;
+      destination = AggregateDestination(aggregate, dynamic.aggregate_path);
+      EmitStore(LowTypeOf(dynamic.type), value.operand, destination);
+      continue;
+    }
     if (dynamic.byte_offset != 0) {
       lowir_model::Instruction base;
       base.kind = lowir_model::Instruction::IK_ADDR;

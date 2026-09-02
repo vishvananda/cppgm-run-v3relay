@@ -1,5 +1,39 @@
 # PA16 Checkpoint Review — cppgm++ --emit-lowir with the basic object model
 
+## CP5 (2026-09-02): static-member identity and aggregate startup stores
+
+The implementation now keeps the static/non-static distinction on the
+canonical semantic binding and function entity across declaration forms.  A
+qualified out-of-class data definition recovers the prior class declaration's
+`Binding::static_member` fact before field creation; class static objects are
+not added to `ClassEntity::fields`, and their external definitions are the
+only definitions collected for global storage.  Qualified lookup delegates to
+the class member graph, so an inherited static function resolves to its
+declaring class.  Member-function redeclaration matching compares the source
+member signature and skips a prior function with the opposite static mode,
+which keeps an implicit-object parameter from colliding with an explicit
+pointer parameter.
+
+LowIR symbol collection now admits class-scope static variables, while
+`LowerLValue` and `GlobalAddress` use the canonical global symbol for static
+member reads, writes, and addresses.  Aggregate dynamic initializers carry a
+root type and index path; `BuildGlobalInitializers` projects that path through
+the existing array/field helpers.  Class static arrays with a dynamic leaf
+are emitted as one zero-initialized object and source-ordered startup stores,
+so constant sibling fields do not accidentally bypass the runtime aggregate
+state.  The declaration/redeclaration matching helpers live in
+`scope_builder_members.cpp`, keeping `scope_builder.cpp` below the audit
+limit without changing ownership semantics.
+
+Validation: the five packet fixtures pass 5/5; `make test-pa16` reports
+175/243 (68 failures, down from 74) with unchanged coverage;
+`make test-report-through-pa15` reports 1139/1139; and
+`make test-report-through-pa16` reports 1314/1382, with the remaining 68
+failures confined to pa16.  The pa16 file audit passes with four pre-existing
+header-weight warnings.  No fixtures or reference files were changed.  The
+next focused ownership boundary is thread-local storage and the remaining
+static-member lvalue/address cases, listed in `pa16/plan.md` as CP6.
+
 ## Review 1 (2026-09-02): CP1–CP4a
 
 Scope: the four implementation checkpoints since the plan (`b0de88827`,

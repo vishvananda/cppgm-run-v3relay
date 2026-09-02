@@ -28,6 +28,7 @@ FRONTEND_OBJ_BASENAMES_cppgm++ := preproc_host parser/ast_parser parser/ast_pars
 	parser/ast_parser_expr parser/ast_scope parser/ast_model parser/recog_token \
 	sema/type_table sema/qualified_name sema/scope_model \
 	sema/sema_tree sema/conversions sema/overload sema/expr_sema sema/scope_builder \
+	sema/scope_builder_members \
 	sema/class_completion \
 	sema/type_builder sema/stmt_builder sema/semantics_dump sema/types_dump \
 	lowir_serialize lower/lowir_types lower/lowir_symbols lower/lowir_function \

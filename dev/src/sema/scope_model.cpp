@@ -893,6 +893,13 @@ BindingId SemaModel::SearchMember(ScopeId scope, EntityId unscoped_enum,
     CollectNamespace(scope, name, filter, visited, found);
     return Latest(found, scope);
   }
+  if (scopes_[scope].kind == SCOPE_CLASS &&
+      scopes_[scope].class_entity != 0)
+  {
+    std::vector<BindingId> members;
+    LookupMember(scopes_[scope].class_entity, name, filter, members);
+    return members.empty() ? 0 : members.back();
+  }
   if (unscoped_enum == 0)
     return DirectBinding(scope, name, filter);
   const BindingId found = DirectBinding(scope, name,
@@ -912,6 +919,9 @@ void SemaModel::CollectMember(ScopeId scope, EntityId unscoped_enum,
     std::vector<ScopeId> visited;
     CollectNamespace(scope, name, filter, visited, result);
   }
+  else if (scopes_[scope].kind == SCOPE_CLASS &&
+           scopes_[scope].class_entity != 0)
+    LookupMember(scopes_[scope].class_entity, name, filter, result);
   else if (unscoped_enum != 0)
   {
     const BindingId enumerator = SearchMember(scope, unscoped_enum, name,

@@ -515,7 +515,7 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     const bool is_function = types_.Kind(type) == TYPE_FUNCTION;
     ClassEntityId member_class = 0;
     const bool is_member = model_.ClassForScope(target_scope, member_class);
-    const bool static_member = is_member &&
+    bool static_member = is_member &&
         SequenceHasKeyword(specifiers, KW_STATIC);
     // 7.1.5p9: a constexpr object is const.
     if (is_constexpr && !is_typedef && !is_function)
@@ -572,7 +572,21 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     model_.BindingAt(binding).access = is_member ? member_access_ :
         ACCESS_PUBLIC;
     model_.BindingAt(binding).declaring_class = is_member ? member_class : 0;
+
+    // An out-of-class definition of a static data member omits the `static`
+    // specifier.  Recover that storage fact from the prior declaration in
+    // the owning class, so the definition remains the same object instead of
+    // becoming a second non-static field.
+    BindingId redeclared_static_member = 0;
+    if (is_member && declared_name.Qualified() && !static_member)
+    {
+      redeclared_static_member = FindStaticMemberVariable(
+          target_scope, name, type);
+      static_member = redeclared_static_member != 0;
+    }
     model_.BindingAt(binding).static_member = static_member;
+    if (redeclared_static_member != 0)
+      model_.BindingAt(binding).redeclared_binding = redeclared_static_member;
     TypeId linkage_type = type;
     while (linkage_type != 0 &&
            types_.Kind(types_.Unqualified(linkage_type)) == TYPE_ARRAY)
@@ -582,13 +596,16 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
         types_.Kind(linkage_type) == TYPE_CV &&
         types_.At(linkage_type).is_const;
     model_.BindingAt(binding).internal_linkage =
-        SequenceHasKeyword(specifiers, KW_STATIC) ||
+        (!is_member && SequenceHasKeyword(specifiers, KW_STATIC)) ||
         (model_.ScopeAt(target_scope).kind == SCOPE_NAMESPACE &&
          !SequenceHasKeyword(specifiers, KW_EXTERN) &&
          namespace_const);
     model_.BindingAt(binding).c_linkage = c_linkage_depth_ != 0;
+    const bool in_class_static_declaration = is_member && static_member &&
+        scope == target_scope;
     model_.BindingAt(binding).extern_declaration =
-        initializer == 0 && SequenceHasKeyword(specifiers, KW_EXTERN);
+        (initializer == 0 && SequenceHasKeyword(specifiers, KW_EXTERN)) ||
+        in_class_static_declaration;
     if (kind == BINDING_VARIABLE)
     {
       if (is_member && !static_member)
@@ -608,14 +625,15 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
         RecordInitializedLocal(target_scope);
     }
     SemaId variable = 0;
-    if (EmitsSemantics() && model_.ScopeAt(target_scope).kind != SCOPE_CLASS)
+    if (EmitsSemantics() && (model_.ScopeAt(target_scope).kind != SCOPE_CLASS ||
+                             static_member))
       variable = MakeSemantic(is_typedef ? SEMA_TYPE_ALIAS : SEMA_VARIABLE,
           target_scope, declaration_node != 0 ? declaration_node :
               (semantic_parent != 0 ? semantic_parent :
                   SemanticParent(target_scope)), type, binding);
     if (!is_typedef)
-      BuildVariable(binding, initializer, declarator, target_scope, variable,
-                    is_constexpr);
+      BuildVariable(binding, initializer, declarator, target_scope,
+                    in_class_static_declaration ? 0 : variable, is_constexpr);
   }
 }
 
@@ -2297,43 +2315,6 @@ bool ScopeBuilder::IsNoThrowDeclarator(AstId declarator, ScopeId scope)
   return false;
 }
 
-// 3.3.10/3.5: a namespace-scope object declared again in the same scope is
-// the same entity.  The later binding records the first one so a consumer
-// that needs one symbol per object has it without repeating the lookup.
-void ScopeBuilder::LinkRedeclaration(BindingId binding, ScopeId scope,
-                                     const string& name, TypeId type)
-{
-  vector<BindingId> priors;
-  model_.DirectBindings(scope, name, LOOKUP_VALUES, priors);
-  for (std::size_t i = 0; i < priors.size(); ++i)
-  {
-    if (priors[i] == binding)
-      continue;
-    const Binding& prior = model_.BindingAt(priors[i]);
-    if (prior.kind != BINDING_VARIABLE)
-      continue;
-    if (!CompatibleRedeclaration(prior.type, type))
-      throw std::runtime_error("object redeclared with a different type");
-    model_.BindingAt(binding).redeclared_binding =
-        prior.redeclared_binding != 0 ? prior.redeclared_binding : priors[i];
-    return;
-  }
-}
-
-bool ScopeBuilder::CompatibleRedeclaration(TypeId prior, TypeId current) const
-{
-  if (prior == current)
-    return true;
-  // 8.3.4p3: an array of unknown bound is completed by a later declaration.
-  if (types_.Kind(prior) != TYPE_ARRAY || types_.Kind(current) != TYPE_ARRAY)
-    return false;
-  const TypeNode& first = types_.At(prior);
-  const TypeNode& second = types_.At(current);
-  return first.base == second.base &&
-      (first.array_bound == 0 || second.array_bound == 0 ||
-       first.array_bound == second.array_bound);
-}
-
 void ScopeBuilder::RecordInitializedLocal(ScopeId scope)
 {
   initialized_locals_[scope].push_back(++jump_sequence_);
@@ -2843,7 +2824,7 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
   }
   // For a class member the declaration's existing `static` linkage fact is
   // also the canonical fact that no implicit object parameter is present.
-  const bool static_member = is_member && internal_linkage;
+  bool static_member = is_member && internal_linkage;
   const bool effective_internal_linkage = is_member ? false : internal_linkage;
   TypeId member_type = 0;
   vector<TypeId> canonical_parameters = parameters;
@@ -2854,6 +2835,12 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
       throw std::runtime_error("member function has no class type");
     member_type = types_.Function(declared.result, parameters,
                                   declared.variadic, member_const);
+    // An out-of-class definition omits `static`.  The member signature is
+    // the stable identity needed to recover the prior declaration's storage
+    // mode before the implicit-object parameter is added to the canonical
+    // function type.
+    if (!static_member)
+      static_member = HasStaticMemberFunction(scope, name, member_type);
     if (!static_member)
     {
       const TypeId this_type = types_.Pointer(
@@ -2894,6 +2881,9 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     const bool same_parameters =
         prior_type.parameters == canonical_type.parameters &&
         prior_type.variadic == canonical_type.variadic;
+    if (is_member && model_.FunctionAt(prior.function).static_member !=
+        static_member)
+      continue;
     if (same_parameters && model_.FunctionAt(prior.function).type != canonical)
       throw std::runtime_error("function redeclaration changes return type");
     if (model_.FunctionAt(prior.function).type == canonical)

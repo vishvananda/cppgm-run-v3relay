@@ -143,10 +143,14 @@ private:
     std::size_t byte_offset;
     std::size_t element_index; // constructor_action element of an array
     TypeId type;
+    TypeId aggregate_type; // root type when the destination is an aggregate leaf
+    std::vector<std::size_t> aggregate_path;
+    bool aggregate_subobject;
     bool constructor_action;
 
     DynamicInitializer()
         : expression(0), byte_offset(0), element_index(0), type(0),
+          aggregate_type(0), aggregate_path(), aggregate_subobject(false),
           constructor_action(false) {}
   };
 
@@ -178,6 +182,10 @@ private:
   BindingId CanonicalBinding(BindingId id) const;
   const GlobalSymbol* GlobalFor(BindingId id) const;
   void BuildGlobalDefinitions();
+  bool TryBuildRuntimeClassAggregate(
+      const GlobalSymbol& symbol, const Binding& binding, TypeId element,
+      const std::vector<SemaId>& elements,
+      lowir_model::GlobalDefinition& global);
   bool ConstantGlobalItem(SemaId node, TypeId type,
                           lowir_model::GlobalDefinition::DataItem& item);
   bool FoldConstructorAction(

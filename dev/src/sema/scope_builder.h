@@ -284,6 +284,10 @@ private:
   void LinkRedeclaration(BindingId binding, ScopeId scope,
                          const std::string& name, TypeId type);
   bool CompatibleRedeclaration(TypeId prior, TypeId current) const;
+  BindingId FindStaticMemberVariable(ScopeId scope, const std::string& name,
+                                     TypeId type) const;
+  bool HasStaticMemberFunction(ScopeId scope, const std::string& name,
+                               TypeId member_type) const;
 
   const std::vector<Pa6Token>& tokens_;
   const AstArena& arena_;

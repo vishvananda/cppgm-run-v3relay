@@ -976,8 +976,28 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
   if (value.kind == SEMA_MEMBER)
   {
     const Binding& binding = model_.BindingAt(value.binding);
-    if (binding.kind == BINDING_FUNCTION || binding.static_member)
+    if (binding.kind == BINDING_FUNCTION)
       Unsupported("a static or function member lvalue");
+    if (binding.static_member) {
+      const GlobalSymbol* global = GlobalFor(value.binding);
+      if (global == 0)
+        Unsupported("a static member without global storage");
+      Value result;
+      result.type = ReferentType(value.type);
+      result.lvalue = true;
+      if (types_.Kind(types_.Unqualified(binding.type)) == TYPE_REFERENCE) {
+        lowir_model::Instruction load;
+        load.kind = lowir_model::Instruction::IK_LOAD;
+        load.dest = NewTemp();
+        load.type = PtrType();
+        load.first = GlobalOperand(global->name);
+        Emit(load);
+        result.operand = TempOperand(load.dest);
+      } else {
+        result.operand = GlobalOperand(global->name);
+      }
+      return result;
+    }
     const std::vector<SemaId> children = Children(node);
     if (children.size() != 1)
       Unsupported("a member without one object");
