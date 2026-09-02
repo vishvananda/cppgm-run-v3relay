@@ -51,6 +51,8 @@ public:
                               const std::vector<TypeId>& arguments,
                               FunctionEntityId& function,
                               BindingId& binding);
+  FunctionEntityId ResolveConstructorForExpression(
+      TypeId type, const std::vector<SemaId>& arguments, ScopeId scope);
 
 private:
   struct ParameterInfo
@@ -136,6 +138,7 @@ private:
                        TypeId type);
   std::string AnonymousTypeName(AstId node, const char* kind) const;
   bool HasConstFunctionQualifier(AstId declarator) const;
+  bool HasVolatileFunctionQualifier(AstId declarator) const;
   bool IsNoThrowDeclarator(AstId declarator, ScopeId scope);
   bool HasNontrivialDestructor(ClassEntityId entity) const;
   FunctionEntityId EnsureDefaultConstructor(TypeId type);
@@ -193,6 +196,7 @@ private:
   QualifiedName NodeName(AstId node) const;
   ScopeId ResolveDeclarationScope(ScopeId scope, AstId identifier,
                                   std::string& name) const;
+  ScopeId EnclosingNamespace(ScopeId scope) const;
   ScopeId ResolveNamespace(ScopeId scope, AstId target) const;
   ScopeId ResolveQualifierScope(ScopeId scope, const QualifiedName& prefix) const;
   TypeKeyword ClassKey(AstId node) const;
@@ -216,6 +220,7 @@ private:
                                    TypeId declared_type, bool definition,
                                    BindingId& binding,
                                    bool member_const = false,
+                                   bool member_volatile = false,
                                    bool internal_linkage = false,
                                    bool noexcept_qualifier = false,
                                    const std::vector<AstId>& default_arguments =

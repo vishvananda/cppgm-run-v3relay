@@ -20,7 +20,9 @@ bool QualifiedName::Qualified() const
 const std::string& QualifiedName::Last() const
 {
   if (components.empty())
+  {
     throw std::runtime_error("empty qualified name");
+  }
   return components.back();
 }
 
@@ -53,10 +55,24 @@ QualifiedName ReadQualifiedName(const std::vector<Pa6Token>& tokens,
   if (last > tokens.size())
     last = tokens.size();
   bool expect_identifier = true;
-  for (std::size_t i = first; i < last; ++i)
-  {
-    const Pa6Token& token = tokens[i];
-    if (token.kind == PA6_IDENTIFIER_TOKEN && expect_identifier)
+	for (std::size_t i = first; i < last; ++i)
+	{
+		const Pa6Token& token = tokens[i];
+		if (token.IsSimple(KW_OPERATOR) && expect_identifier)
+		{
+			// Operator-function-ids are the one qualified-name component
+			// whose spelling is carried by punctuation/keyword tokens rather
+			// than an identifier token.  The parser has already delimited the
+			// component, so consume that complete span here and keep one
+			// canonical lookup spelling (operator+, operator[], operator()).
+			std::string spelling = "operator";
+			for (std::size_t part = i + 1; part < last; ++part)
+				spelling += tokens[part].spelling;
+			result.components.push_back(spelling);
+			expect_identifier = false;
+			break;
+		}
+		if (token.kind == PA6_IDENTIFIER_TOKEN && expect_identifier)
     {
       result.components.push_back(token.spelling);
       expect_identifier = false;

@@ -208,7 +208,7 @@ comes from the intended check.
 | plan | this commit | stage design, failure map |
 | CP1 class model, layout, members, methods (completed) | parser gaps; class-scope declarations accepted; layout and `sizeof`/`alignof`; `this`, member access, base-chain lookup, static members, implicit-object overloads; object slots, projections, method symbols/mangling, class globals as zero data | 55/243 pa16 tests pass (25/243 at start); through-pa15 remains 1139/1139; file audit passes |
 | CP2 constructors, destructors, lifetime (completed) | user/implicit/inheriting ctors and dtors, mem-initializers, default member initializers, subobject plans, demand-driven C1/C2/D1/D2 with aliases, local and array lifetime at every exit, namespace-scope init/fini, thread_local family, EH cleanup shapes, serializer additions | 97/243 pa16 tests pass (146 failures, down from 188); through-pa15 remains 1139/1139; file audit passes |
-| CP3 operator overloading and ADL | member/non-member/hidden-friend operators, ADL sets and source-point rules, built-in fallback, functors, subscript/call/increment operators, chained `<<`, enum operators, literal operator | the operator group (20) passes; expected ≥ 205/243 |
+| CP3 operator overloading and ADL (completed) | member/non-member/hidden-friend operators, ADL sets and source-point rules, built-in fallback, functors, subscript/call/increment operators, chained `<<`, enum operators, literal operator | 142/243 pa16 tests pass (101 failures, down from 146); focused operator/conversion set is 12/12; through-pa15 is 1139/1139; file audit passes |
 | CP4 initialization forms and access control | aggregate/brace-elision/value-init of class objects (locals, globals, nested arrays, string members), copy-init through converting ctors with `explicit` rejection, narrowing rejection, placement new, anonymous struct/union members, bit-field access lowering (7 `400-*` fixtures), access checks with the watch-list verified | 243/243 and through-pa16 clean |
 | CP5 audit and cleanup | architecture audit (`audit.md`), performance evidence, dead-path removal | through-pa16 clean; probe timings recorded |
 
@@ -411,7 +411,7 @@ or partially destroyed object.
   inheriting-constructor fixtures. Keep the existing pa11–pa15 gate and
   file-audit checks as exit criteria; do not edit fixtures or `.ref` files.
 
-## Active Checkpoint: CP3 — operator overloading and ADL
+## Completed Checkpoint: CP3 — operator overloading and ADL
 
 Goal: resolve and lower member, non-member, hidden-friend, and built-in-fallback
 operator expressions with source-point-correct ADL and overload ranking,
@@ -430,3 +430,39 @@ and user-defined literals.
   member prefix/postfix and subscript calls, chained shift stress tests,
   hidden-friend calls, enum operators, and the user-defined literal fixture.
   Preserve the pa11–pa16 gates and do not edit fixtures or `.ref` files.
+
+Evidence (2026-09-02): operator expressions now share one canonical
+candidate-specific ranking path for member and non-member functions;
+associated namespaces/classes, hidden friends, and source-point lookup are
+owned by `SemaModel`; derived-to-base and user-defined constructor conversions
+are represented in the conversion metadata; callable objects, subscripts,
+increments, chained shifts, enum operators, and string literal operators
+lower through the selected function or built-in fallback. Qualified operator
+declarators and ordinary identifiers beginning with `operator` retain their
+separate parser/sema forms. The focused set passes 12/12, including the
+`const volatile` member-overload witness. The final `make test-pa16` run is
+142/243 (101 failures, 45 fewer than the 97/243 checkpoint start), with no
+coverage changes; the exact through-PA15 command is 1139/1139 and the pa16
+file audit passes with five nonfatal warnings.
+
+## Active Checkpoint: CP4 — initialization forms and access control
+
+Goal: complete aggregate and brace-elision initialization, copy/list
+initialization and narrowing diagnostics, placement-new forms, anonymous
+member storage, bit-field expression lowering, and the remaining access
+checks while preserving the CP1–CP3 class, lifetime, and operator paths.
+
+### Implementation Packet
+
+- `dev/src/sema/expr_sema.cpp`, `scope_builder.cpp`, and `conversions.cpp`:
+  own aggregate/value/copy/list initialization, explicit-constructor and
+  narrowing rules, placement-new argument formation, anonymous member lookup,
+  and access checking for private/protected bases and members.
+- `dev/src/lower/lowir_expr.cpp`, `lowir_program.cpp`, and
+  `lowir_symbols.cpp`: lower aggregate/string/array initialization,
+  reference-member storage, bit-field reads and increments, and any required
+  placement or anonymous-member projections.
+- Focus on the remaining `200-*` initialization/access failures,
+  `300-qualified-friend-function-access`, the anonymous/packed and bit-field
+  fixtures, and the `spec/200-*` list-initialization witnesses. Preserve
+  through-PA15 and the file audit; do not edit fixtures or `.ref` files.

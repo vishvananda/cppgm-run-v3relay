@@ -68,6 +68,11 @@ enum LookupFilter
   LOOKUP_FUNCTIONS = 1u << 2,
   LOOKUP_NAMESPACES = 1u << 3,
   LOOKUP_ENUMERATORS = 1u << 4,
+  // A friend defined in a class is declared in the innermost enclosing
+  // namespace, but remains invisible to ordinary namespace lookup until a
+  // matching namespace-scope declaration is provided.  ADL opts into this
+  // bit while collecting the hidden friends associated with an argument.
+  LOOKUP_HIDDEN_FRIENDS = 1u << 5,
   LOOKUP_ANY = LOOKUP_TYPES | LOOKUP_VALUES | LOOKUP_FUNCTIONS |
       LOOKUP_NAMESPACES | LOOKUP_ENUMERATORS,
   // 3.4.3p1: the name before `::` ignores objects, functions and enumerators.
@@ -88,6 +93,7 @@ struct Binding
   bool internal_linkage;
   bool c_linkage;
   bool extern_declaration;
+  bool hidden_friend;
   bool noexcept_qualifier;
   AccessKind access;
   bool static_member;
@@ -178,6 +184,10 @@ struct ClassEntity
   FunctionEntityId constructor;
   FunctionEntityId destructor;
   ClassEntityId inheriting_constructor_base;
+  // Friend declarations are owned by their innermost enclosing class for
+  // ADL, even though their bindings live in that class's enclosing
+  // namespace.  This is the canonical hidden-friend association set.
+  std::vector<BindingId> hidden_friends;
   bool layout_complete;
   bool trivial_default_constructor;
   bool aggregate;
@@ -209,6 +219,7 @@ struct FunctionEntity
   ClassEntityId member_class;
   bool is_member;
   bool member_const;
+  bool member_volatile;
   bool is_template;
   std::vector<TypeId> template_parameters; // TYPE_TEMPLATE_PARAM types, in order
   bool internal_linkage;
@@ -294,10 +305,27 @@ public:
   bool NominatedScope(BindingId binding, ScopeId& scope) const;
   // Member scope of a class type or enumerator scope of an enum type.
   bool ScopeOfType(TypeId type, ScopeId& scope) const;
+  // Inheritance is a semantic relation owned by the class graph.  Consumers
+  // such as overload ranking and LowIR use this query instead of comparing
+  // class type spellings.
+  bool IsDerivedFrom(ClassEntityId derived, ClassEntityId base) const;
   // Class member lookup applies ordinary hiding at each class level, then
   // searches bases.  The result may contain an overload set or an ambiguity.
   void LookupMember(ClassEntityId entity, const std::string& name,
                     unsigned filter, std::vector<BindingId>& result) const;
+  // 13.3.1.2: ordinary operator lookup plus the associated namespaces and
+  // hidden friends of the operand types.  The caller adds member candidates
+  // for the left operand separately because their implicit object has a
+  // different conversion sequence from a non-member argument.
+  void LookupOperatorSet(ScopeId scope, const std::string& name,
+                         const std::vector<TypeId>& argument_types,
+                         std::vector<BindingId>& result) const;
+  // Unqualified function-call lookup uses the same ordinary-plus-ADL
+  // candidate set, but is kept separate at the API boundary so expression
+  // lookup does not accidentally apply ADL to a bare value expression.
+  void LookupCallSet(ScopeId scope, const std::string& name,
+                     const std::vector<TypeId>& argument_types,
+                     std::vector<BindingId>& result) const;
 
   ClassEntityId CreateClass(bool is_union);
   ClassEntity& ClassAt(ClassEntityId id);
@@ -349,6 +377,18 @@ private:
   void CollectClassMember(ClassEntityId entity, const std::string& name,
                           unsigned filter, std::vector<ClassEntityId>& visited,
                           std::vector<BindingId>& result) const;
+  void CollectAssociated(TypeId type, std::vector<ScopeId>& namespaces,
+                         std::vector<ClassEntityId>& classes,
+                         std::vector<TypeId>& visited_types) const;
+  void CollectAssociatedClass(ClassEntityId entity,
+                              std::vector<ScopeId>& namespaces,
+                              std::vector<ClassEntityId>& classes) const;
+  void AddAssociatedNamespace(ScopeId scope,
+                              std::vector<ScopeId>& namespaces) const;
+  void CollectAssociatedNamespace(
+      ScopeId scope, const std::string& name, unsigned filter,
+      std::vector<ScopeId>& visited,
+      std::vector<BindingId>& result) const;
 
   static const ScopeId kNoScope = static_cast<ScopeId>(-1);
 

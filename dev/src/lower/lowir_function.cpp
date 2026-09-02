@@ -41,6 +41,9 @@ void Lowerer::ResetFunction(const std::string& name,
   block_labels_.clear();
   slot_names_.clear();
   slots_.clear();
+  temporary_slots_.clear();
+  temporary_addresses_.clear();
+  constructed_temporaries_.clear();
   goto_labels_.clear();
   condition_labels_.clear();
   controls_.clear();

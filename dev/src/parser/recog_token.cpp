@@ -121,10 +121,18 @@ void Pa6TokenCollector::emit_user_defined_literal_character(
 }
 
 void Pa6TokenCollector::emit_user_defined_literal_string_array(
-	const string& source, const string&, size_t, EFundamentalType,
-	const void*, size_t)
+	const string& source, const string&, size_t num_elements,
+	EFundamentalType type, const void* data, size_t nbytes)
 {
-	append_literal(source);
+	Pa6Token token(PA6_LITERAL_TOKEN, source);
+	token.lit_type = type;
+	token.lit_count = num_elements;
+	if (data != 0 && nbytes != 0)
+	{
+		const unsigned char* bytes = static_cast<const unsigned char*>(data);
+		token.lit_bytes.assign(bytes, bytes + nbytes);
+	}
+	tokens.push_back(token);
 }
 
 void Pa6TokenCollector::emit_user_defined_literal_integer(

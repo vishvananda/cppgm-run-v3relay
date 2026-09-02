@@ -3,6 +3,7 @@
 #include "lower/lowir_lowering.h"
 
 #include <algorithm>
+#include <cctype>
 #include <functional>
 #include <stdexcept>
 
@@ -21,20 +22,43 @@ std::string Join(const std::vector<std::string>& pieces,
   return result + last;
 }
 
+std::string LowirNamePiece(const std::string& source)
+{
+  std::string result;
+  result.reserve(source.size());
+  for (std::size_t i = 0; i < source.size(); ++i) {
+    const unsigned char character =
+        static_cast<unsigned char>(source[i]);
+    result += (std::isalnum(character) || source[i] == '_') ?
+        static_cast<char>(character) : '_';
+  }
+  return result;
+}
+
 // The semantic model spells an operator function `operator<token>`; the
 // PA14 encoder classifies operators by their README word.  This is the only
 // place that bridges the two fixed vocabularies.
 const char* OperatorWord(const std::string& spelling)
 {
   static const struct { const char* token; const char* word; } table[] = {
-    { "new", "new" }, { "newarray", "new-array" }, { "delete", "delete" },
-    { "deletearray", "delete-array" }, { "plus", "plus" },
-    { "minus", "minus" }, { "star", "multiply" }, { "slash", "divide" },
-    { "percent", "remainder" }, { "amp", "bit-and" }, { "pipe", "bit-or" },
-    { "caret", "bit-xor" }, { "equal", "equal" }, { "notequal", "not-equal" },
-    { "lessthan", "less" }, { "greaterthan", "greater" },
-    { "lessequal", "less-equal" }, { "greaterequal", "greater-equal" },
-    { "call", "call" }, { "subscript", "index" }
+    { "new", "new" }, { "new[]", "new-array" }, { "delete", "delete" },
+    { "delete[]", "delete-array" }, { "+", "plus" },
+    { "-", "minus" }, { "*", "multiply" }, { "/", "divide" },
+    { "%", "remainder" }, { "&", "bit-and" }, { "|", "bit-or" },
+    { "^", "bit-xor" }, { "=", "assign" }, { "+=", "plus-assign" },
+    { "-=", "minus-assign" }, { "*=", "multiply-assign" },
+    { "/=", "divide-assign" }, { "%=", "remainder-assign" },
+    { "&=", "bit-and-assign" }, { "|=", "bit-or-assign" },
+    { "^=", "bit-xor-assign" }, { "<<", "shift-left" },
+    { ">>", "shift-right" }, { "<<=", "shift-left-assign" },
+    { ">>=", "shift-right-assign" }, { "==", "equal" },
+    { "!=", "not-equal" }, { "<", "less" }, { ">", "greater" },
+    { "<=", "less-equal" }, { ">=", "greater-equal" },
+    { "&&", "logical-and" }, { "||", "logical-or" },
+    { "!", "logical-not" }, { "~", "complement" },
+    { "++", "increment" }, { "--", "decrement" }, { ",", "comma" },
+    { "->*", "member-pointer" }, { "->", "arrow" },
+    { "()", "call" }, { "[]", "index" }
   };
   for (std::size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i)
     if (spelling == table[i].token)
@@ -49,6 +73,19 @@ const char* OperatorWord(const std::string& spelling)
 // one function share its entity; repeated declarations of one object share
 // the first binding (Binding::redeclared_binding), so each symbol is created
 // once and its definition, if any, is remembered.
+void Lowerer::CollectTemporaryConstructorUses(SemaId node)
+{
+  if (node == 0)
+    return;
+  const SemaNode& value = tree_.At(node);
+  if (value.kind == SEMA_CONSTRUCTOR_ACTION && value.binding == 0 &&
+      value.function != 0)
+    temporary_constructors_.insert(value.function);
+  for (SemaId child = value.first_child; child != 0;
+       child = tree_.At(child).next_sibling)
+    CollectTemporaryConstructorUses(child);
+}
+
 void Lowerer::CollectSymbols(SemaId node)
 {
   if (node == 0)
@@ -60,7 +97,8 @@ void Lowerer::CollectSymbols(SemaId node)
       const FunctionEntity& entity = model_.FunctionAt(value.function);
       if (entity.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
           entity.member_class != 0 &&
-          model_.ClassAt(entity.member_class).trivial_default_constructor)
+          model_.ClassAt(entity.member_class).trivial_default_constructor &&
+          temporary_constructors_.count(value.function) == 0)
         return;
       FunctionSymbol& symbol = functions_[value.function];
       if (symbol.declaration == 0) {
@@ -205,7 +243,8 @@ void Lowerer::NameSymbols()
         model_.ScopeAt(entity.scope).name : entity.name;
     const std::string member_name = destructor ?
         Join(NamespacePieces(entity.scope), "__", "_" + destructor_name) :
-        Join(NamespacePieces(entity.scope), "__", entity.name);
+        Join(NamespacePieces(entity.scope), "__",
+             LowirNamePiece(entity.name));
     symbol.name = TopLevelName(
         "@" + member_name,
         entity.internal_linkage ? std::string() : symbol.object);
@@ -271,13 +310,19 @@ std::vector<std::string> Lowerer::NamespacePieces(ScopeId scope) const
 
 namespace {
 
-bool OperatorTerminal(const std::string& name,
+bool OperatorTerminal(const FunctionEntity& entity, bool unary,
                       abi_mangle::AbiOperatorKind& kind)
 {
+  const std::string& name = entity.name;
   const std::string prefix = "operator";
   if (name.compare(0, prefix.size(), prefix) != 0)
     return false;
-  const char* word = OperatorWord(name.substr(prefix.size()));
+  std::string spelling = name.substr(prefix.size());
+  const char* word = OperatorWord(spelling);
+  if (spelling == "*")
+    word = unary ? "deref" : "multiply";
+  else if (spelling == "&")
+    word = unary ? "address-of" : "bit-and";
   if (word == 0 || !abi_mangle::lookup_operator(word, &kind))
     throw std::logic_error("LowIR lowering does not support the ABI spelling "
                            "of " + name);
@@ -299,19 +344,29 @@ std::string Lowerer::MangleFunction(FunctionEntityId id,
   target.kind = abi_mangle::ABI_TARGET_FACT_FUNCTION;
   target.c_linkage = entity.c_linkage;
   const bool special = entity.special_member != SPECIAL_MEMBER_NONE;
+  const bool literal_operator = entity.name.compare(
+      0, std::string("operator\"\"_").size(), "operator\"\"_") == 0;
   target.function.qualified_name = special ?
       Join(NamespacePieces(entity.scope), "::", "operator") :
-      Join(NamespacePieces(entity.scope), "::", entity.name);
+      Join(NamespacePieces(entity.scope), "::",
+           literal_operator ? "operator" : entity.name);
   target.function.kind = abi_mangle::ABI_FUNCTION_TARGET_PATH;
 
   std::vector<abi_mangle::AbiFunctionRecord> records;
   abi_mangle::AbiOperatorKind operator_kind;
-  if (OperatorTerminal(entity.name, operator_kind)) {
-    target.function.kind = abi_mangle::ABI_FUNCTION_TARGET_ENCODING;
-    abi_mangle::AbiFunctionRecord source;
-    source.kind = abi_mangle::ABI_FUNCTION_RECORD_NAME_SOURCE;
-    source.source_name = "operator";
-    records.push_back(source);
+  const TypeId signature = entity.is_member && entity.member_type != 0 ?
+      entity.member_type : entity.type;
+  const TypeNode& signature_type = types_.At(types_.Unqualified(signature));
+  const std::size_t operand_count = signature_type.parameters.size() +
+      (entity.is_member && !entity.static_member ? 1 : 0);
+  if (literal_operator) {
+    abi_mangle::AbiFunctionRecord terminal;
+    terminal.kind = abi_mangle::ABI_FUNCTION_RECORD_TERMINAL;
+    terminal.terminal.kind = abi_mangle::ABI_TERMINAL_LITERAL_OPERATOR;
+    terminal.terminal.name = entity.name.substr(
+        std::string("operator\"\"").size());
+    records.push_back(terminal);
+  } else if (OperatorTerminal(entity, operand_count == 1, operator_kind)) {
     abi_mangle::AbiFunctionRecord terminal;
     terminal.kind = abi_mangle::ABI_FUNCTION_RECORD_TERMINAL;
     terminal.terminal.kind = abi_mangle::ABI_TERMINAL_OPERATOR;
@@ -334,14 +389,19 @@ std::string Lowerer::MangleFunction(FunctionEntityId id,
           abi_mangle::ABI_SPECIAL_DESTRUCTOR_COMPLETE;
     records.push_back(terminal);
   }
-  const TypeId signature = entity.is_member && entity.member_type != 0 ?
-      entity.member_type : entity.type;
   const TypeNode& type = types_.At(types_.Unqualified(signature));
   if (entity.is_member && entity.member_const)
   {
     abi_mangle::AbiFunctionRecord qualifier;
     qualifier.kind = abi_mangle::ABI_FUNCTION_RECORD_QUALIFIER;
     qualifier.qualifiers.push_back(abi_mangle::ABI_FUNCTION_QUALIFIER_CONST);
+    records.push_back(qualifier);
+  }
+  if (entity.is_member && entity.member_volatile)
+  {
+    abi_mangle::AbiFunctionRecord qualifier;
+    qualifier.kind = abi_mangle::ABI_FUNCTION_RECORD_QUALIFIER;
+    qualifier.qualifiers.push_back(abi_mangle::ABI_FUNCTION_QUALIFIER_VOLATILE);
     records.push_back(qualifier);
   }
   for (std::size_t i = 0; i < type.parameters.size(); ++i) {

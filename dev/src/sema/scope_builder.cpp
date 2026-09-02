@@ -12,6 +12,32 @@
 using std::string;
 using std::vector;
 
+namespace
+{
+
+bool IsOverloadedOperatorName(const string& name)
+{
+  static const char* const suffixes[] = {
+    "new", "new[]", "delete", "delete[]", "+", "-", "*", "/", "%",
+    "^", "&", "|", "~", "!", "=", "<", ">", "+=", "-=", "*=",
+    "/=", "%=", "^=", "&=", "|=", "<<", ">>", "<<=", ">>=", "==",
+    "!=", "<=", ">=", "&&", "||", "++", "--", ",", "->*", "->", "()",
+    "[]"
+  };
+  const string prefix = "operator";
+  if (name.compare(0, prefix.size(), prefix) != 0)
+    return false;
+  const string suffix = name.substr(prefix.size());
+  if (suffix.compare(0, 2, "\"\"") == 0)
+    return true;
+  for (std::size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i)
+    if (suffix == suffixes[i])
+      return true;
+  return false;
+}
+
+}  // namespace
+
 void ScopeBuilder::Build(AstId root)
 {
   if (root == 0)
@@ -438,8 +464,12 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     // 8.3p1: a qualified declarator-id declares in the named scope and its
     // declarator is resolved there.
     string name;
-    const ScopeId target_scope = ResolveDeclarationScope(
-        scope, FindIdentifier(declarator), name);
+    const AstId identifier = FindIdentifier(declarator);
+    const QualifiedName declared_name = NodeName(identifier);
+    ScopeId target_scope = ResolveDeclarationScope(scope, identifier, name);
+    const bool is_friend = SequenceHasKeyword(specifiers, KW_FRIEND);
+    if (is_friend && !declared_name.Qualified())
+      target_scope = EnclosingNamespace(scope);
     const AstId initializer = FindChild(items[i], AST_INITIALIZER);
     const std::size_t incomplete_bound =
         HasIncompleteArray(declarator) && initializer == 0 &&
@@ -447,7 +477,7 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
             std::numeric_limits<std::size_t>::max() :
             (HasIncompleteArray(declarator) ? InitializerBound(initializer) : 0);
     TypeId type = BuildDeclaratorType(
-        declarator, base, target_scope, false,
+        declarator, base, is_friend ? scope : target_scope, false,
         incomplete_bound);
     const bool is_function = types_.Kind(type) == TYPE_FUNCTION;
     ClassEntityId member_class = 0;
@@ -471,11 +501,23 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
       for (std::size_t parameter = 0; parameter < parameters.size();
            ++parameter)
         default_arguments.push_back(parameters[parameter].default_initializer);
+      const bool had_visible_declaration = [&]() {
+        std::vector<BindingId> visible;
+        model_.DirectBindings(target_scope, name, LOOKUP_FUNCTIONS, visible);
+        return !visible.empty();
+      }();
       const FunctionEntityId function = DeclareFunction(
           target_scope, name, type, false, binding,
           HasConstFunctionQualifier(declarator),
+          HasVolatileFunctionQualifier(declarator),
           SequenceHasKeyword(specifiers, KW_STATIC),
           IsNoThrowDeclarator(declarator, target_scope), default_arguments);
+      if (is_friend && !had_visible_declaration &&
+          model_.ClassForScope(scope, member_class))
+      {
+        model_.BindingAt(binding).hidden_friend = true;
+        model_.ClassAt(member_class).hidden_friends.push_back(binding);
+      }
       if (EmitsSemantics() && !is_member)
         MakeSemantic(SEMA_FUNCTION_DECLARATION, target_scope,
                      declaration_node != 0 ? declaration_node :
@@ -632,10 +674,15 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   if (specifiers == 0 || declarator == 0 || body == 0)
     throw std::runtime_error("invalid function definition");
   string name;
-  const ScopeId target_scope = ResolveDeclarationScope(
-      scope, FindIdentifier(declarator), name);
-  const TypeId base = BuildSpecifierType(specifiers, target_scope);
-  const TypeId type = BuildDeclaratorType(declarator, base, target_scope);
+  const AstId identifier = FindIdentifier(declarator);
+  const QualifiedName declared_name = NodeName(identifier);
+  ScopeId target_scope = ResolveDeclarationScope(scope, identifier, name);
+  const bool is_friend = SequenceHasKeyword(specifiers, KW_FRIEND);
+  if (is_friend && !declared_name.Qualified())
+    target_scope = EnclosingNamespace(scope);
+  const ScopeId type_scope = is_friend ? scope : target_scope;
+  const TypeId base = BuildSpecifierType(specifiers, type_scope);
+  const TypeId type = BuildDeclaratorType(declarator, base, type_scope);
   if (types_.Kind(type) != TYPE_FUNCTION)
     throw std::runtime_error("function definition is not a function");
   BindingId binding = 0;
@@ -643,13 +690,14 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   bool variadic = false;
   const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
   if (clause != 0)
-    BuildParameters(clause, target_scope, parameters, variadic);
+    BuildParameters(clause, type_scope, parameters, variadic);
   vector<AstId> default_arguments;
   for (std::size_t parameter = 0; parameter < parameters.size(); ++parameter)
     default_arguments.push_back(parameters[parameter].default_initializer);
   const FunctionEntityId function = DeclareFunction(
       target_scope, name, type, true, binding,
       HasConstFunctionQualifier(declarator),
+      HasVolatileFunctionQualifier(declarator),
       SequenceHasKeyword(specifiers, KW_STATIC),
       IsNoThrowDeclarator(declarator, target_scope), default_arguments);
   ClassEntityId member_class = 0;
@@ -660,8 +708,26 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   // In-class definitions and explicitly inline out-of-class definitions
   // have weak ODR linkage in LowIR.  The same bit also tells lowering that
   // an unused inline body may be omitted.
-  model_.FunctionAt(function).in_class_definition = is_member &&
-      (scope == target_scope || SequenceHasKeyword(specifiers, KW_INLINE));
+  model_.FunctionAt(function).in_class_definition = is_friend ||
+      (is_member &&
+       (scope == target_scope || SequenceHasKeyword(specifiers, KW_INLINE)));
+  if (is_friend && !declared_name.Qualified() &&
+      model_.ClassForScope(scope, member_class))
+  {
+    bool had_visible_declaration = false;
+    std::vector<BindingId> visible;
+    model_.DirectBindings(target_scope, name, LOOKUP_FUNCTIONS, visible);
+    // The declaration just added is the only entry when this is a hidden
+    // friend.  A prior namespace-scope declaration keeps the friend visible
+    // through ordinary lookup.
+    for (std::size_t i = 0; i < visible.size(); ++i)
+      if (visible[i] != binding)
+        had_visible_declaration = true;
+    if (!had_visible_declaration) {
+      model_.BindingAt(binding).hidden_friend = true;
+      model_.ClassAt(member_class).hidden_friends.push_back(binding);
+    }
+  }
   SemaId function_node = 0;
   if (EmitsSemantics())
   {
@@ -678,7 +744,7 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
           binding, function);
   }
   const ScopeId function_scope = model_.CreateScope(
-      SCOPE_FUNCTION, name, target_scope);
+      SCOPE_FUNCTION, name, is_friend ? scope : target_scope);
   if (function_node != 0)
     MapSemanticScope(function_scope, function_node);
 
@@ -777,6 +843,7 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
     return result;
   }();
   const bool member_const = HasConstFunctionQualifier(declarator);
+  const bool member_volatile = HasVolatileFunctionQualifier(declarator);
   const TypeId declared_type = types_.Function(
       types_.Fundamental(FT_VOID), parameter_types, variadic, member_const);
   std::vector<AstId> defaults;
@@ -794,6 +861,7 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
       AST_SPECIAL_MEMBER_DEFINITION || defaulted;
   const FunctionEntityId function = DeclareFunction(
       scope, name, declared_type, definition, binding, member_const,
+      member_volatile,
       false, IsNoThrowDeclarator(declarator, scope), defaults);
   if (binding == 0)
     throw std::runtime_error("special member has no binding");
@@ -919,9 +987,13 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
   for (std::size_t i = 0; i < arguments.size(); ++i)
   {
     const SemaNode& argument = tree_->At(arguments[i]);
+    const bool null_pointer_constant =
+        types_.IsNullPointerType(argument.type) ||
+        (argument.has_value && argument.value == 0 &&
+         types_.IsIntegral(argument.type));
     overload_arguments.push_back(OverloadArgument(
         argument.type, argument.category,
-        types_.IsNullPointerType(argument.type),
+        null_pointer_constant,
         argument.kind == SEMA_ID_EXPRESSION &&
             types_.Kind(types_.Unqualified(argument.type)) == TYPE_FUNCTION));
   }
@@ -931,6 +1003,12 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
     throw std::runtime_error("no viable constructor");
   (void)scope;
   return selected;
+}
+
+FunctionEntityId ScopeBuilder::ResolveConstructorForExpression(
+    TypeId type, const std::vector<SemaId>& arguments, ScopeId scope)
+{
+  return ResolveConstructor(type, arguments, scope);
 }
 
 void ScopeBuilder::BuildMemberInitializers(AstId initializer,
@@ -1836,6 +1914,17 @@ ScopeId ScopeBuilder::ResolveDeclarationScope(ScopeId scope, AstId identifier,
       ResolveQualifierScope(scope, components.Prefix()) : scope;
 }
 
+ScopeId ScopeBuilder::EnclosingNamespace(ScopeId scope) const
+{
+  ScopeId current = scope;
+  while (model_.ScopeAt(current).kind != SCOPE_NAMESPACE) {
+    if (current == model_.GlobalScope())
+      return current;
+    current = model_.ScopeAt(current).parent;
+  }
+  return current;
+}
+
 ScopeId ScopeBuilder::ResolveNamespace(ScopeId scope, AstId target) const
 {
   const BindingId binding = model_.Lookup(scope, NodeName(target),
@@ -1980,6 +2069,26 @@ bool ScopeBuilder::HasConstFunctionQualifier(AstId declarator) const
     else if (have_parameters && value.kind == AST_CV_QUALIFIER &&
              value.first < tokens_.size() &&
              tokens_[value.first].IsSimple(KW_CONST))
+      return true;
+  }
+  return false;
+}
+
+bool ScopeBuilder::HasVolatileFunctionQualifier(AstId declarator) const
+{
+  if (declarator == 0)
+    return false;
+  const AstNode& node = arena_.At(declarator);
+  bool have_parameters = false;
+  for (std::size_t i = 0; i < node.children.size(); ++i)
+  {
+    const AstId child = node.children[i];
+    const AstNode& value = arena_.At(child);
+    if (value.kind == AST_PARAMETER_CLAUSE)
+      have_parameters = true;
+    else if (have_parameters && value.kind == AST_CV_QUALIFIER &&
+             value.first < tokens_.size() &&
+             tokens_[value.first].IsSimple(KW_VOLATILE))
       return true;
   }
   return false;
@@ -2429,6 +2538,7 @@ bool ScopeBuilder::BuildTemplateInstance(FunctionEntityId template_function,
   concrete.is_member = source.is_member;
   concrete.member_class = source.member_class;
   concrete.member_const = source.member_const;
+  concrete.member_volatile = source.member_volatile;
   concrete.member_type = source.member_type == 0 ? 0 :
       SubstituteTemplateType(source.member_type, values);
   if (concrete.member_type != 0)
@@ -2527,6 +2637,7 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
                                                bool definition,
                                                BindingId& binding,
                                                bool member_const,
+                                               bool member_volatile,
                                                bool internal_linkage,
                                                bool noexcept_qualifier,
                                                const vector<AstId>&
@@ -2544,6 +2655,39 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     parameters.push_back(types_.AdjustParameter(declared.parameters[i]));
   ClassEntityId member_class = 0;
   const bool is_member = model_.ClassForScope(scope, member_class);
+  // 13.5p3: an overloaded non-member operator must have at least one
+  // class-or-enumeration parameter.  Allocation/deallocation functions and
+  // literal operators are the language-defined exceptions; they are
+  // ordinary namespace functions even though their names begin with
+  // `operator`.
+  const bool operator_name = IsOverloadedOperatorName(name);
+  const bool literal_operator = name.compare(
+      0, std::string("operator\"\"").size(), "operator\"\"") == 0;
+  const bool allocation_operator = name == "operatornew" ||
+      name == "operatordelete" || name == "operatornew[]" ||
+      name == "operatordelete[]";
+  if (operator_name && !is_member && !literal_operator &&
+      !allocation_operator)
+  {
+    bool has_class_or_enum_parameter = false;
+    for (std::size_t parameter = 0; parameter < parameters.size();
+         ++parameter)
+    {
+      TypeId candidate = parameters[parameter];
+      if (types_.Kind(candidate) == TYPE_REFERENCE)
+        candidate = types_.Referent(candidate);
+      candidate = types_.Unqualified(candidate);
+      if (types_.Kind(candidate) == TYPE_CLASS ||
+          types_.Kind(candidate) == TYPE_ENUM)
+      {
+        has_class_or_enum_parameter = true;
+        break;
+      }
+    }
+    if (!has_class_or_enum_parameter)
+      throw std::runtime_error(
+          "non-member overloaded operator needs a class or enum parameter");
+  }
   // For a class member the declaration's existing `static` linkage fact is
   // also the canonical fact that no implicit object parameter is present.
   const bool static_member = is_member && internal_linkage;
@@ -2560,7 +2704,9 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     if (!static_member)
     {
       const TypeId this_type = types_.Pointer(
-          member_const ? types_.Cv(class_type, true) : class_type);
+          (member_const || member_volatile) ?
+              types_.Cv(class_type, member_const, member_volatile) :
+              class_type);
       canonical_parameters.insert(canonical_parameters.begin(), this_type);
     }
   }
@@ -2574,7 +2720,11 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
   // 13.1/3.3.10: a prior declaration of the name in this scope with the
   // same canonical signature declares the same function.
   vector<BindingId> priors;
-  model_.DirectBindings(scope, name, LOOKUP_ANY, priors);
+  // A later friend declaration must still redeclare the canonical namespace
+  // function entity even though hidden friends are excluded from ordinary
+  // lookup.  Declaration matching opts into that private visibility bit.
+  model_.DirectBindings(scope, name, LOOKUP_ANY | LOOKUP_HIDDEN_FRIENDS,
+                        priors);
   for (std::size_t i = 0; i < priors.size(); ++i)
   {
     const Binding& prior = model_.BindingAt(priors[i]);
@@ -2609,6 +2759,7 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
         entity.is_member = true;
         entity.static_member = static_member;
         entity.member_const = member_const;
+        entity.member_volatile = member_volatile;
       }
       entity.internal_linkage = entity.internal_linkage ||
           effective_internal_linkage;
@@ -2647,6 +2798,7 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     entity.is_member = true;
     entity.static_member = static_member;
     entity.member_const = member_const;
+    entity.member_volatile = member_volatile;
   }
   model_.FunctionAt(function).noexcept_qualifier = noexcept_qualifier;
   model_.FunctionAt(function).default_arguments = canonical_defaults;

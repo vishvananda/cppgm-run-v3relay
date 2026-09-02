@@ -149,6 +149,7 @@ private:
   };
 
   // Symbols.
+  void CollectTemporaryConstructorUses(SemaId node);
   void CollectSymbols(SemaId node);
   void CollectReferencedFunctions(SemaId node,
                                   std::set<FunctionEntityId>& result) const;
@@ -224,11 +225,13 @@ private:
   // Expressions and conversions.
   Value LowerRValue(SemaId node, TypeId expected = 0);
   Value LowerLValue(SemaId node);
+  Value LowerConstructorTemporary(SemaId node);
   Value LowerLiteral(SemaId node, const SemaNode& value, TypeId expected);
   Value LowerArrayDecay(SemaId node);
   Value LowerSubscript(SemaId node, bool lvalue);
   Value LowerConditionalLValue(SemaId node);
   Value LowerReferenceArgument(SemaId node, TypeId parameter);
+  void ProjectDerivedReference(Value& value, TypeId source, TypeId target);
   Value LoadValue(const Value& lvalue);
   Value AddressValue(const Value& lvalue);
   Value Convert(Value value, TypeId target);
@@ -334,6 +337,7 @@ private:
   // Unit-level symbol state.
   std::map<FunctionEntityId, FunctionSymbol> functions_;
   std::vector<FunctionEntityId> function_order_;
+  std::set<FunctionEntityId> temporary_constructors_;
   std::set<FunctionEntityId> referenced_functions_;
   std::map<BindingId, GlobalSymbol> globals_;
   std::vector<BindingId> global_order_;
@@ -346,6 +350,9 @@ private:
   std::set<std::string> block_labels_;
   std::set<std::string> slot_names_;
   std::map<BindingId, std::string> slots_;
+  std::map<SemaId, std::string> temporary_slots_;
+  std::map<SemaId, lowir_model::Operand> temporary_addresses_;
+  std::set<SemaId> constructed_temporaries_;
   std::vector<std::string> goto_labels_; // indexed by label ordinal
   std::map<SemaId, std::string> condition_labels_;
   const std::map<SemaId, std::string>* active_switch_labels_;

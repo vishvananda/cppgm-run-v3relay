@@ -1651,6 +1651,19 @@ AstId Pa10Parser::parse_qualified_name()
 	while (consume_simple(OP_COLON2))
 	{
 		(void)consume_simple(KW_TEMPLATE);
+		// An operator-function-id is a valid final component of a
+		// qualified declarator-id (`Box::operator!`).  It is tokenized with
+		// `operator` as a keyword, so it cannot go through the ordinary
+		// identifier branch below.
+		if (is_simple(KW_OPERATOR))
+		{
+			if (parse_operator_function_id() == 0)
+			{
+				restore(saved);
+				return 0;
+			}
+			break;
+		}
 		if (!is_kind(PA6_IDENTIFIER_TOKEN))
 		{
 			restore(saved);

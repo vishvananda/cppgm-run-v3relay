@@ -5,14 +5,79 @@
 namespace
 {
 
+bool ConversionTargetClass(const TypeTable& types, TypeId type,
+                           ClassEntityId& entity)
+{
+  if (type == 0)
+    return false;
+  if (types.Kind(type) == TYPE_REFERENCE)
+    type = types.Referent(type);
+  type = types.Unqualified(type);
+  if (types.Kind(type) == TYPE_POINTER)
+    type = types.Unqualified(types.At(type).base);
+  if (types.Kind(type) != TYPE_CLASS)
+    return false;
+  entity = static_cast<ClassEntityId>(types.At(type).entity);
+  return entity != 0;
+}
+
+// The standard conversion rank alone leaves two derived-to-base sequences
+// tied.  [over.ics.rank] then prefers the nearer base; for pointer targets,
+// a class-base conversion is also better than the competing conversion to
+// void.  The endpoint metadata is attached while candidates are classified.
+ConversionComparison CompareOverloadConversion(
+    const SemaModel& model, const TypeTable& types,
+    const ImplicitConversion& left, const ImplicitConversion& right)
+{
+  // A member operator's implicit object is represented as the canonical
+  // pointer parameter, while a non-member candidate consumes the same
+  // source expression through an ordinary reference parameter.  Reference
+  // binding sub-ranks do not compare those two parameter kinds; the member
+  // object's cv conversion still participates through rank/qualification.
+  ImplicitConversion comparable_left = left;
+  ImplicitConversion comparable_right = right;
+  if (left.implicit_object || right.implicit_object) {
+    comparable_left.reference = REFERENCE_NONE;
+    comparable_right.reference = REFERENCE_NONE;
+    comparable_left.rvalue_ref_to_rvalue = false;
+    comparable_right.rvalue_ref_to_rvalue = false;
+    comparable_left.function_lvalue_to_lvalue_ref = false;
+    comparable_right.function_lvalue_to_lvalue_ref = false;
+  }
+  const ConversionComparison standard = Compare(comparable_left,
+                                                comparable_right);
+  if (standard != CONVERSION_EQUAL)
+    return standard;
+  const bool left_base = left.kind == CONV_DERIVED_TO_BASE;
+  const bool right_base = right.kind == CONV_DERIVED_TO_BASE;
+  if (left_base != right_base)
+    return left_base ? CONVERSION_BETTER : CONVERSION_WORSE;
+
+  ClassEntityId left_target = 0;
+  ClassEntityId right_target = 0;
+  if (!ConversionTargetClass(types, left.target_type, left_target) ||
+      !ConversionTargetClass(types, right.target_type, right_target) ||
+      left_target == right_target)
+    return CONVERSION_EQUAL;
+  if (model.IsDerivedFrom(left_target, right_target) &&
+      !model.IsDerivedFrom(right_target, left_target))
+    return CONVERSION_BETTER;
+  if (model.IsDerivedFrom(right_target, left_target) &&
+      !model.IsDerivedFrom(left_target, right_target))
+    return CONVERSION_WORSE;
+  return CONVERSION_EQUAL;
+}
+
 // 13.3.3p1: better on no argument worse and at least one strictly better.
-bool BetterThan(const std::vector<ImplicitConversion>& left,
+bool BetterThan(const SemaModel& model, const TypeTable& types,
+                const std::vector<ImplicitConversion>& left,
                 const std::vector<ImplicitConversion>& right)
 {
   bool strict = false;
   for (std::size_t i = 0; i < left.size(); ++i)
   {
-    const ConversionComparison comparison = Compare(left[i], right[i]);
+    const ConversionComparison comparison = CompareOverloadConversion(
+        model, types, left[i], right[i]);
     if (comparison == CONVERSION_WORSE)
       return false;
     if (comparison == CONVERSION_BETTER)
@@ -166,9 +231,12 @@ FunctionEntityId SelectBestOverload(
     if (member_object)
     {
       const OverloadArgument& object = arguments[0];
-      const ImplicitConversion conversion = Classify(
-          types, object.type, object.category, object.is_null_literal,
+      ImplicitConversion conversion = Classify(
+          model, types, object.type, object.category, object.is_null_literal,
           object.is_function_lvalue, function.parameters[0]);
+      conversion.source_type = object.type;
+      conversion.target_type = function.parameters[0];
+      conversion.implicit_object = object.is_implicit_object;
       if (!conversion.Viable())
         viable_candidate = false;
       else
@@ -206,14 +274,19 @@ FunctionEntityId SelectBestOverload(
         source_category = VC_LVALUE;
         function_lvalue = true;
       }
-      const ImplicitConversion conversion = Classify(
-          types, source_type, source_category, source.is_null_literal,
+      ImplicitConversion conversion = Classify(
+          model, types, source_type, source_category, source.is_null_literal,
           function_lvalue, parameter_type);
+      conversion.source_type = source_type;
+      conversion.target_type = parameter_type;
+      conversion.implicit_object = source.is_implicit_object;
       if (!conversion.Viable())
       {
         viable_candidate = false;
         break;
       }
+      if (source.user_defined_conversion)
+        conversion.rank = RANK_CONVERSION;
       candidate.conversions.push_back(conversion);
     }
     if (viable_candidate)
@@ -227,11 +300,119 @@ FunctionEntityId SelectBestOverload(
   // then confirmation that it beats every other one.
   std::size_t best = 0;
   for (std::size_t i = 1; i < viable.size(); ++i)
-    if (BetterThan(viable[i].conversions, viable[best].conversions))
+    if (BetterThan(model, types, viable[i].conversions,
+                   viable[best].conversions))
       best = i;
   for (std::size_t i = 0; i < viable.size(); ++i)
     if (i != best &&
-        !BetterThan(viable[best].conversions, viable[i].conversions))
+        !BetterThan(model, types, viable[best].conversions,
+                    viable[i].conversions))
+      return 0;
+  return viable[best].function;
+}
+
+FunctionEntityId SelectBestOverloadCandidates(
+    const SemaModel& model, TypeTable& types,
+    const std::vector<OverloadCandidate>& candidates)
+{
+  struct RankedCandidate
+  {
+    FunctionEntityId function;
+    std::vector<ImplicitConversion> conversions;
+  };
+
+  std::vector<RankedCandidate> viable;
+  std::vector<FunctionEntityId> seen;
+  for (std::size_t i = 0; i < candidates.size(); ++i)
+  {
+    const FunctionEntityId id = candidates[i].function;
+    if (id == 0 ||
+        std::find(seen.begin(), seen.end(), id) != seen.end())
+      continue;
+    seen.push_back(id);
+    const FunctionEntity& entity = model.FunctionAt(id);
+    if (entity.is_template)
+      continue;
+    const TypeId function_type = entity.type;
+    if (types.Kind(types.Unqualified(function_type)) != TYPE_FUNCTION)
+      continue;
+    const TypeNode& function = types.At(types.Unqualified(function_type));
+    const std::vector<OverloadArgument>& arguments = candidates[i].arguments;
+    std::size_t required = function.parameters.size();
+    while (required > 0 && required <= entity.default_arguments.size() &&
+           entity.default_arguments[required - 1] != 0)
+      --required;
+    if (arguments.size() < required ||
+        (!function.variadic && arguments.size() > function.parameters.size()))
+      continue;
+
+    RankedCandidate ranked;
+    ranked.function = id;
+    ranked.conversions.reserve(arguments.size());
+    bool viable_candidate = true;
+    for (std::size_t argument = 0;
+         argument < arguments.size() && viable_candidate; ++argument)
+    {
+      if (argument >= function.parameters.size())
+      {
+        ImplicitConversion ellipsis;
+        ellipsis.rank = RANK_ELLIPSIS;
+        ranked.conversions.push_back(ellipsis);
+        continue;
+      }
+      const OverloadArgument& source = arguments[argument];
+      const TypeId parameter_type = function.parameters[argument];
+      TypeId source_type = source.type;
+      ValueCategory source_category = source.category;
+      bool function_lvalue = source.is_function_lvalue;
+      TypeId target_function = 0;
+      if (!source.function_candidates.empty() &&
+          TargetFunctionType(types, parameter_type, target_function))
+      {
+        const FunctionEntityId matched = MatchFunctionArgument(
+            model, source.function_candidates, target_function);
+        if (matched == 0)
+        {
+          viable_candidate = false;
+          break;
+        }
+        source_type = model.FunctionAt(matched).type;
+        source_category = VC_LVALUE;
+        function_lvalue = true;
+      }
+      ImplicitConversion conversion = Classify(
+          model, types, source_type, source_category, source.is_null_literal,
+          function_lvalue, parameter_type);
+      conversion.source_type = source_type;
+      conversion.target_type = parameter_type;
+      conversion.implicit_object = source.is_implicit_object;
+      if (!conversion.Viable())
+      {
+        viable_candidate = false;
+        break;
+      }
+      if (source.user_defined_conversion)
+        conversion.rank = RANK_CONVERSION;
+      ranked.conversions.push_back(conversion);
+    }
+    if (viable_candidate)
+      viable.push_back(ranked);
+  }
+  if (viable.empty())
+    return 0;
+
+  std::size_t best = 0;
+  for (std::size_t i = 1; i < viable.size(); ++i)
+  {
+    const bool better = BetterThan(model, types, viable[i].conversions,
+                                   viable[best].conversions);
+    if (better)
+      best = i;
+  }
+  for (std::size_t i = 0; i < viable.size(); ++i)
+    if (i != best &&
+        !BetterThan(model, types, viable[best].conversions,
+                    viable[i].conversions))
       return 0;
   return viable[best].function;
 }

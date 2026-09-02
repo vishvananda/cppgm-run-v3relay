@@ -7,7 +7,8 @@ Binding::Binding()
     : kind(BINDING_VARIABLE), type(0), scope(0), namespace_scope(0),
       function(0), object_binding(0),
       internal_linkage(false), c_linkage(false), extern_declaration(false),
-      noexcept_qualifier(false), access(ACCESS_PUBLIC), static_member(false),
+      hidden_friend(false), noexcept_qualifier(false), access(ACCESS_PUBLIC),
+      static_member(false),
       bit_field(false), bit_width(0), redeclared_binding(0),
       has_const_value(false), const_value(0)
 {
@@ -36,6 +37,7 @@ EnumEntity::EnumEntity()
 FunctionEntity::FunctionEntity()
     : scope(0), type(0), member_type(0), member_pointer_type(0),
       member_class(0), is_member(false), member_const(false),
+      member_volatile(false),
       is_template(false), internal_linkage(false), c_linkage(false),
       noexcept_qualifier(false), special_member(SPECIAL_MEMBER_NONE),
       body(0), ctor_initializer(0), parameter_names(), defaulted(false),
@@ -182,6 +184,8 @@ const Binding& SemaModel::BindingAt(BindingId id) const
 
 bool SemaModel::Matches(const Binding& binding, unsigned filter)
 {
+  if (binding.hidden_friend && (filter & LOOKUP_HIDDEN_FRIENDS) == 0)
+    return false;
   switch (binding.kind)
   {
   case BINDING_TYPE: case BINDING_TYPE_ALIAS:
@@ -348,6 +352,26 @@ BindingId SemaModel::LookupUnqualified(ScopeId scope, const std::string& name,
 
 BindingId SemaModel::LookupTypeName(ScopeId scope, const std::string& name) const
 {
+  // The injected-class-name is a type even though a constructor of the same
+  // spelling is declared in the class scope.  Ordinary type lookup must
+  // therefore skip that constructor and recover the class binding from its
+  // declaring scope (`struct Base { Base& f(); };`).
+  ScopeId current = scope;
+  while (current < scopes_.size() &&
+         scopes_[current].kind == SCOPE_TEMPLATE_PARAMETERS)
+    current = scopes_[current].parent;
+  if (current < scopes_.size() && scopes_[current].kind == SCOPE_CLASS &&
+      scopes_[current].class_entity != 0)
+  {
+    const ClassEntity& owner = classes_[scopes_[current].class_entity];
+    const TypeNode& class_type = types_.At(types_.Unqualified(owner.type));
+    std::string injected_name = scopes_[current].name;
+    const std::size_t separator = injected_name.rfind("::");
+    if (separator != std::string::npos)
+      injected_name = injected_name.substr(separator + 2);
+    if (class_type.kind == TYPE_CLASS && injected_name == name)
+      return LookupTypeName(scopes_[current].parent, name);
+  }
   std::vector<BindingId> found;
   const ScopeId level = WalkUnqualified(scope, name, LOOKUP_TYPES, true,
                                         found);
@@ -373,6 +397,31 @@ bool SemaModel::ScopeOfType(TypeId type, ScopeId& scope) const
       return false;
     scope = entity.enum_scope;
     return true;
+  }
+  return false;
+}
+
+bool SemaModel::IsDerivedFrom(ClassEntityId derived, ClassEntityId base) const
+{
+  if (derived == 0 || base == 0 || derived == base ||
+      derived >= classes_.size() || base >= classes_.size())
+    return false;
+  std::vector<ClassEntityId> pending(1, derived);
+  std::vector<ClassEntityId> visited;
+  while (!pending.empty())
+  {
+    const ClassEntityId current = pending.back();
+    pending.pop_back();
+    if (std::find(visited.begin(), visited.end(), current) != visited.end())
+      continue;
+    visited.push_back(current);
+    const ClassEntity& owner = classes_[current];
+    for (std::size_t i = 0; i < owner.bases.size(); ++i)
+    {
+      if (owner.bases[i].entity == base)
+        return true;
+      pending.push_back(owner.bases[i].entity);
+    }
   }
   return false;
 }
@@ -405,6 +454,192 @@ void SemaModel::LookupMember(ClassEntityId entity, const std::string& name,
   result.clear();
   std::vector<ClassEntityId> visited;
   CollectClassMember(entity, name, filter, visited, result);
+}
+
+void SemaModel::AddAssociatedNamespace(
+    ScopeId scope, std::vector<ScopeId>& namespaces) const
+{
+  if (scope >= scopes_.size())
+    return;
+  ScopeId current = scope;
+  // The associated namespace of a class or enumeration is its innermost
+  // enclosing namespace.  Do not climb namespace parents: ADL deliberately
+  // does not turn `a::b::T` into an argument associated with all of `a`.
+  while (current != GlobalScope())
+  {
+    const Scope& owner = scopes_[current];
+    if (owner.kind == SCOPE_NAMESPACE)
+    {
+      if (std::find(namespaces.begin(), namespaces.end(), current) ==
+          namespaces.end())
+        namespaces.push_back(current);
+      return;
+    }
+    current = owner.parent;
+  }
+  if (std::find(namespaces.begin(), namespaces.end(), GlobalScope()) ==
+      namespaces.end())
+    namespaces.push_back(GlobalScope());
+}
+
+void SemaModel::CollectAssociatedClass(
+    ClassEntityId entity, std::vector<ScopeId>& namespaces,
+    std::vector<ClassEntityId>& classes) const
+{
+  if (entity == 0 || entity >= classes_.size() ||
+      std::find(classes.begin(), classes.end(), entity) != classes.end())
+    return;
+  classes.push_back(entity);
+  const ClassEntity& owner = classes_[entity];
+  if (owner.class_scope != 0)
+  {
+    ScopeId current = owner.class_scope;
+    while (current != GlobalScope())
+    {
+      const Scope& scope = scopes_[current];
+      if (scope.kind == SCOPE_CLASS && scope.class_entity != 0)
+        CollectAssociatedClass(scope.class_entity, namespaces, classes);
+      current = scope.parent;
+    }
+    AddAssociatedNamespace(owner.class_scope, namespaces);
+  }
+  for (std::size_t i = 0; i < owner.bases.size(); ++i)
+    CollectAssociatedClass(owner.bases[i].entity, namespaces, classes);
+}
+
+void SemaModel::CollectAssociated(
+    TypeId type, std::vector<ScopeId>& namespaces,
+    std::vector<ClassEntityId>& classes,
+    std::vector<TypeId>& visited_types) const
+{
+  if (type == 0 ||
+      std::find(visited_types.begin(), visited_types.end(), type) !=
+          visited_types.end())
+    return;
+  visited_types.push_back(type);
+  const TypeNode& node = types_.At(type);
+  switch (node.kind)
+  {
+  case TYPE_CV: case TYPE_REFERENCE: case TYPE_ARRAY:
+    CollectAssociated(node.base, namespaces, classes, visited_types);
+    return;
+  case TYPE_POINTER:
+    // Pointers associate the pointed-to type as well as their own built-in
+    // representation (which contributes no namespace of its own).
+    CollectAssociated(node.base, namespaces, classes, visited_types);
+    return;
+  case TYPE_FUNCTION:
+    CollectAssociated(node.result, namespaces, classes, visited_types);
+    for (std::size_t i = 0; i < node.parameters.size(); ++i)
+      CollectAssociated(node.parameters[i], namespaces, classes,
+                        visited_types);
+    return;
+  case TYPE_MEMBER_POINTER:
+    CollectAssociated(node.member_class, namespaces, classes, visited_types);
+    CollectAssociated(node.base, namespaces, classes, visited_types);
+    return;
+  case TYPE_CLASS:
+    CollectAssociatedClass(static_cast<ClassEntityId>(node.entity),
+                           namespaces, classes);
+    return;
+  case TYPE_ENUM:
+    if (node.entity == 0 || node.entity >= enums_.size())
+      return;
+    {
+      const EnumEntity& enum_entity = enums_[node.entity];
+      if (enum_entity.enum_scope != 0)
+      {
+        const Scope& enum_scope = scopes_[enum_entity.enum_scope];
+        if (enum_scope.kind == SCOPE_ENUM &&
+            enum_scope.parent < scopes_.size() &&
+            scopes_[enum_scope.parent].kind == SCOPE_CLASS &&
+            scopes_[enum_scope.parent].class_entity != 0)
+          CollectAssociatedClass(scopes_[enum_scope.parent].class_entity,
+                                 namespaces, classes);
+        else if (enum_scope.kind == SCOPE_CLASS &&
+                 enum_scope.class_entity != 0)
+          CollectAssociatedClass(enum_scope.class_entity, namespaces, classes);
+        else
+          AddAssociatedNamespace(enum_entity.enum_scope, namespaces);
+      }
+    }
+    return;
+  case TYPE_FUNDAMENTAL: case TYPE_TEMPLATE_PARAM: case TYPE_INVALID:
+    return;
+  }
+}
+
+void SemaModel::CollectAssociatedNamespace(
+    ScopeId scope, const std::string& name, unsigned filter,
+    std::vector<ScopeId>& visited,
+    std::vector<BindingId>& result) const
+{
+  if (scope >= scopes_.size() ||
+      std::find(visited.begin(), visited.end(), scope) != visited.end())
+    return;
+  visited.push_back(scope);
+  DirectBindings(scope, name, filter, result);
+  const Scope& owner = scopes_[scope];
+  if (owner.inline_namespace && owner.parent < scopes_.size() &&
+      scopes_[owner.parent].kind == SCOPE_NAMESPACE)
+    CollectAssociatedNamespace(owner.parent, name, filter, visited, result);
+  for (std::size_t i = 0; i < owner.inline_namespaces.size(); ++i)
+    CollectAssociatedNamespace(owner.inline_namespaces[i], name, filter,
+                               visited, result);
+}
+
+void SemaModel::LookupCallSet(
+    ScopeId scope, const std::string& name,
+    const std::vector<TypeId>& argument_types,
+    std::vector<BindingId>& result) const
+{
+  result.clear();
+  std::vector<BindingId> ordinary;
+  LookupSet(scope, name, LOOKUP_FUNCTIONS, ordinary);
+  result.insert(result.end(), ordinary.begin(), ordinary.end());
+
+  std::vector<ScopeId> namespaces;
+  std::vector<ClassEntityId> classes;
+  std::vector<TypeId> visited_types;
+  for (std::size_t i = 0; i < argument_types.size(); ++i)
+    CollectAssociated(argument_types[i], namespaces, classes, visited_types);
+
+  // ADL searches declarations in associated namespaces.  Using-directives
+  // are deliberately not followed here: a using-declaration creates a
+  // direct binding in the associated namespace, while a using-directive is
+  // ordinary lookup state and must not be imported into ADL.
+  std::vector<ScopeId> visited_namespaces;
+  for (std::size_t i = 0; i < namespaces.size(); ++i)
+  {
+    std::vector<BindingId> found;
+    CollectAssociatedNamespace(namespaces[i], name, LOOKUP_FUNCTIONS,
+                               visited_namespaces, found);
+    for (std::size_t j = 0; j < found.size(); ++j)
+      if (std::find(result.begin(), result.end(), found[j]) == result.end())
+        result.push_back(found[j]);
+  }
+  for (std::size_t i = 0; i < classes.size(); ++i)
+  {
+    const ClassEntity& owner = classes_[classes[i]];
+    for (std::size_t j = 0; j < owner.hidden_friends.size(); ++j)
+    {
+      const BindingId binding = owner.hidden_friends[j];
+      const Binding& value = bindings_[binding];
+      if (value.name != name || value.kind != BINDING_FUNCTION ||
+          !value.hidden_friend ||
+          std::find(result.begin(), result.end(), binding) != result.end())
+        continue;
+      result.push_back(binding);
+    }
+  }
+}
+
+void SemaModel::LookupOperatorSet(
+    ScopeId scope, const std::string& name,
+    const std::vector<TypeId>& argument_types,
+    std::vector<BindingId>& result) const
+{
+  LookupCallSet(scope, name, argument_types, result);
 }
 
 bool SemaModel::NominatedScope(BindingId binding, ScopeId& scope) const

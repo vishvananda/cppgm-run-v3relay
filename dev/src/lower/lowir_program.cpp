@@ -99,6 +99,7 @@ void ProgramLowering::Finish()
 // referenced functions this unit never defines.
 void Lowerer::Run()
 {
+  CollectTemporaryConstructorUses(tree_.Root());
   CollectSymbols(tree_.Root());
   ComputeReferencedFunctions();
   // Deferred in-class definitions are visited in declaration order, while a
@@ -1916,6 +1917,8 @@ void Lowerer::LowerReturn(SemaId node)
     if (result.operand.kind == lowir_model::Operand::OP_SLOT ||
         result.operand.kind == lowir_model::Operand::OP_GLOBAL)
       result = AddressValue(result);
+    ProjectDerivedReference(result, expression.type,
+                            function_return_type_id_);
     result.type = function_return_type_id_;
     if (shared_return_cleanup_)
       EmitSharedReturn(&result);

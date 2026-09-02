@@ -272,7 +272,8 @@ ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
 ImplicitConversion::ImplicitConversion()
     : rank(RANK_NONE), kind(CONV_IDENTITY), qualification(false),
       reference(REFERENCE_NONE), rvalue_ref_to_rvalue(false),
-      function_lvalue_to_lvalue_ref(false)
+      function_lvalue_to_lvalue_ref(false), implicit_object(false),
+      source_type(0), target_type(0)
 {
 }
 
@@ -360,6 +361,107 @@ ImplicitConversion Classify(TypeTable& types, TypeId source,
   }
   return ClassifyValue(types, source, source_category, is_null_literal,
                        target_value);
+}
+
+namespace
+{
+
+bool ClassEntityForType(const TypeTable& types, TypeId type,
+                        ClassEntityId& entity)
+{
+  if (type == 0)
+    return false;
+  if (types.Kind(type) == TYPE_REFERENCE)
+    type = types.Referent(type);
+  type = types.Unqualified(type);
+  if (types.Kind(type) != TYPE_CLASS)
+    return false;
+  entity = static_cast<ClassEntityId>(types.At(type).entity);
+  return entity != 0;
+}
+
+bool CVCompatibleForBase(const TypeTable& types, TypeId source, TypeId target)
+{
+  return !(IsConst(types, source) && !IsConst(types, target)) &&
+      !(IsVolatile(types, source) && !IsVolatile(types, target));
+}
+
+} // namespace
+
+ImplicitConversion Classify(const SemaModel& model, TypeTable& types,
+                            TypeId source, ValueCategory source_category,
+                            bool is_null_literal,
+                            bool is_function_lvalue, TypeId target)
+{
+  const ImplicitConversion standard = Classify(
+      types, source, source_category, is_null_literal,
+      is_function_lvalue, target);
+  if (standard.Viable())
+    return standard;
+
+  const bool target_reference = types.Kind(target) == TYPE_REFERENCE;
+  TypeId source_value = source;
+  if (types.Kind(source_value) == TYPE_REFERENCE)
+    source_value = types.Referent(source_value);
+  TypeId target_value = target_reference ? types.Referent(target) : target;
+
+  ClassEntityId source_class = 0;
+  ClassEntityId target_class = 0;
+  if (ClassEntityForType(types, source_value, source_class) &&
+      ClassEntityForType(types, target_value, target_class) &&
+      model.IsDerivedFrom(source_class, target_class) &&
+      (!target_reference || CVCompatibleForBase(
+          types, source_value, target_value)))
+  {
+    ImplicitConversion result;
+    result.rank = RANK_CONVERSION;
+    result.kind = CONV_DERIVED_TO_BASE;
+    if (target_reference)
+    {
+      const bool target_rvalue = !types.At(target).lvalue_reference;
+      if (target_rvalue) {
+        if (source_category != VC_PRVALUE && source_category != VC_XVALUE)
+          return ImplicitConversion();
+        result.reference = source_category == VC_PRVALUE ?
+            REFERENCE_TEMPORARY : REFERENCE_DIRECT;
+        result.rvalue_ref_to_rvalue = true;
+      } else {
+        if (source_category == VC_LVALUE) {
+          result.reference = REFERENCE_DIRECT;
+        } else if (source_category == VC_PRVALUE ||
+                   source_category == VC_XVALUE) {
+          if (!IsConst(types, target_value) &&
+              !IsVolatile(types, target_value))
+            return ImplicitConversion();
+          result.reference = REFERENCE_TEMPORARY;
+        } else
+          return ImplicitConversion();
+      }
+    }
+    return result;
+  }
+
+  const TypeId source_unqualified = types.Unqualified(source_value);
+  const TypeId target_unqualified = types.Unqualified(target_value);
+  if (types.Kind(source_unqualified) == TYPE_POINTER &&
+      types.Kind(target_unqualified) == TYPE_POINTER)
+  {
+    const TypeId source_pointee = types.At(source_unqualified).base;
+    const TypeId target_pointee = types.At(target_unqualified).base;
+    if (ClassEntityForType(types, source_pointee, source_class) &&
+        ClassEntityForType(types, target_pointee, target_class) &&
+        model.IsDerivedFrom(source_class, target_class) &&
+        CVCompatibleForBase(types, source_pointee, target_pointee))
+    {
+      ImplicitConversion result;
+      result.rank = RANK_CONVERSION;
+      result.kind = CONV_DERIVED_TO_BASE;
+      result.qualification = IsConst(types, target_pointee) &&
+          !IsConst(types, source_pointee);
+      return result;
+    }
+  }
+  return standard;
 }
 
 ConversionComparison Compare(const ImplicitConversion& left,

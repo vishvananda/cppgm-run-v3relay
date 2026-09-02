@@ -48,6 +48,20 @@ bool FindBasePath(const SemaModel& model, ClassEntityId from,
   return false;
 }
 
+bool ClassEntityForType(const TypeTable& types, TypeId type,
+                        ClassEntityId& entity)
+{
+  if (type == 0)
+    return false;
+  if (types.Kind(type) == TYPE_REFERENCE)
+    type = types.Referent(type);
+  type = types.Unqualified(type);
+  if (types.Kind(type) != TYPE_CLASS)
+    return false;
+  entity = static_cast<ClassEntityId>(types.At(type).entity);
+  return entity != 0;
+}
+
 } // namespace
 
 lowir_model::Operand Lowerer::ZeroOperand(TypeId type) const
@@ -173,6 +187,41 @@ Lowerer::Value Lowerer::Convert(Value value, TypeId target)
 {
   if (target == 0 || value.type == 0)
     return value;
+  const TypeId source_unqualified = types_.Unqualified(value.type);
+  const TypeId target_unqualified = types_.Unqualified(target);
+  if (types_.Kind(source_unqualified) == TYPE_POINTER &&
+      types_.Kind(target_unqualified) == TYPE_POINTER)
+  {
+    const TypeId source_pointee = types_.At(source_unqualified).base;
+    const TypeId target_pointee = types_.At(target_unqualified).base;
+    ClassEntityId source_class = 0;
+    ClassEntityId target_class = 0;
+    if (ClassEntityForType(types_, source_pointee, source_class) &&
+        ClassEntityForType(types_, target_pointee, target_class) &&
+        model_.IsDerivedFrom(source_class, target_class))
+    {
+      std::vector<ClassBase> path;
+      std::vector<ClassEntityId> visited;
+      if (!FindBasePath(model_, source_class, target_class, path, visited))
+        Unsupported("a derived pointer without a base path");
+      for (std::size_t i = 0; i < path.size(); ++i)
+      {
+        lowir_model::Instruction projection;
+        projection.kind = lowir_model::Instruction::IK_INDEX;
+        projection.dest = NewTemp();
+        projection.type = I8Type();
+        projection.index_projection = lowir_model::IPK_BASE_SUBOBJECT;
+        projection.first = value.operand;
+        projection.second = Immediate(
+            static_cast<long long>(path[i].offset));
+        Emit(projection);
+        value.operand = TempOperand(projection.dest);
+      }
+      value.type = target;
+      value.lvalue = false;
+      return value;
+    }
+  }
   const LowInfo source = LowInfoOf(value.type);
   const LowInfo destination = LowInfoOf(target);
   const bool immediate = value.operand.kind == lowir_model::Operand::OP_INTEGER;
@@ -520,11 +569,75 @@ Lowerer::Value Lowerer::LowerSubscript(SemaId node, bool lvalue)
   return result;
 }
 
+Lowerer::Value Lowerer::LowerConstructorTemporary(SemaId node)
+{
+  const SemaNode& value = tree_.At(node);
+  if (value.function == 0)
+    Unsupported("a constructor temporary without a constructor");
+  const FunctionEntity& constructor = model_.FunctionAt(value.function);
+  const bool trivial_default =
+      constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
+      constructor.member_class != 0 &&
+      model_.ClassAt(constructor.member_class).trivial_default_constructor;
+  std::map<SemaId, std::string>::iterator slot = temporary_slots_.find(node);
+  if (slot == temporary_slots_.end())
+    slot = temporary_slots_.insert(std::make_pair(
+        node, NewGeneratedSlot(trivial_default ? "tmpobj" : "arg",
+                               LowTypeOf(value.type)))).first;
+
+  if (constructed_temporaries_.insert(node).second) {
+    const std::vector<SemaId> action_children = Children(node);
+    if (action_children.size() != 1 ||
+        tree_.At(action_children[0]).kind != SEMA_CALL)
+      Unsupported("this constructor temporary");
+    const std::vector<SemaId> call_children = Children(action_children[0]);
+    if (call_children.empty() || tree_.At(call_children[0]).kind != SEMA_CALLEE)
+      Unsupported("a constructor temporary without a callee");
+    const TypeNode& callable = types_.At(types_.Unqualified(constructor.type));
+    if (call_children.size() - 1 > callable.parameters.size() - 1)
+      Unsupported("a constructor temporary with too many arguments");
+
+    Value object;
+    object.type = value.type;
+    object.lvalue = true;
+    object.operand = SlotOperand(slot->second);
+    const lowir_model::Operand address = AddressValue(object).operand;
+    temporary_addresses_[node] = address;
+    lowir_model::Instruction call;
+    call.kind = lowir_model::Instruction::IK_CALL;
+    call.type = VoidType();
+    call.call_return_type = VoidType();
+    call.call_returns_void = true;
+    call.first = GlobalOperand(FunctionSymbolName(value.function));
+    call.args.push_back(address);
+    for (std::size_t i = 1; i < call_children.size(); ++i) {
+      const TypeId parameter = callable.parameters[i];
+      if (types_.Kind(types_.Unqualified(parameter)) == TYPE_REFERENCE)
+        call.args.push_back(LowerReferenceArgument(
+            call_children[i], parameter).operand);
+      else
+        call.args.push_back(LowerRValue(call_children[i], parameter).operand);
+    }
+    Emit(call);
+  }
+
+  Value result;
+  result.type = value.type;
+  result.lvalue = true;
+  const std::map<SemaId, lowir_model::Operand>::const_iterator address =
+      temporary_addresses_.find(node);
+  result.operand = address == temporary_addresses_.end() ?
+      SlotOperand(slot->second) : address->second;
+  return result;
+}
+
 Lowerer::Value Lowerer::LowerLValue(SemaId node)
 {
   if (node == 0)
     Unsupported("a missing lvalue");
   const SemaNode& value = tree_.At(node);
+  if (value.kind == SEMA_CONSTRUCTOR_ACTION)
+    return LowerConstructorTemporary(node);
   if (value.kind == SEMA_MEMBER)
   {
     const Binding& binding = model_.BindingAt(value.binding);
@@ -669,6 +782,8 @@ Lowerer::Value Lowerer::LowerRValue(SemaId node, TypeId expected)
   switch (value.kind) {
   case SEMA_LITERAL:
     return LowerLiteral(node, value, expected);
+  case SEMA_CONSTRUCTOR_ACTION:
+    return LowerConstructorTemporary(node);
   case SEMA_ID_EXPRESSION: {
     const Binding& binding = model_.BindingAt(value.binding);
     if (binding.kind == BINDING_ENUMERATOR)
@@ -918,15 +1033,18 @@ Lowerer::Value Lowerer::LowerPointerOffset(Value pointer, SemaId index_node,
   const Value index = LowerRValue(index_node, types_.Fundamental(FT_LONG_INT));
   const std::size_t element_size =
       types_.SizeOf(PointerElementType(pointer.type));
-  lowir_model::Instruction scale;
-  scale.kind = lowir_model::Instruction::IK_BINARY;
-  scale.dest = NewTemp();
-  scale.op = "mul";
-  scale.type = I64Type();
-  scale.first = index.operand;
-  scale.second = Immediate(static_cast<long long>(element_size));
-  Emit(scale);
-  lowir_model::Operand offset = TempOperand(scale.dest);
+  lowir_model::Operand offset = index.operand;
+  if (element_size != 1) {
+    lowir_model::Instruction scale;
+    scale.kind = lowir_model::Instruction::IK_BINARY;
+    scale.dest = NewTemp();
+    scale.op = "mul";
+    scale.type = I64Type();
+    scale.first = index.operand;
+    scale.second = Immediate(static_cast<long long>(element_size));
+    Emit(scale);
+    offset = TempOperand(scale.dest);
+  }
   if (subtract) {
     lowir_model::Instruction negate;
     negate.kind = lowir_model::Instruction::IK_BINARY;
@@ -1357,6 +1475,7 @@ Lowerer::Value Lowerer::LowerReferenceArgument(SemaId node, TypeId parameter)
   if (source.category == VC_LVALUE || source.category == VC_XVALUE ||
       source.kind == SEMA_CALL || source.kind == SEMA_SUBSCRIPT ||
       source.kind == SEMA_CONDITIONAL ||
+      source.kind == SEMA_CONSTRUCTOR_ACTION ||
       (source.kind == SEMA_UNARY && source.op == OP_STAR)) {
     address = AddressValue(LowerLValue(node));
   } else if (source.kind == SEMA_BINARY && source.op == OP_COMMA) {
@@ -1372,9 +1491,41 @@ Lowerer::Value Lowerer::LowerReferenceArgument(SemaId node, TypeId parameter)
     EmitStore(LowTypeOf(referent), materialized.operand, storage.operand);
     address = AddressValue(storage);
   }
+  ProjectDerivedReference(address, source.type, referent);
   address.type = referent;
   address.lvalue = false;
   return address;
+}
+
+void Lowerer::ProjectDerivedReference(Value& value, TypeId source,
+                                      TypeId target)
+{
+  const TypeId source_object = ReferentType(source);
+  const TypeId target_object = ReferentType(target);
+  ClassEntityId source_class = 0;
+  ClassEntityId target_class = 0;
+  if (ClassEntityForType(types_, source_object, source_class) &&
+      ClassEntityForType(types_, target_object, target_class) &&
+      model_.IsDerivedFrom(source_class, target_class))
+  {
+    std::vector<ClassBase> path;
+    std::vector<ClassEntityId> visited;
+    if (!FindBasePath(model_, source_class, target_class, path, visited))
+      Unsupported("a derived reference without a base path");
+    for (std::size_t i = 0; i < path.size(); ++i)
+    {
+      lowir_model::Instruction projection;
+      projection.kind = lowir_model::Instruction::IK_INDEX;
+      projection.dest = NewTemp();
+      projection.type = I8Type();
+      projection.index_projection = lowir_model::IPK_BASE_SUBOBJECT;
+      projection.first = value.operand;
+      projection.second = Immediate(
+          static_cast<long long>(path[i].offset));
+      Emit(projection);
+      value.operand = TempOperand(projection.dest);
+    }
+  }
 }
 
 // Arguments are lowered in order before an indirect callee is evaluated;

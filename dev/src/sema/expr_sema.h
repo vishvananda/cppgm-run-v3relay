@@ -78,6 +78,10 @@ private:
   SemaId AnalyzeSizeof(AstId expression, ScopeId scope);
   SemaId AnalyzeCall(AstId expression, ScopeId scope);
   void ResolveCallCallee(AstId callee, ScopeId scope, CallResolution& result);
+  SemaId TryFunctionalCast(AstId expression, AstId callee, AstId arguments,
+                           ScopeId scope);
+  SemaId TryCallableObjectExpression(AstId expression, AstId callee,
+                                     AstId arguments, ScopeId scope);
   SemaId AnalyzeFunctionalCast(AstId expression, TypeId target,
                                ScopeId scope,
                                const std::vector<AstId>& arguments);
@@ -108,6 +112,25 @@ private:
                           std::vector<BindingId>& bindings);
   void FunctionCandidates(const QualifiedName& name, ScopeId scope,
                           std::vector<FunctionEntityId>& candidates);
+  bool IsOperatorFunction(ETokenType op) const;
+  std::string OperatorFunctionName(ETokenType op) const;
+  SemaId MakeImplicitObject(SemaId object, ScopeId scope);
+  OverloadArgument MakeOperatorArgument(SemaId expression, TypeId target,
+                                        ScopeId scope);
+  SemaId BuildConstructorTemporary(
+      AstId source, TypeId target, ScopeId scope,
+      const std::vector<SemaId>& arguments);
+  SemaId BuildResolvedCall(AstId source, ScopeId scope,
+                           FunctionEntityId function,
+                           SemaId implicit_object,
+                           const std::vector<SemaId>& arguments);
+  SemaId TryOperatorCall(AstId source, ScopeId scope, ETokenType op,
+                         const std::vector<SemaId>& operands,
+                         bool allow_member = true,
+                         bool allow_nonmember = true,
+                         bool postfix = false);
+  SemaId TryCallableObjectCall(AstId source, ScopeId scope, SemaId object,
+                               const std::vector<SemaId>& arguments);
   TypeId CommonConditionalType(SemaId left, SemaId right) const;
   bool CanConvert(SemaId expression, TypeId target) const;
   void FoldLiteral(SemaId node, AstId expression);
