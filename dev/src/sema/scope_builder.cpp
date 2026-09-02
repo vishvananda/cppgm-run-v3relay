@@ -25,7 +25,7 @@ void ScopeBuilder::Build(AstId root)
     BuildNode(children[i], model_.GlobalScope());
 }
 
-void ScopeBuilder::BuildNode(AstId node, ScopeId scope)
+void ScopeBuilder::BuildNode(AstId node, ScopeId scope, SemaId semantic_parent)
 {
   if (node == 0)
     return;
@@ -36,7 +36,9 @@ void ScopeBuilder::BuildNode(AstId node, ScopeId scope)
   case AST_USING_DIRECTIVE: BuildUsingDirective(node, scope); return;
   case AST_USING_DECLARATION: BuildUsingDeclaration(node, scope); return;
   case AST_ALIAS_DECLARATION: BuildAlias(node, scope); return;
-  case AST_SIMPLE_DECLARATION: BuildSimpleDeclaration(node, scope); return;
+  case AST_SIMPLE_DECLARATION:
+    BuildSimpleDeclaration(node, scope, semantic_parent);
+    return;
   case AST_FUNCTION_DEFINITION: BuildFunctionDefinition(node, scope); return;
   case AST_ENUM_SPECIFIER: case AST_ENUM_DECLARATION:
     if (tree_ != 0 && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
@@ -231,7 +233,8 @@ void ScopeBuilder::BuildAlias(AstId node, ScopeId scope)
     MakeSemantic(SEMA_TYPE_ALIAS, scope, SemanticParent(scope), type, binding);
 }
 
-void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
+void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
+                                          SemaId semantic_parent)
 {
   const AstId specifiers = FindChild(node, AST_DECL_SPECIFIER_SEQ);
   const AstId list = FindChild(node, AST_INIT_DECLARATOR_LIST);
@@ -251,7 +254,9 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
   if (list == 0)
   {
     if (tree_ != 0 && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
-      MakeSemantic(SEMA_SIMPLE_DECLARATION, scope, SemanticParent(scope));
+      MakeSemantic(SEMA_SIMPLE_DECLARATION, scope,
+                   semantic_parent != 0 ? semantic_parent :
+                       SemanticParent(scope));
     return;
   }
 
@@ -261,7 +266,8 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
   SemaId declaration_node = 0;
   if (tree_ != 0 && model_.ScopeAt(scope).kind == SCOPE_BLOCK)
     declaration_node = MakeSemantic(SEMA_SIMPLE_DECLARATION, scope,
-                                    SemanticParent(scope));
+                                    semantic_parent != 0 ? semantic_parent :
+                                        SemanticParent(scope));
   for (std::size_t i = 0; i < items.size(); ++i)
   {
     const AstId declarator = FindChild(items[i], AST_DECLARATOR);
@@ -301,7 +307,8 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope)
     {
       variable = MakeSemantic(is_typedef ? SEMA_TYPE_ALIAS : SEMA_VARIABLE,
           target_scope, declaration_node != 0 ? declaration_node :
-              SemanticParent(target_scope), type, binding);
+              (semantic_parent != 0 ? semantic_parent :
+                  SemanticParent(target_scope)), type, binding);
       if (!is_typedef && initializer != 0)
       {
         const SemaId initialized = AnalyzeInitializer(initializer, target_scope,

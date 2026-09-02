@@ -132,4 +132,6 @@ private:
   std::map<std::pair<TypeId, bool>, TypeId> references_;
   std::map<std::pair<TypeId, std::size_t>, TypeId> arrays_;
   std::map<FunctionKey, TypeId> functions_;
+  std::map<std::pair<EntityId, std::pair<TypeKeyword, std::string> >, TypeId>
+      class_types_;
 };

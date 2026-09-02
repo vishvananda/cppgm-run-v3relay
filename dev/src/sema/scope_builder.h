@@ -75,7 +75,7 @@ private:
   };
 
   // Declarations and scopes.
-  void BuildNode(AstId node, ScopeId scope);
+  void BuildNode(AstId node, ScopeId scope, SemaId semantic_parent = 0);
   void BuildTemplate(AstId node, ScopeId scope);
   void BuildTemplateParameter(AstId parameter, ScopeId scope);
   void BuildNamespace(AstId node, ScopeId scope);
@@ -83,7 +83,8 @@ private:
   void BuildUsingDirective(AstId node, ScopeId scope);
   void BuildUsingDeclaration(AstId node, ScopeId scope);
   void BuildAlias(AstId node, ScopeId scope);
-  void BuildSimpleDeclaration(AstId node, ScopeId scope);
+  void BuildSimpleDeclaration(AstId node, ScopeId scope,
+                              SemaId semantic_parent = 0);
   void RecordConstantValue(BindingId binding, AstId init_declarator,
                            bool is_constexpr, ScopeId scope);
   void BuildFunctionDefinition(AstId node, ScopeId scope);
@@ -135,10 +136,11 @@ private:
                        const std::string& anonymous_name);
   TypeId BuildTypeId(AstId node, ScopeId lookup_scope);
   TypeId BuildDeclaratorType(AstId declarator, TypeId base,
-                             ScopeId lookup_scope);
+                             ScopeId lookup_scope,
+                             bool parameter_context = false);
   TypeId ApplyPrefix(TypeId base, const std::vector<AstId>& prefix);
   TypeId ApplySuffix(TypeId base, const std::vector<AstId>& suffix,
-                     ScopeId lookup_scope);
+                     ScopeId lookup_scope, bool parameter_context);
   void BuildParameters(AstId clause, ScopeId lookup_scope,
                        std::vector<ParameterInfo>& parameters, bool& variadic);
   TypeId BuildDecltype(AstId expression, ScopeId lookup_scope);

@@ -335,6 +335,7 @@ bool Pa10Parser::can_start_declaration() const
 		current.IsSimple(KW_DECLTYPE) || current.IsSimple(KW_TYPENAME) ||
 		current.IsSimple(KW_STATIC_ASSERT) || current.IsSimple(KW_USING) ||
 		current.IsSimple(KW_TEMPLATE) ||
+		current.IsSimple(OP_COLON2) ||
 		current.IsSimple(KW_CLASS) || current.IsSimple(KW_STRUCT) ||
 		current.IsSimple(KW_UNION) || current.IsSimple(KW_ENUM) ||
 		current.IsSimple(KW_NAMESPACE);

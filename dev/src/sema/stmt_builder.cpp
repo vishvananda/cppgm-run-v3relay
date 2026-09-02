@@ -362,7 +362,9 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
   const AstKind kind = arena_.At(node).kind;
   if (IsDeclarationKind(kind))
   {
-    BuildNode(node, context.scope);
+    // The statement context owns the semantic placement, while the scope
+    // passed to declaration analysis remains the lexical lookup scope.
+    BuildNode(node, context.scope, context.semantic_parent);
     return;
   }
   if (tree_ == 0)

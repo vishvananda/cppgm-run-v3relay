@@ -493,19 +493,66 @@ AstId Pa10Parser::parse_pack_expansion(AstId expression)
 
 AstId Pa10Parser::parse_postfix_root()
 {
-	if (token(pos_).kind == PA6_SIMPLE_TOKEN && is_builtin_type(token(pos_).simple_type) &&
-		is_simple(OP_LPAREN, pos_ + 1))
+	// A functional cast starts with a complete fundamental type-id, not just
+	// its first keyword.  Keeping the whole span on the callee lets semantic
+	// analysis apply the canonical keyword-combination rules (unsigned long,
+	// long long, and their cv-qualified forms).
+	const Mark fundamental = mark();
+	if (token(pos_).kind == PA6_SIMPLE_TOKEN &&
+		(is_builtin_type(token(pos_).simple_type) ||
+		 is_cv_qualifier(token(pos_).simple_type)))
 	{
-		const AstId callee = make_span(AST_ID_EXPRESSION, pos_, pos_ + 1,
-			token(pos_).spelling);
-		++pos_;
-		AstId arguments = parse_argument_list(AST_PAREN_ARGUMENT_LIST);
-		if (arguments == 0)
-			return 0;
-		const AstId result = make(AST_CALL_EXPRESSION);
-		add(result, callee);
-		add(result, arguments);
-		return result;
+		const size_t start = pos_;
+		bool have_fundamental = false;
+		while (token(pos_).kind == PA6_SIMPLE_TOKEN &&
+			(is_builtin_type(token(pos_).simple_type) ||
+			 is_cv_qualifier(token(pos_).simple_type)))
+		{
+			have_fundamental = have_fundamental ||
+				is_builtin_type(token(pos_).simple_type);
+			++pos_;
+		}
+		if (have_fundamental && is_simple(OP_LPAREN))
+		{
+			const AstId callee = make_join(AST_ID_EXPRESSION, start, pos_);
+			AstId arguments = parse_argument_list(AST_PAREN_ARGUMENT_LIST);
+			if (arguments == 0)
+			{
+				restore(fundamental);
+				return 0;
+			}
+			const AstId result = make(AST_CALL_EXPRESSION);
+			add(result, callee);
+			add(result, arguments);
+			return result;
+		}
+		restore(fundamental);
+	}
+
+	// `decltype(e)(value)` has the same postfix-call AST shape as a
+	// fundamental functional cast, but the parsed decltype operand must remain
+	// a child of the callee for semantic type construction.
+	const Mark decltype_mark = mark();
+	if (is_simple(KW_DECLTYPE))
+	{
+		const AstId decltype_node = parse_decltype_specifier(false);
+		if (decltype_node != 0 && is_simple(OP_LPAREN))
+		{
+			const AstId callee = make_join(AST_ID_EXPRESSION,
+				decltype_mark.position, pos_);
+			add(callee, decltype_node);
+			AstId arguments = parse_argument_list(AST_PAREN_ARGUMENT_LIST);
+			if (arguments == 0)
+			{
+				restore(decltype_mark);
+				return 0;
+			}
+			const AstId result = make(AST_CALL_EXPRESSION);
+			add(result, callee);
+			add(result, arguments);
+			return result;
+		}
+		restore(decltype_mark);
 	}
 	if (is_simple(OP_LPAREN))
 	{

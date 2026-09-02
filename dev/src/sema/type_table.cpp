@@ -275,12 +275,19 @@ TypeId TypeTable::Function(TypeId result, const std::vector<TypeId>& parameters,
 TypeId TypeTable::Class(EntityId entity, TypeKeyword key,
                         const std::string& name)
 {
+  const std::pair<EntityId, std::pair<TypeKeyword, std::string> > cache_key(
+      entity, std::make_pair(key, name));
+  const std::map<std::pair<EntityId,
+      std::pair<TypeKeyword, std::string> >, TypeId>::const_iterator found =
+      class_types_.find(cache_key);
+  if (found != class_types_.end())
+    return found->second;
   TypeNode node;
   node.kind = TYPE_CLASS;
   node.entity = entity;
   node.keyword = key;
   node.name = name;
-  return Add(node);
+  return class_types_[cache_key] = Add(node);
 }
 
 TypeId TypeTable::Enum(EntityId entity, bool scoped, TypeId underlying,

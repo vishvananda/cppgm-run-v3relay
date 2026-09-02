@@ -344,8 +344,11 @@ listed):
   calls, built-ins, decltype over calls — completed at 153/166; focused call
   fixtures match, through-pa11 remains 657/657, the file audit passes, and
   the 10k/20k/40k semantics probe is linear and near parser-only cost.
-- CP3 parser functional casts and `::` statements, 7.3.4p2 directive
-  application — 157/166; through-pa10 589/589 and PA10 dumps unchanged.
+- CP3 parser/front-end expression and statement boundaries — completed at
+  157/166; the four packet fixtures and two using-directive regressions pass,
+  `make test-report-through-pa11` is 657/657, and the file audit passes with
+  its existing header-layout warning.  The nine class/member/constructor
+  fixtures remain the CP4 boundary.
 - CP4 class-aware fixtures (anonymous/local unions with constructor actions,
   member expressions, member pointers, `this`-first member functions,
   static_cast over overloaded member/template names, appended instantiation
@@ -540,23 +543,43 @@ reference results, assignment/subscript handling, and target retargeting;
 `type_builder.cpp` variadic packs and `nullptr_t`; and `scope_model.cpp`
 lexical qualifier precedence.
 
-## Active Checkpoint: CP3 — parser/front-end expression and statement boundaries
+## Completed Checkpoint: CP3 — parser/front-end expression and statement boundaries
 
-Goal: preserve the CP2 153/166 semantic baseline while closing the remaining
-parser-owned functional-cast and local-declaration forms and the outstanding
-statement-tree layout boundary. Leave the nine class/member/constructor
-fixtures for CP4.
+Outcome: functional-cast roots now retain complete fundamental and `decltype`
+type-id spans; leading-global qualified declarations enter the statement
+parser; local incomplete array parameters receive the required pointer
+adjustment; and declaration semantic parents preserve default-statement tree
+ownership without changing lexical lookup.  Qualified class type spellings
+are retained through a keyword-aware type cache, while the existing
+using-directive and enum presentation behavior remains unchanged.
 
-Implementation boundary: trace the parser AST contracts through the existing
-semantic entry points for `decltype(...)` functional casts, scoped-enum
-functional casts, local `extern` declarations, and default-statement
-declaration ownership/indentation. Start with
-`pa12/tests/general/300-decltype-functional-cast.t`,
-`pa12/tests/general/300-scoped-enum-functional-cast-integral.t`,
-`pa12/tests/general/300-local-extern-function-declaration.t`, and
-`pa12/tests/general/200-switch-default-declaration.t`. Keep the existing
-using-directive qualifier regression green.
+Evidence: the four packet fixtures pass 4/4 and the two using-directive
+regressions pass 2/2.  `make test-pa12` reports 157/166, reducing the
+turn-start 13 failures to the nine named CP4 fixtures without changing test
+coverage.  `make test-report-through-pa11` reports 657/657.
+`perl scripts/cppgm_file_audit.pl --stage pa12 --paths dev/src` passes with
+one pre-existing `recog_parser.h` implementation-body warning.
 
-Exit evidence: focused parser/statement fixtures, `make test-pa12`,
-`make test-report-through-pa11`, and the pa12 file audit; target the ledger's
-157/166 CP3 checkpoint without reducing CP2 coverage.
+## Active Checkpoint: CP4 — class/member/constructor semantic ownership
+
+Goal: preserve the CP3 157/166 baseline while closing the nine deferred
+class/member/constructor fixtures and reach 166/166 without reducing coverage.
+
+Implementation boundary: begin with
+`pa12/tests/general/200-local-anonymous-union-variable.t`,
+`pa12/tests/general/300-block-anonymous-union-injected-members.t`,
+`pa12/tests/general/300-elaborated-local-struct-copy-init.t`,
+`pa12/tests/general/300-member-function-pointer-return-pointer-const.t`,
+`pa12/tests/general/300-member-function-pointer-type-alias-and-function.t`,
+`pa12/tests/general/300-member-pointer-type-alias-and-function.t`,
+`pa12/tests/general/300-reference-binding-pointee-const-pointer.t`,
+`pa12/tests/general/300-static-cast-member-overload-prefers-nontemplate.t`,
+and
+`pa12/tests/general/300-static-cast-overloaded-function-template-argument.t`.
+Trace class/member declarations, constructor actions, member-pointer type
+construction, and member/template overload selection through their canonical
+semantic owners.
+
+Exit evidence: focused CP4 fixtures, `make test-pa12`,
+`make test-report-through-pa11`, and the pa12 file audit, with all earlier PAs
+passing and no coverage reduction.

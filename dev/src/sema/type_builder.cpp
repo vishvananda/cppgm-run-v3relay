@@ -173,7 +173,23 @@ TypeId ScopeBuilder::LookupType(ScopeId scope, const QualifiedName& name) const
       model_.LookupTypeName(scope, name.components[0]);
   if (binding == 0 || model_.BindingAt(binding).type == 0)
     throw std::runtime_error("unknown type name: " + name.Last());
-  return model_.BindingAt(binding).type;
+  const Binding& value = model_.BindingAt(binding);
+  const TypeId type = value.type;
+  // A leading-global namespace qualification is retained in the type dump
+  // for declarations such as `::n::S`; nested class lookup keeps the
+  // established unqualified spelling (`C::D` is `struct D`).
+  if (name.global && value.kind == BINDING_TYPE)
+  {
+    const TypeNode& named = types_.At(types_.Unqualified(type));
+    if (named.kind == TYPE_CLASS)
+    {
+      std::string spelling = name.Joined();
+      if (name.global)
+        spelling = spelling.substr(2);
+      return types_.Class(named.entity, named.keyword, spelling);
+    }
+  }
+  return type;
 }
 
 // One specifier that denotes a type: a class or enum specifier, an elaborated
@@ -252,7 +268,7 @@ TypeId ScopeBuilder::ApplyPrefix(TypeId base, const vector<AstId>& prefix)
 
 // Parameter clauses and array bounds, right to left onto the base (8.3).
 TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
-                                 ScopeId lookup_scope)
+                                 ScopeId lookup_scope, bool parameter_context)
 {
   TypeId result = base;
   for (std::size_t i = suffix.size(); i != 0; --i)
@@ -273,6 +289,14 @@ TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
       long long bound = 0;
       if (node.children.empty() || node.children[0] == 0)
       {
+        if (parameter_context)
+        {
+          // 8.3.5p5: an array parameter is adjusted to a pointer before the
+          // function type is formed.  An omitted bound therefore never needs
+          // to become a synthetic array type in the canonical type table.
+          result = types_.Pointer(result);
+          continue;
+        }
         if (pending_array_bound_ == 0)
           throw std::runtime_error("incomplete array type");
         bound = static_cast<long long>(pending_array_bound_);
@@ -296,7 +320,8 @@ TypeId ScopeBuilder::ApplySuffix(TypeId base, const vector<AstId>& suffix,
 // takes that type as its base (`int *(*p)[3]` is pointer to array of 3
 // pointer to int).
 TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
-                                         ScopeId lookup_scope)
+                                         ScopeId lookup_scope,
+                                         bool parameter_context)
 {
   if (declarator == 0)
     return base;
@@ -322,13 +347,14 @@ TypeId ScopeBuilder::BuildDeclaratorType(AstId declarator, TypeId base,
       suffix.push_back(child);
   }
   const TypeId declared = ApplySuffix(ApplyPrefix(base, prefix), suffix,
-                                      lookup_scope);
+                                      lookup_scope, parameter_context);
   if (nested == 0)
     return declared;
   const AstNode& inner = arena_.At(nested);
   if (inner.children.size() != 1)
     throw std::runtime_error("invalid nested declarator");
-  return BuildDeclaratorType(inner.children[0], declared, lookup_scope);
+  return BuildDeclaratorType(inner.children[0], declared, lookup_scope,
+                             false);
 }
 
 void ScopeBuilder::BuildParameters(AstId clause, ScopeId lookup_scope,
@@ -356,7 +382,7 @@ void ScopeBuilder::BuildParameters(AstId clause, ScopeId lookup_scope,
     if (declarator != 0 && FindChild(declarator, AST_PARAMETER_PACK) != 0)
       variadic = true;
     ParameterInfo info;
-    info.type = BuildDeclaratorType(declarator, base, lookup_scope);
+    info.type = BuildDeclaratorType(declarator, base, lookup_scope, true);
     info.name = IdentifierName(FindIdentifier(declarator));
     parameters.push_back(info);
   }
