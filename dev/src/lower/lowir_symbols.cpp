@@ -259,9 +259,22 @@ void Lowerer::NameSymbols()
         SPECIAL_MEMBER_DESTRUCTOR;
     const std::string destructor_name = destructor ?
         model_.ScopeAt(entity.scope).name : entity.name;
+    // A nested class scope is recorded with its qualified spelling (for
+    // example `B::D`) even though its enclosing class is already a separate
+    // scope component.  LowIR names are a flat display namespace, so retain
+    // only the innermost component here; ABI object names continue to use the
+    // canonical qualified spelling through NamespacePieces below.
+    std::vector<std::string> lowir_scopes = NamespacePieces(entity.scope);
+    for (std::size_t scope_index = 0; scope_index < lowir_scopes.size();
+         ++scope_index) {
+      const std::size_t separator = lowir_scopes[scope_index].rfind("::");
+      if (separator != std::string::npos)
+        lowir_scopes[scope_index] =
+            lowir_scopes[scope_index].substr(separator + 2);
+    }
     const std::string member_name = destructor ?
-        Join(NamespacePieces(entity.scope), "__", "_" + destructor_name) :
-        Join(NamespacePieces(entity.scope), "__",
+        Join(lowir_scopes, "__", "_" + destructor_name) :
+        Join(lowir_scopes, "__",
              LowirNamePiece(entity.name));
     symbol.name = TopLevelName(
         "@" + member_name,

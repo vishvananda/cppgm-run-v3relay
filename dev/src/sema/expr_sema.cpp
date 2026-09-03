@@ -1904,13 +1904,18 @@ SemaId ExpressionAnalyzer::AnalyzeSizeof(AstId expression, ScopeId scope)
 void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
                                             CallResolution& result)
 {
-  const AstNode& callee_node = arena_.At(callee);
+  // Resolve parenthesized member calls directly; function objects stay indirect.
+  AstId resolved_callee = callee;
+  while (arena_.At(resolved_callee).kind == AST_PARENTHESIZED_EXPRESSION)
+    resolved_callee = Child(resolved_callee, 0);
+  if (arena_.At(resolved_callee).kind != AST_MEMBER_EXPRESSION) resolved_callee = callee;
+  const AstNode& callee_node = arena_.At(resolved_callee);
   result.member_callee = callee_node.kind == AST_MEMBER_EXPRESSION;
   result.named_callee = result.member_callee ||
       callee_node.kind == AST_ID_EXPRESSION ||
       callee_node.kind == AST_IDENTIFIER;
   if (result.member_callee) {
-    const SemaId member = Analyze(callee, scope);
+    const SemaId member = Analyze(resolved_callee, scope);
     if (tree_.At(member).kind == SEMA_PSEUDO_DESTRUCTOR)
     {
       result.pseudo_expression = member;
@@ -1931,7 +1936,6 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
     object_type = types_.Unqualified(object_type);
     if (types_.Kind(object_type) != TYPE_CLASS)
       throw std::runtime_error("member call object is not a class");
-
     if (tree_.At(member).function != 0 &&
         model_.FunctionAt(tree_.At(member).function).special_member ==
             SPECIAL_MEMBER_DESTRUCTOR)
@@ -1940,7 +1944,7 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
         throw std::runtime_error("member destructor has no binding");
       result.bindings.push_back(tree_.At(member).binding);
       result.implicit_object = object;
-      if (tokens_[arena_.At(callee).first].IsSimple(OP_DOT)) {
+      if (tokens_[arena_.At(resolved_callee).first].IsSimple(OP_DOT)) {
         TypeId address_type = NodeInfo(object).type;
         if (types_.Kind(address_type) == TYPE_REFERENCE)
           address_type = types_.Referent(address_type);
@@ -1954,8 +1958,7 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
       result.pseudo_destructor = true;
       return;
     }
-
-    const AstId member_name = Child(callee, 1);
+    const AstId member_name = Child(resolved_callee, 1);
     model_.LookupMember(types_.At(object_type).entity,
                         arena_.At(member_name).text, LOOKUP_FUNCTIONS,
                         result.bindings);
@@ -1968,7 +1971,7 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
       if (!function.is_member || function.static_member)
         continue;
       result.implicit_object = object;
-      if (tokens_[arena_.At(callee).first].IsSimple(OP_DOT)) {
+      if (tokens_[arena_.At(resolved_callee).first].IsSimple(OP_DOT)) {
         TypeId address_type = NodeInfo(object).type;
         if (types_.Kind(address_type) == TYPE_REFERENCE)
           address_type = types_.Referent(address_type);
@@ -1985,9 +1988,7 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
     ResolveNamedCallee(ExpressionName(callee), scope, result);
 }
 
-// A callee named by an id-expression: ordinary lookup of the name, and the
-// implicit object argument when a member function candidate is visible
-// from inside a member body.
+// Resolve ordinary lookup and the implicit object for a member-body call.
 void ExpressionAnalyzer::ResolveNamedCallee(const QualifiedName& name,
                                             ScopeId scope,
                                             CallResolution& result)
@@ -2000,6 +2001,7 @@ void ExpressionAnalyzer::ResolveNamedCallee(const QualifiedName& name,
     if (binding.kind != BINDING_FUNCTION || binding.function == 0)
       continue;
     const FunctionEntity& function = model_.FunctionAt(binding.function);
+    result.suppress_adl = result.suppress_adl || function.is_member;
     if (!function.is_member || function.static_member)
       continue;
     const BindingId this_binding = model_.LookupUnqualified(
@@ -2182,10 +2184,8 @@ SemaId ExpressionAnalyzer::FinishCall(
         true));
   }
 
-  // An unqualified call combines ordinary lookup with ADL at the call
-  // site.  AnalyzeName intentionally does not do this, since a bare value
-  // expression must not acquire function candidates merely from its type.
-  if (named_callee && !member_callee && !name.Qualified())
+  // Unqualified calls use ADL unless ordinary lookup found a member function.
+  if (named_callee && !member_callee && !name.Qualified() && !resolution.suppress_adl)
   {
     vector<TypeId> argument_types;
     argument_types.reserve(overload_arguments.size());

@@ -60,12 +60,14 @@ private:
     SemaId pseudo_expression;
     bool member_callee;
     bool named_callee;
+    bool suppress_adl;
     bool has_implicit_object;
     bool pseudo_destructor;
 
     CallResolution()
         : implicit_object(0), pseudo_expression(0), member_callee(false),
-          named_callee(false), has_implicit_object(false),
+          named_callee(false), suppress_adl(false),
+          has_implicit_object(false),
           pseudo_destructor(false) {}
   };
 

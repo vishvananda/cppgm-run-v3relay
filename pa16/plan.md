@@ -280,6 +280,7 @@ comes from the intended check.
 | review 3 (completed; `audit.md`) | wide value-initialized members zeroed; by-value class objects copied with `copyobj` (empty classes keep the fixture slot); one owner for a body's jump context; one named-call path; typed alias ordering; serializer writers shared; pseudo-destructor target by type | 218/243 (25 failures, the turn-start set; strict subset of review 2's 58); through-pa15 1139/1139; file audit passes with five warnings; probes linear |
 | CP11 builtin, lookup, and common-reference boundaries (completed) | builtin declaration ownership and LowIR metadata; using-declaration overload sets; function/tag call disambiguation; derived/base conditional glvalue binding and address projection | 223/243 pa16 tests pass (20 failures, down from 25) with unchanged coverage; focused packet 6/6; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | CP12 aggregate leaf evaluation and constant global data (completed) | supplied local aggregate values lower before destination projection, including member leaves; recursive transactional folding of constant class/array globals with layout padding; translation-unit string pooling by code-unit type and bytes | 227/243 pa16 tests pass (16 failures, down from 20) with unchanged coverage; focused aggregate/data set 4/4; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
+| CP13 direct call resolution and nested LowIR naming (completed) | ordinary member lookup suppresses ADL; parenthesized member calls retain direct member resolution; nested class scope spellings use one LowIR component without changing ABI object names | 229/243 pa16 tests pass (14 failures, down from 16) with unchanged coverage; focused call set 3/3; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -762,45 +763,48 @@ start) with unchanged coverage; `make test-report-through-pa15` is 1139/1139;
 and `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src` passes
 with five nonfatal warnings.  No fixtures or reference files changed.
 
-## Active Checkpoint: CP13 — remaining call, constructor, lifecycle, and bit-field boundaries
+## Completed Checkpoint: CP13 — direct call resolution and nested LowIR naming
 
-Goal: reduce the remaining 16 pa16 failures while preserving the CP1–CP12
-semantic owners and the review-3 owners (`BuildFunctionBody`, `FinishCall`,
-`ZeroInitializeObject`, `ClassEntity::empty`).
+Delivered: ordinary unqualified calls now retain the ordinary member-function
+set instead of adding associated-namespace candidates, and parenthesized member
+callees resolve through the same direct-member path as unparenthesized calls.
+Nested class scope names are flattened to their innermost LowIR component while
+ABI object names continue to use canonical qualified scope data.
+
+Evidence (2026-09-03): the focused comparison for
+`200-implicit-member-call-suppresses-adl`,
+`200-nested-class-private-enclosing-access`, and
+`200-parenthesized-member-call` passed 3/3.  The required `make test-pa16`
+result is 229/243 (14 failures, down from the 16-failure start) with unchanged
+coverage; `make test-report-through-pa15` is 1139/1139; and
+`perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src` passes with
+five nonfatal warnings.  No fixtures or reference files changed.
+
+## Active Checkpoint: CP14 — class member selection and lifetime initialization
+
+Goal: reduce the remaining 14 pa16 failures while preserving CP1–CP13 and the
+review-3 owners (`BuildFunctionBody`, `FinishCall`, `ZeroInitializeObject`,
+`ClassEntity::empty`).
 
 ### Implementation Packet
 
-- Own the next canonical semantic or direct-lowering boundary; do not edit
-  fixtures or `.ref` files.  Remaining semantic failures are
-  `200-implicit-member-call-suppresses-adl` (no unique viable overload),
-  `200-nested-class-private-enclosing-access` (indirect call lacks a
-  signature), `200-parenthesized-member-call` (static/function member
-  lvalue), `200-string-literal-does-not-convert-to-mutable-void-pointer`
-  (no viable constructor), and
-  `spec/200-const-reference-binds-derived-pointer-prvalue` (incompatible
-  pointer comparison).  Trace these through `expr_sema.cpp`,
-  `conversions.cpp`, `overload.cpp`, and the corresponding LowIR call/type
-  consumer before changing a layer.
-- Remaining LowIR shape mismatches are
-  `100-function-pointer-nested-param-name-shadow`,
-  `200-const-subobject-member-call`,
+- Own the next canonical class-object boundary; do not edit fixtures or `.ref`
+  files.  Start with `200-const-subobject-member-call`, tracing const member
+  selection and the emitted member projection through `expr_sema.cpp`,
+  `conversions.cpp`, `overload.cpp`, and `lower/lowir_expr.cpp`.
+- If that ownership path is stable, continue through the related class
+  initialization/lifetime fixtures
   `200-friend-derived-private-base-defaulted-constructor`,
   `200-nested-braced-member-aggregate-init`,
-  `200-unnamed-namespace-hidden-friend-single-definition`,
-  `300-callable-field-hides-private-base-method`,
-  `300-friend-function-definition-skip`,
-  `300-operator-nullptr-t-from-zero`,
-  `300-synthesized-array-member-lifecycle`,
-  `300-value-init-empty-functional-cast-aggregate`, and
-  `400-bit-field-prefix-postfix-increment`; read each current
-  `.my.lowir.compare.diff` before editing.
-- The direct lowering owners are `dev/src/lower/lowir_expr.cpp`
-  (`Convert`, `LowerMember`, `LowerCall`, `LowerAssignment`),
-  `dev/src/lower/lowir_program.cpp` (`LowerVariable`,
-  `LowerMemberInitializer`, `ZeroInitializeObject`), and
-  `dev/src/lower/lowir_symbols.cpp` (`BuildDeclarations`, symbol/function
-  emission).  Preserve the known non-goals in `audit.md` review 3 finding 10:
-  block-scope `static` objects and by-value copy semantics (PA17).
+  `300-synthesized-array-member-lifecycle`, and
+  `300-value-init-empty-functional-cast-aggregate`, using class completion and
+  `lower/lowir_program.cpp` (`LowerVariable`, `LowerMemberInitializer`,
+  `ZeroInitializeObject`).  Read each current `.my.lowir.compare.diff` first.
+- Keep the remaining semantic boundaries
+  (`200-string-literal-does-not-convert-to-mutable-void-pointer` and
+  `spec/200-const-reference-binds-derived-pointer-prvalue`) and unrelated
+  LowIR mismatches queued for later packets.  Preserve the known PA17
+  non-goals: block-scope `static` objects and by-value copy semantics.
 - Require a focused comparison, `make test-pa16`, the through-pa15 report,
-  and the pa16 file audit before closing CP13; the failing set must shrink,
+  and the pa16 file audit before closing CP14; the failing set must shrink,
   never merely shift.
