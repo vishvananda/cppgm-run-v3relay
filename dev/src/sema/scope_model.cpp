@@ -120,6 +120,16 @@ ScopeId SemaModel::GlobalScope() const
   return 0;
 }
 
+bool SemaModel::InUnnamedNamespace(ScopeId scope) const
+{
+  for (ScopeId current = scope; current != GlobalScope();
+       current = scopes_[current].parent)
+    if (scopes_[current].kind == SCOPE_NAMESPACE &&
+        scopes_[current].unnamed_namespace)
+      return true;
+  return false;
+}
+
 ScopeId SemaModel::CreateScope(ScopeKind kind, const std::string& name,
                                ScopeId parent, bool inline_namespace)
 {

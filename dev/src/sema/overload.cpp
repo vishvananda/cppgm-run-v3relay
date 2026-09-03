@@ -158,6 +158,28 @@ bool CallableFunctionType(TypeTable& types, TypeId type,
   return false;
 }
 
+void ConstructorCandidates(const SemaModel& model, const ClassEntity& owner,
+                           bool copy_initialization,
+                           std::vector<BindingId>& candidates)
+{
+  std::vector<BindingId> declared;
+  model.DirectBindings(owner.class_scope,
+                       model.ScopeAt(owner.class_scope).name,
+                       LOOKUP_FUNCTIONS, declared);
+  for (std::size_t i = 0; i < declared.size(); ++i)
+  {
+    const Binding& binding = model.BindingAt(declared[i]);
+    if (binding.function == 0)
+      continue;
+    const FunctionEntity& function = model.FunctionAt(binding.function);
+    if (function.special_member != SPECIAL_MEMBER_CONSTRUCTOR ||
+        function.deleted ||
+        (copy_initialization && function.explicit_constructor))
+      continue;
+    candidates.push_back(declared[i]);
+  }
+}
+
 FunctionEntityId SelectBestOverload(
     const SemaModel& model, TypeTable& types,
     const std::vector<BindingId>& bindings,
@@ -276,7 +298,7 @@ FunctionEntityId SelectBestOverload(
       }
       ImplicitConversion conversion = Classify(
           model, types, source_type, source_category, source.is_null_literal,
-          function_lvalue, parameter_type);
+          function_lvalue, parameter_type, !source.standard_conversions_only);
       conversion.source_type = source_type;
       conversion.target_type = parameter_type;
       conversion.implicit_object = source.is_implicit_object;
@@ -382,7 +404,7 @@ FunctionEntityId SelectBestOverloadCandidates(
       }
       ImplicitConversion conversion = Classify(
           model, types, source_type, source_category, source.is_null_literal,
-          function_lvalue, parameter_type);
+          function_lvalue, parameter_type, !source.standard_conversions_only);
       conversion.source_type = source_type;
       conversion.target_type = parameter_type;
       conversion.implicit_object = source.is_implicit_object;

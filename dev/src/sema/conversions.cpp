@@ -117,26 +117,6 @@ bool PointerToVoidCompatible(const TypeTable& types, TypeId source,
   return true;
 }
 
-unsigned& UserDefinedConversionDepth()
-{
-  static thread_local unsigned depth = 0;
-  return depth;
-}
-
-class UserDefinedConversionGuard
-{
-public:
-  UserDefinedConversionGuard()
-  {
-    ++UserDefinedConversionDepth();
-  }
-
-  ~UserDefinedConversionGuard()
-  {
-    --UserDefinedConversionDepth();
-  }
-};
-
 ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
                                  ValueCategory source_category,
                                  bool is_null_literal, TypeId target)
@@ -337,7 +317,7 @@ ImplicitConversion::ImplicitConversion()
     : rank(RANK_NONE), kind(CONV_IDENTITY), qualification(false),
       reference(REFERENCE_NONE), rvalue_ref_to_rvalue(false),
       function_lvalue_to_lvalue_ref(false), implicit_object(false),
-      source_type(0), target_type(0)
+      source_type(0), target_type(0), conversion_function(0)
 {
 }
 
@@ -450,57 +430,46 @@ bool CVCompatibleForBase(const TypeTable& types, TypeId source, TypeId target)
       !(IsVolatile(types, source) && !IsVolatile(types, target));
 }
 
-bool HasConvertingConstructor(const SemaModel& model, TypeTable& types,
-                              TypeId source, ValueCategory source_category,
-                              bool is_null_literal,
-                              bool is_function_lvalue, TypeId target)
+// 13.3.1.4: the converting constructor of the target class that
+// copy-initialization from `source` selects, or 0.  The source may use only
+// a standard conversion sequence (13.3.3.1p4).
+FunctionEntityId SelectConvertingConstructor(
+    const SemaModel& model, TypeTable& types, TypeId source,
+    ValueCategory source_category, bool is_null_literal,
+    bool is_function_lvalue, TypeId target)
 {
   TypeId target_value = target;
   if (types.Kind(target_value) == TYPE_REFERENCE)
     target_value = types.Referent(target_value);
   const TypeId class_type = types.Unqualified(target_value);
   if (types.Kind(class_type) != TYPE_CLASS)
-    return false;
+    return 0;
 
   TypeId source_value = source;
   if (types.Kind(source_value) == TYPE_REFERENCE)
     source_value = types.Referent(source_value);
   if (types.Unqualified(source_value) == class_type)
-    return false;
+    return 0;
 
   const ClassEntityId class_entity =
       static_cast<ClassEntityId>(types.At(class_type).entity);
   const ClassEntity& owner = model.ClassAt(class_entity);
   if (owner.class_scope == 0 || owner.constructors.empty())
-    return false;
+    return 0;
 
-  std::vector<BindingId> bindings;
-  model.DirectBindings(owner.class_scope,
-                       model.ScopeAt(owner.class_scope).name,
-                       LOOKUP_FUNCTIONS, bindings);
+  // An implicit conversion is a copy-initialization of the target class.
   std::vector<BindingId> converting;
-  for (std::size_t i = 0; i < bindings.size(); ++i)
-  {
-    const Binding& binding = model.BindingAt(bindings[i]);
-    if (binding.function == 0)
-      continue;
-    const FunctionEntity& function = model.FunctionAt(binding.function);
-    // An implicit conversion is a copy-initialization of the target class;
-    // explicit constructors are therefore not candidates here.
-    if (function.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
-        !function.deleted && !function.explicit_constructor)
-      converting.push_back(bindings[i]);
-  }
+  ConstructorCandidates(model, owner, true, converting);
   if (converting.empty())
-    return false;
+    return 0;
 
   std::vector<OverloadArgument> arguments;
   arguments.push_back(OverloadArgument(
       types.Pointer(class_type), VC_PRVALUE, false, false, true));
   arguments.push_back(OverloadArgument(
       source, source_category, is_null_literal, is_function_lvalue));
-  UserDefinedConversionGuard guard;
-  return SelectBestOverload(model, types, converting, arguments, true) != 0;
+  arguments.back().standard_conversions_only = true;
+  return SelectBestOverload(model, types, converting, arguments, true);
 }
 
 } // namespace
@@ -508,7 +477,8 @@ bool HasConvertingConstructor(const SemaModel& model, TypeTable& types,
 ImplicitConversion Classify(const SemaModel& model, TypeTable& types,
                             TypeId source, ValueCategory source_category,
                             bool is_null_literal,
-                            bool is_function_lvalue, TypeId target)
+                            bool is_function_lvalue, TypeId target,
+                            bool allow_user_defined)
 {
   const ImplicitConversion standard = Classify(
       types, source, source_category, is_null_literal,
@@ -595,18 +565,22 @@ ImplicitConversion Classify(const SemaModel& model, TypeTable& types,
 
   // 13.3.3.1.2: a converting constructor contributes one user-defined
   // conversion sequence after the standard sequence has been ruled out.
-  // The guard prevents constructor-parameter ranking from recursively
-  // introducing a second user-defined conversion into the same sequence.
-  if (UserDefinedConversionDepth() == 0 &&
+  // The selection marks the source as standard-only, so ranking the
+  // constructor's parameter cannot nest a second user-defined conversion.
+  const FunctionEntityId converting =
+      allow_user_defined &&
       (!target_reference ||
        !types.At(target).lvalue_reference ||
-       IsConst(types, target_value) || IsVolatile(types, target_value)) &&
-      HasConvertingConstructor(model, types, source, source_category,
-                               is_null_literal, is_function_lvalue, target))
+       IsConst(types, target_value) || IsVolatile(types, target_value)) ?
+      SelectConvertingConstructor(model, types, source, source_category,
+                                  is_null_literal, is_function_lvalue,
+                                  target) : 0;
+  if (converting != 0)
   {
     ImplicitConversion result;
     result.rank = RANK_CONVERSION;
     result.kind = CONV_USER_DEFINED;
+    result.conversion_function = converting;
     if (target_reference)
     {
       result.reference = REFERENCE_TEMPORARY;

@@ -310,6 +310,7 @@ void Lowerer::CollectSlots(SemaId node, std::set<BindingId>& seen,
       value.kind == SEMA_FUNCTION_DECLARATION)
     return;
   if (value.kind == SEMA_VARIABLE && value.binding != 0 &&
+      !model_.BindingAt(value.binding).extern_declaration &&
       seen.insert(value.binding).second)
     AddSourceSlot(value.binding);
   if (value.kind == SEMA_CONSTRUCTOR_ACTION && value.binding == 0 &&

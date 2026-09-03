@@ -15,6 +15,10 @@ struct OverloadArgument
   bool is_function_lvalue;
   bool is_implicit_object;
   bool user_defined_conversion;
+  // 13.3.3.1p4: only a standard conversion sequence may convert this
+  // argument (the argument of a constructor that is itself being considered
+  // as a user-defined conversion).
+  bool standard_conversions_only;
   // An overloaded function name as an argument: the entities it may denote
   // (13.4 selects among them per parameter type).
   std::vector<FunctionEntityId> function_candidates;
@@ -27,7 +31,8 @@ struct OverloadArgument
       : type(type), category(category), is_null_literal(is_null_literal),
         is_function_lvalue(is_function_lvalue),
         is_implicit_object(is_implicit_object),
-        user_defined_conversion(user_defined_conversion) {}
+        user_defined_conversion(user_defined_conversion),
+        standard_conversions_only(false) {}
 };
 
 // A single operator/call candidate may have a different argument view from
@@ -62,6 +67,14 @@ FunctionEntityId SelectBestOverload(
 FunctionEntityId SelectBestOverloadCandidates(
     const SemaModel& model, TypeTable& types,
     const std::vector<OverloadCandidate>& candidates);
+
+// The constructors of `owner` that overload resolution may consider for an
+// initialization (12.3.1p2, 13.3.1.3): declared, not deleted, and not
+// explicit when the form is copy-initialization.  One owner for direct
+// constructor selection and for user-defined conversion sequences.
+void ConstructorCandidates(const SemaModel& model, const ClassEntity& owner,
+                           bool copy_initialization,
+                           std::vector<BindingId>& candidates);
 
 // Select the unique function entity denoted by an overloaded function name
 // when the surrounding initialization supplies a pointer/reference-to-

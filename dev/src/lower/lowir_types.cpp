@@ -360,18 +360,8 @@ std::string Lowerer::QualifiedTypeName(TypeId type) const
 
   // The type node owns the leaf spelling (including template arguments);
   // declaration scopes own only its enclosing namespace/class path.
-  std::vector<std::string> pieces;
-  scope = model_.ScopeAt(scope).parent;
-  while (scope != model_.GlobalScope()) {
-    const Scope& owner = model_.ScopeAt(scope);
-    if (owner.kind == SCOPE_NAMESPACE && owner.unnamed_namespace)
-      pieces.push_back("_GLOBAL__N_1");
-    else if ((owner.kind == SCOPE_NAMESPACE || owner.kind == SCOPE_CLASS) &&
-             !owner.name.empty() && owner.name != "<unnamed>")
-      pieces.push_back(owner.name);
-    scope = owner.parent;
-  }
-  std::reverse(pieces.begin(), pieces.end());
+  const std::vector<std::string> pieces =
+      NamespacePieces(model_.ScopeAt(scope).parent);
   std::string result;
   for (std::size_t i = 0; i < pieces.size(); ++i) {
     if (!result.empty())

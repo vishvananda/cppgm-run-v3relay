@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <deque>
 #include <iosfwd>
 #include <map>
 #include <string>
@@ -137,7 +138,9 @@ private:
 
   TypeId Add(const TypeNode& node);
 
-  std::vector<TypeNode> nodes_;
+  // A deque so that a TypeNode reference from At() stays valid while later
+  // types are interned: callers hold one across conversions and lowering.
+  std::deque<TypeNode> nodes_;
   std::map<EFundamentalType, TypeId> fundamentals_;
   std::map<std::pair<TypeId, unsigned>, TypeId> cv_;
   std::map<TypeId, TypeId> pointers_;

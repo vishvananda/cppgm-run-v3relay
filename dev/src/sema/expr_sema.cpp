@@ -807,12 +807,14 @@ OverloadArgument ExpressionAnalyzer::MakeOperatorArgument(
 SemaId ExpressionAnalyzer::BuildConstructorTemporary(
     AstId source, TypeId target, ScopeId scope,
     const vector<SemaId>& arguments, bool list_initialization,
-    bool copy_initialization)
+    bool copy_initialization, FunctionEntityId selected)
 {
   const TypeId class_type = types_.Unqualified(target);
   if (types_.Kind(class_type) != TYPE_CLASS)
     throw std::runtime_error("constructor temporary target is not a class");
-  const FunctionEntityId constructor =
+  // A conversion sequence that already selected its converting constructor
+  // supplies it; every other form selects here.
+  const FunctionEntityId constructor = selected != 0 ? selected :
       builder_.ResolveConstructor(
           class_type, arguments, scope, copy_initialization);
   const FunctionEntity& entity = model_.FunctionAt(constructor);
@@ -2665,7 +2667,7 @@ SemaId ExpressionAnalyzer::Initialize(SemaId expression, TypeId target,
     // ownership path.
     const SemaId temporary = BuildConstructorTemporary(
         0, class_type, tree_.At(expression).scope, constructor_arguments,
-        false, true);
+        false, true, conversion.conversion_function);
     tree_.At(temporary).user_defined_conversion = true;
     return temporary;
   }

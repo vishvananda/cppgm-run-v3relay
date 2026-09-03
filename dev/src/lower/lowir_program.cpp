@@ -356,6 +356,10 @@ void Lowerer::LowerVariableDeclaration(SemaId node)
 void Lowerer::LowerVariable(SemaId variable_node)
 {
   const SemaNode& variable = tree_.At(variable_node);
+  // A block-scope extern declaration starts no lifetime here: its uses reach
+  // the namespace object through the global symbol.
+  if (model_.BindingAt(variable.binding).extern_declaration)
+    return;
   const std::vector<SemaId> initializer = Children(variable_node);
   const TypeId declared = variable.type;
   const TypeId unqualified = types_.Unqualified(declared);

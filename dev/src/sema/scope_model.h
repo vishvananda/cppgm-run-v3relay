@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -308,6 +309,9 @@ public:
   explicit SemaModel(TypeTable& types);
 
   ScopeId GlobalScope() const;
+  // 7.3.1.1: whether a scope lies inside an unnamed namespace, the one fact
+  // behind scope-given internal linkage and the ABI namespace component.
+  bool InUnnamedNamespace(ScopeId scope) const;
   ScopeId CreateScope(ScopeKind kind, const std::string& name,
                       ScopeId parent, bool inline_namespace = false);
   // A reopened namespace may become inline (7.3.1p2).
@@ -470,9 +474,12 @@ private:
   static const ScopeId kNoScope = static_cast<ScopeId>(-1);
 
   TypeTable& types_;
-  std::vector<Scope> scopes_;
-  std::vector<Binding> bindings_;
-  std::vector<ClassEntity> classes_;
-  std::vector<EnumEntity> enums_;
-  std::vector<FunctionEntity> functions_;
+  // Deques so that a reference returned by ScopeAt, BindingAt, ClassAt,
+  // EnumAt or FunctionAt stays valid while later entities are created:
+  // builders hold one across declaration and completion work.
+  std::deque<Scope> scopes_;
+  std::deque<Binding> bindings_;
+  std::deque<ClassEntity> classes_;
+  std::deque<EnumEntity> enums_;
+  std::deque<FunctionEntity> functions_;
 };

@@ -156,7 +156,8 @@ private:
       AstId source, TypeId target, ScopeId scope,
       const std::vector<SemaId>& arguments,
       bool list_initialization = false,
-      bool copy_initialization = false);
+      bool copy_initialization = false,
+      FunctionEntityId selected = 0);
   SemaId BuildResolvedCall(AstId source, ScopeId scope,
                            FunctionEntityId function,
                            SemaId implicit_object,

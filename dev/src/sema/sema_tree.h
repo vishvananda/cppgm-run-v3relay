@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <deque>
 #include <vector>
 
 #include "posttoken_types.h"
@@ -113,6 +114,8 @@ public:
   void Truncate(std::size_t mark);
 
 private:
-  std::vector<SemaNode> nodes_;
+  // A deque so that a SemaNode reference from At() stays valid while later
+  // nodes are made: analyzers hold one across child analysis.
+  std::deque<SemaNode> nodes_;
   SemaId root_;
 };

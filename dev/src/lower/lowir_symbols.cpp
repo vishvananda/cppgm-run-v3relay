@@ -35,16 +35,6 @@ std::string LowirNamePiece(const std::string& source)
   return result;
 }
 
-bool InUnnamedNamespace(const SemaModel& model, ScopeId scope)
-{
-  for (ScopeId current = scope; current != model.GlobalScope();
-       current = model.ScopeAt(current).parent)
-    if (model.ScopeAt(current).kind == SCOPE_NAMESPACE &&
-        model.ScopeAt(current).unnamed_namespace)
-      return true;
-  return false;
-}
-
 // The semantic model spells an operator function `operator<token>`; the
 // PA14 encoder classifies operators by their README word.  This is the only
 // place that bridges the two fixed vocabularies.
@@ -187,8 +177,7 @@ bool Lowerer::ConstructorHasNoWork(
       if (initializer.function == 0) {
         return finish(false);
       }
-      std::set<FunctionEntityId> nested(active);
-      if (!ConstructorHasNoWork(initializer.function, nested)) {
+      if (!ConstructorHasNoWork(initializer.function, active)) {
         return finish(false);
       }
     } else {
@@ -197,8 +186,7 @@ bool Lowerer::ConstructorHasNoWork(
       }
       initialized_bases.insert(
           model_.FunctionAt(initializer.function).member_class);
-      std::set<FunctionEntityId> nested(active);
-      if (!ConstructorHasNoWork(initializer.function, nested)) {
+      if (!ConstructorHasNoWork(initializer.function, active)) {
         return finish(false);
       }
     }
@@ -214,8 +202,7 @@ bool Lowerer::ConstructorHasNoWork(
         model_.ClassAt(base.entity).trivial_default_constructor)
       continue;
     const FunctionEntityId constructor = DefaultConstructor(base.entity);
-    std::set<FunctionEntityId> nested(active);
-    if (constructor == 0 || !ConstructorHasNoWork(constructor, nested)) {
+    if (constructor == 0 || !ConstructorHasNoWork(constructor, active)) {
       return finish(false);
     }
   }
@@ -247,8 +234,7 @@ bool Lowerer::ConstructorHasNoWork(
       continue;
     const FunctionEntityId constructor =
         DefaultConstructor(types_.At(element).entity);
-    std::set<FunctionEntityId> nested(active);
-    if (constructor == 0 || !ConstructorHasNoWork(constructor, nested)) {
+    if (constructor == 0 || !ConstructorHasNoWork(constructor, active)) {
       return finish(false);
     }
   }
@@ -361,19 +347,24 @@ void Lowerer::CollectSymbols(SemaId node)
   } else if (value.kind == SEMA_VARIABLE && value.binding != 0) {
     const Binding& binding = model_.BindingAt(value.binding);
     const Scope& declaration_scope = model_.ScopeAt(binding.scope);
+    // A block-scope extern declaration denotes its namespace entity
+    // (3.5p6-7) through the canonical binding sema linked it to.
     if (declaration_scope.kind == SCOPE_NAMESPACE ||
-        (declaration_scope.kind == SCOPE_CLASS && binding.static_member)) {
+        (declaration_scope.kind == SCOPE_CLASS && binding.static_member) ||
+        binding.extern_declaration) {
       const BindingId canonical = CanonicalBinding(value.binding);
+      const Binding& entity = model_.BindingAt(canonical);
       GlobalSymbol& symbol = globals_[canonical];
       if (symbol.binding == 0) {
         symbol.binding = canonical;
         global_order_.push_back(canonical);
       }
       symbol.internal_linkage = symbol.internal_linkage ||
-          binding.internal_linkage;
-      symbol.c_linkage = symbol.c_linkage || binding.c_linkage;
+          binding.internal_linkage || entity.internal_linkage;
+      symbol.c_linkage = symbol.c_linkage || binding.c_linkage ||
+          entity.c_linkage;
       symbol.thread_local_storage = symbol.thread_local_storage ||
-          binding.thread_local_storage;
+          binding.thread_local_storage || entity.thread_local_storage;
       if (!binding.extern_declaration && symbol.definition == 0)
         symbol.definition = node;
     }
@@ -755,7 +746,7 @@ std::string Lowerer::GlobalObjectName(const GlobalSymbol& symbol) const
   // component in the qualified name.  It must not also use the local-name
   // `L` encoding reserved for a namespace-scope `static` entity.
   target.internal_linkage = symbol.internal_linkage &&
-      !InUnnamedNamespace(model_, binding.scope);
+      !model_.InUnnamedNamespace(binding.scope);
   target.qualified_name =
       Join(NamespacePieces(binding.scope), "::", binding.name);
   const std::vector<abi_mangle::AbiFunctionRecord> records;

@@ -229,7 +229,6 @@ private:
   ScopeId ResolveDeclarationScope(ScopeId scope, AstId identifier,
                                   std::string& name) const;
   ScopeId EnclosingNamespace(ScopeId scope) const;
-  bool HasInternalLinkage(ScopeId scope) const;
   ScopeId ResolveNamespace(ScopeId scope, AstId target) const;
   ScopeId ResolveQualifierScope(ScopeId scope, const QualifiedName& prefix) const;
   TypeKeyword ClassKey(AstId node) const;
@@ -303,6 +302,8 @@ private:
                        unsigned target_sequence, ScopeId target_scope) const;
   void LinkRedeclaration(BindingId binding, ScopeId scope,
                          const std::string& name, TypeId type);
+  void LinkBlockScopeExtern(BindingId binding, ScopeId scope,
+                            const std::string& name, TypeId type);
   bool CompatibleRedeclaration(TypeId prior, TypeId current) const;
   BindingId FindStaticMemberVariable(ScopeId scope, const std::string& name,
                                      TypeId type) const;

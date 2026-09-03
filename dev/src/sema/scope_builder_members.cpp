@@ -121,6 +121,56 @@ void ScopeBuilder::LinkRedeclaration(BindingId binding, ScopeId scope,
   }
 }
 
+// 3.5p6-7: a block-scope `extern` variable declaration names the entity with
+// linkage that a visible declaration inside the innermost enclosing namespace
+// already declares; otherwise it declares a new member of that namespace.
+// Either way the block binding stands for the namespace entity through
+// redeclared_binding, so lowering gives it no slot and no lifetime.
+void ScopeBuilder::LinkBlockScopeExtern(BindingId binding, ScopeId scope,
+                                        const std::string& name, TypeId type)
+{
+  const ScopeId namespace_scope = EnclosingNamespace(scope);
+  for (ScopeId level = scope;; level = model_.ScopeAt(level).parent)
+  {
+    const ScopeKind kind = model_.ScopeAt(level).kind;
+    if (kind == SCOPE_NAMESPACE || kind == SCOPE_BLOCK ||
+        kind == SCOPE_FUNCTION)
+    {
+      std::vector<BindingId> priors;
+      model_.DirectBindings(level, name, LOOKUP_VALUES, priors);
+      for (std::size_t i = 0; i < priors.size(); ++i)
+      {
+        if (priors[i] == binding)
+          continue;
+        const Binding& prior = model_.BindingAt(priors[i]);
+        if (prior.kind != BINDING_VARIABLE)
+          continue;
+        if (kind != SCOPE_NAMESPACE && !prior.extern_declaration)
+          throw std::runtime_error(
+              "extern declaration follows a declaration with no linkage");
+        if (!CompatibleRedeclaration(prior.type, type))
+          throw std::runtime_error(
+              "object redeclared with a different type");
+        model_.BindingAt(binding).redeclared_binding =
+            prior.redeclared_binding != 0 ? prior.redeclared_binding :
+                priors[i];
+        return;
+      }
+    }
+    if (level == namespace_scope)
+      break;
+  }
+  const BindingId member = model_.AddBinding(namespace_scope, name,
+                                             BINDING_VARIABLE, type);
+  Binding& value = model_.BindingAt(member);
+  value.access = ACCESS_PUBLIC;
+  value.extern_declaration = true;
+  value.internal_linkage = model_.InUnnamedNamespace(namespace_scope);
+  value.c_linkage = model_.BindingAt(binding).c_linkage;
+  value.thread_local_storage = model_.BindingAt(binding).thread_local_storage;
+  model_.BindingAt(binding).redeclared_binding = member;
+}
+
 bool ScopeBuilder::CompatibleRedeclaration(TypeId prior, TypeId current) const
 {
   if (prior == current)

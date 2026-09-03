@@ -52,6 +52,9 @@ struct ImplicitConversion
   // context-free standard-sequence ordering.
   TypeId source_type;
   TypeId target_type;
+  // CONV_USER_DEFINED: the converting constructor the sequence selected,
+  // so initialization builds that action without a second selection.
+  FunctionEntityId conversion_function;
 
   ImplicitConversion();
   bool Viable() const { return rank != RANK_NONE; }
@@ -65,10 +68,14 @@ ImplicitConversion Classify(TypeTable& types, TypeId source,
 // pointer conversions.  The plain overload remains useful for contexts that
 // intentionally have no class graph, while semantic overload resolution
 // always supplies the owning model.
+// 13.3.3.1p4: `allow_user_defined` is false for the argument of a
+// constructor that is itself being considered as a user-defined conversion,
+// so only a standard conversion sequence may convert it.
 ImplicitConversion Classify(const SemaModel& model, TypeTable& types,
                             TypeId source, ValueCategory source_category,
                             bool is_null_literal,
-                            bool is_function_lvalue, TypeId target);
+                            bool is_function_lvalue, TypeId target,
+                            bool allow_user_defined = true);
 
 // Member access applies cv-qualification from the selected object to a
 // non-static data member, while preserving mutable and reference members.
