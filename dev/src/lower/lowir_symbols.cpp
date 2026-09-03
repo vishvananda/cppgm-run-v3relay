@@ -127,6 +127,205 @@ void Lowerer::CollectTemporaryConstructorUses(SemaId node,
     CollectTemporaryConstructorUses(child, value.kind == SEMA_VARIABLE);
 }
 
+// A defaulted constructor still has a semantic definition even when all of
+// its direct subobjects have no observable initialization work.  This helper
+// proves that property from the completed semantic model instead of guessing
+// from ClassEntity::empty or trivial_default_constructor: a user-provided
+// empty base/member constructor is non-trivial, but its call is nevertheless
+// removable under the as-if rule when the whole recursive plan is empty.
+bool Lowerer::ConstructorHasNoWork(
+    FunctionEntityId function, std::set<FunctionEntityId>& active) const
+{
+  if (function == 0)
+    return false;
+  const std::map<FunctionEntityId, bool>::const_iterator cached =
+      constructor_no_work_cache_.find(function);
+  if (cached != constructor_no_work_cache_.end())
+    return cached->second;
+  if (!active.insert(function).second)
+    return false;
+  const auto finish = [&](bool result) {
+    active.erase(function);
+    constructor_no_work_cache_[function] = result;
+    return result;
+  };
+  const std::map<FunctionEntityId, FunctionSymbol>::const_iterator found =
+      functions_.find(function);
+  if (found == functions_.end() || found->second.definition == 0) {
+    return finish(false);
+  }
+  const FunctionEntity& entity = model_.FunctionAt(function);
+  if (entity.special_member != SPECIAL_MEMBER_CONSTRUCTOR || entity.deleted ||
+      entity.member_class == 0 || !entity.default_member_initializers.empty()) {
+    return finish(false);
+  }
+  for (std::size_t parameter = 1;
+       parameter < entity.default_arguments.size(); ++parameter)
+    if (entity.default_arguments[parameter] != 0)
+      return finish(false);
+  for (std::size_t parameter = 1;
+       parameter < entity.default_semantic_arguments.size(); ++parameter)
+    if (entity.default_semantic_arguments[parameter] != 0)
+      return finish(false);
+  const SemaId body = FunctionBody(found->second.definition);
+  if (body == 0 || tree_.At(body).first_child != 0) {
+    return finish(false);
+  }
+
+  const ClassEntity& owner = model_.ClassAt(entity.member_class);
+  std::set<ClassEntityId> initialized_bases;
+  std::set<BindingId> initialized_fields;
+  for (SemaId child = tree_.At(found->second.definition).first_child;
+       child != 0; child = tree_.At(child).next_sibling) {
+    const SemaNode& initializer = tree_.At(child);
+    if (initializer.kind != SEMA_MEMBER_INITIALIZER)
+      continue;
+    if (initializer.binding != 0) {
+      initialized_fields.insert(initializer.binding);
+      // A scalar/reference member initializer stores or binds a value.  A
+      // class member can be empty only if its selected constructor is too.
+      if (initializer.function == 0) {
+        return finish(false);
+      }
+      std::set<FunctionEntityId> nested(active);
+      if (!ConstructorHasNoWork(initializer.function, nested)) {
+        return finish(false);
+      }
+    } else {
+      if (initializer.function == 0) {
+        return finish(false);
+      }
+      initialized_bases.insert(
+          model_.FunctionAt(initializer.function).member_class);
+      std::set<FunctionEntityId> nested(active);
+      if (!ConstructorHasNoWork(initializer.function, nested)) {
+        return finish(false);
+      }
+    }
+  }
+
+  // Completion normally materializes every non-trivial omitted subobject as
+  // a semantic action.  Walk the class layout as a second guard so this
+  // proof remains correct for synthesized definitions whose action list is
+  // sparse or for a future completion path that adds an implicit action late.
+  for (std::size_t i = 0; i < owner.bases.size(); ++i) {
+    const ClassBase& base = owner.bases[i];
+    if (initialized_bases.count(base.entity) != 0 ||
+        model_.ClassAt(base.entity).trivial_default_constructor)
+      continue;
+    const FunctionEntityId constructor = DefaultConstructor(base.entity);
+    std::set<FunctionEntityId> nested(active);
+    if (constructor == 0 || !ConstructorHasNoWork(constructor, nested)) {
+      return finish(false);
+    }
+  }
+  for (std::size_t i = 0; i < owner.fields.size(); ++i) {
+    const ClassField& field = owner.fields[i];
+    if (field.static_member)
+      continue;
+    if (field.binding == 0) {
+      if (field.initializer != 0)
+        return finish(false);
+      TypeId anonymous = types_.Unqualified(field.type);
+      while (types_.Kind(anonymous) == TYPE_ARRAY)
+        anonymous = types_.Unqualified(types_.At(anonymous).base);
+      if (types_.Kind(anonymous) == TYPE_CLASS ||
+          types_.Kind(anonymous) == TYPE_REFERENCE)
+        return finish(false);
+      continue;
+    }
+    if (field.initializer != 0 ||
+        initialized_fields.count(field.binding) != 0)
+      continue;
+    TypeId element = types_.Unqualified(field.type);
+    while (types_.Kind(element) == TYPE_ARRAY)
+      element = types_.Unqualified(types_.At(element).base);
+    if (types_.Kind(element) == TYPE_REFERENCE)
+      return finish(false);
+    if (types_.Kind(element) != TYPE_CLASS ||
+        model_.ClassAt(types_.At(element).entity).trivial_default_constructor)
+      continue;
+    const FunctionEntityId constructor =
+        DefaultConstructor(types_.At(element).entity);
+    std::set<FunctionEntityId> nested(active);
+    if (constructor == 0 || !ConstructorHasNoWork(constructor, nested)) {
+      return finish(false);
+    }
+  }
+  return finish(true);
+}
+
+bool Lowerer::CanElideDefaultedDeclarationConstructor(SemaId action) const
+{
+  if (action == 0 || tree_.At(action).kind != SEMA_CONSTRUCTOR_ACTION ||
+      tree_.At(action).binding == 0 || tree_.At(action).function == 0) {
+    return false;
+  }
+  const std::vector<SemaId> children = Children(action);
+  if (children.size() != 1 || tree_.At(children[0]).kind != SEMA_CALL)
+    return false;
+  const std::vector<SemaId> call_children = Children(children[0]);
+  // The call owns its destination address as the first argument after the
+  // callee.  Default arguments are expressions owned by the call site;
+  // keeping this proof to that two-child form avoids eliding their effects.
+  if (call_children.size() != 2)
+    return false;
+  const FunctionEntity& entity = model_.FunctionAt(tree_.At(action).function);
+  if (!entity.defaulted || entity.special_member != SPECIAL_MEMBER_CONSTRUCTOR)
+    return false;
+  std::set<FunctionEntityId> active;
+  return ConstructorHasNoWork(tree_.At(action).function, active);
+}
+
+// The checked LowIR keeps the base-subobject entry even when the complete
+// defaulted wrapper is optimized away.  Preserve that ABI demand explicitly
+// from the semantic initializer rather than relying on lowering a body that
+// is no longer emitted.
+void Lowerer::MarkElidedConstructorBaseVariants()
+{
+  for (std::size_t i = 0; i < function_order_.size(); ++i) {
+    const FunctionEntityId function = function_order_[i];
+    const FunctionEntity& entity = model_.FunctionAt(function);
+    if (!entity.defaulted ||
+        entity.special_member != SPECIAL_MEMBER_CONSTRUCTOR)
+      continue;
+    std::set<FunctionEntityId> active;
+    if (!ConstructorHasNoWork(function, active))
+      continue;
+    const FunctionSymbol& symbol = functions_[function];
+    if (symbol.definition == 0)
+      continue;
+    std::set<ClassEntityId> initialized_bases;
+    for (SemaId child = tree_.At(symbol.definition).first_child;
+         child != 0; child = tree_.At(child).next_sibling) {
+      const SemaNode& initializer = tree_.At(child);
+      if (initializer.kind != SEMA_MEMBER_INITIALIZER ||
+          initializer.binding != 0 || initializer.function == 0)
+        continue;
+      initialized_bases.insert(
+          model_.FunctionAt(initializer.function).member_class);
+      const std::map<FunctionEntityId, FunctionSymbol>::iterator base =
+          functions_.find(initializer.function);
+      if (base != functions_.end())
+        base->second.base_required = true;
+    }
+    const ClassEntity& owner = model_.ClassAt(entity.member_class);
+    for (std::size_t base_index = 0; base_index < owner.bases.size();
+         ++base_index) {
+      const ClassBase& base_info = owner.bases[base_index];
+      if (initialized_bases.count(base_info.entity) != 0 ||
+          model_.ClassAt(base_info.entity).trivial_default_constructor)
+        continue;
+      const FunctionEntityId base_constructor =
+          DefaultConstructor(base_info.entity);
+      const std::map<FunctionEntityId, FunctionSymbol>::iterator base =
+          functions_.find(base_constructor);
+      if (base != functions_.end())
+        base->second.base_required = true;
+    }
+  }
+}
+
 void Lowerer::CollectSymbols(SemaId node)
 {
   if (node == 0)
@@ -201,6 +400,9 @@ void Lowerer::CollectReferencedFunctions(
   if ((value.kind == SEMA_CALLEE || value.kind == SEMA_ID_EXPRESSION) &&
       value.function != 0)
     result.insert(value.function);
+  if (value.kind == SEMA_CONSTRUCTOR_ACTION &&
+      CanElideDefaultedDeclarationConstructor(node))
+    return;
   for (SemaId child = value.first_child; child != 0;
        child = tree_.At(child).next_sibling)
     CollectReferencedFunctions(child, result);

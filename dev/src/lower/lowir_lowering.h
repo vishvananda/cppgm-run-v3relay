@@ -203,6 +203,14 @@ private:
   void CollectTemporaryConstructorUses(SemaId node,
                                        bool variable_initializer = false);
   bool ImplicitValueInitialization(SemaId action) const;
+  // A declaration-owned defaulted constructor may be omitted from LowIR only
+  // when its complete initialization plan is provably side-effect free.  The
+  // semantic base/member actions remain authoritative; this is an as-if
+  // lowering decision, not a change to triviality or constructor viability.
+  bool CanElideDefaultedDeclarationConstructor(SemaId action) const;
+  bool ConstructorHasNoWork(FunctionEntityId function,
+                            std::set<FunctionEntityId>& active) const;
+  void MarkElidedConstructorBaseVariants();
   void CollectSymbols(SemaId node);
   void CollectReferencedFunctions(SemaId node,
                                   std::set<FunctionEntityId>& result) const;
@@ -507,6 +515,7 @@ private:
   std::vector<FunctionEntityId> function_order_;
   std::set<FunctionEntityId> temporary_constructors_;
   std::set<FunctionEntityId> referenced_functions_;
+  mutable std::map<FunctionEntityId, bool> constructor_no_work_cache_;
   std::map<BindingId, GlobalSymbol> globals_;
   std::vector<BindingId> global_order_;
   std::vector<DynamicInitializer> dynamic_initializers_;

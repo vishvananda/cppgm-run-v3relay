@@ -99,8 +99,10 @@ void ProgramLowering::Finish()
 // referenced functions this unit never defines.
 void Lowerer::Run()
 {
+  constructor_no_work_cache_.clear();
   CollectTemporaryConstructorUses(tree_.Root());
   CollectSymbols(tree_.Root());
+  MarkElidedConstructorBaseVariants();
   ComputeReferencedFunctions();
   // Deferred in-class definitions are visited in declaration order, while a
   // call from a later body may refer to an earlier member.  Apply the complete
@@ -403,6 +405,14 @@ void Lowerer::LowerVariable(SemaId variable_node)
       if (function == 0)
         Unsupported("a constructor action without a function");
       const std::vector<SemaId> call_children = Children(action_children[0]);
+      if (CanElideDefaultedDeclarationConstructor(initializer[0])) {
+        // The semantic action still starts the object's lifetime.  Its
+        // complete defaulted initialization is omitted only after the shared
+        // no-work proof has retained every non-trivial subobject's ABI demand.
+        (void)AddressValue(object);
+        RegisterLiveObject(variable.binding, declared);
+        return;
+      }
       const bool declaration_default = tree_.At(initializer[0]).binding != 0 &&
           call_children.size() == 2;
       if (model_.ClassAt(model_.FunctionAt(function).member_class)

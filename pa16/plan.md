@@ -311,6 +311,7 @@ comes from the intended check.
 | CP14 class member selection and lifetime initialization (completed) | const-qualified member projections with mutable/reference exceptions; recursive class completion through arrays; empty aggregate-constructor elision; synthesized array construction/unwind and reverse destruction; value-initialization zeroing | 231/243 pa16 tests pass (12 failures, down from 14) with unchanged coverage; packet 4/5 exact, with the remaining friend fixture retaining the standard-required base construction; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | review 4 (completed; `audit.md`) | three review-3 regressions restored (function-pointer field callee, temporary-constructor demand); qualified class-head spelling owned by sema (correct ABI names); linked guard chains at `kInlineCleanupLimit`; omitted aggregate subobjects constructed, dynamic class aggregates initialized at startup; startup bodies built before the emission walk; builtin kinds typed | 234/243 (9 failures; strict subset of the turn-start 12 and of review 3's 25); through-pa15 1139/1139; file audit passes with five warnings; probes linear, quadratic array/member emission removed |
 | CP16 conversion classification and temporary ownership (completed) | converting-constructor viability and copy-initialization actions; derived-pointer composite types and reference projection; source-ordered conversion temporaries without perturbing ordinary constructor/conditional slots | 242/243 pa16 tests pass (one failure, down from three) with unchanged coverage; focused conversion and recovery set passes; through-pa15 1139/1139; file audit passes with six warnings; no fixture or reference changes |
+| CP17 defaulted-constructor emission boundary (completed) | recursive no-work proof for declaration-owned defaulted constructors; as-if elision of an empty complete wrapper; explicit retention of required non-trivial base ABI entries; bounded per-entity proof cache | 243/243 pa16 tests pass (the one remaining mismatch removed) with unchanged coverage; focused constructor plus five adjacent lifetime fixtures pass 6/6; through-pa15 1139/1139; file audit passes with six warnings; no fixture or reference changes |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -896,23 +897,36 @@ from three) with unchanged coverage; `make test-report-through-pa15` is
 1139/1139; and `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src`
 passes with six nonfatal warnings.  No fixtures or reference files changed.
 
-## Active Checkpoint: CP17 — defaulted-constructor emission boundary
+## Completed Checkpoint: CP17 — defaulted-constructor emission boundary
 
-Goal: resolve or formally bound the remaining defaulted-constructor LowIR
-shape mismatch without weakening standard-required base initialization.
+Delivered: LowIR now proves declaration-owned defaulted construction is
+side-effect free from the completed semantic constructor graph before omitting
+an empty complete wrapper.  The proof rejects default arguments, default
+member initializers, initialized scalar/reference members, non-empty bodies,
+and recursive or unavailable constructors; results are cached per function
+entity.  Semantic base initialization remains intact, while each required
+non-trivial direct base keeps its ABI base-entry demand even when the complete
+wrapper is elided.
+
+Evidence (2026-09-03): the focused
+`200-friend-derived-private-base-defaulted-constructor` comparison passes, as
+do five adjacent defaulted, aggregate, explicit-base, and inherited-constructor
+fixtures.  `make test-pa16` is 243/243 with unchanged coverage;
+`make test-report-through-pa15` is 1139/1139; and
+`perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src` passes with six
+nonfatal warnings.  No fixtures or reference files changed.
+
+## Active Checkpoint: CP18 — block-scope extern class declaration ownership
+
+Goal: close the recorded block-scope `extern` class declaration boundary while
+keeping storage ownership and lifetime decisions canonical.
 
 ### Implementation Packet
 
-- Start with the exact LowIR diff for
-  `200-friend-derived-private-base-defaulted-constructor` and trace the
-  defaulted constructor's complete/base entry ownership through sema and
-  lowering; keep the required base call unless a canonical ABI rule assigns
-  the omission to another layer.
-- Treat the checked reference's omitted derived-constructor body as an oracle
-  boundary until semantic and ABI evidence shows a compiler-owned mismatch;
-  do not regenerate the fixture to hide the difference.
-- Leave the block-scope `extern` class declaration gap recorded and preserve
-  the PA17 non-goals: block-scope `static` objects and by-value copy semantics.
-- Require the focused constructor comparison, `make test-pa16`, the
-  through-pa15 report, and the pa16 file audit; preserve the current one-failure
-  boundary unless a standard-aligned fix removes it.
+- Start with the recorded block-scope `extern` class declaration gap and trace
+  its binding, type completeness, and declaration-only LowIR ownership through
+  sema and lowering.
+- Preserve the PA17 non-goals: block-scope `static` objects and by-value copy
+  semantics.
+- Require a focused declaration comparison, `make test-pa16`, the
+  through-pa15 report, and the pa16 file audit; preserve unchanged coverage.
