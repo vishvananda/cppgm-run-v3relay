@@ -79,8 +79,20 @@ void Lowerer::CollectTemporaryConstructorUses(SemaId node)
     return;
   const SemaNode& value = tree_.At(node);
   if (value.kind == SEMA_CONSTRUCTOR_ACTION && value.binding == 0 &&
-      value.function != 0)
-    temporary_constructors_.insert(value.function);
+      value.function != 0) {
+    const FunctionEntity& constructor = model_.FunctionAt(value.function);
+    const std::vector<SemaId> action_children = Children(node);
+    const bool value_initialization = action_children.size() == 1 &&
+        tree_.At(action_children[0]).kind == SEMA_CALL &&
+        Children(action_children[0]).size() == 1;
+    const bool trivial_value_initialization = value_initialization &&
+        constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
+        constructor.member_class != 0 &&
+        model_.ClassAt(constructor.member_class).trivial_default_constructor &&
+        (constructor.synthesized || constructor.defaulted);
+    if (!trivial_value_initialization)
+      temporary_constructors_.insert(value.function);
+  }
   for (SemaId child = value.first_child; child != 0;
        child = tree_.At(child).next_sibling)
     CollectTemporaryConstructorUses(child);

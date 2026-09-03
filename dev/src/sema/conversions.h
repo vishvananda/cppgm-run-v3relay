@@ -69,6 +69,15 @@ ImplicitConversion Classify(const SemaModel& model, TypeTable& types,
                             bool is_null_literal,
                             bool is_function_lvalue, TypeId target);
 
+// Member access applies cv-qualification from the selected object to a
+// non-static data member, while preserving mutable and reference members.
+void MemberObjectQualifiers(const TypeTable& types, TypeId object_type,
+                            ETokenType access_operator, bool& is_const,
+                            bool& is_volatile);
+TypeId MemberAccessType(TypeTable& types, TypeId member_type,
+                        bool static_member, bool mutable_member,
+                        TypeId object_type, ETokenType access_operator);
+
 enum ConversionComparison
 {
   CONVERSION_BETTER,

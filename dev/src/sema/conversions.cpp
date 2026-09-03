@@ -145,6 +145,11 @@ ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
   {
     result.kind = CONV_LVALUE_TO_RVALUE;
     result.rank = RANK_EXACT;
+    // The lvalue-to-rvalue conversion discards cv-qualification on the
+    // value itself, but not qualification nested in a pointer or aggregate
+    // type.  Normalize that one outer layer before checking the target so a
+    // const pointer member can still select a const-pointee overload.
+    source_value = types.Unqualified(source_value);
   }
 
   if (is_null_literal && !types.IsNullPointerType(source_value) &&
@@ -268,6 +273,43 @@ ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
 }
 
 } // namespace
+
+void MemberObjectQualifiers(const TypeTable& types, TypeId object_type,
+                            ETokenType access_operator, bool& is_const,
+                            bool& is_volatile)
+{
+  is_const = false;
+  is_volatile = false;
+  if (types.Kind(object_type) == TYPE_REFERENCE)
+    object_type = types.Referent(object_type);
+  if (access_operator == OP_ARROW) {
+    if (!types.IsPointer(object_type))
+      return;
+    object_type = types.At(types.Unqualified(object_type)).base;
+  }
+  if (types.Kind(object_type) == TYPE_CV) {
+    is_const = types.At(object_type).is_const;
+    is_volatile = types.At(object_type).is_volatile;
+  }
+}
+
+TypeId MemberAccessType(TypeTable& types, TypeId member_type,
+                        bool static_member, bool mutable_member,
+                        TypeId object_type, ETokenType access_operator)
+{
+  const bool reference_member =
+      types.Kind(types.Unqualified(member_type)) == TYPE_REFERENCE;
+  if (static_member || reference_member)
+    return reference_member ? types.Referent(member_type) : member_type;
+  if (mutable_member)
+    return member_type;
+  bool is_const = false;
+  bool is_volatile = false;
+  MemberObjectQualifiers(types, object_type, access_operator, is_const,
+                         is_volatile);
+  return is_const || is_volatile ?
+      types.Cv(member_type, is_const, is_volatile) : member_type;
+}
 
 ImplicitConversion::ImplicitConversion()
     : rank(RANK_NONE), kind(CONV_IDENTITY), qualification(false),

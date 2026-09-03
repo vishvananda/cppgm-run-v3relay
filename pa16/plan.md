@@ -281,6 +281,7 @@ comes from the intended check.
 | CP11 builtin, lookup, and common-reference boundaries (completed) | builtin declaration ownership and LowIR metadata; using-declaration overload sets; function/tag call disambiguation; derived/base conditional glvalue binding and address projection | 223/243 pa16 tests pass (20 failures, down from 25) with unchanged coverage; focused packet 6/6; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | CP12 aggregate leaf evaluation and constant global data (completed) | supplied local aggregate values lower before destination projection, including member leaves; recursive transactional folding of constant class/array globals with layout padding; translation-unit string pooling by code-unit type and bytes | 227/243 pa16 tests pass (16 failures, down from 20) with unchanged coverage; focused aggregate/data set 4/4; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | CP13 direct call resolution and nested LowIR naming (completed) | ordinary member lookup suppresses ADL; parenthesized member calls retain direct member resolution; nested class scope spellings use one LowIR component without changing ABI object names | 229/243 pa16 tests pass (14 failures, down from 16) with unchanged coverage; focused call set 3/3; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
+| CP14 class member selection and lifetime initialization (completed) | const-qualified member projections with mutable/reference exceptions; recursive class completion through arrays; empty aggregate-constructor elision; synthesized array construction/unwind and reverse destruction; value-initialization zeroing | 231/243 pa16 tests pass (12 failures, down from 14) with unchanged coverage; packet 4/5 exact, with the remaining friend fixture retaining the standard-required base construction; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -780,31 +781,42 @@ coverage; `make test-report-through-pa15` is 1139/1139; and
 `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src` passes with
 five nonfatal warnings.  No fixtures or reference files changed.
 
-## Active Checkpoint: CP14 — class member selection and lifetime initialization
+## Completed Checkpoint: CP14 — class member selection and lifetime initialization
 
-Goal: reduce the remaining 14 pa16 failures while preserving CP1–CP13 and the
-review-3 owners (`BuildFunctionBody`, `FinishCall`, `ZeroInitializeObject`,
-`ClassEntity::empty`).
+Delivered: member access now owns object cv propagation while preserving
+mutable and reference-member semantics, and lvalue-to-rvalue conversion drops
+only top-level cv before overload ranking.  Class completion follows
+non-static array elements and skips static fields.  Aggregate lowering keeps
+real constructor work, elides empty user-provided nested calls, value-initializes
+synthetic/defaulted no-argument objects with zero stores, and emits array
+construction/unwind plus reverse member destruction with cleanup suffixes.
+
+Evidence (2026-09-03): the focused packet comparison passed 4/5; the remaining
+friend/defaulted-constructor fixture differs because its checked reference
+omits the derived constructor's required base call.  The adjacent const-member
+overload and mutable-member checks pass.  `make test-pa16` is 231/243 (12
+failures, down from 14) with unchanged coverage; `make
+test-report-through-pa15` is 1139/1139; and the pa16 file audit passes with
+five warnings.  No fixtures or reference files changed.
+
+## Active Checkpoint: CP15 — callable conversion and friend lookup boundaries
+
+Goal: reduce the remaining 12 pa16 failures while preserving CP1–CP14 and
+their canonical owners.
 
 ### Implementation Packet
 
-- Own the next canonical class-object boundary; do not edit fixtures or `.ref`
-  files.  Start with `200-const-subobject-member-call`, tracing const member
-  selection and the emitted member projection through `expr_sema.cpp`,
-  `conversions.cpp`, `overload.cpp`, and `lower/lowir_expr.cpp`.
-- If that ownership path is stable, continue through the related class
-  initialization/lifetime fixtures
-  `200-friend-derived-private-base-defaulted-constructor`,
-  `200-nested-braced-member-aggregate-init`,
-  `300-synthesized-array-member-lifecycle`, and
-  `300-value-init-empty-functional-cast-aggregate`, using class completion and
-  `lower/lowir_program.cpp` (`LowerVariable`, `LowerMemberInitializer`,
-  `ZeroInitializeObject`).  Read each current `.my.lowir.compare.diff` first.
-- Keep the remaining semantic boundaries
-  (`200-string-literal-does-not-convert-to-mutable-void-pointer` and
-  `spec/200-const-reference-binds-derived-pointer-prvalue`) and unrelated
-  LowIR mismatches queued for later packets.  Preserve the known PA17
-  non-goals: block-scope `static` objects and by-value copy semantics.
-- Require a focused comparison, `make test-pa16`, the through-pa15 report,
-  and the pa16 file audit before closing CP14; the failing set must shrink,
-  never merely shift.
+- Start with `300-member-function-pointer-field-call`,
+  `300-temporary-functor-call`, and
+  `300-prvalue-derived-base-friend-operator`; trace callable/member-pointer
+  conversion, implicit-object ranking, and derived-prvalue binding through
+  `expr_sema.cpp`, `conversions.cpp`, `overload.cpp`, and
+  `lower/lowir_expr.cpp`.
+- If that path is stable, inspect the remaining named LowIR mismatches for
+  function-pointer parameter shadowing, hidden-friend definitions, callable
+  fields, nullptr operators, and bit-field increment ordering.  Keep the
+  string-literal mutable-void-pointer and const-reference derived-pointer
+  diagnostics queued until their conversion ownership is isolated.
+- Preserve the known PA17 non-goals: block-scope `static` objects and by-value
+  copy semantics.  Require focused comparisons, `make test-pa16`, the
+  through-pa15 report, and the pa16 file audit; the failing set must shrink.

@@ -18,7 +18,6 @@ bool IsConstObject(const TypeTable& types, TypeId type)
   return type != 0 && types.Kind(type) == TYPE_CV &&
       types.At(type).is_const;
 }
-
 bool IsScopedEnum(const TypeTable& types, TypeId type)
 {
   type = types.Unqualified(type);
@@ -520,7 +519,24 @@ SemaId ExpressionAnalyzer::AnalyzeName(AstId expression, ScopeId scope)
   if ((value.kind == BINDING_VARIABLE || value.kind == BINDING_PARAMETER) &&
       model_.ScopeAt(value.scope).kind == SCOPE_CLASS)
   {
-    const SemaId result = MakeExpression(SEMA_MEMBER, expression, value.type,
+    SemaId object = 0;
+    TypeId member_type = value.type;
+    if (!value.static_member)
+    {
+      const BindingId this_binding = model_.LookupUnqualified(
+          scope, "this", LOOKUP_VALUES);
+      if (this_binding == 0)
+        throw std::runtime_error("non-static member used outside a member function");
+      const Binding& this_value = model_.BindingAt(this_binding);
+      const ClassField* field = model_.FieldFor(binding);
+      member_type = MemberAccessType(types_, value.type, false,
+                                     field != 0 && field->mutable_member,
+                                     this_value.type, OP_ARROW);
+      object = MakeExpression(SEMA_ID_EXPRESSION, 0, this_value.type,
+                              VC_PRVALUE, scope, KW_THIS);
+      tree_.At(object).binding = this_binding;
+    }
+    const SemaId result = MakeExpression(SEMA_MEMBER, expression, member_type,
                                          VC_LVALUE, scope);
     SemaNode& member = tree_.At(result);
     member.binding = binding;
@@ -528,19 +544,10 @@ SemaId ExpressionAnalyzer::AnalyzeName(AstId expression, ScopeId scope)
     member.value = value.const_value;
     if (!value.static_member)
     {
-      const BindingId this_binding = model_.LookupUnqualified(
-          scope, "this", LOOKUP_VALUES);
-      if (this_binding == 0)
-        throw std::runtime_error("non-static member used outside a member function");
-      const SemaId object = MakeExpression(SEMA_ID_EXPRESSION, 0,
-                                           model_.BindingAt(this_binding).type,
-                                           VC_PRVALUE, scope, KW_THIS);
-      tree_.At(object).binding = this_binding;
       Append(result, object);
     }
     return result;
   }
-
   // 8.3.5p5: a parameter declared with array or function type has the
   // adjusted pointer type; a reference names its referent (5p5).
   TypeId type = value.type;
@@ -1099,18 +1106,14 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
   const AstNode& member_name_node = arena_.At(member_name);
   const bool pseudo_destructor = IsPseudoDestructorName(
       tokens_, member_name_node);
+  const ETokenType op = Operator(expression);
   TypeId object_type = NodeInfo(object).type;
   if (types_.Kind(object_type) == TYPE_REFERENCE)
     object_type = types_.Referent(object_type);
   bool object_const = false;
   bool object_volatile = false;
-  if (types_.Kind(object_type) == TYPE_CV)
-  {
-    object_const = types_.At(object_type).is_const;
-    object_volatile = types_.At(object_type).is_volatile;
-  }
-
-  const ETokenType op = Operator(expression);
+  MemberObjectQualifiers(types_, object_type, op, object_const,
+                         object_volatile);
   TypeId class_type = types_.Unqualified(object_type);
   if (op == OP_ARROW)
   {
@@ -1182,7 +1185,6 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
     Append(result, object);
     return result;
   }
-
   if (types_.Kind(class_type) != TYPE_CLASS)
     throw std::runtime_error("member access requires a class object");
   ScopeId class_scope = 0;
@@ -1207,18 +1209,16 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
         throw std::runtime_error("ambiguous class member");
       binding = candidates[i];
       break;
-    }
+  }
   const Binding& member = model_.BindingAt(binding);
-  const bool reference_member = !member.static_member &&
-      types_.Kind(types_.Unqualified(member.type)) == TYPE_REFERENCE;
   // A reference data member expression denotes its referent as an lvalue;
   // the reference wrapper is storage metadata consumed by LowerLValue.  In
   // particular, cv on the containing object does not qualify the referred
   // object a reference member names.
-  TypeId type = reference_member ? types_.Referent(member.type) : member.type;
-  if (!member.static_member && !reference_member &&
-      (object_const || object_volatile))
-    type = types_.Cv(type, object_const, object_volatile);
+  const ClassField* field = model_.FieldFor(binding);
+  TypeId type = MemberAccessType(types_, member.type, member.static_member,
+                                 field != 0 && field->mutable_member,
+                                 object_type, op);
   const SemaId result = MakeExpression(SEMA_MEMBER, expression, type,
                                        VC_LVALUE, scope, op);
   SemaNode& semantic = tree_.At(result);

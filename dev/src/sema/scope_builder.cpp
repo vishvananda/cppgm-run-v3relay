@@ -643,6 +643,8 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
         ClassField field(binding, type);
         field.access = member_access_;
         field.initializer = initializer;
+        field.mutable_member =
+            SequenceHasKeyword(specifiers, KW_MUTABLE);
         field.requested_alignment = AlignmentSpecifiers(node, scope);
         model_.BindingAt(binding).field_index =
             model_.ClassAt(member_class).fields.size();
@@ -1727,15 +1729,20 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
         !model_.FunctionAt(value.constructors[i]).defaulted &&
         !model_.FunctionAt(value.constructors[i]).deleted)
       value.trivial_default_constructor = false;
-  for (std::size_t i = 0; i < value.fields.size(); ++i)
-    if (value.fields[i].initializer != 0)
+  for (std::size_t i = 0; i < value.fields.size(); ++i) {
+    if (value.fields[i].static_member)
+      continue;
+    if (value.fields[i].initializer != 0) {
       value.trivial_default_constructor = false;
-    else {
-      const TypeId field_type = types_.Unqualified(value.fields[i].type);
-      if (types_.Kind(field_type) == TYPE_CLASS &&
-          !model_.ClassAt(types_.At(field_type).entity)
-              .trivial_default_constructor)
-        value.trivial_default_constructor = false;
+      continue;
+    }
+    TypeId element = types_.Unqualified(value.fields[i].type);
+    while (types_.Kind(element) == TYPE_ARRAY)
+      element = types_.Unqualified(types_.At(element).base);
+    if (types_.Kind(element) == TYPE_CLASS &&
+        !model_.ClassAt(types_.At(element).entity)
+            .trivial_default_constructor)
+      value.trivial_default_constructor = false;
   }
   for (std::size_t i = 0; i < value.bases.size(); ++i)
     if (!model_.ClassAt(value.bases[i].entity).trivial_default_constructor)

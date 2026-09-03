@@ -401,6 +401,16 @@ void Lowerer::LowerVariable(SemaId variable_node)
     // address in the action also makes explicit and synthesized construction
     // use the same call lowering path.
     if (initializer.empty()) {
+      const ClassEntityId entity = types_.At(unqualified).entity;
+      const ClassEntity& class_entity = model_.ClassAt(entity);
+      if (!class_entity.trivial_default_constructor) {
+        const FunctionEntityId constructor = DefaultConstructor(entity);
+        if (constructor == 0)
+          Unsupported("a class without a default constructor");
+        const Value address = AddressValue(object);
+        EmitVoidCall(FunctionSymbolName(constructor),
+                     std::vector<lowir_model::Operand>(1, address.operand));
+      }
       RegisterLiveObject(variable.binding, declared);
       return;
     }
@@ -414,9 +424,11 @@ void Lowerer::LowerVariable(SemaId variable_node)
           tree_.At(action_children[0]).function;
       if (function == 0)
         Unsupported("a constructor action without a function");
+      const std::vector<SemaId> call_children = Children(action_children[0]);
+      const bool declaration_default = tree_.At(initializer[0]).binding != 0 &&
+          call_children.size() == 2;
       if (model_.ClassAt(model_.FunctionAt(function).member_class)
-              .trivial_default_constructor)
-      {
+              .trivial_default_constructor && declaration_default) {
         (void)AddressValue(object);
         RegisterLiveObject(variable.binding, declared);
         return;
@@ -428,9 +440,23 @@ void Lowerer::LowerVariable(SemaId variable_node)
       // it through the aggregate constructor argument path.
       if (tree_.At(initializer[0]).binding != 0)
         (void)LowerCall(action_children[0], 0);
-      else
-        LowerAggregateConstructor(initializer[0], declared,
-                                  AddressValue(object).operand);
+      else {
+        const FunctionEntity& constructor = model_.FunctionAt(function);
+        const bool value_initialization = call_children.size() == 1;
+        if (value_initialization &&
+            (constructor.synthesized || constructor.defaulted)) {
+          const lowir_model::Operand destination =
+              AddressValue(object).operand;
+          ZeroInitializeObject(declared, destination);
+          if (!model_.ClassAt(constructor.member_class)
+                  .trivial_default_constructor)
+            EmitVoidCall(FunctionSymbolName(function),
+                         std::vector<lowir_model::Operand>(1, destination));
+        } else {
+          LowerAggregateConstructor(initializer[0], declared,
+                                    AddressValue(object).operand);
+        }
+      }
       RegisterLiveObject(variable.binding, declared);
       return;
     }
@@ -438,9 +464,10 @@ void Lowerer::LowerVariable(SemaId variable_node)
         tree_.At(initializer[0]).kind == SEMA_BRACED_INIT_LIST) {
       // A braced aggregate still begins the lifetime of the complete class
       // object before its fields are initialized.  Preserve that address
-      // operation even when no non-trivial constructor call is required.
+      // operation when the aggregate lowering has actual storage work.
       initialized_bitfield_units_.clear();
-      (void)AddressValue(object);
+      if (AggregateInitializationHasWork(initializer[0], declared))
+        (void)AddressValue(object);
       LowerAggregateObjectInitializer(initializer[0], declared, object,
                                       std::vector<std::size_t>());
       RegisterLiveObject(variable.binding, declared);
@@ -516,6 +543,74 @@ void Lowerer::LowerVariable(SemaId variable_node)
             SlotOperand(SlotFor(variable.binding)));
 }
 
+// Whether aggregate lowering below will form or write a destination.  Empty
+// aggregate subobjects do not need a standalone lifetime address; a later
+// use of the complete object will form its own address.  The walk follows
+// the same field/element ownership as LowerAggregateObjectInitializer, so an
+// enclosing aggregate only materializes storage when a scalar, reference, or
+// constructor action actually reaches it.
+bool Lowerer::AggregateInitializationHasWork(SemaId node, TypeId type) const
+{
+  const std::vector<SemaId> values = node == 0 ? std::vector<SemaId>() :
+      Children(node);
+  const TypeId unqualified = types_.Unqualified(type);
+  if (types_.Kind(unqualified) == TYPE_ARRAY) {
+    if (values.size() == 1 && IsStringLiteralArray(values[0], type))
+      return true;
+    const TypeId element = types_.At(unqualified).base;
+    const std::size_t bound = types_.At(unqualified).array_bound;
+    for (std::size_t i = 0; i < bound; ++i) {
+      const SemaId value = i < values.size() ? values[i] : 0;
+      const TypeId element_unqualified = types_.Unqualified(element);
+      if (types_.Kind(element_unqualified) == TYPE_CLASS) {
+        const ClassEntity& element_class = model_.ClassAt(
+            types_.At(element_unqualified).entity);
+        if (!element_class.aggregate ||
+            (value != 0 &&
+             tree_.At(value).kind == SEMA_CONSTRUCTOR_ACTION))
+          return true;
+        if (AggregateInitializationHasWork(value, element))
+          return true;
+        continue;
+      }
+      if (types_.Kind(element_unqualified) == TYPE_ARRAY) {
+        if (AggregateInitializationHasWork(value, element))
+          return true;
+        continue;
+      }
+      return true;
+    }
+    return values.size() > bound;
+  }
+  if (types_.Kind(unqualified) != TYPE_CLASS)
+    return true;
+  const ClassEntity& class_entity = model_.ClassAt(
+      types_.At(unqualified).entity);
+  std::size_t value_index = 0;
+  for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
+    const ClassField& field = class_entity.fields[i];
+    if (field.static_member || field.binding == 0)
+      continue;
+    const TypeId field_type = types_.Unqualified(field.type);
+    const bool aggregate = types_.Kind(field_type) == TYPE_ARRAY ||
+        (types_.Kind(field_type) == TYPE_CLASS &&
+         model_.ClassAt(types_.At(field_type).entity).aggregate);
+    if (aggregate) {
+      const SemaId value = value_index < values.size() ?
+          values[value_index] : 0;
+      if (value != 0 && IsStringLiteralArray(value, field.type))
+        return true;
+      if (AggregateInitializationHasWork(value, field.type))
+        return true;
+      if (value != 0)
+        ++value_index;
+      continue;
+    }
+    return true;
+  }
+  return value_index != values.size();
+}
+
 bool Lowerer::IsStringLiteralArray(SemaId node, TypeId type) const
 {
   if (node == 0 || tree_.At(node).kind != SEMA_LITERAL ||
@@ -568,8 +663,34 @@ lowir_model::Operand Lowerer::AggregateDestination(
   return destination;
 }
 
+// An empty user-provided constructor has no initialization work of its own.
+// Aggregate initialization still evaluates the constructor arguments and
+// forms the destination, but the no-op call need not survive into LowIR.
+bool Lowerer::CanElideEmptyAggregateConstructor(SemaId node) const
+{
+  if (node == 0 || tree_.At(node).kind != SEMA_CONSTRUCTOR_ACTION ||
+      tree_.At(node).function == 0)
+    return false;
+  const FunctionEntity& entity = model_.FunctionAt(tree_.At(node).function);
+  if (entity.special_member != SPECIAL_MEMBER_CONSTRUCTOR ||
+      entity.synthesized || entity.defaulted)
+    return false;
+  const std::map<FunctionEntityId, FunctionSymbol>::const_iterator found =
+      functions_.find(tree_.At(node).function);
+  if (found == functions_.end() || found->second.definition == 0)
+    return false;
+  const SemaId definition = found->second.definition;
+  for (SemaId child = tree_.At(definition).first_child; child != 0;
+       child = tree_.At(child).next_sibling)
+    if (tree_.At(child).kind == SEMA_MEMBER_INITIALIZER)
+      return false;
+  const SemaId body = FunctionBody(definition);
+  return body != 0 && tree_.At(body).first_child == 0;
+}
+
 void Lowerer::LowerAggregateConstructor(
-    SemaId node, TypeId type, const lowir_model::Operand& destination)
+    SemaId node, TypeId type, const lowir_model::Operand& destination,
+    bool emit_call)
 {
   if (node == 0 || tree_.At(node).kind != SEMA_CONSTRUCTOR_ACTION ||
       tree_.At(node).function == 0)
@@ -586,7 +707,6 @@ void Lowerer::LowerAggregateConstructor(
       model_.FunctionAt(function).type));
   if (call_children.size() - 1 > callable.parameters.size() - 1)
     Unsupported("an aggregate constructor with too many arguments");
-  const std::string& symbol = FunctionSymbolName(function);
   std::vector<lowir_model::Operand> arguments(1, destination);
   for (std::size_t i = 1; i < call_children.size(); ++i) {
     const TypeId parameter = callable.parameters[i];
@@ -595,7 +715,8 @@ void Lowerer::LowerAggregateConstructor(
             call_children[i], parameter).operand :
         LowerRValue(call_children[i], parameter).operand);
   }
-  EmitVoidCall(symbol, arguments);
+  if (emit_call)
+    EmitVoidCall(FunctionSymbolName(function), arguments);
   (void)type;
 }
 
@@ -681,8 +802,9 @@ void Lowerer::LowerAggregateObjectInitializer(
       if (types_.Kind(element_unqualified) == TYPE_CLASS &&
           model_.ClassAt(types_.At(element_unqualified).entity).aggregate) {
         if (value != 0 && tree_.At(value).kind == SEMA_CONSTRUCTOR_ACTION)
-          LowerAggregateConstructor(
-              value, element, AggregateDestination(object, element_path));
+              LowerAggregateConstructor(
+              value, element, AggregateDestination(object, element_path),
+              !CanElideEmptyAggregateConstructor(value));
         else
           LowerAggregateObjectInitializer(value, element, object, element_path);
       } else if (types_.Kind(element_unqualified) == TYPE_ARRAY) {
@@ -696,7 +818,9 @@ void Lowerer::LowerAggregateObjectInitializer(
           } else if (tree_.At(value).kind == SEMA_CONSTRUCTOR_ACTION) {
             const lowir_model::Operand destination = AggregateDestination(
                 object, element_path);
-            LowerAggregateConstructor(value, element, destination);
+            LowerAggregateConstructor(
+                value, element, destination,
+                !CanElideEmptyAggregateConstructor(value));
           } else {
             // Evaluate a supplied initializer before projecting the
             // destination subobject.  This keeps expression side effects in
@@ -760,7 +884,9 @@ void Lowerer::LowerAggregateObjectInitializer(
                  SEMA_CONSTRUCTOR_ACTION) {
         const lowir_model::Operand destination = AggregateDestination(
             object, field_path);
-        LowerAggregateConstructor(values[value_index], field.type, destination);
+        LowerAggregateConstructor(
+            values[value_index], field.type, destination,
+            !CanElideEmptyAggregateConstructor(values[value_index]));
       } else {
         const Value initialized = LowerRValue(values[value_index], field.type);
         const lowir_model::Operand destination = AggregateDestination(
@@ -1167,20 +1293,20 @@ void Lowerer::EmitSharedReturnCleanups()
   EmitReturn(&result);
 }
 
-void Lowerer::EmitSubobjectDestructors(ClassEntityId entity)
+void Lowerer::CollectSubobjectDestructors(
+    ClassEntityId entity, std::vector<SubobjectDestructor>& result) const
 {
   const ClassEntity& owner = model_.ClassAt(entity);
   for (std::size_t i = owner.fields.size(); i != 0; --i) {
-    const ClassField& field = owner.fields[i - 1];
+    const std::size_t field_index = i - 1;
+    const ClassField& field = owner.fields[field_index];
     if (field.static_member || field.binding == 0)
       continue;
     const TypeId field_type = types_.Unqualified(field.type);
     TypeId element = field_type;
-    bool array = false;
-    if (types_.Kind(field_type) == TYPE_ARRAY) {
+    const bool array = types_.Kind(field_type) == TYPE_ARRAY;
+    if (array)
       element = types_.Unqualified(types_.At(field_type).base);
-      array = true;
-    }
     if (types_.Kind(element) != TYPE_CLASS ||
         !NeedsDestructor(types_.At(element).entity))
       continue;
@@ -1188,34 +1314,92 @@ void Lowerer::EmitSubobjectDestructors(ClassEntityId entity)
         model_.ClassAt(types_.At(element).entity).destructor;
     if (destructor == 0)
       continue;
-    const lowir_model::Operand member = ProjectField(LoadThis(), field.offset);
-    if (array) {
-      Value subobject;
-      subobject.type = field.type;
-      subobject.lvalue = true;
-      subobject.operand = member;
-      const std::size_t bound = types_.At(field_type).array_bound;
-      for (std::size_t index = 0; index < bound; ++index) {
-        const std::string& symbol = FunctionSymbolName(destructor);
-        EmitVoidCall(symbol, std::vector<lowir_model::Operand>(
-            1, LowerArrayElementAddress(subobject, element, index)));
-      }
-    } else
-      EmitVoidCall(FunctionSymbolName(destructor),
-                   std::vector<lowir_model::Operand>(1, member));
+    const std::size_t bound = array ? types_.At(field_type).array_bound : 1;
+    for (std::size_t index = bound; index != 0; --index) {
+      SubobjectDestructor entry;
+      entry.function = destructor;
+      entry.array = array;
+      entry.member_index = field_index;
+      entry.array_index = index - 1;
+      result.push_back(entry);
+    }
   }
   for (std::size_t i = owner.bases.size(); i != 0; --i) {
-    const ClassBase& base = owner.bases[i - 1];
+    const std::size_t base_index = i - 1;
+    const ClassBase& base = owner.bases[base_index];
     if (!NeedsDestructor(base.entity))
       continue;
     const FunctionEntityId destructor =
         model_.ClassAt(base.entity).destructor;
     if (destructor == 0)
       continue;
+    SubobjectDestructor entry;
+    entry.function = destructor;
+    entry.base = true;
+    entry.member_index = base_index;
+    result.push_back(entry);
+  }
+}
+
+void Lowerer::EmitSubobjectDestructor(
+    ClassEntityId entity, const SubobjectDestructor& destructor)
+{
+  const ClassEntity& owner = model_.ClassAt(entity);
+  if (destructor.base) {
+    const ClassBase& base = owner.bases[destructor.member_index];
     const lowir_model::Operand subobject = ProjectField(
         LoadThis(), base.offset, lowir_model::IPK_BASE_SUBOBJECT);
-    EmitVoidCall(FunctionBaseSymbolName(destructor),
+    EmitVoidCall(FunctionBaseSymbolName(destructor.function),
                  std::vector<lowir_model::Operand>(1, subobject));
+    return;
+  }
+  const ClassField& field = owner.fields[destructor.member_index];
+  const lowir_model::Operand member = ProjectField(LoadThis(), field.offset);
+  if (!destructor.array) {
+    EmitVoidCall(FunctionSymbolName(destructor.function),
+                 std::vector<lowir_model::Operand>(1, member));
+    return;
+  }
+  const TypeId field_type = types_.Unqualified(field.type);
+  const TypeId element = types_.Unqualified(types_.At(field_type).base);
+  Value subobject;
+  subobject.type = field.type;
+  subobject.lvalue = true;
+  subobject.operand = member;
+  EmitVoidCall(FunctionSymbolName(destructor.function),
+               std::vector<lowir_model::Operand>(1,
+                   LowerArrayElementAddress(subobject, element,
+                                            destructor.array_index)));
+}
+
+void Lowerer::EmitSubobjectDestructors(ClassEntityId entity, bool guarded)
+{
+  std::vector<SubobjectDestructor> destructors;
+  CollectSubobjectDestructors(entity, destructors);
+  for (std::size_t i = 0; i < destructors.size(); ++i) {
+    if (!guarded || i + 1 == destructors.size()) {
+      EmitSubobjectDestructor(entity, destructors[i]);
+      continue;
+    }
+    const std::string cleanup_label = NewBlockLabel("destructor_suffix_cleanup");
+    const std::string next_label = NewBlockLabel("destructor_suffix_next");
+    lowir_model::Instruction cleanup;
+    cleanup.kind = lowir_model::Instruction::IK_EH_CLEANUP;
+    cleanup.first = LabelOperand(cleanup_label);
+    Emit(cleanup);
+    EmitSubobjectDestructor(entity, destructors[i]);
+    lowir_model::Instruction end;
+    end.kind = lowir_model::Instruction::IK_EH_END;
+    Emit(end);
+    EmitJump(next_label);
+    StartBlock(cleanup_label);
+    for (std::size_t suffix = i + 1; suffix < destructors.size(); ++suffix)
+      EmitSubobjectDestructor(entity, destructors[suffix]);
+    Emit(end);
+    lowir_model::Instruction resume;
+    resume.kind = lowir_model::Instruction::IK_RESUME;
+    Emit(resume);
+    StartBlock(next_label);
   }
 }
 
@@ -1238,11 +1422,11 @@ void Lowerer::EmitDestructorBody(FunctionEntityId function,
     lowir_model::Instruction end;
     end.kind = lowir_model::Instruction::IK_EH_END;
     Emit(end);
-    EmitSubobjectDestructors(entity.member_class);
+    EmitSubobjectDestructors(entity.member_class, true);
     EmitJump(end_label);
   }
   StartBlock(cleanup_label);
-  EmitSubobjectDestructors(entity.member_class);
+  EmitSubobjectDestructors(entity.member_class, false);
   lowir_model::Instruction end;
   end.kind = lowir_model::Instruction::IK_EH_END;
   Emit(end);
@@ -1425,6 +1609,64 @@ void Lowerer::EmitDefaultConstruction(FunctionEntityId constructor,
   EmitVoidCall(symbol, arguments);
 }
 
+void Lowerer::EmitArrayDefaultConstructions(FunctionEntityId constructor,
+                                            FunctionEntityId destructor,
+                                            TypeId array_type,
+                                            std::size_t field_offset)
+{
+  const TypeId array = types_.Unqualified(array_type);
+  const TypeId element = types_.Unqualified(types_.At(array).base);
+  const std::size_t bound = types_.At(array).array_bound;
+  const bool guarded = destructor != 0 &&
+      !model_.FunctionAt(constructor).noexcept_qualifier;
+
+  const auto emit_constructor = [&](std::size_t index) {
+    const lowir_model::Operand member = ProjectField(LoadThis(), field_offset);
+    Value subobject;
+    subobject.type = array_type;
+    subobject.lvalue = true;
+    subobject.operand = member;
+    EmitDefaultConstruction(constructor, FunctionSymbolName(constructor),
+                            LowerArrayElementAddress(subobject, element,
+                                                     index));
+  };
+  const auto emit_destructor = [&](std::size_t index) {
+    const lowir_model::Operand member = ProjectField(LoadThis(), field_offset);
+    Value subobject;
+    subobject.type = array_type;
+    subobject.lvalue = true;
+    subobject.operand = member;
+    EmitVoidCall(FunctionSymbolName(destructor),
+                 std::vector<lowir_model::Operand>(1,
+                     LowerArrayElementAddress(subobject, element, index)));
+  };
+
+  for (std::size_t index = 0; index < bound; ++index) {
+    if (!guarded || index == 0) {
+      emit_constructor(index);
+      continue;
+    }
+    const std::string cleanup_label = NewBlockLabel("call_unwind_dispatch");
+    const std::string end_label = NewBlockLabel("call_unwind_end");
+    lowir_model::Instruction try_instruction;
+    try_instruction.kind = lowir_model::Instruction::IK_EH_TRY;
+    try_instruction.first = LabelOperand(cleanup_label);
+    Emit(try_instruction);
+    emit_constructor(index);
+    lowir_model::Instruction end;
+    end.kind = lowir_model::Instruction::IK_EH_END;
+    Emit(end);
+    EmitJump(end_label);
+    StartBlock(cleanup_label);
+    for (std::size_t previous = index; previous != 0; --previous)
+      emit_destructor(previous - 1);
+    lowir_model::Instruction resume;
+    resume.kind = lowir_model::Instruction::IK_RESUME;
+    Emit(resume);
+    StartBlock(end_label);
+  }
+}
+
 // 8.5p5 zero-initialization of one object at `destination`.  An object of
 // scalar width is one integer store (the fixtures' spelling for a
 // value-initialized class member); a wider object is zeroed per base,
@@ -1438,6 +1680,46 @@ void Lowerer::ZeroInitializeObject(TypeId type,
   if (!is_class && !is_array) {
     EmitStore(LowTypeOf(unqualified), ZeroOperand(unqualified), destination);
     return;
+  }
+  if (is_class && types_.SizeOf(unqualified) > 8 &&
+      types_.SizeOf(unqualified) % 8 == 0) {
+    const ClassEntity& class_entity = model_.ClassAt(
+        types_.At(unqualified).entity);
+    bool byte_zeroable = class_entity.bases.empty();
+    for (std::size_t i = 0; byte_zeroable && i < class_entity.fields.size();
+         ++i) {
+      const ClassField& field = class_entity.fields[i];
+      if (field.static_member)
+        continue;
+      const TypeKind kind = types_.Kind(types_.Unqualified(field.type));
+      byte_zeroable = field.bit_width == 0 && kind != TYPE_CLASS &&
+          kind != TYPE_ARRAY && kind != TYPE_REFERENCE;
+    }
+    if (byte_zeroable) {
+      const std::size_t size = types_.SizeOf(unqualified);
+      for (std::size_t offset = 0; offset < size;) {
+        lowir_model::Operand place = destination;
+        if (offset != 0) {
+          lowir_model::Instruction projection;
+          projection.kind = lowir_model::Instruction::IK_INDEX;
+          projection.dest = NewTemp();
+          projection.type = I8Type();
+          projection.first = destination;
+          projection.second = Immediate(static_cast<long long>(offset));
+          Emit(projection);
+          place = TempOperand(projection.dest);
+        }
+        const std::size_t remaining = size - offset;
+        const std::size_t width = remaining >= 8 ? 8 : remaining >= 4 ?
+            4 : remaining >= 2 ? 2 : 1;
+        EmitStore(width == 8 ? I64Type() : width == 4 ?
+            LowTypeOf(types_.Fundamental(FT_INT)) : width == 2 ?
+            LowTypeOf(types_.Fundamental(FT_SHORT_INT)) :
+            LowTypeOf(types_.Fundamental(FT_CHAR)), Immediate(0), place);
+        offset += width;
+      }
+      return;
+    }
   }
   switch (types_.SizeOf(unqualified)) {
   case 1:
@@ -1575,18 +1857,30 @@ void Lowerer::LowerConstructorInitializers(FunctionEntityId function,
                 destination);
       continue;
     }
-    if (types_.Kind(field_type) != TYPE_CLASS)
+    TypeId element_type = field_type;
+    const bool array = types_.Kind(element_type) == TYPE_ARRAY;
+    if (array)
+      element_type = types_.Unqualified(types_.At(element_type).base);
+    if (types_.Kind(element_type) != TYPE_CLASS)
       continue;
-    if (model_.ClassAt(types_.At(field_type).entity)
+    if (model_.ClassAt(types_.At(element_type).entity)
             .trivial_default_constructor)
       continue;
     const FunctionEntityId constructor = DefaultConstructor(
-        types_.At(field_type).entity);
+        types_.At(element_type).entity);
     if (constructor == 0)
       Unsupported("a member without a default constructor");
-    const lowir_model::Operand member = ProjectField(LoadThis(), field.offset);
-    EmitDefaultConstruction(constructor, FunctionSymbolName(constructor),
-                            member);
+    if (!array) {
+      const lowir_model::Operand member =
+          ProjectField(LoadThis(), field.offset);
+      EmitDefaultConstruction(constructor, FunctionSymbolName(constructor),
+                              member);
+      continue;
+    }
+    const FunctionEntityId destructor =
+        model_.ClassAt(types_.At(element_type).entity).destructor;
+    EmitArrayDefaultConstructions(constructor, destructor, field.type,
+                                  field.offset);
   }
 }
 

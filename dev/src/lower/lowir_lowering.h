@@ -398,6 +398,7 @@ private:
   void LowerReturn(SemaId node);
   void LowerVariableDeclaration(SemaId node);
   void LowerVariable(SemaId variable_node);
+  bool AggregateInitializationHasWork(SemaId node, TypeId type) const;
   void LowerAggregateObjectInitializer(
       SemaId node, TypeId type, const Value& object,
       const std::vector<std::size_t>& path);
@@ -407,8 +408,10 @@ private:
   void LowerAggregateStringInitializer(
       SemaId node, TypeId type, const Value& object,
       const std::vector<std::size_t>& path);
+  bool CanElideEmptyAggregateConstructor(SemaId node) const;
   void LowerAggregateConstructor(SemaId node, TypeId type,
-                                 const lowir_model::Operand& destination);
+                                 const lowir_model::Operand& destination,
+                                 bool emit_call = true);
   void LowerAggregateDefaultConstructor(
       TypeId type, const lowir_model::Operand& destination);
   lowir_model::Operand LowerArrayElementAddress(
@@ -432,7 +435,23 @@ private:
   void EmitSharedReturnCleanups();
   bool NeedsDestructor(ClassEntityId entity) const;
   bool HasSubobjectDestructors(ClassEntityId entity) const;
-  void EmitSubobjectDestructors(ClassEntityId entity);
+  struct SubobjectDestructor
+  {
+    FunctionEntityId function;
+    bool base;
+    bool array;
+    std::size_t member_index;
+    std::size_t array_index;
+
+    SubobjectDestructor()
+        : function(0), base(false), array(false), member_index(0),
+          array_index(0) {}
+  };
+  void CollectSubobjectDestructors(
+      ClassEntityId entity, std::vector<SubobjectDestructor>& result) const;
+  void EmitSubobjectDestructor(ClassEntityId entity,
+                               const SubobjectDestructor& destructor);
+  void EmitSubobjectDestructors(ClassEntityId entity, bool guarded);
   void EmitDestructorBody(FunctionEntityId function, SemaId function_node);
   void LowerConstructorInitializers(FunctionEntityId function,
                                     SemaId function_node);
@@ -440,6 +459,10 @@ private:
   void EmitDefaultConstruction(FunctionEntityId constructor,
                                const std::string& symbol,
                                const lowir_model::Operand& destination);
+  void EmitArrayDefaultConstructions(FunctionEntityId constructor,
+                                     FunctionEntityId destructor,
+                                     TypeId array_type,
+                                     std::size_t field_offset);
   FunctionEntityId DefaultConstructor(ClassEntityId entity) const;
   void PushControl(const std::string& break_label,
                    const std::string& continue_label);

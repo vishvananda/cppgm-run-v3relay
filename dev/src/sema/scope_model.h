@@ -139,12 +139,13 @@ struct ClassField
   AccessKind access;
   AstId initializer;
   bool static_member;
+  bool mutable_member;
 
   ClassField(BindingId binding = 0, TypeId type = 0)
       : binding(binding), type(type), offset(0), bit_offset(0),
         bit_width(0), requested_alignment(0), access(ACCESS_PUBLIC),
         initializer(0),
-        static_member(false) {}
+        static_member(false), mutable_member(false) {}
 };
 
 struct Scope
