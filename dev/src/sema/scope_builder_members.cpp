@@ -318,22 +318,25 @@ void ScopeBuilder::RecordAssignmentMember(FunctionEntityId function)
     owner.move_assignment = function;
 }
 
-// A defaulted operator= is parsed as an ordinary member declaration, but it
-// still needs a deferred definition node so symbol collection can retain its
-// body when the call is odr-used.  Its body is intentionally empty here; the
-// LowIR special-member path supplies the subobject plan after class layout is
-// complete.
+// A defaulted operator= is parsed as an ordinary member declaration.  In-class
+// definitions wait for class completion; an out-of-class definition is already
+// in a complete-class context and can be attached immediately.
 void ScopeBuilder::BuildDefaultedMemberDefinition(
     FunctionEntityId function, BindingId binding, ScopeId target_scope,
-    const std::string& name, const std::vector<ParameterInfo>& parameters)
+    const std::string& name, const std::vector<ParameterInfo>& parameters,
+    bool defer_definition)
 {
   if (!EmitsSemantics())
     return;
   FunctionEntity& entity = model_.FunctionAt(function);
   entity.defined = true;
-  const SemaId function_node = MakeDetachedSemantic(
-      SEMA_FUNCTION_DEFINITION, target_scope, entity.type, binding, function);
-  DeferSemantic(function_node);
+  const SemaId function_node = defer_definition ? MakeDetachedSemantic(
+      SEMA_FUNCTION_DEFINITION, target_scope, entity.type, binding, function) :
+      MakeSemantic(SEMA_FUNCTION_DEFINITION, target_scope,
+                   SemanticParent(target_scope), entity.type, binding,
+                   function);
+  if (defer_definition)
+    DeferSemantic(function_node);
   const ScopeId function_scope = model_.CreateScope(
       SCOPE_FUNCTION, name, target_scope);
   model_.ScopeAt(function_scope).function_entity = function;
@@ -353,8 +356,11 @@ void ScopeBuilder::BuildDefaultedMemberDefinition(
     MakeSemantic(SEMA_PARAMETER, function_scope, function_node,
                  canonical.parameters[i + 1], parameter);
   }
-  deferred_member_bodies_.push_back(DeferredMemberBody(
-      0, function_scope, function, function_node));
+  if (defer_definition)
+    deferred_member_bodies_.push_back(DeferredMemberBody(
+        0, function_scope, function, function_node));
+  else
+    BuildFunctionBody(0, function_scope, function, function_node);
 }
 
 // Build an implicit/defaulted special member as a normal function entity and

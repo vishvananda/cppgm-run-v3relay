@@ -595,7 +595,7 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
         function_entity.in_class_definition =
             function_entity.in_class_definition || scope == target_scope;
         BuildDefaultedMemberDefinition(function, binding, target_scope, name,
-                                       parameters);
+                                       parameters, scope == target_scope);
       }
       if (is_friend && has_friend_owner)
       {
@@ -765,13 +765,53 @@ void ScopeBuilder::BuildVariable(BindingId binding, AstId initializer,
     const bool copy_list_initialization = value_kind == AST_BRACED_INIT_LIST &&
         after_declarator < tokens_.size() &&
         tokens_[after_declarator].IsSimple(OP_ASS);
+    // A conditional expression already produces the complete class value.
+    // Copy-initialization of that prvalue is the elided class boundary; it
+    // must not be reinterpreted as a one-argument constructor call.
+    if (value_kind == AST_CONDITIONAL_EXPRESSION)
+    {
+      const std::size_t mark = Tree().Mark();
+      const SemaId conditional = expression_.Analyze(value, scope);
+      const TypeId source_type = types_.Unqualified(
+          tree_->At(conditional).type);
+      if (types_.Kind(source_type) == TYPE_CLASS &&
+          types_.At(source_type).entity == types_.At(unqualified).entity &&
+          tree_->At(conditional).category == VC_PRVALUE)
+      {
+        tree_->Append(variable, conditional);
+        return;
+      }
+      Tree().Truncate(mark);
+    }
+    // A C-style or named cast to this class is likewise an expression-owned
+    // construction.  Preserve that complete value so lowering can initialize
+    // the declared object at its destination instead of trying to resolve
+    // the cast AST itself as a constructor argument.
+    if (value_kind == AST_CAST_EXPRESSION)
+    {
+      const std::size_t mark = Tree().Mark();
+      const SemaId cast = expression_.Analyze(value, scope);
+      const SemaNode& cast_node = tree_->At(cast);
+      const TypeId source_type = types_.Unqualified(cast_node.type);
+      if (types_.Kind(source_type) == TYPE_CLASS &&
+          types_.At(source_type).entity == types_.At(unqualified).entity &&
+          (cast_node.kind == SEMA_CONSTRUCTOR_ACTION ||
+           cast_node.category == VC_PRVALUE))
+      {
+        tree_->Append(variable, cast);
+        return;
+      }
+      Tree().Truncate(mark);
+    }
     // A direct one-argument initialization from the same trivially
     // copyable class still selects the copy constructor semantically, but
     // its complete-object transfer is the raw value boundary.  Retain the
     // source expression so lowering emits `copyobj` instead of manufacturing
     // an otherwise empty constructor call.
     if (value_kind == AST_PAREN_INITIALIZER &&
-        arena_.At(value).children.size() == 1) {
+        arena_.At(value).children.size() == 1 &&
+        arena_.At(arena_.At(value).children[0]).kind !=
+            AST_BRACED_INIT_LIST) {
       const SemaId argument = expression_.Analyze(
           arena_.At(value).children[0], scope);
       TypeId source_type = types_.Unqualified(tree_->At(argument).type);
@@ -1304,27 +1344,43 @@ void ScopeBuilder::BuildMemberInitializers(AstId initializer,
     }
     if (!aggregate_initializer && types_.Kind(target_unqualified) == TYPE_CLASS)
     {
-      target_constructor = ResolveConstructor(target_type, arguments,
-                                               function_scope);
-      const TypeNode& constructor_type = types_.At(types_.Unqualified(
-          model_.FunctionAt(target_constructor).type));
-      std::vector<SemaId> converted;
-      converted.reserve(constructor_type.parameters.size() - 1);
-      for (std::size_t argument = 0; argument < arguments.size(); ++argument)
-        converted.push_back(expression_.Initialize(
-            arguments[argument], constructor_type.parameters[argument + 1]));
-      const FunctionEntity& constructor = model_.FunctionAt(target_constructor);
-      for (std::size_t parameter = arguments.size() + 1;
-           parameter < constructor_type.parameters.size(); ++parameter)
+      TypeId source_type = arguments.size() == 1 ?
+          types_.Unqualified(tree_->At(arguments[0]).type) : 0;
+      if (source_type != 0 && types_.Kind(source_type) == TYPE_REFERENCE)
+        source_type = types_.Unqualified(types_.Referent(source_type));
+      const bool trivial_class_copy = arguments.size() == 1 &&
+          source_type != 0 &&
+          types_.Kind(source_type) == TYPE_CLASS &&
+          types_.At(source_type).entity ==
+              types_.At(target_unqualified).entity &&
+          model_.ClassAt(types_.At(target_unqualified).entity)
+              .trivially_copyable;
+      if (trivial_class_copy)
+        target_constructor = 0;
+      else
       {
-        if (parameter >= constructor.default_arguments.size() ||
-            constructor.default_arguments[parameter] == 0)
-          throw std::runtime_error("missing constructor argument");
-        converted.push_back(expression_.AnalyzeInitializer(
-            constructor.default_arguments[parameter], constructor.scope,
-            constructor_type.parameters[parameter]));
+        target_constructor = ResolveConstructor(target_type, arguments,
+                                                 function_scope);
+        const TypeNode& constructor_type = types_.At(types_.Unqualified(
+            model_.FunctionAt(target_constructor).type));
+        std::vector<SemaId> converted;
+        converted.reserve(constructor_type.parameters.size() - 1);
+        for (std::size_t argument = 0; argument < arguments.size(); ++argument)
+          converted.push_back(expression_.Initialize(
+              arguments[argument], constructor_type.parameters[argument + 1]));
+        const FunctionEntity& constructor = model_.FunctionAt(target_constructor);
+        for (std::size_t parameter = arguments.size() + 1;
+             parameter < constructor_type.parameters.size(); ++parameter)
+        {
+          if (parameter >= constructor.default_arguments.size() ||
+              constructor.default_arguments[parameter] == 0)
+            throw std::runtime_error("missing constructor argument");
+          converted.push_back(expression_.AnalyzeInitializer(
+              constructor.default_arguments[parameter], constructor.scope,
+              constructor_type.parameters[parameter]));
+        }
+        arguments.swap(converted);
       }
-      arguments.swap(converted);
     }
     else if (!aggregate_initializer && !empty_array_value_initializer)
     {
@@ -1349,6 +1405,18 @@ void ScopeBuilder::AddConstructorActionWithArguments(
 {
   if (!EmitsSemantics())
     return;
+  bool has_braced_argument = false;
+  for (std::size_t i = 0; i < argument_nodes.size(); ++i)
+    if (arena_.At(argument_nodes[i]).kind == AST_BRACED_INIT_LIST)
+      has_braced_argument = true;
+  if (has_braced_argument)
+  {
+    const SemaId action = expression_.BuildConstructorCall(
+        0, type, scope, argument_nodes, list_initialization,
+        copy_initialization, binding);
+    tree_->Append(variable, action);
+    return;
+  }
   std::vector<SemaId> arguments;
   for (std::size_t i = 0; i < argument_nodes.size(); ++i)
     arguments.push_back(expression_.Analyze(argument_nodes[i], scope));
@@ -2782,7 +2850,19 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
              member_lvalue_ref_qualifier ||
          model_.FunctionAt(prior.function).member_rvalue_ref_qualifier !=
              member_rvalue_ref_qualifier))
+    {
+      const FunctionEntity& prior_entity = model_.FunctionAt(prior.function);
+      const bool prior_ref = prior_entity.member_lvalue_ref_qualifier ||
+          prior_entity.member_rvalue_ref_qualifier;
+      const bool current_ref = member_lvalue_ref_qualifier ||
+          member_rvalue_ref_qualifier;
+      if (same_parameters && prior_ref != current_ref &&
+          prior_entity.member_const == member_const &&
+          prior_entity.member_volatile == member_volatile)
+        throw std::runtime_error(
+            "unqualified and ref-qualified member overloads conflict");
       continue;
+    }
     if (same_parameters && model_.FunctionAt(prior.function).type != canonical)
       throw std::runtime_error("function redeclaration changes return type");
     if (model_.FunctionAt(prior.function).type == canonical)

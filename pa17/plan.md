@@ -192,7 +192,8 @@ is a memory error (valgrind first).
 | CP2 implicit copy/move members | this checkpoint | bucket B: `EnsureCopyMoveMembers`, deletion rules, synthesized bodies with trivial prefix, deleted candidates, elided-copy access | 106/228; PA1-PA16 1382/1382; PA11 68/68; PA12 166/166; audit passed; focused matrix green; scaling 2.0×/2.1×; coverage unchanged |
 | review 1 | — | ownership, PA11/PA12 dumps, valgrind, probes | — |
 | CP3 temporaries and lifetimes | this checkpoint | bucket C: canonical temporary ownership, full-expression destruction, `eh_try` cleanup regions, reference extension, condition declarations, empty-destructor elision, conversion-operator condition calls, and slot naming | 113/228 from 106/228; five packet fixtures 5/5; PA1-PA16 1382/1382; full-through 1495/1610; audit passed; coverage unchanged |
-| CP4 ref-qualifiers, out-of-class operators, class casts, braced call arguments | — | bucket D | target ≥ 155/228 |
+| CP4a ref-qualified calls and class-construction boundaries | this checkpoint | bucket D slice: ref-qualified overload ownership, out-of-class defaulted members, braced call arguments, and class/C-style cast construction | 121/228 from 113/228; eight new passes; named fixtures 5/5; PA1-PA16 1382/1382; audit passed; coverage unchanged |
+| CP4b remaining operators and class-cast edges | — | bucket D: qualified operator ownership, reference-target casts, and remaining implicit-object ranking | continue from 121/228 |
 | CP5 conversion functions | — | bucket E: parser, `SPECIAL_MEMBER_CONVERSION`, `Classify`, built-in operator candidates | target ≥ 185/228 |
 | review 2 | — | as review 1 | — |
 | CP6 allocation and deallocation | — | bucket F | target ≥ 205/228 |
@@ -360,18 +361,14 @@ the file audit passed.  The representative probes measured 2.0× `wideval`
 and 2.1× `byaddr` growth at doubling, with five `copyobj` transfers for five
 modeled `wideval` transfers.
 
-## Active Checkpoint: CP4 ref-qualifiers, operators, and class casts
+## Active Checkpoint: CP4b remaining operators and class-cast edges
 
-Goal: complete ref-qualified calls, out-of-class operator ownership, braced
-call arguments, and class-cast initialization while preserving the value and
-lifetime boundaries established here.  Start from 113/228 with PA1-PA16
-clean; target at least 155/228.
+Goal: continue bucket D from 121/228 with PA1-PA16 clean, closing the
+remaining qualified-operator, reference-target cast, and implicit-object
+ranking gaps without disturbing the completed class-construction boundary.
 
-Scope: ref-qualified overload viability and implicit-object binding,
-out-of-class special-member/operator definitions, parenthesized braced
-arguments, and `static_cast<Class>`/C-style class initialization.  Focus next
-on `200-ref-qualified-member-call-conditional-shadowed-setter`,
-`spec/200-ref-qualified-mixed-overload-bad`,
-`200-out-of-class-special-members`,
-`200-parenthesized-braced-aggregate-constructor-arg`, and
-`200-static-cast-explicit-constructor`.
+Scope: out-of-class qualified operator/conversion ownership, reference-target
+class casts, and ref-qualified implicit-object ranking.  Focus next on
+`300-ref-qualified-member-call-implicit-object-rank`,
+`400-out-of-class-qualified-conversion-operator-result`, and
+`400-static-cast-class-reference-temporary`.

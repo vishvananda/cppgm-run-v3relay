@@ -414,6 +414,10 @@ void Lowerer::LowerClassValueInto(
     }
     return;
   }
+  if (value.kind == SEMA_CONDITIONAL) {
+    LowerConditionalObjectInto(source, type, destination);
+    return;
+  }
   const Value result = (value.category == VC_LVALUE ||
                         value.category == VC_XVALUE) ?
       Value() : LowerRValue(source, type);
@@ -423,6 +427,41 @@ void Lowerer::LowerClassValueInto(
   } else {
     EmitCopyObject(type, result.operand, destination);
   }
+}
+
+void Lowerer::LowerConditionalObjectInto(
+    SemaId node, TypeId type, const lowir_model::Operand& destination)
+{
+  const std::vector<SemaId> children = Children(node);
+  if (children.size() != 3)
+    Unsupported("this class conditional expression");
+  const std::string then_label = NewBlockLabel("condobj_then");
+  const std::string else_label = NewBlockLabel("condobj_else");
+  const std::string end_label = NewBlockLabel("condobj_end");
+  const SemaNode& condition = tree_.At(children[0]);
+  bool materialize_logical = false;
+  if (condition.kind == SEMA_BINARY && IsLogicalOperator(condition.op)) {
+    const std::vector<SemaId> condition_children = Children(children[0]);
+    if (condition_children.size() != 2)
+      Unsupported("this class logical condition");
+    const SemaNode& left = tree_.At(condition_children[0]);
+    materialize_logical = !(IsKnownIntegralLiteral(left, types_) &&
+        ((condition.op == OP_LOR && left.value != 0) ||
+         (condition.op == OP_LAND && left.value == 0)));
+  }
+  if (materialize_logical)
+    EmitBranch(LowerLogicalValue(children[0]).operand, then_label, else_label);
+  else {
+    PrepareConditionLabels(children[0]);
+    LowerCondition(children[0], then_label, else_label);
+  }
+  StartBlock(then_label);
+  LowerClassValueInto(children[1], type, destination);
+  EmitJump(end_label);
+  StartBlock(else_label);
+  LowerClassValueInto(children[2], type, destination);
+  EmitJump(end_label);
+  StartBlock(end_label);
 }
 
 void Lowerer::LowerVariable(SemaId variable_node)
@@ -1646,9 +1685,12 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
       model_.ClassAt(model_.FunctionAt(owner).member_class);
   const std::vector<SemaId> arguments = Children(node);
   const bool is_base = initializer.binding == 0 && initializer.function != 0;
-  const bool destination_before_arguments = initializer.function != 0 &&
-      (is_base || types_.Kind(types_.Unqualified(initializer.type)) ==
-          TYPE_CLASS);
+  const bool destination_before_arguments =
+      (initializer.function != 0 &&
+       (is_base || types_.Kind(types_.Unqualified(initializer.type)) ==
+           TYPE_CLASS)) ||
+      (initializer.function == 0 &&
+       types_.Kind(types_.Unqualified(initializer.type)) == TYPE_CLASS);
   const bool aggregate_initializer = !is_base &&
       initializer.function == 0 && arguments.size() == 1 &&
       tree_.At(arguments[0]).kind == SEMA_BRACED_INIT_LIST &&
@@ -1690,6 +1732,9 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
         types_.Kind(types_.Unqualified(target_field->type)) == TYPE_REFERENCE)
       lowered_arguments.push_back(LowerReferenceArgument(
           arguments[0], target_field->type).operand);
+    else if (types_.Kind(types_.Unqualified(initializer.type)) == TYPE_CLASS)
+      lowered_arguments.push_back(
+          AddressValue(LowerLValue(arguments[0])).operand);
     else
       lowered_arguments.push_back(
           LowerRValue(arguments[0], initializer.type).operand);

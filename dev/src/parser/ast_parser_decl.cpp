@@ -1038,7 +1038,25 @@ AstId Pa10Parser::parse_special_member_definition()
 	const AstId body = (is_simple(OP_COLON) && ctor_initializer == 0) ?
 		0 : parse_compound_statement();
 	scopes_.Pop();
+	AstId initializer = 0;
 	if (body == 0)
+	{
+		if (ctor_initializer != 0 || !consume_simple(OP_ASS))
+		{
+			restore(saved);
+			return 0;
+		}
+		if (!is_simple(KW_DEFAULT) && !is_simple(KW_DELETE))
+		{
+			restore(saved);
+			return 0;
+		}
+		initializer = make(AST_INITIALIZER);
+		add(initializer, make_span(AST_SPECIAL_INITIALIZER, pos_, pos_ + 1,
+			token(pos_).spelling));
+		++pos_;
+	}
+	if (body == 0 && !consume_simple(OP_SEMICOLON))
 	{
 		restore(saved);
 		return 0;
@@ -1054,6 +1072,7 @@ AstId Pa10Parser::parse_special_member_definition()
 	}
 	add(result, declarator);
 	add(result, ctor_initializer);
+	add(result, initializer);
 	add(result, body);
 	return result;
 }
@@ -1656,7 +1675,8 @@ AstId Pa10Parser::parse_paren_initializer()
 		return result;
 	while (true)
 	{
-		AstId expression = parse_assignment_expression();
+		AstId expression = is_simple(OP_LBRACE) ? parse_braced_init_list() :
+			parse_assignment_expression();
 		if (expression == 0)
 		{
 			restore(saved);

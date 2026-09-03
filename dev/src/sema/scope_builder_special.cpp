@@ -236,6 +236,11 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
         model_.FunctionAt(function).body, function_scope, function,
         function_node));
   else
+  {
+    if (entity.ctor_initializer != 0)
+      BuildMemberInitializers(entity.ctor_initializer, function_scope,
+                              function_node, function);
     BuildFunctionBody(model_.FunctionAt(function).body, function_scope,
                       function, function_node);
+  }
 }

@@ -191,7 +191,7 @@ private:
   void BuildDefaultedMemberDefinition(
       FunctionEntityId function, BindingId binding, ScopeId target_scope,
       const std::string& name,
-      const std::vector<ParameterInfo>& parameters);
+      const std::vector<ParameterInfo>& parameters, bool defer_definition);
   void AddConstructorAction(SemaId variable, ScopeId scope, TypeId type,
                             BindingId binding, AstId declarator);
   void AddConstructorActionWithArguments(

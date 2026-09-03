@@ -715,7 +715,11 @@ AstId Pa10Parser::parse_argument_list(AstKind kind)
 		return result;
 	while (true)
 	{
-		AstId argument = parse_assignment_expression();
+		// An initializer-clause is also a valid call argument.  Keep the
+		// braced form intact so semantic analysis can bind it to the
+		// selected parameter type.
+		AstId argument = is_simple(OP_LBRACE) ? parse_braced_init_list() :
+			parse_assignment_expression();
 		if (argument == 0)
 		{
 			restore(saved);

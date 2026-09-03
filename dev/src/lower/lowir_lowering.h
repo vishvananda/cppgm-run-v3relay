@@ -469,6 +469,8 @@ private:
   void LowerVariable(SemaId variable_node);
   void LowerClassValueInto(SemaId source, TypeId type,
                            const lowir_model::Operand& destination);
+  void LowerConditionalObjectInto(
+      SemaId source, TypeId type, const lowir_model::Operand& destination);
   bool AggregateInitializationHasWork(SemaId node, TypeId type) const;
   void LowerAggregateObjectInitializer(
       SemaId node, TypeId type, const Value& object,

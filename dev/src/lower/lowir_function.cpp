@@ -341,15 +341,27 @@ void Lowerer::CollectSlots(SemaId node, std::set<BindingId>& seen,
       seen.insert(value.binding).second)
     AddSourceSlot(value.binding);
   if (value.kind == SEMA_CONSTRUCTOR_ACTION && value.binding == 0 &&
-      value.function != 0 && value.user_defined_conversion &&
-      in_class_initializer)
+      value.function != 0 && in_class_initializer)
   {
-    TemporaryObject& temporary = temporaries_[node];
-    if (temporary.slot.empty())
+    const SemaId parent = SemanticParent(node);
+    const bool object_initializer = parent != 0 &&
+        tree_.At(parent).kind == SEMA_VARIABLE &&
+        tree_.At(parent).first_child == node;
+    // A direct expression action in a call is a value/reference argument and
+    // needs materialization storage.  A branch of a class conditional is
+    // lowered directly into the enclosing destination, so it must remain
+    // slot-free just like a declaration-owned action.
+    const bool call_argument = parent != 0 &&
+        tree_.At(parent).kind == SEMA_CALL &&
+        tree_.At(parent).first_child != node;
+    if (!object_initializer &&
+        (value.user_defined_conversion || call_argument))
     {
-      temporary.slot = NewGeneratedSlot(
-          ConstructorTemporaryIsObjectExpression(node) ? "tmpobj" : "arg",
-          LowTypeOf(value.type));
+      TemporaryObject& temporary = temporaries_[node];
+      if (temporary.slot.empty())
+        temporary.slot = NewGeneratedSlot(
+            ConstructorTemporaryIsObjectExpression(node) ? "tmpobj" : "arg",
+            LowTypeOf(value.type));
     }
   }
   const bool child_in_class_initializer = in_class_initializer ||

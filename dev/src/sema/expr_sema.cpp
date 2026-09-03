@@ -837,66 +837,6 @@ OverloadArgument ExpressionAnalyzer::MakeOperatorArgument(
   return result;
 }
 
-SemaId ExpressionAnalyzer::BuildConstructorTemporary(
-    AstId source, TypeId target, ScopeId scope,
-    const vector<SemaId>& arguments, bool list_initialization,
-    bool copy_initialization, FunctionEntityId selected)
-{
-  const TypeId class_type = types_.Unqualified(target);
-  if (types_.Kind(class_type) != TYPE_CLASS)
-    throw std::runtime_error("constructor temporary target is not a class");
-  // A conversion sequence that already selected its converting constructor
-  // supplies it; every other form selects here.
-  const FunctionEntityId constructor = selected != 0 ? selected :
-      builder_.ResolveConstructor(
-          class_type, arguments, scope, copy_initialization);
-  const FunctionEntity& entity = model_.FunctionAt(constructor);
-  const TypeNode& callable = types_.At(types_.Unqualified(entity.type));
-  if (arguments.size() + 1 > callable.parameters.size())
-    throw std::runtime_error("constructor temporary has too many arguments");
-
-  vector<SemaId> converted;
-  converted.reserve(callable.parameters.size() - 1);
-  for (size_t i = 0; i < arguments.size(); ++i) {
-    // 12.8p32 selects a move constructor in the return context by treating
-    // the named local as an xvalue.  Preserve that selected value category
-    // while binding the constructor's rvalue-reference parameter; otherwise
-    // the later materialization would retry the argument as an lvalue and
-    // reject the already-selected move operation.
-    if (entity.move_constructor && tree_.At(arguments[i]).category == VC_LVALUE)
-      tree_.At(arguments[i]).category = VC_XVALUE;
-    converted.push_back(Initialize(arguments[i], callable.parameters[i + 1],
-                                   false, list_initialization));
-  }
-  for (size_t parameter = arguments.size() + 1;
-       parameter < callable.parameters.size(); ++parameter)
-  {
-    if (parameter >= entity.default_arguments.size() ||
-        entity.default_arguments[parameter] == 0)
-      throw std::runtime_error("missing constructor argument");
-    converted.push_back(AnalyzeInitializer(
-        entity.default_arguments[parameter], entity.scope,
-        callable.parameters[parameter]));
-  }
-
-  const SemaId action = MakeExpression(SEMA_CONSTRUCTOR_ACTION, source,
-                                       class_type, VC_XVALUE, scope);
-  tree_.At(action).function = constructor;
-  const SemaId call = MakeExpression(
-      SEMA_CALL, 0, types_.Fundamental(FT_VOID), VC_PRVALUE, scope);
-  tree_.At(call).function = constructor;
-  const SemaId callee = tree_.Make(SEMA_CALLEE);
-  SemaNode& callee_node = tree_.At(callee);
-  callee_node.scope = scope;
-  callee_node.type = entity.type;
-  callee_node.function = constructor;
-  Append(action, call);
-  Append(call, callee);
-  for (size_t i = 0; i < converted.size(); ++i)
-    Append(call, converted[i]);
-  return action;
-}
-
 SemaId ExpressionAnalyzer::InitializeReturn(SemaId expression, TypeId target)
 {
   if (expression == 0 || target == 0)
@@ -1958,6 +1898,10 @@ SemaId ExpressionAnalyzer::AnalyzeCast(AstId expression, ScopeId scope)
   const SemaId operand = Analyze(Child(expression, 1), scope);
   CheckBaseConversionAccess(NodeInfo(operand).type, target, scope);
   const TypeId target_kind = types_.Unqualified(target);
+  if (types_.Kind(target_kind) == TYPE_CLASS)
+    return BuildConstructorTemporary(expression, target, scope,
+                                     std::vector<SemaId>(1, operand), false,
+                                     false);
   if (types_.Kind(target_kind) == TYPE_POINTER ||
       types_.Kind(target_kind) == TYPE_MEMBER_POINTER)
     (void)RetargetFunctionAddress(operand, target);
@@ -2641,6 +2585,13 @@ SemaId ExpressionAnalyzer::AnalyzeFunctionalCast(
   const TypeId target_unqualified = types_.Unqualified(target);
   if (types_.Kind(target_unqualified) == TYPE_CLASS)
   {
+    bool has_braced_argument = false;
+    for (size_t i = 0; i < args.size(); ++i)
+      if (arena_.At(args[i]).kind == AST_BRACED_INIT_LIST)
+        has_braced_argument = true;
+    if (has_braced_argument)
+      return BuildConstructorCall(expression, target, scope, args, true,
+                                  false);
     vector<SemaId> analyzed_arguments;
     analyzed_arguments.reserve(args.size());
     for (size_t i = 0; i < args.size(); ++i)

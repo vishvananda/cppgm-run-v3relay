@@ -30,6 +30,14 @@ public:
   SemaId Initialize(SemaId expression, TypeId target,
                     bool constexpr_object = false,
                     bool list_initialization = false);
+  // Analyze constructor arguments whose braced clauses need the selected
+  // parameter type before overload resolution can classify them.
+  SemaId BuildConstructorCall(
+      AstId source, TypeId target, ScopeId scope,
+      const std::vector<AstId>& arguments,
+      bool list_initialization = false,
+      bool copy_initialization = false,
+      BindingId destination_binding = 0);
   // Return initialization has the special xvalue-then-lvalue constructor
   // selection order; class prvalues are already materialized and are
   // returned unchanged for elision.
@@ -167,7 +175,12 @@ private:
       const std::vector<SemaId>& arguments,
       bool list_initialization = false,
       bool copy_initialization = false,
-      FunctionEntityId selected = 0);
+      FunctionEntityId selected = 0,
+      BindingId destination_binding = 0);
+  TypeId BracedArgumentTarget(TypeId target, std::size_t index,
+                              bool copy_initialization) const;
+  SemaId MaterializeBracedArgument(AstId argument, TypeId target,
+                                   ScopeId scope);
   SemaId BuildResolvedCall(AstId source, ScopeId scope,
                            FunctionEntityId function,
                            SemaId implicit_object,
