@@ -35,6 +35,16 @@ std::string LowirNamePiece(const std::string& source)
   return result;
 }
 
+bool InUnnamedNamespace(const SemaModel& model, ScopeId scope)
+{
+  for (ScopeId current = scope; current != model.GlobalScope();
+       current = model.ScopeAt(current).parent)
+    if (model.ScopeAt(current).kind == SCOPE_NAMESPACE &&
+        model.ScopeAt(current).unnamed_namespace)
+      return true;
+  return false;
+}
+
 // The semantic model spells an operator function `operator<token>`; the
 // PA14 encoder classifies operators by their README word.  This is the only
 // place that bridges the two fixed vocabularies.
@@ -138,6 +148,7 @@ void Lowerer::CollectSymbols(SemaId node)
       if (entity.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
           entity.member_class != 0 &&
           model_.ClassAt(entity.member_class).trivial_default_constructor &&
+          !entity.internal_linkage &&
           temporary_constructors_.count(value.function) == 0)
         return;
       FunctionSymbol& symbol = functions_[value.function];
@@ -208,6 +219,28 @@ void Lowerer::ComputeReferencedFunctions()
       pending.push_back(function_order_[i]);
   }
 
+  // A hidden friend is an inline definition, so its own body is demand
+  // emitted.  Its referenced inline friends still need to be retained when
+  // the containing friend is not itself selected; this is the same bounded
+  // body-reference walk used for ordinary inline callees.
+  for (std::size_t i = 0; i < function_order_.size(); ++i) {
+    const FunctionEntityId function = function_order_[i];
+    const FunctionSymbol& symbol = functions_[function];
+    if (symbol.definition == 0 || !IsHiddenFriend(symbol))
+      continue;
+    std::set<FunctionEntityId> references;
+    CollectReferencedFunctions(symbol.definition, references);
+    for (std::set<FunctionEntityId>::const_iterator reference =
+             references.begin(); reference != references.end(); ++reference) {
+      referenced_functions_.insert(*reference);
+      const std::map<FunctionEntityId, FunctionSymbol>::const_iterator
+          callee = functions_.find(*reference);
+      if (callee != functions_.end() && callee->second.definition != 0 &&
+          model_.FunctionAt(*reference).in_class_definition)
+        pending.push_back(*reference);
+    }
+  }
+
   // Global initializers are roots too.  Do not descend into function
   // definitions here: an unreferenced inline body must not retain an
   // external declaration used only by that body.
@@ -250,6 +283,14 @@ void Lowerer::ComputeReferencedFunctions()
         pending.push_back(*reference);
     }
   }
+}
+
+bool Lowerer::IsHiddenFriend(const FunctionSymbol& symbol) const
+{
+  if (symbol.declaration == 0)
+    return false;
+  const BindingId binding = tree_.At(symbol.declaration).binding;
+  return binding != 0 && model_.BindingAt(binding).hidden_friend;
 }
 
 BindingId Lowerer::CanonicalBinding(BindingId id) const
@@ -348,8 +389,10 @@ std::vector<std::string> Lowerer::NamespacePieces(ScopeId scope) const
   std::vector<std::string> pieces;
   while (scope != model_.GlobalScope()) {
     const Scope& value = model_.ScopeAt(scope);
-    if ((value.kind == SCOPE_NAMESPACE || value.kind == SCOPE_CLASS) &&
-        !value.name.empty() && value.name != "<unnamed>")
+    if (value.kind == SCOPE_NAMESPACE && value.unnamed_namespace)
+      pieces.push_back("_GLOBAL__N_1");
+    else if ((value.kind == SCOPE_NAMESPACE || value.kind == SCOPE_CLASS) &&
+             !value.name.empty() && value.name != "<unnamed>")
       pieces.push_back(value.name);
     scope = value.parent;
   }
@@ -506,7 +549,11 @@ std::string Lowerer::GlobalObjectName(const GlobalSymbol& symbol) const
     return binding.name;
   abi_mangle::AbiTargetRecord target;
   target.kind = abi_mangle::ABI_TARGET_FACT_VARIABLE;
-  target.internal_linkage = symbol.internal_linkage;
+  // An unnamed namespace is already represented by its unique namespace
+  // component in the qualified name.  It must not also use the local-name
+  // `L` encoding reserved for a namespace-scope `static` entity.
+  target.internal_linkage = symbol.internal_linkage &&
+      !InUnnamedNamespace(model_, binding.scope);
   target.qualified_name =
       Join(NamespacePieces(binding.scope), "::", binding.name);
   const std::vector<abi_mangle::AbiFunctionRecord> records;
@@ -1228,7 +1275,8 @@ void Lowerer::BuildGlobalDefinitions()
                 AddThreadLocalInitializer(symbol, initializer[0],
                                           binding.type, true);
             } else {
-              shared_.needs_init_function_ = true;
+              if (!symbol.internal_linkage)
+                shared_.needs_init_function_ = true;
               if (!trivial) {
                 DynamicInitializer dynamic;
                 dynamic.expression = action_children[0];

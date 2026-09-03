@@ -229,6 +229,7 @@ private:
   ScopeId ResolveDeclarationScope(ScopeId scope, AstId identifier,
                                   std::string& name) const;
   ScopeId EnclosingNamespace(ScopeId scope) const;
+  bool HasInternalLinkage(ScopeId scope) const;
   ScopeId ResolveNamespace(ScopeId scope, AstId target) const;
   ScopeId ResolveQualifierScope(ScopeId scope, const QualifiedName& prefix) const;
   TypeKeyword ClassKey(AstId node) const;

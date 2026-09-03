@@ -849,40 +849,50 @@ failures, down from 14) with unchanged coverage; `make
 test-report-through-pa15` is 1139/1139; and the pa16 file audit passes with
 five warnings.  No fixtures or reference files changed.
 
-## Active Checkpoint: CP15 — empty-base layout and hidden-friend definitions
+## Completed Checkpoint: CP15 — empty-base layout and hidden-friend definitions
 
-Goal: reduce the remaining 9 pa16 failures while preserving CP1–CP14 and the
-review-4 owners (`BuildClassDefinition`'s last-component spelling,
-`CallResolution::indirect_callee`, `BuiltinFunctionKind`,
-`kInlineCleanupLimit`, the startup-first emission order in `Lowerer::Run`).
+Delivered: complete-class layout now applies the empty-base optimization while
+reserving a same-type member's address, fixing the callable-field layout and
+its derived projections.  Unnamed namespaces own internal linkage through the
+semantic scope path and retain their ABI namespace component without adding a
+second local-name encoding.  Hidden-friend demand walks retain inline friends
+referenced by another friend while internal hidden definitions remain emitted;
+internal trivial special members receive their complete/base entries and
+trivial-lifecycle metadata.  LowIR represents `nullptr_t` as its 64-bit value
+word, rejects aggregate classes as accidental scalar conversions, preserves
+narrow representable literals at the literal boundary, and reprojects the
+final destination of aggregate bit-field read-modify-write stores.
+
+Evidence (2026-09-03): the focused packet comparison passed 6/7; the only
+remaining mismatch is the queued defaulted-constructor fixture whose checked
+reference omits the derived constructor's required base call.  The fixed
+callable-field, unnamed-namespace, hidden-friend, function-pointer,
+`nullptr_t`, and bit-field fixtures all pass exact comparison.  The required
+`make test-pa16` result is 240/243 (three failures, down from 234/243) with
+unchanged coverage; `make test-report-through-pa15` is 1139/1139; and
+`perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src` passes with
+six nonfatal warnings.  No fixtures or reference files changed.
+
+## Active Checkpoint: CP16 — conversion diagnostics and defaulted construction
+
+Goal: reduce the remaining three pa16 failures while preserving CP1–CP15 and
+the review-4 ownership boundaries.
 
 ### Implementation Packet
 
-- Start with `300-callable-field-hides-private-base-method`: the call already
-  resolves through the callable field; the mismatch is layout.  Itanium gives
-  an empty direct base at offset 0 no storage, so a first member of another
-  type also sits at offset 0 and the class has size 1 (the fixture pins
-  `obj<1x1>` and `index i8 %t, 0`).  Own this in `CompleteClassLayout`
-  (`scope_builder.cpp`) beside `ClassEntity::empty`; a member whose type is
-  the empty base itself must still follow it.  Re-run the alignment and
-  derived-layout fixtures after the change.
-- Then the hidden-friend definition shapes
-  (`200-unnamed-namespace-hidden-friend-single-definition`,
-  `300-friend-function-definition-skip`) and the remaining LowIR mismatches
-  (`100-function-pointer-nested-param-name-shadow`,
-  `300-operator-nullptr-t-from-zero`,
-  `400-bit-field-prefix-postfix-increment`, and
-  `200-friend-derived-private-base-defaulted-constructor`, whose reference
-  omits the base call); read each `.my.lowir.compare.diff` first.
-- Keep the two diagnostics
-  (`200-string-literal-does-not-convert-to-mutable-void-pointer`,
-  `spec/200-const-reference-binds-derived-pointer-prvalue`) queued until
-  their conversion ownership in `conversions.cpp` is isolated.
-- Leave the block-scope `extern` class declaration gap (audit review 4,
-  finding 10) recorded; do not extend the automatic-slot lowering it falls
-  into.  Preserve the PA17 non-goals: block-scope `static` objects and
-  by-value copy semantics.
-- Require focused comparisons, `make test-pa16`, the through-pa15 report, and
-  the pa16 file audit; the failing set must shrink, never merely shift, and
-  every fixture passing at review 4 must still pass (diff the sets, not the
-  counts).
+- Start with the two queued diagnostics
+  (`200-string-literal-does-not-convert-to-mutable-void-pointer` and
+  `spec/200-const-reference-binds-derived-pointer-prvalue`); isolate their
+  conversion classification and initialization ownership in `conversions.cpp`
+  before changing lowering.
+- Revisit
+  `200-friend-derived-private-base-defaulted-constructor` only after reading
+  its current diff and confirming whether the checked reference's omitted
+  base call is a fixture/reference-shape issue or an actual semantic owner;
+  preserve the standard-required base initialization unless evidence assigns
+  the omission elsewhere.
+- Leave the block-scope `extern` class declaration gap recorded and preserve
+  the PA17 non-goals: block-scope `static` objects and by-value copy semantics.
+- Require focused diagnostics and constructor comparisons, `make test-pa16`,
+  the through-pa15 report, and the pa16 file audit; the failing set must shrink
+  without shifting or reducing coverage.

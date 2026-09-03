@@ -389,6 +389,16 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
       lowir_model::LLM_DEFAULT;
   if (entity.noexcept_qualifier)
     function_.boundary.unwind = lowir_model::CUM_NO;
+  if (entity.special_member != SPECIAL_MEMBER_NONE &&
+      entity.member_class != 0) {
+    const ClassEntity& owner = model_.ClassAt(entity.member_class);
+    const bool trivial = entity.special_member == SPECIAL_MEMBER_CONSTRUCTOR ?
+        owner.trivial_default_constructor : owner.trivial_destructor;
+    if (trivial) {
+      function_.boundary.unwind = lowir_model::CUM_NO;
+      function_.metadata.object_trivial_lifecycle = true;
+    }
+  }
   const bool is_main = entity.name == "main" &&
       entity.scope == model_.GlobalScope();
   if (is_main) {

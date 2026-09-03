@@ -47,6 +47,19 @@ bool ClassEntityForType(const TypeTable& types, TypeId type,
   return entity != 0;
 }
 
+bool FitsSmallIntegerLiteral(long long value, const LowInfo& destination)
+{
+  if (!destination.Integer() || destination.bits == 0 ||
+      destination.bits >= 32)
+    return false;
+  if (destination.is_unsigned)
+    return value >= 0 && static_cast<unsigned long long>(value) <=
+        ((1ULL << destination.bits) - 1ULL);
+  const long long minimum = -(1LL << (destination.bits - 1));
+  const long long maximum = (1LL << (destination.bits - 1)) - 1LL;
+  return value >= minimum && value <= maximum;
+}
+
 } // namespace
 
 bool Lowerer::FindBitField(SemaId node, ClassField& field) const
@@ -551,6 +564,16 @@ Lowerer::Value Lowerer::LowerLiteral(SemaId node_id, const SemaNode& node,
     result.operand = Immediate(node.value);
   } else {
     Unsupported("a synthesized literal");
+  }
+  if (expected != 0 && result.operand.kind == lowir_model::Operand::OP_INTEGER &&
+      FitsSmallIntegerLiteral(result.operand.int_value, LowInfoOf(expected))) {
+    // A representable literal already has its final bits.  Retagging it at
+    // the literal boundary avoids manufacturing a conversion temporary for
+    // narrow scalar storage (the same value from a computed expression must
+    // still use the ordinary conversion path).
+    result.type = expected;
+    result.lvalue = false;
+    return result;
   }
   return Convert(result, expected);
 }

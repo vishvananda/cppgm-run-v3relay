@@ -368,7 +368,7 @@ void ScopeBuilder::BuildInheritedConstructors(ClassEntityId derived,
         }(), source_type.variadic);
     const FunctionEntityId inherited = model_.CreateFunction(
         scope, name, function_type);
-    FunctionEntity& function = model_.FunctionAt(inherited);
+    FunctionEntity& function = model_.FunctionAt(inherited); function.internal_linkage = HasInternalLinkage(scope);
     function.is_member = true;
     function.member_class = derived;
     function.member_type = types_.Function(types_.Fundamental(FT_VOID),
@@ -628,8 +628,8 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
     model_.BindingAt(binding).internal_linkage =
         (!is_member && SequenceHasKeyword(specifiers, KW_STATIC)) ||
         (model_.ScopeAt(target_scope).kind == SCOPE_NAMESPACE &&
-         !SequenceHasKeyword(specifiers, KW_EXTERN) &&
-         namespace_const);
+         ((!SequenceHasKeyword(specifiers, KW_EXTERN) && namespace_const) ||
+          HasInternalLinkage(target_scope)));
     model_.BindingAt(binding).c_linkage = c_linkage_depth_ != 0;
     const bool in_class_static_declaration = is_member && static_member &&
         scope == target_scope;
@@ -1038,7 +1038,7 @@ FunctionEntityId ScopeBuilder::EnsureAggregateConstructor(
   const std::string name = model_.ScopeAt(owner.class_scope).name;
   const FunctionEntityId constructor = model_.CreateFunction(
       owner.class_scope, name, constructor_type);
-  FunctionEntity& function = model_.FunctionAt(constructor);
+  FunctionEntity& function = model_.FunctionAt(constructor); function.internal_linkage = HasInternalLinkage(owner.class_scope);
   function.is_member = true;
   function.member_class = class_entity;
   function.member_type = types_.Function(types_.Fundamental(FT_VOID),
@@ -1555,7 +1555,6 @@ bool LayoutKnown(const SemaModel& model, const TypeTable& types, TypeId type)
 }
 
 } // namespace
-
 void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
 {
   ClassEntity& value = model_.ClassAt(entity);
@@ -1583,7 +1582,8 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
         base_entity.alignment : std::min(base_entity.alignment, pack_alignment);
     const std::size_t base_size = base_entity.size;
     alignment = std::max(alignment, base_alignment);
-    if (value.is_union)
+    // Empty bases use offset zero; a same-type member reserves their size.
+    if (base_entity.empty || value.is_union)
       value.bases[i].offset = 0;
     else
     {
@@ -1686,6 +1686,16 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
     else
     {
       offset = AlignUp(offset, field_alignment);
+      for (std::size_t base = 0; base < value.bases.size(); ++base)
+      {
+        const ClassBase& base_info = value.bases[base];
+        const ClassEntity& base_entity = model_.ClassAt(base_info.entity);
+        if (base_entity.empty &&
+            types_.Kind(types_.Unqualified(field.type)) == TYPE_CLASS &&
+            types_.At(types_.Unqualified(field.type)).entity ==
+                base_info.entity)
+          offset = std::max(offset, base_entity.size);
+      }
       field.offset = offset;
       offset += field_size;
     }
@@ -2105,7 +2115,12 @@ ScopeId ScopeBuilder::EnclosingNamespace(ScopeId scope) const
   }
   return current;
 }
-
+bool ScopeBuilder::HasInternalLinkage(ScopeId scope) const
+{
+  for (ScopeId current = scope; current != model_.GlobalScope(); current = model_.ScopeAt(current).parent)
+    if (model_.ScopeAt(current).kind == SCOPE_NAMESPACE && model_.ScopeAt(current).unnamed_namespace) return true;
+  return false;
+}
 ScopeId ScopeBuilder::ResolveNamespace(ScopeId scope, AstId target) const
 {
   const BindingId binding = model_.Lookup(scope, NodeName(target),
@@ -2367,7 +2382,7 @@ FunctionEntityId ScopeBuilder::EnsureDefaultConstructor(TypeId type)
   const std::string name = model_.ScopeAt(owner.class_scope).name;
   const FunctionEntityId constructor = model_.CreateFunction(
       owner.class_scope, name, constructor_type);
-  FunctionEntity& function = model_.FunctionAt(constructor);
+  FunctionEntity& function = model_.FunctionAt(constructor); function.internal_linkage = HasInternalLinkage(owner.class_scope);
   function.is_member = true;
   function.member_class = class_entity;
   function.member_type = types_.Function(types_.Fundamental(FT_VOID),
@@ -2430,7 +2445,7 @@ FunctionEntityId ScopeBuilder::EnsureDestructor(TypeId type)
   const std::string name = "~" + model_.ScopeAt(owner.class_scope).name;
   const FunctionEntityId destructor = model_.CreateFunction(
       owner.class_scope, name, destructor_type);
-  FunctionEntity& function = model_.FunctionAt(destructor);
+  FunctionEntity& function = model_.FunctionAt(destructor); function.internal_linkage = HasInternalLinkage(owner.class_scope);
   function.is_member = true;
   function.member_class = class_entity;
   function.member_type = types_.Function(types_.Fundamental(FT_VOID),
@@ -2662,7 +2677,7 @@ bool ScopeBuilder::BuildTemplateInstance(FunctionEntityId template_function,
 
   const FunctionEntityId instance = model_.CreateFunction(
       source.scope, source.name, instance_type);
-  FunctionEntity& concrete = model_.FunctionAt(instance);
+  FunctionEntity& concrete = model_.FunctionAt(instance); concrete.internal_linkage = source.internal_linkage;
   concrete.is_member = source.is_member;
   concrete.member_class = source.member_class;
   concrete.member_const = source.member_const;
@@ -2821,7 +2836,7 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
   // For a class member the declaration's existing `static` linkage fact is
   // also the canonical fact that no implicit object parameter is present.
   bool static_member = is_member && internal_linkage;
-  const bool effective_internal_linkage = is_member ? false : internal_linkage;
+  const bool effective_internal_linkage = HasInternalLinkage(scope) || (!is_member && internal_linkage);
   TypeId member_type = 0;
   vector<TypeId> canonical_parameters = parameters;
   if (is_member)

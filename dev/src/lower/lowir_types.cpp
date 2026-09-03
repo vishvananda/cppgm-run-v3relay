@@ -236,7 +236,11 @@ LowInfo Lowerer::LowInfoOf(TypeId type) const
     case FT_FLOAT: return FloatInfo(32);
     case FT_DOUBLE: return FloatInfo(64);
     case FT_LONG_DOUBLE: return FloatInfo(80);
-    case FT_NULLPTR_T: return KindInfo(LowInfo::LK_POINTER);
+    // `nullptr_t` has pointer semantics in overload resolution and ABI
+    // mangling, but LowIR carries its null value as the target's 64-bit
+    // integer word.  Keeping that representation distinct from `ptr` also
+    // preserves the callable signature of a function taking nullptr_t.
+    case FT_NULLPTR_T: return IntegerInfo(64, false);
     }
     break;
   default:
@@ -360,8 +364,10 @@ std::string Lowerer::QualifiedTypeName(TypeId type) const
   scope = model_.ScopeAt(scope).parent;
   while (scope != model_.GlobalScope()) {
     const Scope& owner = model_.ScopeAt(scope);
-    if ((owner.kind == SCOPE_NAMESPACE || owner.kind == SCOPE_CLASS) &&
-        !owner.name.empty() && owner.name != "<unnamed>")
+    if (owner.kind == SCOPE_NAMESPACE && owner.unnamed_namespace)
+      pieces.push_back("_GLOBAL__N_1");
+    else if ((owner.kind == SCOPE_NAMESPACE || owner.kind == SCOPE_CLASS) &&
+             !owner.name.empty() && owner.name != "<unnamed>")
       pieces.push_back(owner.name);
     scope = owner.parent;
   }

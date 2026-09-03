@@ -120,7 +120,7 @@ void Lowerer::Run()
     FunctionSymbol& symbol = functions_[function_order_[i]];
     if (symbol.definition != 0 &&
         entity.special_member != SPECIAL_MEMBER_NONE &&
-        !entity.in_class_definition)
+        (!entity.in_class_definition || entity.internal_linkage))
       symbol.base_required = true;
   }
   BuildGlobalDefinitions();
@@ -158,12 +158,13 @@ void Lowerer::Run()
         emitted_one = true;
       }
       if (symbol.definition != 0 && emitted.count(id) == 0 &&
-          (!entity.in_class_definition || symbol.referenced)) {
+          (!entity.in_class_definition || symbol.referenced ||
+           entity.internal_linkage)) {
         program_.functions.push_back(BuildFunction(symbol));
         emitted.insert(id);
         emitted_one = true;
         if (entity.special_member != SPECIAL_MEMBER_NONE &&
-            !entity.c_linkage) {
+            !entity.c_linkage && !entity.internal_linkage) {
           lowir_model::ObjectAlias alias;
           alias.object_symbol = symbol.base_object;
           alias.target = symbol.name;
@@ -917,8 +918,21 @@ void Lowerer::LowerAggregateObjectInitializer(
       const lowir_model::Operand destination = AggregateDestination(
           object, field_path);
       if (bit_field) {
-        StoreBitField(field, destination, initialized_value.type,
-                      initialized_value.operand, preserve, field.type);
+        if (preserve) {
+          const lowir_model::Operand merged = MergeBitField(
+              field, destination, initialized_value.type,
+              initialized_value.operand, true, field.type);
+          // Aggregate initialization evaluates the allocation-unit read
+          // before forming the final store location.  Re-projecting here
+          // keeps that ownership explicit across the read-modify-write
+          // boundary.
+          const lowir_model::Operand store_destination =
+              AggregateDestination(object, field_path);
+          EmitStore(LowTypeOf(field.type), merged, store_destination);
+        } else {
+          StoreBitField(field, destination, initialized_value.type,
+                        initialized_value.operand, false, field.type);
+        }
         MarkBitFieldUnitInitialized(field);
       } else
         EmitStore(LowTypeOf(field.type), initialized_value.operand, destination);

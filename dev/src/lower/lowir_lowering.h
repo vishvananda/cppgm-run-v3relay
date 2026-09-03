@@ -207,6 +207,7 @@ private:
   void CollectReferencedFunctions(SemaId node,
                                   std::set<FunctionEntityId>& result) const;
   void ComputeReferencedFunctions();
+  bool IsHiddenFriend(const FunctionSymbol& symbol) const;
   void NameSymbols();
   std::string TopLevelName(const std::string& base,
                            const std::string& external_object);

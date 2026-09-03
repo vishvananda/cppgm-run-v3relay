@@ -780,6 +780,12 @@ OverloadArgument ExpressionAnalyzer::MakeOperatorArgument(
   class_type = types_.Unqualified(class_type);
   if (types_.Kind(class_type) != TYPE_CLASS)
     return result;
+  // Aggregate initialization is not an implicit scalar-to-class conversion:
+  // an aggregate has no converting constructor.  Constructor lookup remains
+  // valid for classes that actually declare constructors.
+  if (model_.ClassAt(types_.At(class_type).entity).aggregate &&
+      model_.ClassAt(types_.At(class_type).entity).constructors.empty())
+    return result;
   vector<SemaId> constructor_arguments(1, expression);
   try
   {
