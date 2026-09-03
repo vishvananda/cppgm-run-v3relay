@@ -592,6 +592,21 @@ void ExpressionAnalyzer::LookupNameBindings(const QualifiedName& name,
                                             ScopeId scope,
                                             vector<BindingId>& bindings)
 {
+  // A qualified call can name an implicitly-declared assignment operator
+  // directly (`Base::operator=(value)`).  Its declaration is on demand just
+  // like an unqualified class assignment, but the lookup qualifier must be
+  // resolved before the class scope can be asked for the generated binding.
+  if (name.Qualified() && name.Last() == "operator=")
+  {
+    const BindingId qualifier = model_.LookupQualified(
+        scope, name.Prefix(), LOOKUP_TYPES);
+    if (qualifier != 0)
+    {
+      TypeId class_type = types_.Unqualified(model_.BindingAt(qualifier).type);
+      if (types_.Kind(class_type) == TYPE_CLASS)
+        builder_.EnsureCopyMoveMembers(class_type, false, true);
+    }
+  }
   if (name.Qualified())
     model_.LookupQualifiedSet(scope, name, LOOKUP_ANY, bindings);
   else
@@ -842,9 +857,17 @@ SemaId ExpressionAnalyzer::BuildConstructorTemporary(
 
   vector<SemaId> converted;
   converted.reserve(callable.parameters.size() - 1);
-  for (size_t i = 0; i < arguments.size(); ++i)
+  for (size_t i = 0; i < arguments.size(); ++i) {
+    // 12.8p32 selects a move constructor in the return context by treating
+    // the named local as an xvalue.  Preserve that selected value category
+    // while binding the constructor's rvalue-reference parameter; otherwise
+    // the later materialization would retry the argument as an lvalue and
+    // reject the already-selected move operation.
+    if (entity.move_constructor && tree_.At(arguments[i]).category == VC_LVALUE)
+      tree_.At(arguments[i]).category = VC_XVALUE;
     converted.push_back(Initialize(arguments[i], callable.parameters[i + 1],
                                    false, list_initialization));
+  }
   for (size_t parameter = arguments.size() + 1;
        parameter < callable.parameters.size(); ++parameter)
   {
@@ -890,8 +913,7 @@ SemaId ExpressionAnalyzer::InitializeReturn(SemaId expression, TypeId target)
     if (types_.Kind(source_class) == TYPE_CLASS &&
         types_.At(source_class).entity == types_.At(target_class).entity) {
       const ClassEntity& owner = model_.ClassAt(types_.At(target_class).entity);
-      if (!owner.trivially_copyable &&
-          (owner.copy_constructor != 0 || owner.move_constructor != 0)) {
+      if (!owner.trivially_copyable) {
         const FunctionEntityId selected = builder_.SelectReturnConstructor(
             target_class, expression, source.scope);
         if (selected == 0)
@@ -913,6 +935,8 @@ SemaId ExpressionAnalyzer::BuildResolvedCall(
   if (function == 0)
     throw std::runtime_error("operator call has no function");
   const FunctionEntity& entity = model_.FunctionAt(function);
+  if (entity.deleted)
+    throw std::runtime_error("call to a deleted function");
   const TypeId function_type = entity.type;
   const TypeNode& callable = types_.At(types_.Unqualified(function_type));
   const bool member_object = entity.is_member && !entity.static_member;
@@ -1673,6 +1697,9 @@ SemaId ExpressionAnalyzer::AnalyzeAssignment(AstId expression, ScopeId scope)
       Analyze(right_ast, scope);
   if (IsOperatorFunction(op))
   {
+    if (op == OP_ASS &&
+        types_.Kind(types_.Unqualified(lhs_value)) == TYPE_CLASS)
+      builder_.EnsureCopyMoveMembers(lhs_value, false, true);
     vector<SemaId> operands;
     operands.push_back(left);
     operands.push_back(right);
@@ -1977,17 +2004,19 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
                                             CallResolution& result)
 {
   // A parenthesized member name still names the member (`(o.f)(x)`);
-  // function objects and other callee expressions stay indirect.
+  // a parenthesized function name still names the function but suppresses
+  // ADL, while function objects and other callee expressions stay indirect.
   AstId resolved_callee = callee;
   while (arena_.At(resolved_callee).kind == AST_PARENTHESIZED_EXPRESSION)
     resolved_callee = Child(resolved_callee, 0);
-  if (arena_.At(resolved_callee).kind != AST_MEMBER_EXPRESSION)
-    resolved_callee = callee;
   const AstNode& callee_node = arena_.At(resolved_callee);
   result.member_callee = callee_node.kind == AST_MEMBER_EXPRESSION;
   result.named_callee = result.member_callee ||
       callee_node.kind == AST_ID_EXPRESSION ||
       callee_node.kind == AST_IDENTIFIER;
+  if (!result.member_callee && result.named_callee &&
+      resolved_callee != callee)
+    result.suppress_adl = true;
   if (result.member_callee) {
     const SemaId member = Analyze(resolved_callee, scope);
     if (tree_.At(member).kind == SEMA_PSEUDO_DESTRUCTOR)
@@ -2069,7 +2098,7 @@ void ExpressionAnalyzer::ResolveCallCallee(AstId callee, ScopeId scope,
       break;
     }
   } else if (result.named_callee)
-    ResolveNamedCallee(ExpressionName(callee), scope, result);
+    ResolveNamedCallee(ExpressionName(resolved_callee), scope, result);
 }
 
 // Resolve ordinary lookup and the implicit object for a member-body call.
@@ -2148,12 +2177,18 @@ SemaId ExpressionAnalyzer::TryFunctionalCast(AstId expression, AstId callee,
 SemaId ExpressionAnalyzer::TryCallableObjectExpression(
     AstId expression, AstId callee, AstId arguments, ScopeId scope)
 {
-  bool may_be_callable_object = callee != 0 &&
-      arena_.At(callee).kind != AST_ID_EXPRESSION &&
-      arena_.At(callee).kind != AST_IDENTIFIER;
-  if (!may_be_callable_object && callee != 0)
+  AstId named_callee = callee;
+  while (named_callee != 0 &&
+         arena_.At(named_callee).kind == AST_PARENTHESIZED_EXPRESSION)
+    named_callee = Child(named_callee, 0);
+  bool may_be_callable_object = named_callee != 0 &&
+      arena_.At(named_callee).kind != AST_ID_EXPRESSION &&
+      arena_.At(named_callee).kind != AST_IDENTIFIER;
+  if (!may_be_callable_object && named_callee != 0 &&
+      (arena_.At(named_callee).kind == AST_ID_EXPRESSION ||
+       arena_.At(named_callee).kind == AST_IDENTIFIER))
   {
-    const QualifiedName callee_name = ExpressionName(callee);
+    const QualifiedName callee_name = ExpressionName(named_callee);
     vector<BindingId> direct_bindings;
     LookupNameBindings(callee_name, scope, direct_bindings);
     bool has_function = false;
@@ -2727,14 +2762,19 @@ SemaId ExpressionAnalyzer::Initialize(SemaId expression, TypeId target,
       source.category != VC_PRVALUE &&
       tree_.At(expression).kind != SEMA_CONSTRUCTOR_ACTION) {
     const ClassEntity& owner = model_.ClassAt(types_.At(target_class).entity);
-    if (!owner.trivially_copyable &&
-        (owner.copy_constructor != 0 || owner.move_constructor != 0)) {
-      const FunctionEntityId selected = builder_.ResolveConstructor(
-          target_class, std::vector<SemaId>(1, expression),
-          tree_.At(expression).scope, true);
-      return BuildConstructorTemporary(
-          0, target_class, tree_.At(expression).scope,
-          std::vector<SemaId>(1, expression), false, true, selected);
+    if (!owner.trivially_copyable) {
+      builder_.EnsureCopyMoveMembers(target_class, true, false);
+      const ClassEntity& refreshed_owner =
+          model_.ClassAt(types_.At(target_class).entity);
+      if (refreshed_owner.copy_constructor != 0 ||
+          refreshed_owner.move_constructor != 0) {
+        const FunctionEntityId selected = builder_.ResolveConstructor(
+            target_class, std::vector<SemaId>(1, expression),
+            tree_.At(expression).scope, true);
+        return BuildConstructorTemporary(
+            0, target_class, tree_.At(expression).scope,
+            std::vector<SemaId>(1, expression), false, true, selected);
+      }
     }
   }
   const ImplicitConversion conversion = Classify(

@@ -189,7 +189,7 @@ is a memory error (valgrind first).
 | --- | --- | --- | --- |
 | plan | this commit | stage design, failure map | 42/228 at start |
 | CP1 value boundary and trivial value transfer | this checkpoint | bucket A: `ClassBoundary`, `trivially_copyable`, copy/move classification, two-stage return selection, `$argobj`/`$retobj`/`$discard`/`$arg` shapes, indirect result and return-slot reuse | 73/228; PA1-PA16 1382/1382; audit passed; scaling probes 2.0×; coverage unchanged |
-| CP2 implicit copy/move members | — | bucket B: `EnsureCopyMoveMembers`, deletion rules, synthesized bodies with trivial prefix, deleted candidates, elided-copy access | target ≥ 105/228 |
+| CP2 implicit copy/move members | this checkpoint | bucket B: `EnsureCopyMoveMembers`, deletion rules, synthesized bodies with trivial prefix, deleted candidates, elided-copy access | 106/228; PA1-PA16 1382/1382; PA11 68/68; PA12 166/166; audit passed; focused matrix green; scaling 2.0×/2.1×; coverage unchanged |
 | review 1 | — | ownership, PA11/PA12 dumps, valgrind, probes | — |
 | CP3 temporaries and lifetimes | — | bucket C: full-expression temporaries, `eh_try` regions, reference extension, condition declarations, empty-destructor elision, slot naming | target ≥ 130/228 |
 | CP4 ref-qualifiers, out-of-class operators, class casts, braced call arguments | — | bucket D | target ≥ 155/228 |
@@ -346,17 +346,31 @@ per transfer.
   compute the ordinal from a canonical order) before the aggregate
   constructor is appended, or the LowIR name pairing changes.
 
-## Active Checkpoint: CP2 implicit copy/move members
+## Completed Checkpoint: CP2 implicit copy/move members
 
-Goal: complete on-demand implicit copy/move constructor and assignment
-entities, including deletion and access rules, then synthesize their
-prefix-plus-subobject bodies without changing the CP1 ABI boundary.  Start
-from 73/228 with PA1-PA16 clean; progress requires fewer PA17 failures.
+Outcome: on-demand copy/move constructors and assignments now own their
+canonical entities, deletion state, overload selection, and synthesized
+prefix-plus-subobject LowIR bodies.  Direct and indirect class boundaries
+remain owned by the CP1 query; same-class trivial direct initialization uses
+the existing `copyobj` boundary, and temporary context is resolved through a
+single cached semantic-parent map.  The final gate reached 106/228 from
+73/228 with no coverage reduction; the focused CP2/prvalue matrix passed,
+PA11 and PA12 remained 68/68 and 166/166, prior PAs remained 1382/1382, and
+the file audit passed.  The representative probes measured 2.0× `wideval`
+and 2.1× `byaddr` growth at doubling, with five `copyobj` transfers for five
+modeled `wideval` transfers.
 
-Scope: `EnsureCopyMoveMembers` and assignment-member ownership in
-`scope_builder_members.cpp`, `scope_model.*`, overload selection, and the
-corresponding LowIR constructor/assignment body lowering.  Focus first on
-`200-implicit-copy-constructor`, `200-implicit-copy-assignment`,
-`300-leading-trivial-prefix-storage-copy`,
-`spec/100-defaulted-move-nontrivial-subobject`,
-`spec/200-moveonly-defaulted-move-assignment`, and the deleted-member cases.
+## Active Checkpoint: CP3 temporaries and lifetimes
+
+Goal: complete full-expression temporary ownership and destruction while
+preserving the value-boundary and special-member facts established here.
+Start from 106/228 with PA1-PA16 clean; target at least 130/228.
+
+Scope: `Lowerer` temporary bookkeeping, reference lifetime extension,
+`eh_try` cleanup regions, conditional/short-circuit paths, and empty
+destructor elision.  Focus next on
+`200-constructor-argument-temporary-dtor`,
+`200-base-initializer-temporary-full-expression`,
+`400-short-circuit-left-temporary-dtor`,
+`400-local-reference-extends-class-temporary-lifetime`, and
+`400-shadowed-local-cleanup-rebind-on-return`.

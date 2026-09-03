@@ -246,10 +246,21 @@ void Lowerer::EmitStore(const lowir_model::LowType& type,
 void Lowerer::EmitCopyObject(TypeId type, const lowir_model::Operand& source,
                              const lowir_model::Operand& destination)
 {
+  EmitCopyObjectBytes(types_.SizeOf(type), types_.AlignOf(type), source,
+                      destination);
+}
+
+void Lowerer::EmitCopyObjectBytes(
+    std::size_t bytes, std::size_t alignment,
+    const lowir_model::Operand& source,
+    const lowir_model::Operand& destination)
+{
+  if (bytes == 0)
+    return;
   lowir_model::Instruction copy;
   copy.kind = lowir_model::Instruction::IK_COPYOBJ;
-  copy.byte_count = types_.SizeOf(type);
-  copy.byte_alignment = types_.AlignOf(type);
+  copy.byte_count = bytes;
+  copy.byte_alignment = alignment == 0 ? 1 : alignment;
   copy.first = source;
   copy.second = destination;
   Emit(copy);
@@ -484,6 +495,8 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
   if (body == 0)
     Unsupported("a function without a body");
   return_slot_binding_ = ReturnSlotBinding(body, type.result);
+  if (return_slot_binding_ != 0)
+    parameter_addresses_[return_slot_binding_] = TempOperand("%ret");
   // A return that destroys a long prefix of the same local-object stack at
   // every source exit would duplicate that suffix quadratically.  For large
   // return sets, route exits through one linked cleanup chain; small
@@ -530,12 +543,19 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
               TempOperand(function_.params[parameter_index].name),
               SlotOperand(function_.slots[i].first));
   }
-  if (entity.special_member == SPECIAL_MEMBER_CONSTRUCTOR)
-    LowerConstructorInitializers(id, node);
-  if (entity.special_member == SPECIAL_MEMBER_DESTRUCTOR)
-    EmitDestructorBody(id, node);
-  else
-    LowerSequence(body);
+  const bool implicit_special = (entity.synthesized || entity.defaulted) &&
+      (entity.copy_constructor || entity.move_constructor ||
+       entity.copy_assignment || entity.move_assignment);
+  if (implicit_special)
+    LowerImplicitSpecialMember(id, node);
+  else {
+    if (entity.special_member == SPECIAL_MEMBER_CONSTRUCTOR)
+      LowerConstructorInitializers(id, node);
+    if (entity.special_member == SPECIAL_MEMBER_DESTRUCTOR)
+      EmitDestructorBody(id, node);
+    else
+      LowerSequence(body);
+  }
   if (!Terminated()) {
     // 6.6.3p2/3.6.1p5: main returns 0 when it falls off the end.  Any other
     // value-returning function that can fall off the end gets the same

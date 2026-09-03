@@ -212,6 +212,8 @@ private:
   };
 
   // Symbols.
+  void CollectSemanticParents(SemaId node, SemaId parent);
+  SemaId SemanticParent(SemaId node) const;
   void CollectTemporaryConstructorUses(SemaId node,
                                        bool variable_initializer = false);
   bool ImplicitValueInitialization(SemaId action) const;
@@ -321,6 +323,9 @@ private:
                  const lowir_model::Operand& destination);
   void EmitCopyObject(TypeId type, const lowir_model::Operand& source,
                       const lowir_model::Operand& destination);
+  void EmitCopyObjectBytes(std::size_t bytes, std::size_t alignment,
+                           const lowir_model::Operand& source,
+                           const lowir_model::Operand& destination);
   void EmitVoidCall(const std::string& symbol,
                     const std::vector<lowir_model::Operand>& arguments);
   void EmitReturn(const Value* value);
@@ -341,6 +346,7 @@ private:
   Value LowerNew(SemaId node, TypeId expected);
   Value LowerLValue(SemaId node);
   Value LowerConstructorTemporary(SemaId node);
+  bool IsObjectExpression(SemaId node) const;
   bool ConstructorTemporaryIsObjectExpression(SemaId node) const;
   Value LowerLiteral(SemaId node, const SemaNode& value, TypeId expected);
   Value LowerArrayDecay(SemaId node);
@@ -507,6 +513,8 @@ private:
   void EmitEhEnd();
   void EmitResume();
   void EmitDestructorBody(FunctionEntityId function, SemaId function_node);
+  void LowerImplicitSpecialMember(FunctionEntityId function,
+                                  SemaId function_node);
   void LowerConstructorInitializers(FunctionEntityId function,
                                     SemaId function_node);
   void LowerMemberInitializer(SemaId node, FunctionEntityId owner);
@@ -535,6 +543,9 @@ private:
   // Unit-level symbol state.
   std::map<FunctionEntityId, FunctionSymbol> functions_;
   std::vector<FunctionEntityId> function_order_;
+  // Build once per unit; temporary context otherwise would require a full
+  // semantic-tree scan for every constructor action.
+  std::map<SemaId, SemaId> semantic_parents_;
   std::set<FunctionEntityId> temporary_constructors_;
   std::set<SemaId> elided_return_actions_;
   std::set<FunctionEntityId> referenced_functions_;

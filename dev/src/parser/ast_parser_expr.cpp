@@ -685,10 +685,19 @@ AstId Pa10Parser::parse_id_expression()
 			restore(component);
 			++pos_;
 		}
-		if (!consume_simple(OP_COLON2))
-			break;
-		if (!is_kind(PA6_IDENTIFIER_TOKEN))
-		{
+			if (!consume_simple(OP_COLON2))
+				break;
+			if (is_simple(KW_OPERATOR))
+			{
+				if (parse_operator_function_id() == 0)
+				{
+					restore(saved);
+					return 0;
+				}
+				break;
+			}
+			if (!is_kind(PA6_IDENTIFIER_TOKEN))
+			{
 			restore(saved);
 			return 0;
 		}

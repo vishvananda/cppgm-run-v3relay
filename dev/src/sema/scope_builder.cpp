@@ -581,6 +581,22 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
           SequenceHasKeyword(specifiers, KW_STATIC),
           IsNoThrowDeclarator(declarator, target_scope), default_arguments,
           SequenceHasKeyword(specifiers, KW_EXPLICIT));
+      const AstId special_initializer = FindChild(
+          initializer, AST_SPECIAL_INITIALIZER);
+      const bool defaulted = special_initializer != 0 &&
+          arena_.At(special_initializer).text == "default";
+      const bool deleted = special_initializer != 0 &&
+          arena_.At(special_initializer).text == "delete";
+      FunctionEntity& function_entity = model_.FunctionAt(function);
+      function_entity.defaulted = function_entity.defaulted || defaulted;
+      function_entity.deleted = function_entity.deleted || deleted;
+      RecordAssignmentMember(function);
+      if (defaulted && is_member && !deleted) {
+        function_entity.in_class_definition =
+            function_entity.in_class_definition || scope == target_scope;
+        BuildDefaultedMemberDefinition(function, binding, target_scope, name,
+                                       parameters);
+      }
       if (is_friend && has_friend_owner)
       {
         RecordFriend(friend_owner, model_.FunctionAt(function).friend_of);
@@ -749,12 +765,32 @@ void ScopeBuilder::BuildVariable(BindingId binding, AstId initializer,
     const bool copy_list_initialization = value_kind == AST_BRACED_INIT_LIST &&
         after_declarator < tokens_.size() &&
         tokens_[after_declarator].IsSimple(OP_ASS);
+    // A direct one-argument initialization from the same trivially
+    // copyable class still selects the copy constructor semantically, but
+    // its complete-object transfer is the raw value boundary.  Retain the
+    // source expression so lowering emits `copyobj` instead of manufacturing
+    // an otherwise empty constructor call.
+    if (value_kind == AST_PAREN_INITIALIZER &&
+        arena_.At(value).children.size() == 1) {
+      const SemaId argument = expression_.Analyze(
+          arena_.At(value).children[0], scope);
+      TypeId source_type = types_.Unqualified(tree_->At(argument).type);
+      if (types_.Kind(source_type) == TYPE_REFERENCE)
+        source_type = types_.Unqualified(types_.Referent(source_type));
+      if (types_.Kind(source_type) == TYPE_CLASS &&
+          types_.At(source_type).entity == types_.At(unqualified).entity &&
+          class_entity.trivially_copyable) {
+        tree_->Append(variable, expression_.Initialize(argument, type));
+        return;
+      }
+    }
     // A class functional cast (`T(args)`) is an expression-shaped
     // constructor action.  Let expression analysis own that form; the
     // declaration-specific path below is for direct/list initialization,
     // whose AST children are already the constructor arguments.
     if (value_kind != AST_CALL_EXPRESSION &&
-        !class_entity.aggregate && !class_entity.constructors.empty())
+        (value_kind == AST_PAREN_INITIALIZER ||
+         (!class_entity.aggregate && !class_entity.constructors.empty())))
     {
       std::vector<AstId> arguments = arena_.At(value).children;
       bool copy_initialization = false;
@@ -850,6 +886,7 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
       SequenceHasKeyword(specifiers, KW_STATIC),
       IsNoThrowDeclarator(declarator, target_scope), default_arguments,
       SequenceHasKeyword(specifiers, KW_EXPLICIT));
+  RecordAssignmentMember(function);
   ClassEntityId member_class = 0;
   const bool is_member = model_.ClassForScope(target_scope, member_class) &&
       model_.FunctionAt(function).is_member;
@@ -959,16 +996,30 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
     throw std::runtime_error("constructor target is not a class");
   const ClassEntityId class_entity = types_.At(class_type).entity;
   ClassEntity& owner = model_.ClassAt(class_entity);
-  if (owner.constructors.empty())
+  if (arguments.size() == 1 && arguments[0] != 0) {
+    TypeId source_type = types_.Unqualified(tree_->At(arguments[0]).type);
+    if (types_.Kind(source_type) == TYPE_REFERENCE)
+      source_type = types_.Unqualified(types_.Referent(source_type));
+    if (types_.Kind(source_type) == TYPE_CLASS &&
+        types_.At(source_type).entity == class_entity &&
+        !owner.trivially_copyable &&
+        tree_->At(arguments[0]).category != VC_PRVALUE)
+      EnsureCopyMoveMembers(class_type, true, false);
+  }
+  // The on-demand call above may have populated the constructor overload set.
+  ClassEntity& refreshed_owner = model_.ClassAt(class_entity);
+  if (refreshed_owner.constructors.empty())
   {
     if (arguments.empty())
       return EnsureDefaultConstructor(class_type);
-    if (owner.aggregate && !owner.is_union && owner.bases.empty())
+    if (refreshed_owner.aggregate && !refreshed_owner.is_union &&
+        refreshed_owner.bases.empty())
       return EnsureAggregateConstructor(class_type, arguments);
     throw std::runtime_error("class has no viable constructor");
   }
   std::vector<BindingId> candidates;
-  ConstructorCandidates(model_, owner, copy_initialization, candidates);
+  ConstructorCandidates(model_, refreshed_owner, copy_initialization,
+                        candidates);
   if (candidates.empty())
     throw std::runtime_error("class has only deleted constructors");
   std::vector<OverloadArgument> overload_arguments;
@@ -991,6 +1042,8 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
       model_, types_, candidates, overload_arguments, true);
   if (selected == 0)
     throw std::runtime_error("no viable constructor");
+  if (model_.FunctionAt(selected).deleted)
+    throw std::runtime_error("selected constructor is deleted");
   (void)scope;
   return selected;
 }
@@ -1001,14 +1054,23 @@ FunctionEntityId ScopeBuilder::SelectReturnConstructor(
   const TypeId class_type = types_.Unqualified(type);
   if (types_.Kind(class_type) != TYPE_CLASS || argument == 0)
     return 0;
-  const ClassEntity& owner = model_.ClassAt(types_.At(class_type).entity);
+  const ClassEntityId class_entity = types_.At(class_type).entity;
+  ClassEntity& owner = model_.ClassAt(class_entity);
+  TypeId source_type = types_.Unqualified(tree_->At(argument).type);
+  if (types_.Kind(source_type) == TYPE_REFERENCE)
+    source_type = types_.Unqualified(types_.Referent(source_type));
+  if (types_.Kind(source_type) == TYPE_CLASS &&
+      types_.At(source_type).entity == class_entity &&
+      !owner.trivially_copyable)
+    EnsureCopyMoveMembers(class_type, true, false);
+  ClassEntity& refreshed_owner = model_.ClassAt(class_entity);
   // An aggregate or an otherwise trivial class has no declared constructor
   // action to select here.  Its object boundary is handled by lowering.
-  if (owner.constructors.empty())
+  if (refreshed_owner.constructors.empty())
     return 0;
 
   std::vector<BindingId> candidates;
-  ConstructorCandidates(model_, owner, false, candidates);
+  ConstructorCandidates(model_, refreshed_owner, false, candidates);
   if (candidates.empty())
     return 0;
   const SemaNode& source = tree_->At(argument);
@@ -1033,6 +1095,8 @@ FunctionEntityId ScopeBuilder::SelectReturnConstructor(
     const FunctionEntityId selected = SelectBestOverload(
         model_, types_, candidates, arguments, true);
     if (selected != 0) {
+      if (model_.FunctionAt(selected).deleted)
+        throw std::runtime_error("selected return constructor is deleted");
       (void)scope;
       return selected;
     }

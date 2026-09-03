@@ -185,7 +185,6 @@ void ConstructorCandidates(const SemaModel& model, const ClassEntity& owner,
       continue;
     const FunctionEntity& function = model.FunctionAt(binding.function);
     if (function.special_member != SPECIAL_MEMBER_CONSTRUCTOR ||
-        function.deleted ||
         (copy_initialization && function.explicit_constructor))
       continue;
     candidates.push_back(declared[i]);

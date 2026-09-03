@@ -1,6 +1,7 @@
 // Translation-unit entry, condition lowering, and statement lowering.
 #include "lower/lowir_lowering.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -99,6 +100,8 @@ void ProgramLowering::Finish()
 // referenced functions this unit never defines.
 void Lowerer::Run()
 {
+  semantic_parents_.clear();
+  CollectSemanticParents(tree_.Root(), 0);
   constructor_no_work_cache_.clear();
   CollectTemporaryConstructorUses(tree_.Root());
   CollectSymbols(tree_.Root());
@@ -1695,6 +1698,18 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
 
   if (initializer.function != 0) {
     const FunctionEntity& constructor = model_.FunctionAt(initializer.function);
+    if (is_base)
+      lower_arguments();
+    const ClassEntity& constructed_class =
+        constructor.member_class == 0 ? owner_class :
+        model_.ClassAt(constructor.member_class);
+    if ((constructor.copy_constructor || constructor.move_constructor) &&
+        constructed_class.trivially_copyable) {
+      if (lowered_arguments.size() != 1)
+        Unsupported("a trivial special member initializer with wrong arity");
+      EmitCopyObject(initializer.type, lowered_arguments[0], destination);
+      return;
+    }
     const bool trivial_default =
         constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
         constructor.member_class != 0 &&
@@ -1710,8 +1725,6 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
     const std::string symbol = is_base ?
         FunctionBaseSymbolName(initializer.function) :
         FunctionSymbolName(initializer.function);
-    if (is_base)
-      lower_arguments();
     std::vector<lowir_model::Operand> call_arguments(1, destination);
     call_arguments.insert(call_arguments.end(), lowered_arguments.begin(),
                           lowered_arguments.end());
@@ -1731,7 +1744,10 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
     MarkBitFieldUnitInitialized(*member_field);
     return;
   }
-  EmitStore(LowTypeOf(initializer.type), lowered_arguments[0], destination);
+  if (types_.Kind(types_.Unqualified(initializer.type)) == TYPE_CLASS)
+    EmitCopyObject(initializer.type, lowered_arguments[0], destination);
+  else
+    EmitStore(LowTypeOf(initializer.type), lowered_arguments[0], destination);
 }
 
 // Arguments of an implicit default construction of a subobject: the
@@ -1938,6 +1954,216 @@ void Lowerer::ZeroInitializeObject(TypeId type,
   }
 }
 
+// Defaulted and implicitly-declared copy/move members share one bounded
+// storage plan.  Trivial leading and trailing ranges are copied as bytes;
+// only nontrivial class subobjects cross their canonical special-member call
+// boundary.  The source parameter is a reference slot, so every subobject
+// projection starts from a freshly loaded source address just like an
+// ordinary member-initializer call.
+void Lowerer::LowerImplicitSpecialMember(FunctionEntityId function,
+                                         SemaId function_node)
+{
+  const FunctionEntity& entity = model_.FunctionAt(function);
+  if (entity.member_class == 0)
+    Unsupported("a special member without a class owner");
+  const ClassEntity& owner = model_.ClassAt(entity.member_class);
+  const bool constructor = entity.copy_constructor || entity.move_constructor;
+  const bool move = entity.move_constructor || entity.move_assignment;
+  const bool assignment = entity.copy_assignment || entity.move_assignment;
+  if (!constructor && !assignment)
+    Unsupported("an unclassified implicit special member");
+
+  std::vector<SemaId> parameters;
+  CollectParameters(function_node, parameters);
+  if (parameters.size() < 2)
+    Unsupported("a special member without a source parameter");
+  const BindingId source_binding = tree_.At(parameters[1]).binding;
+  if (source_binding == 0)
+    Unsupported("a special member source without a binding");
+
+  const auto LoadSource = [&]() -> lowir_model::Operand {
+    lowir_model::Instruction load;
+    load.kind = lowir_model::Instruction::IK_LOAD;
+    load.dest = NewTemp();
+    load.type = PtrType();
+    load.first = SlotOperand(SlotFor(source_binding));
+    Emit(load);
+    return TempOperand(load.dest);
+  };
+  const auto ObjectElement = [&](TypeId type) -> TypeId {
+    TypeId result = types_.Unqualified(type);
+    while (result != 0 && types_.Kind(result) == TYPE_ARRAY)
+      result = types_.Unqualified(types_.At(result).base);
+    return result;
+  };
+  const auto Operation = [&](ClassEntityId sub) -> FunctionEntityId {
+    const ClassEntity& value = model_.ClassAt(sub);
+    FunctionEntityId result = 0;
+    if (constructor) {
+      result = move ? value.move_constructor : value.copy_constructor;
+      if (move && result == 0)
+        result = value.copy_constructor;
+    } else {
+      result = move ? value.move_assignment : value.copy_assignment;
+      if (move && result == 0)
+        result = value.copy_assignment;
+    }
+    if (result == 0 || model_.FunctionAt(result).deleted)
+      return 0;
+    return result;
+  };
+
+  struct Subobject
+  {
+    std::size_t offset;
+    std::size_t size;
+    ClassEntityId entity;
+    bool base;
+    FunctionEntityId operation;
+
+    Subobject(std::size_t offset = 0, std::size_t size = 0,
+              ClassEntityId entity = 0, bool base = false,
+              FunctionEntityId operation = 0)
+        : offset(offset), size(size), entity(entity), base(base),
+          operation(operation) {}
+  };
+  std::vector<Subobject> subobjects;
+  for (std::size_t i = 0; i < owner.bases.size(); ++i) {
+    const ClassBase& base = owner.bases[i];
+    const ClassEntity& value = model_.ClassAt(base.entity);
+    const bool has_operation = constructor ?
+        (move ? value.move_constructor != 0 : value.copy_constructor != 0) :
+        (move ? value.move_assignment != 0 : value.copy_assignment != 0);
+    if ((constructor && value.trivially_copyable) ||
+        (!constructor && value.trivially_copyable && !has_operation))
+      continue;
+    const FunctionEntityId operation = Operation(base.entity);
+    if (operation == 0)
+      Unsupported("a special member with an unavailable base operation");
+    subobjects.push_back(Subobject(base.offset, value.size, base.entity, true,
+                                   operation));
+  }
+  for (std::size_t i = 0; i < owner.fields.size(); ++i) {
+    const ClassField& field = owner.fields[i];
+    if (field.static_member)
+      continue;
+    TypeId element = ObjectElement(field.type);
+    if (types_.Kind(element) != TYPE_CLASS)
+      continue;
+    const ClassEntityId sub_entity =
+        static_cast<ClassEntityId>(types_.At(element).entity);
+    const ClassEntity& value = model_.ClassAt(sub_entity);
+    const bool has_operation = constructor ?
+        (move ? value.move_constructor != 0 : value.copy_constructor != 0) :
+        (move ? value.move_assignment != 0 : value.copy_assignment != 0);
+    if ((constructor && value.trivially_copyable) ||
+        (!constructor && value.trivially_copyable && !has_operation))
+      continue;
+    const FunctionEntityId operation = Operation(sub_entity);
+    if (operation == 0)
+      Unsupported("a special member with an unavailable field operation");
+    const std::size_t element_size = types_.SizeOf(element);
+    const bool array = types_.Kind(types_.Unqualified(field.type)) ==
+        TYPE_ARRAY;
+    const std::size_t count = array ?
+        types_.At(types_.Unqualified(field.type)).array_bound : 1;
+    for (std::size_t index = 0; index < count; ++index)
+      subobjects.push_back(Subobject(field.offset + index * element_size,
+                                     element_size, sub_entity, false,
+                                     operation));
+  }
+  std::stable_sort(subobjects.begin(), subobjects.end(),
+                   [](const Subobject& left, const Subobject& right) {
+                     return left.offset < right.offset;
+                   });
+
+  // ClassEntity::size includes tail padding added for the enclosing
+  // object's alignment.  It is not an object subrange that a synthesized
+  // member needs to copy, so stop the final trivial range at the end of the
+  // last base or non-static data member instead.
+  std::size_t object_extent = 0;
+  for (std::size_t i = 0; i < owner.bases.size(); ++i) {
+    const ClassBase& base = owner.bases[i];
+    object_extent = std::max(object_extent,
+                             base.offset + model_.ClassAt(base.entity).size);
+  }
+  for (std::size_t i = 0; i < owner.fields.size(); ++i) {
+    const ClassField& field = owner.fields[i];
+    if (field.static_member)
+      continue;
+    object_extent = std::max(object_extent,
+                             field.offset + types_.SizeOf(field.type));
+  }
+  object_extent = std::min(object_extent, owner.size);
+
+  const auto RangeAlignment = [&](std::size_t offset,
+                                  std::size_t bytes) -> std::size_t {
+    std::size_t result = owner.alignment == 0 ? 1 : owner.alignment;
+    while (result > 1 && (offset % result != 0 || bytes % result != 0))
+      result /= 2;
+    return result;
+  };
+  const auto AtOffset = [&](const lowir_model::Operand& base,
+                            std::size_t offset,
+                            lowir_model::IndexProjectionKind kind)
+      -> lowir_model::Operand {
+    return ProjectField(base, offset, kind);
+  };
+  const auto EmitRange = [&](std::size_t offset, std::size_t bytes) {
+    if (bytes == 0)
+      return;
+    const lowir_model::Operand target = offset == 0 ? LoadThis() :
+        ProjectField(LoadThis(), offset);
+    const lowir_model::Operand source = offset == 0 ? LoadSource() :
+        ProjectField(LoadSource(), offset);
+    EmitCopyObjectBytes(bytes, RangeAlignment(offset, bytes), source, target);
+  };
+
+  std::size_t cursor = 0;
+  for (std::size_t i = 0; i < subobjects.size(); ++i) {
+    const Subobject& subobject = subobjects[i];
+    if (subobject.offset > cursor)
+      EmitRange(cursor, subobject.offset - cursor);
+    const lowir_model::IndexProjectionKind projection = subobject.base ?
+        lowir_model::IPK_BASE_SUBOBJECT : lowir_model::IPK_FIELD;
+    const lowir_model::Operand target = AtOffset(
+        LoadThis(), subobject.offset, projection);
+    const lowir_model::Operand source = AtOffset(
+        LoadSource(), subobject.offset, projection);
+    const std::string symbol = subobject.base ?
+        FunctionBaseSymbolName(subobject.operation) :
+        FunctionSymbolName(subobject.operation);
+    if (constructor) {
+      EmitVoidCall(symbol, std::vector<lowir_model::Operand>{target, source});
+    } else {
+      lowir_model::Instruction call;
+      call.kind = lowir_model::Instruction::IK_CALL;
+      call.dest = NewTemp();
+      const TypeNode& operation_type = types_.At(types_.Unqualified(
+          model_.FunctionAt(subobject.operation).type));
+      call.type = LowTypeOf(operation_type.result);
+      call.call_return_type = call.type;
+      call.call_returns_void = false;
+      call.first = GlobalOperand(symbol);
+      call.args.push_back(target);
+      call.args.push_back(source);
+      Emit(call);
+    }
+    cursor = std::max(cursor, subobject.offset + subobject.size);
+  }
+  if (cursor < object_extent)
+    EmitRange(cursor, object_extent - cursor);
+
+  if (assignment) {
+    Value result;
+    result.type = types_.At(types_.Unqualified(entity.type)).result;
+    result.operand = LoadThis();
+    EmitReturn(&result);
+  } else {
+    EmitReturn(0);
+  }
+}
+
 void Lowerer::LowerConstructorInitializers(FunctionEntityId function,
                                            SemaId function_node)
 {
@@ -2014,9 +2240,12 @@ void Lowerer::LowerConstructorInitializers(FunctionEntityId function,
       }
       const lowir_model::Operand destination =
           ProjectField(LoadThis(), field.offset);
-      EmitStore(LowTypeOf(field.type),
-                LowerRValue(default_initializer, field.type).operand,
-                destination);
+      if (types_.Kind(types_.Unqualified(field.type)) == TYPE_CLASS)
+        LowerClassValueInto(default_initializer, field.type, destination);
+      else
+        EmitStore(LowTypeOf(field.type),
+                  LowerRValue(default_initializer, field.type).operand,
+                  destination);
       continue;
     }
     TypeId element_type = field_type;
@@ -2363,7 +2592,19 @@ void Lowerer::LowerReturn(SemaId node)
     destination.operand = SlotOperand(
         NewGeneratedSlot("retobj", LowTypeOf(function_return_type_id_)));
     const lowir_model::Operand address = AddressValue(destination).operand;
-    LowerClassValueInto(children[0], function_return_type_id_, address);
+    const ClassEntity& return_class = model_.ClassAt(
+        types_.At(types_.Unqualified(function_return_type_id_)).entity);
+    const SemaNode& returned = tree_.At(children[0]);
+    if (!return_class.empty || returned.kind == SEMA_CONSTRUCTOR_ACTION ||
+        returned.kind == SEMA_BRACED_INIT_LIST)
+      LowerClassValueInto(children[0], function_return_type_id_, address);
+    else if (returned.kind == SEMA_CALL)
+      (void)LowerCall(children[0], function_return_type_id_);
+    else if (returned.category == VC_LVALUE ||
+             returned.category == VC_XVALUE)
+      (void)AddressValue(LowerLValue(children[0]));
+    else
+      (void)LowerRValue(children[0], function_return_type_id_);
     Value result;
     result.type = function_return_type_id_;
     result.operand = destination.operand;

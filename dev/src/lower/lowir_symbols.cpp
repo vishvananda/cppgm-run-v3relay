@@ -68,6 +68,23 @@ const char* OperatorWord(const std::string& spelling)
 
 }  // namespace
 
+void Lowerer::CollectSemanticParents(SemaId node, SemaId parent)
+{
+  if (node == 0)
+    return;
+  semantic_parents_[node] = parent;
+  for (SemaId child = tree_.At(node).first_child; child != 0;
+       child = tree_.At(child).next_sibling)
+    CollectSemanticParents(child, node);
+}
+
+SemaId Lowerer::SemanticParent(SemaId node) const
+{
+  const std::map<SemaId, SemaId>::const_iterator found =
+      semantic_parents_.find(node);
+  return found == semantic_parents_.end() ? 0 : found->second;
+}
+
 // One walk over the unit in source order records every function entity the
 // unit declares and every namespace-scope object.  Repeated declarations of
 // one function share its entity; repeated declarations of one object share
@@ -384,11 +401,19 @@ BindingId Lowerer::ReturnSlotBinding(SemaId body, TypeId result) const
       types_.At(types_.Unqualified(result)).entity);
   if (!owner.trivial_destructor)
     return 0;
-  const std::vector<SemaId> statements = Children(body);
-  if (statements.size() != 2 ||
-      tree_.At(statements[0]).kind != SEMA_SIMPLE_DECLARATION ||
-      tree_.At(statements[1]).kind != SEMA_RETURN_STATEMENT)
+  if (CountReturnStatements(body) != 1)
     return 0;
+  const std::vector<SemaId> statements = Children(body);
+  if (statements.size() < 2 ||
+      tree_.At(statements[0]).kind != SEMA_SIMPLE_DECLARATION ||
+      tree_.At(statements.back()).kind != SEMA_RETURN_STATEMENT)
+    return 0;
+  // The local may be modified before the final return.  It is still the
+  // caller-owned object throughout the body, but an earlier return would
+  // need a separate construction path and therefore cannot be elided here.
+  for (std::size_t i = 1; i + 1 < statements.size(); ++i)
+    if (tree_.At(statements[i]).kind == SEMA_RETURN_STATEMENT)
+      return 0;
   const std::vector<SemaId> declarations = Children(statements[0]);
   if (declarations.size() != 1 ||
       tree_.At(declarations[0]).kind != SEMA_VARIABLE)
@@ -415,7 +440,7 @@ BindingId Lowerer::ReturnSlotBinding(SemaId body, TypeId result) const
   }
   if (!default_initialized)
     return 0;
-  const std::vector<SemaId> returned = Children(statements[1]);
+  const std::vector<SemaId> returned = Children(statements.back());
   if (returned.size() != 1)
     return 0;
   const SemaNode& expression = tree_.At(returned[0]);
@@ -440,7 +465,7 @@ void Lowerer::CollectReturnSlotCandidates(SemaId node)
     const BindingId binding = ReturnSlotBinding(body, callable.result);
     if (binding != 0) {
       const std::vector<SemaId> statements = Children(body);
-      const std::vector<SemaId> returned = Children(statements[1]);
+      const std::vector<SemaId> returned = Children(statements.back());
       if (returned.size() == 1 &&
           tree_.At(returned[0]).kind == SEMA_CONSTRUCTOR_ACTION)
         elided_return_actions_.insert(returned[0]);
@@ -464,6 +489,51 @@ void Lowerer::CollectReferencedFunctions(
   const SemaNode& value = tree_.At(node);
   if (value.kind == SEMA_FUNCTION_DEFINITION ||
       value.kind == SEMA_FUNCTION_DECLARATION) {
+    if (value.kind == SEMA_FUNCTION_DEFINITION && value.function != 0) {
+      const FunctionEntity& function = model_.FunctionAt(value.function);
+      const bool special = function.copy_constructor ||
+          function.move_constructor || function.copy_assignment ||
+          function.move_assignment;
+      if (special && (function.synthesized || function.defaulted) &&
+          !function.deleted && function.member_class != 0) {
+        const bool constructor = function.copy_constructor ||
+            function.move_constructor;
+        const bool move = function.move_constructor ||
+            function.move_assignment;
+        const ClassEntity& owner = model_.ClassAt(function.member_class);
+        const auto add_subobject = [&](ClassEntityId sub) {
+          const ClassEntity& value = model_.ClassAt(sub);
+          if (value.trivially_copyable)
+            return;
+          FunctionEntityId operation = 0;
+          if (constructor) {
+            operation = move ? value.move_constructor :
+                value.copy_constructor;
+            if (move && operation == 0)
+              operation = value.copy_constructor;
+          } else {
+            operation = move ? value.move_assignment :
+                value.copy_assignment;
+            if (move && operation == 0)
+              operation = value.copy_assignment;
+          }
+          if (operation != 0 && !model_.FunctionAt(operation).deleted)
+            result.insert(operation);
+        };
+        for (std::size_t i = 0; i < owner.bases.size(); ++i)
+          add_subobject(owner.bases[i].entity);
+        for (std::size_t i = 0; i < owner.fields.size(); ++i) {
+          if (owner.fields[i].static_member)
+            continue;
+          TypeId element = types_.Unqualified(owner.fields[i].type);
+          while (types_.Kind(element) == TYPE_ARRAY)
+            element = types_.Unqualified(types_.At(element).base);
+          if (types_.Kind(element) == TYPE_CLASS)
+            add_subobject(static_cast<ClassEntityId>(
+                types_.At(element).entity));
+        }
+      }
+    }
     for (SemaId child = value.first_child; child != 0;
          child = tree_.At(child).next_sibling)
       CollectReferencedFunctions(child, result);
@@ -473,8 +543,22 @@ void Lowerer::CollectReferencedFunctions(
       value.function != 0)
     result.insert(value.function);
   if (value.kind == SEMA_CONSTRUCTOR_ACTION &&
-      IsReturnSlotReuseAction(node))
+      IsReturnSlotReuseAction(node)) {
+    // NRVO removes the selected wrapper constructor call, but a generated
+    // wrapper can still select non-trivial subobject constructors.  Preserve
+    // those definitions without retaining the elided wrapper itself.
+    if (value.function != 0) {
+      const std::map<FunctionEntityId, FunctionSymbol>::const_iterator
+          selected = functions_.find(value.function);
+      if (selected != functions_.end() && selected->second.definition != 0) {
+        const FunctionEntity& constructor = model_.FunctionAt(value.function);
+        if ((constructor.synthesized || constructor.defaulted) &&
+            !constructor.deleted)
+          CollectReferencedFunctions(selected->second.definition, result);
+      }
+    }
     return;
+  }
   if (value.kind == SEMA_CONSTRUCTOR_ACTION &&
       CanElideDefaultedDeclarationConstructor(node))
     return;

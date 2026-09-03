@@ -66,6 +66,12 @@ public:
   // lowering.
   FunctionEntityId SelectReturnConstructor(TypeId type, SemaId argument,
                                            ScopeId scope);
+  // Materialize the copy/move special members once a class value operation
+  // needs them.  Constructor and assignment demand are kept separate so a
+  // trivial value boundary can remain a byte transfer while an assignment
+  // still names its canonical operator= entity.
+  void EnsureCopyMoveMembers(TypeId type, bool constructors = true,
+                             bool assignments = true);
   // Explicit destructor expressions use the same canonical target as
   // lifetime synthesis.  A trivial class returns zero, which is the
   // semantic no-op required for a destructor with no runtime body.
@@ -181,6 +187,11 @@ private:
   FunctionEntityId EnsureAggregateConstructor(
       TypeId type, const std::vector<SemaId>& arguments);
   FunctionEntityId EnsureDestructor(TypeId type);
+  void RecordAssignmentMember(FunctionEntityId function);
+  void BuildDefaultedMemberDefinition(
+      FunctionEntityId function, BindingId binding, ScopeId target_scope,
+      const std::string& name,
+      const std::vector<ParameterInfo>& parameters);
   void AddConstructorAction(SemaId variable, ScopeId scope, TypeId type,
                             BindingId binding, AstId declarator);
   void AddConstructorActionWithArguments(

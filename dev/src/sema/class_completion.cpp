@@ -91,6 +91,9 @@ void ScopeBuilder::CompleteClassMembers(ClassEntityId entity,
       if (function.special_member != SPECIAL_MEMBER_CONSTRUCTOR ||
           function.deleted || function.member_class != entity)
         continue;
+      if ((function.copy_constructor || function.move_constructor) &&
+          (function.synthesized || function.defaulted))
+        continue;
       if (function.ctor_initializer != 0)
         BuildMemberInitializers(function.ctor_initializer, pending.scope,
                                 pending.function_node, pending.function);
@@ -116,6 +119,8 @@ void ScopeBuilder::CompleteClassMembers(ClassEntityId entity,
         continue;
       const FunctionEntity& function = model_.FunctionAt(pending.function);
       if (function.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
+          (!(function.copy_constructor || function.move_constructor) ||
+           (!function.synthesized && !function.defaulted)) &&
           !function.deleted && function.member_class == entity)
         BuildConstructorDefaults(pending.function, pending.function_node,
                                  pending.scope);

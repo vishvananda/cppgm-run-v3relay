@@ -303,13 +303,9 @@ Lowerer::Value Lowerer::ZeroValue(TypeId type)
     result.operand = ZeroOperand(type);
     return result;
   }
-  lowir_model::Instruction copy;
-  copy.kind = lowir_model::Instruction::IK_COPY;
-  copy.dest = NewTemp();
-  copy.type = PtrType();
-  copy.first = NullptrImmediate();
-  Emit(copy);
-  result.operand = TempOperand(copy.dest);
+  // A synthesized zero value is already typed by its destination context;
+  // null pointer storage does not need an intermediate copy instruction.
+  result.operand = Immediate(0);
   return result;
 }
 
@@ -872,6 +868,25 @@ Lowerer::Value Lowerer::LowerSubscript(SemaId node, bool lvalue)
   return result;
 }
 
+bool Lowerer::IsObjectExpression(SemaId node) const
+{
+  const SemaId parent_id = SemanticParent(node);
+  if (parent_id == 0)
+    return false;
+  const SemaNode& parent = tree_.At(parent_id);
+  if (parent.kind == SEMA_MEMBER && parent.first_child == node)
+    return true;
+  // A member call stores its prvalue object in the implicit `&object`
+  // argument.  Distinguish that shape from a value passed to an ordinary
+  // call by checking the grandparent once, through the cached parent map.
+  if (parent.kind == SEMA_UNARY && parent.op == OP_AMP &&
+      parent.first_child == node) {
+    const SemaId call_id = SemanticParent(parent_id);
+    return call_id != 0 && tree_.At(call_id).kind == SEMA_CALL;
+  }
+  return false;
+}
+
 Lowerer::Value Lowerer::LowerConstructorTemporary(SemaId node)
 {
   const SemaNode& value = tree_.At(node);
@@ -936,6 +951,8 @@ bool Lowerer::ConstructorTemporaryIsObjectExpression(SemaId node) const
   if (action_children.size() != 1 ||
       tree_.At(action_children[0]).kind != SEMA_CALL)
     return false;
+  if (IsObjectExpression(node))
+    return true;
   const std::vector<SemaId> call_children = Children(action_children[0]);
   if (call_children.size() == 1 && tree_.At(node).function != 0) {
     const FunctionEntity& constructor =
@@ -1199,18 +1216,30 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
   }
   if (value.kind == SEMA_CALL &&
       types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS) {
-    Value result = LowerCall(node, 0);
-    if (result.lvalue)
-      return result;
     // A direct class result is an object value.  Member access needs a
     // stable address, so materialize it once in an object-expression slot.
+    // Form the destination address before evaluating the call.  Apart from
+    // making the lifetime boundary explicit, this preserves the source
+    // order of the address-producing operation and the value-producing call.
+    const bool object_expression = IsObjectExpression(node);
     Value storage;
     storage.type = value.type;
     storage.lvalue = true;
     storage.operand = SlotOperand(
-        NewGeneratedSlot("tmpobj", LowTypeOf(value.type)));
+        NewGeneratedSlot(object_expression ? "tmpobj" : "arg",
+                         LowTypeOf(value.type)));
     const lowir_model::Operand destination = AddressValue(storage).operand;
+    const bool indirect_result =
+        ClassBoundary(value.type, true) == CBM_INDIRECT_RESULT;
+    Value result = indirect_result ?
+        LowerCall(node, 0, &destination) : LowerCall(node, 0);
+    if (result.lvalue)
+      return result;
     EmitCopyObject(value.type, result.operand, destination);
+    // Keep the already-formed address as the lvalue representation.  A
+    // member projection can then reuse it instead of emitting a second
+    // address calculation for the same temporary slot.
+    storage.operand = destination;
     return storage;
   }
   if (value.kind == SEMA_CONDITIONAL && value.category == VC_LVALUE)
@@ -1781,8 +1810,19 @@ Lowerer::Value Lowerer::LowerAssignment(SemaId node, Value* assigned_lvalue)
   Value rhs;
   if (value.op == OP_ASS) {
     const TypeId target = ReferentType(tree_.At(children[0]).type);
-    rhs = tree_.At(children[1]).kind == SEMA_BRACED_INIT_LIST ?
-        LowerRValue(children[1], target) : LowerRValue(children[1]);
+    const bool null_pointer = types_.IsPointer(target) &&
+        (IsZeroLiteral(children[1]) || IsNullptrLiteral(children[1]));
+    if (null_pointer) {
+      // A null pointer constant stored directly into a pointer object is
+      // already in its final representation; the conversion temporary is
+      // only needed when the value must be materialized for another ABI
+      // boundary such as a reference argument.
+      rhs.type = target;
+      rhs.operand = Immediate(0);
+    } else {
+      rhs = tree_.At(children[1]).kind == SEMA_BRACED_INIT_LIST ?
+          LowerRValue(children[1], target) : LowerRValue(children[1]);
+    }
     // Apply the assignment conversion while the right operand is still the
     // only evaluated side.  Derived-to-base pointer projection (and any
     // future conversion with observable lowering) therefore precedes the
@@ -2066,6 +2106,17 @@ Lowerer::Value Lowerer::LowerClassArgument(SemaId node, TypeId parameter)
 
   // Direct object parameters retain the opaque object value at the call
   // boundary.  The callee's entry sequence copies it into its named slot.
+  if (source.kind == SEMA_CONSTRUCTOR_ACTION) {
+    // A prvalue constructor action already owns the complete initialization
+    // plan.  Use the argument object's storage as its construction result;
+    // manufacturing a second temporary would turn a direct value transfer
+    // into an unnecessary by-address round trip.
+    LowerAggregateConstructor(node, parameter, destination_address.operand);
+    Value result;
+    result.type = parameter;
+    result.operand = SlotOperand(slot);
+    return result;
+  }
   const Value copied = source.category == VC_LVALUE ||
       source.category == VC_XVALUE ?
       AddressValue(LowerLValue(node)) : LowerRValue(node, parameter);

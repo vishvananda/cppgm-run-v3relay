@@ -859,14 +859,19 @@ AstId Pa10Parser::parse_statement()
 		// a static member function.  Keep the tentative expression available
 		// for semantic lookup; a real type-name declaration still falls back
 		// transactionally below when this parse cannot form a call.
-		const bool qualified_type_call =
-			binding != 0 &&
-			(*binding == BIND_TYPE || *binding == BIND_TEMPLATE) &&
-			is_simple(OP_COLON2, pos_ + 1) &&
-			is_kind(PA6_IDENTIFIER_TOKEN, pos_ + 2) &&
-			is_simple(OP_LPAREN, pos_ + 3);
-		if (is_kind(PA6_IDENTIFIER_TOKEN) &&
-			(binding == 0 || *binding == BIND_NAMESPACE || qualified_type_call) &&
+			const bool qualified_type_call =
+				binding != 0 &&
+				(*binding == BIND_TYPE || *binding == BIND_TEMPLATE) &&
+				is_simple(OP_COLON2, pos_ + 1) &&
+				((is_kind(PA6_IDENTIFIER_TOKEN, pos_ + 2) &&
+				  is_simple(OP_LPAREN, pos_ + 3)) ||
+				 (is_simple(KW_OPERATOR, pos_ + 2)));
+			const bool qualified_operator_call =
+				is_simple(OP_COLON2, pos_ + 1) &&
+				is_simple(KW_OPERATOR, pos_ + 2);
+			if (is_kind(PA6_IDENTIFIER_TOKEN) &&
+				(binding == 0 || *binding == BIND_NAMESPACE ||
+				 qualified_type_call || qualified_operator_call) &&
 			!qualified_pointer_declaration)
 		{
 			const Mark expression_mark = mark();
