@@ -60,6 +60,12 @@ public:
                                        const std::vector<SemaId>& arguments,
                                        ScopeId scope,
                                        bool copy_initialization = false);
+  // Return initialization gives an automatic object an xvalue trial before
+  // the ordinary lvalue copy trial (12.8p32).  The expression analyzer uses
+  // the selected entity to build the one constructor action consumed by
+  // lowering.
+  FunctionEntityId SelectReturnConstructor(TypeId type, SemaId argument,
+                                           ScopeId scope);
   // Explicit destructor expressions use the same canonical target as
   // lifetime synthesis.  A trivial class returns zero, which is the
   // semantic no-op required for a destructor with no runtime body.
@@ -168,6 +174,8 @@ private:
   std::string AnonymousTypeName(AstId node, const char* kind) const;
   bool HasConstFunctionQualifier(AstId declarator) const;
   bool HasVolatileFunctionQualifier(AstId declarator) const;
+  void FunctionRefQualifiers(AstId declarator, bool& lvalue,
+                             bool& rvalue) const;
   bool IsNoThrowDeclarator(AstId declarator, ScopeId scope);
   FunctionEntityId EnsureDefaultConstructor(TypeId type);
   FunctionEntityId EnsureAggregateConstructor(
@@ -253,6 +261,8 @@ private:
                                    BindingId& binding,
                                    bool member_const = false,
                                    bool member_volatile = false,
+                                   bool member_lvalue_ref_qualifier = false,
+                                   bool member_rvalue_ref_qualifier = false,
                                    bool internal_linkage = false,
                                    bool noexcept_qualifier = false,
                                    const std::vector<AstId>& default_arguments =

@@ -375,6 +375,87 @@ void Lowerer::CollectSymbols(SemaId node)
     CollectSymbols(child);
 }
 
+BindingId Lowerer::ReturnSlotBinding(SemaId body, TypeId result) const
+{
+  if (body == 0 || ClassBoundary(result, true) != CBM_INDIRECT_RESULT ||
+      types_.Kind(types_.Unqualified(result)) != TYPE_CLASS)
+    return 0;
+  const ClassEntity& owner = model_.ClassAt(
+      types_.At(types_.Unqualified(result)).entity);
+  if (!owner.trivial_destructor)
+    return 0;
+  const std::vector<SemaId> statements = Children(body);
+  if (statements.size() != 2 ||
+      tree_.At(statements[0]).kind != SEMA_SIMPLE_DECLARATION ||
+      tree_.At(statements[1]).kind != SEMA_RETURN_STATEMENT)
+    return 0;
+  const std::vector<SemaId> declarations = Children(statements[0]);
+  if (declarations.size() != 1 ||
+      tree_.At(declarations[0]).kind != SEMA_VARIABLE)
+    return 0;
+  const SemaNode& variable = tree_.At(declarations[0]);
+  if (variable.binding == 0 ||
+      types_.Kind(types_.Unqualified(variable.type)) != TYPE_CLASS ||
+      types_.At(types_.Unqualified(variable.type)).entity !=
+          types_.At(types_.Unqualified(result)).entity)
+    return 0;
+  const std::vector<SemaId> initializer = Children(declarations[0]);
+  bool default_initialized = initializer.empty();
+  if (initializer.size() == 1 &&
+      tree_.At(initializer[0]).kind == SEMA_CONSTRUCTOR_ACTION) {
+    const SemaNode& action = tree_.At(initializer[0]);
+    const std::vector<SemaId> action_children = Children(initializer[0]);
+    if (action.function == 0 ||
+        action_children.size() != 1 ||
+        tree_.At(action_children[0]).kind != SEMA_CALL)
+      return 0;
+    const FunctionEntity& constructor = model_.FunctionAt(action.function);
+    default_initialized = constructor.special_member ==
+        SPECIAL_MEMBER_CONSTRUCTOR;
+  }
+  if (!default_initialized)
+    return 0;
+  const std::vector<SemaId> returned = Children(statements[1]);
+  if (returned.size() != 1)
+    return 0;
+  const SemaNode& expression = tree_.At(returned[0]);
+  if (expression.kind == SEMA_ID_EXPRESSION &&
+      expression.binding == variable.binding)
+    return variable.binding;
+  if (expression.kind == SEMA_CONSTRUCTOR_ACTION &&
+      expression.binding == 0)
+    return variable.binding;
+  return 0;
+}
+
+void Lowerer::CollectReturnSlotCandidates(SemaId node)
+{
+  if (node == 0)
+    return;
+  const SemaNode& value = tree_.At(node);
+  if (value.kind == SEMA_FUNCTION_DEFINITION && value.function != 0) {
+    const FunctionEntity& function = model_.FunctionAt(value.function);
+    const TypeNode& callable = types_.At(types_.Unqualified(function.type));
+    const SemaId body = FunctionBody(node);
+    const BindingId binding = ReturnSlotBinding(body, callable.result);
+    if (binding != 0) {
+      const std::vector<SemaId> statements = Children(body);
+      const std::vector<SemaId> returned = Children(statements[1]);
+      if (returned.size() == 1 &&
+          tree_.At(returned[0]).kind == SEMA_CONSTRUCTOR_ACTION)
+        elided_return_actions_.insert(returned[0]);
+    }
+  }
+  for (SemaId child = value.first_child; child != 0;
+       child = tree_.At(child).next_sibling)
+    CollectReturnSlotCandidates(child);
+}
+
+bool Lowerer::IsReturnSlotReuseAction(SemaId node) const
+{
+  return elided_return_actions_.count(node) != 0;
+}
+
 void Lowerer::CollectReferencedFunctions(
     SemaId node, std::set<FunctionEntityId>& result) const
 {
@@ -391,6 +472,9 @@ void Lowerer::CollectReferencedFunctions(
   if ((value.kind == SEMA_CALLEE || value.kind == SEMA_ID_EXPRESSION) &&
       value.function != 0)
     result.insert(value.function);
+  if (value.kind == SEMA_CONSTRUCTOR_ACTION &&
+      IsReturnSlotReuseAction(node))
+    return;
   if (value.kind == SEMA_CONSTRUCTOR_ACTION &&
       CanElideDefaultedDeclarationConstructor(node))
     return;
@@ -687,6 +771,22 @@ std::string Lowerer::MangleFunction(FunctionEntityId id,
     abi_mangle::AbiFunctionRecord qualifier;
     qualifier.kind = abi_mangle::ABI_FUNCTION_RECORD_QUALIFIER;
     qualifier.qualifiers.push_back(abi_mangle::ABI_FUNCTION_QUALIFIER_VOLATILE);
+    records.push_back(qualifier);
+  }
+  if (entity.is_member && entity.member_lvalue_ref_qualifier)
+  {
+    abi_mangle::AbiFunctionRecord qualifier;
+    qualifier.kind = abi_mangle::ABI_FUNCTION_RECORD_QUALIFIER;
+    qualifier.qualifiers.push_back(
+        abi_mangle::ABI_FUNCTION_QUALIFIER_LVALUE_REFERENCE);
+    records.push_back(qualifier);
+  }
+  if (entity.is_member && entity.member_rvalue_ref_qualifier)
+  {
+    abi_mangle::AbiFunctionRecord qualifier;
+    qualifier.kind = abi_mangle::ABI_FUNCTION_RECORD_QUALIFIER;
+    qualifier.qualifiers.push_back(
+        abi_mangle::ABI_FUNCTION_QUALIFIER_RVALUE_REFERENCE);
     records.push_back(qualifier);
   }
   for (std::size_t i = 0; i < type.parameters.size(); ++i) {
@@ -1909,9 +2009,11 @@ lowir_model::FunctionDeclaration Lowerer::BuildFunctionDeclaration(
   const FunctionEntity& entity = model_.FunctionAt(id);
   const TypeNode& type = types_.At(types_.Unqualified(entity.type));
   const TypeId result_type = types_.Unqualified(type.result);
-  result.return_type = types_.Kind(result_type) == TYPE_CLASS &&
-      !model_.ClassAt(types_.At(result_type).entity).layout_complete ?
-      VoidType() : LowTypeOf(type.result);
+  const bool incomplete_class = types_.Kind(result_type) == TYPE_CLASS &&
+      !model_.ClassAt(types_.At(result_type).entity).layout_complete;
+  const ClassBoundaryMode result_boundary = ClassBoundary(type.result, true);
+  result.return_type = result_boundary == CBM_INDIRECT_RESULT ||
+      incomplete_class ? VoidType() : LowTypeOf(type.result);
   result.boundary.arity = type.variadic ? lowir_model::CAM_VARIADIC :
       lowir_model::CAM_FIXED;
   result.metadata.binding = base_variant ? lowir_model::SBM_STRONG :
@@ -1925,12 +2027,24 @@ lowir_model::FunctionDeclaration Lowerer::BuildFunctionDeclaration(
         symbol.object;
   std::vector<SemaId> parameters;
   CollectParameters(symbol.declaration, parameters);
+  if (result_boundary == CBM_INDIRECT_RESULT) {
+    lowir_model::Parameter result_parameter;
+    result_parameter.name = "%ret";
+    result_parameter.type = PtrType();
+    result_parameter.metadata.passing = lowir_model::PPM_INDIRECT_RESULT;
+    result.params.push_back(result_parameter);
+  }
   for (std::size_t i = 0; i < type.parameters.size(); ++i) {
     lowir_model::Parameter parameter;
     parameter.name = "%arg" + std::to_string(i);
-    parameter.type = LowTypeOf(type.parameters[i]);
     if (types_.Kind(types_.Unqualified(type.parameters[i])) == TYPE_REFERENCE)
       parameter.metadata.passing = lowir_model::PPM_REFERENCE;
+    if (ClassBoundary(type.parameters[i], false) == CBM_BY_ADDRESS) {
+      parameter.type = PtrType();
+      parameter.metadata.passing = lowir_model::PPM_BY_ADDRESS;
+    } else {
+      parameter.type = LowTypeOf(type.parameters[i]);
+    }
     if (i < parameters.size()) {
       const Binding& binding =
           model_.BindingAt(tree_.At(parameters[i]).binding);

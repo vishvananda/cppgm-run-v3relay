@@ -564,6 +564,10 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
       for (std::size_t parameter = 0; parameter < parameters.size();
            ++parameter)
         default_arguments.push_back(parameters[parameter].default_initializer);
+      bool member_lvalue_ref_qualifier = false;
+      bool member_rvalue_ref_qualifier = false;
+      FunctionRefQualifiers(declarator, member_lvalue_ref_qualifier,
+                            member_rvalue_ref_qualifier);
       const bool had_visible_declaration = [&]() {
         std::vector<BindingId> visible;
         model_.DirectBindings(target_scope, name, LOOKUP_FUNCTIONS, visible);
@@ -573,6 +577,7 @@ void ScopeBuilder::BuildSimpleDeclaration(AstId node, ScopeId scope,
           target_scope, name, type, false, binding,
           HasConstFunctionQualifier(declarator),
           HasVolatileFunctionQualifier(declarator),
+          member_lvalue_ref_qualifier, member_rvalue_ref_qualifier,
           SequenceHasKeyword(specifiers, KW_STATIC),
           IsNoThrowDeclarator(declarator, target_scope), default_arguments,
           SequenceHasKeyword(specifiers, KW_EXPLICIT));
@@ -833,10 +838,15 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
   vector<AstId> default_arguments;
   for (std::size_t parameter = 0; parameter < parameters.size(); ++parameter)
     default_arguments.push_back(parameters[parameter].default_initializer);
+  bool member_lvalue_ref_qualifier = false;
+  bool member_rvalue_ref_qualifier = false;
+  FunctionRefQualifiers(declarator, member_lvalue_ref_qualifier,
+                        member_rvalue_ref_qualifier);
   const FunctionEntityId function = DeclareFunction(
       target_scope, name, type, true, binding,
       HasConstFunctionQualifier(declarator),
       HasVolatileFunctionQualifier(declarator),
+      member_lvalue_ref_qualifier, member_rvalue_ref_qualifier,
       SequenceHasKeyword(specifiers, KW_STATIC),
       IsNoThrowDeclarator(declarator, target_scope), default_arguments,
       SequenceHasKeyword(specifiers, KW_EXPLICIT));
@@ -983,6 +993,51 @@ FunctionEntityId ScopeBuilder::ResolveConstructor(
     throw std::runtime_error("no viable constructor");
   (void)scope;
   return selected;
+}
+
+FunctionEntityId ScopeBuilder::SelectReturnConstructor(
+    TypeId type, SemaId argument, ScopeId scope)
+{
+  const TypeId class_type = types_.Unqualified(type);
+  if (types_.Kind(class_type) != TYPE_CLASS || argument == 0)
+    return 0;
+  const ClassEntity& owner = model_.ClassAt(types_.At(class_type).entity);
+  // An aggregate or an otherwise trivial class has no declared constructor
+  // action to select here.  Its object boundary is handled by lowering.
+  if (owner.constructors.empty())
+    return 0;
+
+  std::vector<BindingId> candidates;
+  ConstructorCandidates(model_, owner, false, candidates);
+  if (candidates.empty())
+    return 0;
+  const SemaNode& source = tree_->At(argument);
+  const bool null_pointer_constant =
+      types_.IsNullPointerType(source.type) ||
+      (source.has_value && source.value == 0 &&
+       types_.IsIntegral(source.type));
+  const bool function_lvalue = source.kind == SEMA_ID_EXPRESSION &&
+      types_.Kind(types_.Unqualified(source.type)) == TYPE_FUNCTION;
+
+  // 12.8p32: the local is treated as an xvalue for the first overload
+  // trial; if no move construction is viable, retry as an lvalue so a copy
+  // constructor remains usable.  The source type and qualification stay
+  // unchanged across the two trials.
+  for (int trial = 0; trial != 2; ++trial) {
+    const ValueCategory category = trial == 0 ? VC_XVALUE : VC_LVALUE;
+    std::vector<OverloadArgument> arguments;
+    arguments.push_back(OverloadArgument(
+        types_.Pointer(class_type), VC_PRVALUE, false, false, true));
+    arguments.push_back(OverloadArgument(
+        source.type, category, null_pointer_constant, function_lvalue));
+    const FunctionEntityId selected = SelectBestOverload(
+        model_, types_, candidates, arguments, true);
+    if (selected != 0) {
+      (void)scope;
+      return selected;
+    }
+  }
+  return 0;
 }
 
 FunctionEntityId ScopeBuilder::EnsureAggregateConstructor(
@@ -1512,265 +1567,6 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
   return type;
 }
 
-namespace
-{
-
-std::size_t AlignUp(std::size_t value, std::size_t alignment)
-{
-  if (alignment <= 1)
-    return value;
-  const std::size_t remainder = value % alignment;
-  return remainder == 0 ? value : value + alignment - remainder;
-}
-
-bool LayoutKnown(const SemaModel& model, const TypeTable& types, TypeId type)
-{
-  const TypeNode& node = types.At(type);
-  switch (node.kind)
-  {
-  case TYPE_CV: case TYPE_REFERENCE:
-    return LayoutKnown(model, types, node.base);
-  case TYPE_FUNDAMENTAL:
-    return FundamentalSize(node.fundamental) != 0;
-  case TYPE_POINTER: case TYPE_MEMBER_POINTER: case TYPE_ENUM:
-    return true;
-  case TYPE_ARRAY:
-    return node.array_bound != 0 && LayoutKnown(model, types, node.base);
-  case TYPE_CLASS:
-    return model.ClassAt(node.entity).layout_complete;
-  case TYPE_TEMPLATE_PARAM: case TYPE_FUNCTION: case TYPE_INVALID:
-    return false;
-  }
-  return false;
-}
-
-} // namespace
-
-void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
-{
-  ClassEntity& value = model_.ClassAt(entity);
-  if (value.layout_complete)
-    return;
-
-  // A primary class template is a layout pattern until its template
-  // parameters are substituted.  Preserve the fields for lookup, but defer
-  // sizeof/alignment and offset assignment while one of them is incomplete.
-  for (std::size_t i = 0; i < value.fields.size(); ++i)
-    if (!LayoutKnown(model_, types_, value.fields[i].type))
-      return;
-
-  std::size_t offset = 0;
-  std::size_t alignment = 1;
-  std::size_t size = 0;
-  const std::size_t pack_alignment = value.pack_alignment;
-  for (std::size_t i = 0; i < value.bases.size(); ++i)
-  {
-    const ClassBase& base = value.bases[i];
-    const ClassEntity& base_entity = model_.ClassAt(base.entity);
-    if (!base_entity.layout_complete)
-      throw std::runtime_error("base class is incomplete");
-    const std::size_t base_alignment = pack_alignment == 0 ?
-        base_entity.alignment : std::min(base_entity.alignment, pack_alignment);
-    const std::size_t base_size = base_entity.size;
-    alignment = std::max(alignment, base_alignment);
-    // Empty bases use offset zero; a same-type member reserves their size.
-    if (base_entity.empty || value.is_union)
-      value.bases[i].offset = 0;
-    else
-    {
-      offset = AlignUp(offset, base_alignment);
-      value.bases[i].offset = offset;
-      offset += base_size;
-    }
-    size = std::max(size, value.is_union ? base_size : offset);
-  }
-
-  // A bit-field allocation unit is the storage-sized unit of its declared
-  // type.  Adjacent fields share it only when the next field still fits;
-  // changing type or crossing the unit boundary starts a new aligned unit.
-  // `bit_offset` is measured from the low bit because the x86-64 LowIR model
-  // represents the target's ordinary little-endian allocation convention.
-  std::size_t bit_unit_offset = 0;
-  std::size_t bit_unit_size = 0;
-  unsigned bit_unit_bits = 0;
-  unsigned bit_used = 0;
-  bool have_bit_unit = false;
-  for (std::size_t i = 0; i < value.fields.size(); ++i)
-  {
-    ClassField& field = value.fields[i];
-    if (field.static_member)
-      continue;
-    const std::size_t natural_field_alignment = types_.AlignOf(field.type);
-    if (field.requested_alignment != 0 &&
-        field.requested_alignment < natural_field_alignment)
-      throw std::runtime_error("member alignas weakens natural alignment");
-    const std::size_t requested_field_alignment = std::max(
-        natural_field_alignment, field.requested_alignment);
-    const std::size_t field_alignment = pack_alignment == 0 ?
-        requested_field_alignment :
-        std::min(requested_field_alignment, pack_alignment);
-    const std::size_t field_size = types_.SizeOf(field.type);
-    alignment = std::max(alignment, field_alignment);
-    if (field.bit_width != 0 || field.binding == 0)
-    {
-      const TypeId allocation_type = types_.Unqualified(field.type);
-      const TypeId unit_type = types_.Kind(allocation_type) == TYPE_ENUM ?
-          types_.Unqualified(types_.At(allocation_type).base) :
-          allocation_type;
-      const unsigned unit_bits = static_cast<unsigned>(
-          FundamentalSize(types_.At(unit_type).fundamental) * 8);
-      if (field.bit_width == 0)
-      {
-        // A zero-width unnamed field ends the current unit and forces the
-        // following field to begin at the next unit boundary.
-        if (have_bit_unit)
-        {
-          offset = std::max(offset, bit_unit_offset + bit_unit_size);
-          have_bit_unit = false;
-          bit_used = 0;
-        }
-        offset = AlignUp(offset, field_alignment);
-        field.offset = value.is_union ? 0 : offset;
-        field.bit_offset = 0;
-        size = std::max(size, value.is_union ? field_size : offset);
-        continue;
-      }
-      if (value.is_union)
-      {
-        field.offset = 0;
-        field.bit_offset = 0;
-        size = std::max(size, field_size);
-        continue;
-      }
-      if (!have_bit_unit || bit_unit_size != field_size ||
-          bit_used + field.bit_width > unit_bits)
-      {
-        if (have_bit_unit)
-          offset = std::max(offset, bit_unit_offset + bit_unit_size);
-        offset = AlignUp(offset, field_alignment);
-        bit_unit_offset = offset;
-        bit_unit_size = field_size;
-        bit_unit_bits = unit_bits;
-        bit_used = 0;
-        have_bit_unit = true;
-      }
-      field.offset = bit_unit_offset;
-      field.bit_offset = bit_used;
-      bit_used += field.bit_width;
-      size = std::max(size, bit_unit_offset + bit_unit_size);
-      if (bit_used == bit_unit_bits)
-      {
-        offset = bit_unit_offset + bit_unit_size;
-        have_bit_unit = false;
-        bit_used = 0;
-      }
-      continue;
-    }
-    if (have_bit_unit)
-    {
-      offset = std::max(offset, bit_unit_offset + bit_unit_size);
-      have_bit_unit = false;
-      bit_used = 0;
-    }
-    if (value.is_union)
-      field.offset = 0;
-    else
-    {
-      offset = AlignUp(offset, field_alignment);
-      for (std::size_t base = 0; base < value.bases.size(); ++base)
-      {
-        const ClassBase& base_info = value.bases[base];
-        const ClassEntity& base_entity = model_.ClassAt(base_info.entity);
-        if (base_entity.empty &&
-            types_.Kind(types_.Unqualified(field.type)) == TYPE_CLASS &&
-            types_.At(types_.Unqualified(field.type)).entity ==
-                base_info.entity)
-          offset = std::max(offset, base_entity.size);
-      }
-      field.offset = offset;
-      offset += field_size;
-    }
-    size = std::max(size, value.is_union ? field_size : offset);
-  }
-  if (have_bit_unit)
-    offset = std::max(offset, bit_unit_offset + bit_unit_size);
-  bool empty = true;
-  for (std::size_t i = 0; empty && i < value.bases.size(); ++i)
-    empty = model_.ClassAt(value.bases[i].entity).empty;
-  for (std::size_t i = 0; empty && i < value.fields.size(); ++i)
-    empty = value.fields[i].static_member;
-  value.empty = empty;
-
-  // C++ gives every complete class object a nonzero size, and an object's
-  // size is a multiple of its alignment.
-  if (size == 0)
-    size = 1;
-  if (value.requested_alignment != 0 &&
-      value.requested_alignment < alignment)
-    throw std::runtime_error("class alignas weakens natural alignment");
-  alignment = std::max(alignment, value.requested_alignment);
-  size = AlignUp(size, alignment);
-  value.size = size;
-  value.alignment = alignment;
-  value.layout_complete = true;
-  value.aggregate = value.bases.empty();
-  for (std::size_t i = 0; i < value.fields.size(); ++i) {
-    const ClassField& field = value.fields[i];
-    if (field.static_member)
-      continue;
-    if (field.access != ACCESS_PUBLIC || field.initializer != 0)
-      value.aggregate = false;
-  }
-  for (std::size_t i = 0; i < value.constructors.size(); ++i) {
-    const FunctionEntity& constructor =
-        model_.FunctionAt(value.constructors[i]);
-    if (!constructor.synthesized && !constructor.defaulted &&
-        !constructor.deleted)
-      value.aggregate = false;
-  }
-  value.trivial_default_constructor = true;
-  for (std::size_t i = 0; i < value.constructors.size(); ++i)
-    if (!model_.FunctionAt(value.constructors[i]).synthesized &&
-        !model_.FunctionAt(value.constructors[i]).defaulted &&
-        !model_.FunctionAt(value.constructors[i]).deleted)
-      value.trivial_default_constructor = false;
-  for (std::size_t i = 0; i < value.fields.size(); ++i) {
-    if (value.fields[i].static_member)
-      continue;
-    if (value.fields[i].initializer != 0) {
-      value.trivial_default_constructor = false;
-      continue;
-    }
-    TypeId element = types_.Unqualified(value.fields[i].type);
-    while (types_.Kind(element) == TYPE_ARRAY)
-      element = types_.Unqualified(types_.At(element).base);
-    if (types_.Kind(element) == TYPE_CLASS &&
-        !model_.ClassAt(types_.At(element).entity)
-            .trivial_default_constructor)
-      value.trivial_default_constructor = false;
-  }
-  for (std::size_t i = 0; i < value.bases.size(); ++i)
-    if (!model_.ClassAt(value.bases[i].entity).trivial_default_constructor)
-      value.trivial_default_constructor = false;
-  value.trivial_destructor = value.destructor == 0 ||
-      model_.FunctionAt(value.destructor).synthesized;
-  for (std::size_t i = 0; i < value.bases.size(); ++i)
-    if (!model_.ClassAt(value.bases[i].entity).trivial_destructor)
-      value.trivial_destructor = false;
-  for (std::size_t i = 0; i < value.fields.size(); ++i)
-  {
-    if (value.fields[i].static_member)
-      continue;
-    TypeId element = types_.Unqualified(value.fields[i].type);
-    while (types_.Kind(element) == TYPE_ARRAY)
-      element = types_.Unqualified(types_.At(element).base);
-    if (types_.Kind(element) == TYPE_CLASS &&
-        !model_.ClassAt(types_.At(element).entity).trivial_destructor)
-      value.trivial_destructor = false;
-  }
-  types_.SetClassLayout(entity, size, alignment);
-}
-
 // `struct S;` declares S in the current scope unless the scope already
 // declares a class S (3.3.1, 7.1.6.3).
 TypeId ScopeBuilder::BuildClassForward(AstId node, ScopeId scope)
@@ -2276,6 +2072,34 @@ bool ScopeBuilder::HasVolatileFunctionQualifier(AstId declarator) const
   return false;
 }
 
+void ScopeBuilder::FunctionRefQualifiers(AstId declarator, bool& lvalue,
+                                         bool& rvalue) const
+{
+  lvalue = false;
+  rvalue = false;
+  if (declarator == 0)
+    return;
+  const AstNode& node = arena_.At(declarator);
+  bool have_parameters = false;
+  for (std::size_t i = 0; i < node.children.size(); ++i)
+  {
+    const AstId child = node.children[i];
+    const AstNode& value = arena_.At(child);
+    if (value.kind == AST_PARAMETER_CLAUSE)
+    {
+      have_parameters = true;
+      continue;
+    }
+    if (!have_parameters || value.kind != AST_REF_QUALIFIER ||
+        value.first >= tokens_.size())
+      continue;
+    if (tokens_[value.first].IsSimple(OP_AMP))
+      lvalue = true;
+    else if (tokens_[value.first].IsSimple(OP_LAND))
+      rvalue = true;
+  }
+}
+
 // 15.4: `noexcept`, `noexcept(constant)` with a true constant, and the empty
 // dynamic specification `throw()` promise not to throw.  The parser joins
 // each specification into one function-qualifier node whose first token
@@ -2671,6 +2495,8 @@ bool ScopeBuilder::BuildTemplateInstance(FunctionEntityId template_function,
   concrete.member_class = source.member_class;
   concrete.member_const = source.member_const;
   concrete.member_volatile = source.member_volatile;
+  concrete.member_lvalue_ref_qualifier = source.member_lvalue_ref_qualifier;
+  concrete.member_rvalue_ref_qualifier = source.member_rvalue_ref_qualifier;
   concrete.member_type = source.member_type == 0 ? 0 :
       SubstituteTemplateType(source.member_type, values);
   if (concrete.member_type != 0)
@@ -2771,6 +2597,8 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
                                                BindingId& binding,
                                                bool member_const,
                                                bool member_volatile,
+                                               bool member_lvalue_ref_qualifier,
+                                               bool member_rvalue_ref_qualifier,
                                                bool internal_linkage,
                                                bool noexcept_qualifier,
                                                const vector<AstId>&
@@ -2885,6 +2713,12 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     if (is_member && model_.FunctionAt(prior.function).static_member !=
         static_member)
       continue;
+    if (is_member &&
+        (model_.FunctionAt(prior.function).member_lvalue_ref_qualifier !=
+             member_lvalue_ref_qualifier ||
+         model_.FunctionAt(prior.function).member_rvalue_ref_qualifier !=
+             member_rvalue_ref_qualifier))
+      continue;
     if (same_parameters && model_.FunctionAt(prior.function).type != canonical)
       throw std::runtime_error("function redeclaration changes return type");
     if (model_.FunctionAt(prior.function).type == canonical)
@@ -2904,6 +2738,8 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
         entity.static_member = static_member;
         entity.member_const = member_const;
         entity.member_volatile = member_volatile;
+        entity.member_lvalue_ref_qualifier = member_lvalue_ref_qualifier;
+        entity.member_rvalue_ref_qualifier = member_rvalue_ref_qualifier;
       }
       entity.internal_linkage = entity.internal_linkage ||
           effective_internal_linkage;
@@ -2946,6 +2782,8 @@ FunctionEntityId ScopeBuilder::DeclareFunction(ScopeId scope,
     entity.static_member = static_member;
     entity.member_const = member_const;
     entity.member_volatile = member_volatile;
+    entity.member_lvalue_ref_qualifier = member_lvalue_ref_qualifier;
+    entity.member_rvalue_ref_qualifier = member_rvalue_ref_qualifier;
   }
   model_.FunctionAt(function).noexcept_qualifier = noexcept_qualifier;
   model_.FunctionAt(function).explicit_constructor = explicit_constructor;

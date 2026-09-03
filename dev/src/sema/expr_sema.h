@@ -30,6 +30,10 @@ public:
   SemaId Initialize(SemaId expression, TypeId target,
                     bool constexpr_object = false,
                     bool list_initialization = false);
+  // Return initialization has the special xvalue-then-lvalue constructor
+  // selection order; class prvalues are already materialized and are
+  // returned unchanged for elision.
+  SemaId InitializeReturn(SemaId expression, TypeId target);
   bool TryConstant(SemaId expression, long long& value) const;
   long long Value(SemaId expression) const;
   const SemaNode& Node(SemaId expression) const;
@@ -150,6 +154,8 @@ private:
   bool IsOperatorFunction(ETokenType op) const;
   std::string OperatorFunctionName(ETokenType op) const;
   SemaId MakeImplicitObject(SemaId object, ScopeId scope);
+  ValueCategory ImplicitObjectCategory(SemaId object,
+                                      bool member_callee) const;
   OverloadArgument MakeOperatorArgument(SemaId expression, TypeId target,
                                         ScopeId scope);
   SemaId BuildConstructorTemporary(

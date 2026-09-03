@@ -255,6 +255,19 @@ lowir_model::LowType Lowerer::LowTypeOf(TypeId type) const
   return RenderLowType(LowInfoOf(type));
 }
 
+ClassBoundaryMode Lowerer::ClassBoundary(TypeId type, bool result) const
+{
+  TypeId class_type = types_.Unqualified(type);
+  if (types_.Kind(class_type) != TYPE_CLASS)
+    return CBM_DIRECT_OBJECT;
+  const ClassEntity& entity = model_.ClassAt(types_.At(class_type).entity);
+  if (!entity.trivially_copyable)
+    return result ? CBM_INDIRECT_RESULT : CBM_BY_ADDRESS;
+  if (result && entity.size > 8)
+    return CBM_INDIRECT_RESULT;
+  return CBM_DIRECT_OBJECT;
+}
+
 bool Lowerer::IsUnsigned(TypeId type) const
 {
   return LowInfoOf(type).is_unsigned;

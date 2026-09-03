@@ -98,6 +98,7 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
   const FunctionEntityId function = DeclareFunction(
       target_scope, name, declared_type, definition, binding, member_const,
       member_volatile,
+      false, false,
       false, IsNoThrowDeclarator(declarator, target_scope), defaults,
       explicit_constructor);
   if (binding == 0)
@@ -126,6 +127,40 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
   else
   {
     ClassEntity& owner = model_.ClassAt(member_class);
+    // 12.8p2-3: a copy/move constructor has a first parameter that is a
+    // reference to the class itself, and every later parameter has a
+    // default argument.  Record the category once on the canonical entity;
+    // overload selection and class triviality then share this fact.
+    bool copy_constructor = false;
+    bool move_constructor = false;
+    if (!parameters.empty()) {
+      TypeId first_parameter = parameters[0].type;
+      const bool reference =
+          types_.Kind(types_.Unqualified(first_parameter)) == TYPE_REFERENCE;
+      bool lvalue_reference = false;
+      if (reference) {
+        lvalue_reference = types_.At(types_.Unqualified(first_parameter))
+            .lvalue_reference;
+        first_parameter = types_.Referent(first_parameter);
+      }
+      first_parameter = types_.Unqualified(first_parameter);
+      const bool same_class = types_.Kind(first_parameter) == TYPE_CLASS &&
+          types_.At(first_parameter).entity == member_class;
+      bool later_defaulted = true;
+      for (std::size_t i = 1; i < parameters.size(); ++i)
+        if (parameters[i].default_initializer == 0)
+          later_defaulted = false;
+      copy_constructor = reference && lvalue_reference && same_class &&
+          later_defaulted;
+      move_constructor = reference && !lvalue_reference && same_class &&
+          later_defaulted;
+    }
+    entity.copy_constructor = copy_constructor;
+    entity.move_constructor = move_constructor;
+    if (copy_constructor)
+      owner.copy_constructor = function;
+    if (move_constructor)
+      owner.move_constructor = function;
     if (std::find(owner.constructors.begin(), owner.constructors.end(),
                   function) == owner.constructors.end())
       owner.constructors.push_back(function);

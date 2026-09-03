@@ -878,13 +878,10 @@ Lowerer::Value Lowerer::LowerConstructorTemporary(SemaId node)
   if (value.function == 0)
     Unsupported("a constructor temporary without a constructor");
   const FunctionEntity& constructor = model_.FunctionAt(value.function);
-  const bool trivial_default =
-      constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
-      constructor.member_class != 0 &&
-      model_.ClassAt(constructor.member_class).trivial_default_constructor;
   TemporaryObject& temporary = temporaries_[node];
   if (temporary.slot.empty())
-    temporary.slot = NewGeneratedSlot(trivial_default ? "tmpobj" : "arg",
+    temporary.slot = NewGeneratedSlot(
+        ConstructorTemporaryIsObjectExpression(node) ? "tmpobj" : "arg",
                                       LowTypeOf(value.type));
 
   if (!temporary.constructed) {
@@ -929,6 +926,38 @@ Lowerer::Value Lowerer::LowerConstructorTemporary(SemaId node)
   result.lvalue = true;
   result.operand = temporary.address;
   return result;
+}
+
+bool Lowerer::ConstructorTemporaryIsObjectExpression(SemaId node) const
+{
+  if (node == 0 || tree_.At(node).kind != SEMA_CONSTRUCTOR_ACTION)
+    return false;
+  const std::vector<SemaId> action_children = Children(node);
+  if (action_children.size() != 1 ||
+      tree_.At(action_children[0]).kind != SEMA_CALL)
+    return false;
+  const std::vector<SemaId> call_children = Children(action_children[0]);
+  if (call_children.size() == 1 && tree_.At(node).function != 0) {
+    const FunctionEntity& constructor =
+        model_.FunctionAt(tree_.At(node).function);
+    if (constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
+        constructor.member_class != 0 &&
+        model_.ClassAt(constructor.member_class).trivial_default_constructor)
+      return true;
+  }
+  for (std::size_t i = 1; i < call_children.size(); ++i) {
+    SemaId argument = call_children[i];
+    while (argument != 0 && tree_.At(argument).kind == SEMA_CAST) {
+      const std::vector<SemaId> cast_children = Children(argument);
+      if (cast_children.size() != 1)
+        break;
+      argument = cast_children[0];
+    }
+    if (argument != 0 && (tree_.At(argument).kind == SEMA_MEMBER ||
+                          tree_.At(argument).kind == SEMA_CALL))
+      return true;
+  }
+  return false;
 }
 
 Lowerer::Value Lowerer::LowerNew(SemaId node, TypeId expected)
@@ -1107,6 +1136,12 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
       Value result;
       result.type = ReferentType(value.type);
       result.lvalue = true;
+      const std::map<BindingId, lowir_model::Operand>::const_iterator address =
+          parameter_addresses_.find(value.binding);
+      if (address != parameter_addresses_.end()) {
+        result.operand = address->second;
+        return result;
+      }
       const GlobalSymbol* global = GlobalFor(value.binding);
       const lowir_model::Operand storage = global != 0 ?
           GlobalOperand(global->name) : SlotOperand(SlotFor(value.binding));
@@ -1161,6 +1196,22 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
     result.type = types_.Referent(value.type);
     result.lvalue = true;
     return result;
+  }
+  if (value.kind == SEMA_CALL &&
+      types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS) {
+    Value result = LowerCall(node, 0);
+    if (result.lvalue)
+      return result;
+    // A direct class result is an object value.  Member access needs a
+    // stable address, so materialize it once in an object-expression slot.
+    Value storage;
+    storage.type = value.type;
+    storage.lvalue = true;
+    storage.operand = SlotOperand(
+        NewGeneratedSlot("tmpobj", LowTypeOf(value.type)));
+    const lowir_model::Operand destination = AddressValue(storage).operand;
+    EmitCopyObject(value.type, result.operand, destination);
+    return storage;
   }
   if (value.kind == SEMA_CONDITIONAL && value.category == VC_LVALUE)
     return LowerConditionalLValue(node);
@@ -1252,6 +1303,9 @@ Lowerer::Value Lowerer::LowerRValue(SemaId node, TypeId expected)
   case SEMA_CALL:
   {
     Value result = LowerCall(node, 0);
+    if (types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS &&
+        result.lvalue)
+      result = LoadValue(result);
     if (types_.Kind(value.type) == TYPE_REFERENCE) {
       // A reference-returning call is an lvalue designating the object at
       // the returned address.  Loading that lvalue is what turns `T&` into a
@@ -1798,7 +1852,22 @@ void Lowerer::LowerDiscard(SemaId node)
 {
   if (node == 0)
     return;
-  if (tree_.At(node).kind == SEMA_CALL)
+  if (tree_.At(node).kind == SEMA_CALL &&
+      types_.Kind(types_.Unqualified(tree_.At(node).type)) == TYPE_CLASS) {
+    Value discard;
+    discard.type = tree_.At(node).type;
+    discard.lvalue = true;
+    discard.operand = SlotOperand(
+        NewGeneratedSlot("discard", LowTypeOf(discard.type)));
+    const lowir_model::Operand destination = AddressValue(discard).operand;
+    if (ClassBoundary(discard.type, true) == CBM_INDIRECT_RESULT)
+      (void)LowerCall(node, 0, &destination);
+    else {
+      const Value result = LowerCall(node, 0);
+      EmitCopyObject(discard.type, result.operand, destination);
+    }
+  }
+  else if (tree_.At(node).kind == SEMA_CALL)
     (void)LowerCall(node, 0);
   else if (tree_.At(node).category == VC_LVALUE &&
            types_.Kind(types_.Unqualified(ReferentType(
@@ -1959,25 +2028,48 @@ Lowerer::Value Lowerer::LowerClassArgument(SemaId node, TypeId parameter)
   const TypeId object_type = types_.Unqualified(parameter);
   if (types_.Kind(object_type) != TYPE_CLASS)
     Unsupported("a non-class object argument");
-  const ClassEntity& class_entity =
-      model_.ClassAt(types_.At(object_type).entity);
-
-  const std::string slot = NewGeneratedSlot("argobj", LowTypeOf(parameter));
+  const ClassBoundaryMode boundary = ClassBoundary(parameter, false);
+  const std::string slot = NewGeneratedSlot(
+      boundary == CBM_BY_ADDRESS ? "arg" : "argobj", LowTypeOf(parameter));
   Value destination;
   destination.type = parameter;
   destination.lvalue = true;
   destination.operand = SlotOperand(slot);
-  // The parameter object's address enters the instruction stream first;
-  // the opaque object operand passed to the call is the slot itself.
   const Value destination_address = AddressValue(destination);
 
-  // Copy construction is outside PA16, so the class objects that reach a
-  // by-value parameter are trivially copyable: an empty class has no value
-  // to copy, any other class is copied as one object (`copyobj`).
   const SemaNode& source = tree_.At(node);
-  const Value copied = source.category == VC_LVALUE ?
+  if (boundary == CBM_BY_ADDRESS) {
+    // A constructor action owns the selected copy/move/converting
+    // constructor and is lowered directly into the argument slot.  This is
+    // the address-passed counterpart of a direct object copy.
+    if (source.kind == SEMA_CONSTRUCTOR_ACTION) {
+      LowerAggregateConstructor(node, parameter,
+                                destination_address.operand);
+    } else if (source.kind == SEMA_CALL &&
+               types_.Kind(types_.Unqualified(source.type)) == TYPE_CLASS &&
+               ClassBoundary(source.type, true) == CBM_INDIRECT_RESULT) {
+      (void)LowerCall(node, parameter, &destination_address.operand);
+    } else if (source.category == VC_LVALUE || source.category == VC_XVALUE) {
+      EmitCopyObject(object_type, AddressValue(LowerLValue(node)).operand,
+                     destination_address.operand);
+    } else {
+      EmitCopyObject(object_type, LowerRValue(node, parameter).operand,
+                     destination_address.operand);
+    }
+
+    Value result;
+    result.type = parameter;
+    result.lvalue = true;
+    result.operand = destination_address.operand;
+    return result;
+  }
+
+  // Direct object parameters retain the opaque object value at the call
+  // boundary.  The callee's entry sequence copies it into its named slot.
+  const Value copied = source.category == VC_LVALUE ||
+      source.category == VC_XVALUE ?
       AddressValue(LowerLValue(node)) : LowerRValue(node, parameter);
-  if (!class_entity.empty)
+  if (!model_.ClassAt(types_.At(object_type).entity).empty)
     EmitCopyObject(object_type, copied.operand, destination_address.operand);
 
   Value result;
@@ -2047,7 +2139,10 @@ void Lowerer::ProjectDerivedReference(Value& value, TypeId source,
 
 // Arguments are lowered in order before an indirect callee is evaluated;
 // a direct callee names its symbol and thereby requests its declaration.
-Lowerer::Value Lowerer::LowerCall(SemaId node, TypeId expected)
+Lowerer::Value Lowerer::LowerCall(
+    SemaId node, TypeId expected,
+    const lowir_model::Operand* indirect_destination,
+    const std::string& indirect_stem)
 {
   const std::vector<SemaId> children = Children(node);
   if (children.empty())
@@ -2065,17 +2160,43 @@ Lowerer::Value Lowerer::LowerCall(SemaId node, TypeId expected)
       (!type.variadic && arguments > type.parameters.size()))
     Unsupported("a call whose argument count does not match");
 
+  const ClassBoundaryMode result_boundary = ClassBoundary(type.result, true);
+  const bool indirect_result = result_boundary == CBM_INDIRECT_RESULT;
+  lowir_model::Operand result_destination;
+  if (indirect_result) {
+    if (indirect_destination != 0) {
+      result_destination = *indirect_destination;
+    } else {
+      Value storage;
+      storage.type = type.result;
+      storage.lvalue = true;
+      storage.operand = SlotOperand(NewGeneratedSlot(
+          indirect_stem.empty() ? "arg" : indirect_stem,
+          LowTypeOf(type.result)));
+      result_destination = AddressValue(storage).operand;
+    }
+  }
+
   lowir_model::Instruction call;
   call.kind = lowir_model::Instruction::IK_CALL;
-  call.type = LowTypeOf(type.result);
+  call.type = indirect_result ? VoidType() : LowTypeOf(type.result);
   call.call_return_type = call.type;
-  call.call_returns_void = IsVoidType(types_, type.result);
+  call.call_returns_void = indirect_result || IsVoidType(types_, type.result);
+  if (indirect_result)
+    call.args.push_back(result_destination);
   if (direct) {
     call.first = GlobalOperand(FunctionSymbolName(callee.function));
   } else {
     call.has_call_signature = true;
     call.call_boundary.arity = type.variadic ? lowir_model::CAM_VARIADIC :
         lowir_model::CAM_FIXED;
+    if (indirect_result) {
+      lowir_model::Parameter result_parameter;
+      result_parameter.name = "%ret";
+      result_parameter.type = PtrType();
+      result_parameter.metadata.passing = lowir_model::PPM_INDIRECT_RESULT;
+      call.call_params.push_back(result_parameter);
+    }
     for (std::size_t i = 0; i < type.parameters.size(); ++i) {
       lowir_model::Parameter parameter;
       parameter.name = "%arg" + std::to_string(i);
@@ -2083,6 +2204,10 @@ Lowerer::Value Lowerer::LowerCall(SemaId node, TypeId expected)
       if (types_.Kind(types_.Unqualified(type.parameters[i])) ==
           TYPE_REFERENCE)
         parameter.metadata.passing = lowir_model::PPM_REFERENCE;
+      if (ClassBoundary(type.parameters[i], false) == CBM_BY_ADDRESS) {
+        parameter.type = PtrType();
+        parameter.metadata.passing = lowir_model::PPM_BY_ADDRESS;
+      }
       call.call_params.push_back(parameter);
     }
   }
@@ -2093,8 +2218,7 @@ Lowerer::Value Lowerer::LowerCall(SemaId node, TypeId expected)
     if (types_.Kind(types_.Unqualified(parameter_type)) == TYPE_REFERENCE)
       call.args.push_back(
           LowerReferenceArgument(children[i], parameter_type).operand);
-    else if (types_.Kind(types_.Unqualified(parameter_type)) == TYPE_CLASS &&
-             tree_.At(children[i]).category == VC_LVALUE)
+    else if (types_.Kind(types_.Unqualified(parameter_type)) == TYPE_CLASS)
       call.args.push_back(LowerClassArgument(children[i], parameter_type).operand);
     else
       call.args.push_back(LowerRValue(children[i], parameter_type).operand);
@@ -2106,8 +2230,13 @@ Lowerer::Value Lowerer::LowerCall(SemaId node, TypeId expected)
   Emit(call);
   Value result;
   result.type = type.result;
-  if (!call.call_returns_void)
+  if (indirect_result) {
+    result.operand = result_destination;
+    result.lvalue = true;
+  } else if (!call.call_returns_void)
     result.operand = TempOperand(call.dest);
+  if (indirect_result)
+    return result;
   return Convert(result, expected);
 }
 

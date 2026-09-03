@@ -17,7 +17,11 @@ bool SameMemberParameterList(const TypeTable& types,
   return left_type.variadic == right_type.variadic &&
       left_type.parameters == right_type.parameters &&
       left.member_const == right.member_const &&
-      left.member_volatile == right.member_volatile;
+      left.member_volatile == right.member_volatile &&
+      left.member_lvalue_ref_qualifier ==
+          right.member_lvalue_ref_qualifier &&
+      left.member_rvalue_ref_qualifier ==
+          right.member_rvalue_ref_qualifier;
 }
 
 } // namespace
@@ -43,9 +47,12 @@ Scope::Scope()
 
 ClassEntity::ClassEntity()
     : class_scope(0), type(0), default_constructor(0),
+      copy_constructor(0), move_constructor(0), copy_assignment(0),
+      move_assignment(0),
       size(0), alignment(1), requested_alignment(0), pack_alignment(0),
       destructor(0), inheriting_constructor_base(0), layout_complete(false),
       trivial_default_constructor(true), trivial_destructor(true),
+      trivially_copyable(true),
       empty(false), aggregate(true), is_union(false), defined(false)
 {
 }
@@ -95,7 +102,10 @@ const char* BuiltinObjectName(BuiltinFunctionKind kind)
 FunctionEntity::FunctionEntity()
     : scope(0), type(0), member_type(0), member_pointer_type(0),
       member_class(0), is_member(false), member_const(false),
-      member_volatile(false),
+      member_volatile(false), member_lvalue_ref_qualifier(false),
+      member_rvalue_ref_qualifier(false),
+      copy_constructor(false), move_constructor(false),
+      copy_assignment(false), move_assignment(false),
       is_template(false), internal_linkage(false), c_linkage(false),
       noexcept_qualifier(false), special_member(SPECIAL_MEMBER_NONE),
       body(0), ctor_initializer(0), parameter_names(), defaulted(false),

@@ -19,6 +19,18 @@
 
 namespace lowir_lowering {
 
+// The source language has one class value type, but a function boundary has
+// three distinct ownership shapes: an opaque direct object, an address to
+// caller-owned storage, or an indirect result destination.  Keeping this
+// decision in one query prevents declarations, calls, and definitions from
+// drifting apart.
+enum ClassBoundaryMode
+{
+  CBM_DIRECT_OBJECT,
+  CBM_BY_ADDRESS,
+  CBM_INDIRECT_RESULT
+};
+
 // Builds one LowIR program from the translation units of one invocation.
 // Units are analyzed independently; the facts that span units live here:
 // top-level name uniqueness, the identity of an external symbol declared by
@@ -212,6 +224,9 @@ private:
                             std::set<FunctionEntityId>& active) const;
   void MarkElidedConstructorBaseVariants();
   void CollectSymbols(SemaId node);
+  void CollectReturnSlotCandidates(SemaId node);
+  BindingId ReturnSlotBinding(SemaId body, TypeId result) const;
+  bool IsReturnSlotReuseAction(SemaId node) const;
   void CollectReferencedFunctions(SemaId node,
                                   std::set<FunctionEntityId>& result) const;
   void ComputeReferencedFunctions();
@@ -273,6 +288,7 @@ private:
   // Type and ABI ownership.
   LowInfo LowInfoOf(TypeId type) const;
   lowir_model::LowType LowTypeOf(TypeId type) const;
+  ClassBoundaryMode ClassBoundary(TypeId type, bool result) const;
   std::string QualifiedTypeName(TypeId type) const;
   bool IsUnsigned(TypeId type) const;
   unsigned TypeBits(TypeId type) const;
@@ -325,6 +341,7 @@ private:
   Value LowerNew(SemaId node, TypeId expected);
   Value LowerLValue(SemaId node);
   Value LowerConstructorTemporary(SemaId node);
+  bool ConstructorTemporaryIsObjectExpression(SemaId node) const;
   Value LowerLiteral(SemaId node, const SemaNode& value, TypeId expected);
   Value LowerArrayDecay(SemaId node);
   Value LowerSubscript(SemaId node, bool lvalue);
@@ -380,7 +397,9 @@ private:
   bool BitFieldUnitInitialized(const ClassField& field) const;
   void MarkBitFieldUnitInitialized(const ClassField& field);
   Value LowerConditional(SemaId node, TypeId expected);
-  Value LowerCall(SemaId node, TypeId expected);
+  Value LowerCall(SemaId node, TypeId expected,
+                  const lowir_model::Operand* indirect_destination = 0,
+                  const std::string& indirect_stem = std::string());
   Value LowerUnary(SemaId node, bool postfix, TypeId expected,
                    bool as_lvalue = false);
   Value LowerIncrement(SemaId node, SemaId operand_node, bool postfix,
@@ -426,6 +445,8 @@ private:
   void LowerReturn(SemaId node);
   void LowerVariableDeclaration(SemaId node);
   void LowerVariable(SemaId variable_node);
+  void LowerClassValueInto(SemaId source, TypeId type,
+                           const lowir_model::Operand& destination);
   bool AggregateInitializationHasWork(SemaId node, TypeId type) const;
   void LowerAggregateObjectInitializer(
       SemaId node, TypeId type, const Value& object,
@@ -462,6 +483,7 @@ private:
   void EmitSharedReturn(const Value* value);
   void EmitSharedReturnCleanups();
   bool NeedsDestructor(ClassEntityId entity) const;
+  bool DestructorHasNoWork(ClassEntityId entity) const;
   bool HasSubobjectDestructors(ClassEntityId entity) const;
   struct SubobjectDestructor
   {
@@ -514,6 +536,7 @@ private:
   std::map<FunctionEntityId, FunctionSymbol> functions_;
   std::vector<FunctionEntityId> function_order_;
   std::set<FunctionEntityId> temporary_constructors_;
+  std::set<SemaId> elided_return_actions_;
   std::set<FunctionEntityId> referenced_functions_;
   mutable std::map<FunctionEntityId, bool> constructor_no_work_cache_;
   std::map<BindingId, GlobalSymbol> globals_;
@@ -531,6 +554,9 @@ private:
   std::set<std::string> block_labels_;
   std::set<std::string> slot_names_;
   std::map<BindingId, std::string> slots_;
+  // A by-address class parameter owns a source slot but its semantic name
+  // denotes the incoming pointer directly.
+  std::map<BindingId, lowir_model::Operand> parameter_addresses_;
   std::map<SemaId, TemporaryObject> temporaries_;
   // Bit-field allocation units (class scope, unit offset) already written
   // by the initialization in progress; later writes preserve neighbours.
@@ -552,6 +578,7 @@ private:
   unsigned generated_slot_counter_;
   TypeId function_return_type_id_;
   bool building_base_variant_;
+  BindingId return_slot_binding_;
 };
 
 }  // namespace lowir_lowering

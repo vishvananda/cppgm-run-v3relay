@@ -102,6 +102,8 @@ void Lowerer::Run()
   constructor_no_work_cache_.clear();
   CollectTemporaryConstructorUses(tree_.Root());
   CollectSymbols(tree_.Root());
+  elided_return_actions_.clear();
+  CollectReturnSlotCandidates(tree_.Root());
   MarkElidedConstructorBaseVariants();
   ComputeReferencedFunctions();
   // Deferred in-class definitions are visited in declaration order, while a
@@ -353,6 +355,68 @@ void Lowerer::LowerVariableDeclaration(SemaId node)
       LowerVariable(child);
 }
 
+void Lowerer::LowerClassValueInto(
+    SemaId source, TypeId type, const lowir_model::Operand& destination)
+{
+  if (source == 0)
+    Unsupported("a missing class initializer");
+  const SemaNode& value = tree_.At(source);
+  if (value.kind == SEMA_CONSTRUCTOR_ACTION) {
+    const std::vector<SemaId> action_children = Children(source);
+    if (action_children.size() != 1 ||
+        tree_.At(action_children[0]).kind != SEMA_CALL)
+      Unsupported("this class constructor action");
+    // Named-object constructor actions carry their own `&object` semantic
+    // argument.  Expression-owned actions do not, so inject the destination
+    // known by this lowering boundary.
+    if (value.binding != 0) {
+      (void)LowerCall(action_children[0], 0);
+      return;
+    }
+    if (ImplicitValueInitialization(source)) {
+      ZeroInitializeObject(type, destination);
+      const FunctionEntity& constructor = model_.FunctionAt(value.function);
+      if (constructor.member_class != 0 &&
+          !model_.ClassAt(constructor.member_class)
+              .trivial_default_constructor)
+        EmitVoidCall(FunctionSymbolName(value.function),
+                     std::vector<lowir_model::Operand>(1, destination));
+      return;
+    }
+    LowerAggregateConstructor(source, type, destination);
+    return;
+  }
+  if (value.kind == SEMA_BRACED_INIT_LIST) {
+    Value object;
+    object.type = type;
+    object.lvalue = true;
+    object.operand = destination;
+    initialized_bitfield_units_.clear();
+    LowerAggregateObjectInitializer(source, type, object,
+                                    std::vector<std::size_t>());
+    return;
+  }
+  if (value.kind == SEMA_CALL &&
+      types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS) {
+    if (ClassBoundary(value.type, true) == CBM_INDIRECT_RESULT) {
+      (void)LowerCall(source, type, &destination);
+    } else {
+      const Value result = LowerCall(source, type);
+      EmitCopyObject(type, result.operand, destination);
+    }
+    return;
+  }
+  const Value result = (value.category == VC_LVALUE ||
+                        value.category == VC_XVALUE) ?
+      Value() : LowerRValue(source, type);
+  if (value.category == VC_LVALUE || value.category == VC_XVALUE) {
+    EmitCopyObject(type, AddressValue(LowerLValue(source)).operand,
+                   destination);
+  } else {
+    EmitCopyObject(type, result.operand, destination);
+  }
+}
+
 void Lowerer::LowerVariable(SemaId variable_node)
 {
   const SemaNode& variable = tree_.At(variable_node);
@@ -387,6 +451,33 @@ void Lowerer::LowerVariable(SemaId variable_node)
   }
   if (types_.Kind(unqualified) == TYPE_CLASS)
   {
+    if (variable.binding == return_slot_binding_) {
+      if (!initializer.empty() && initializer.size() == 1 &&
+          tree_.At(initializer[0]).kind == SEMA_CONSTRUCTOR_ACTION) {
+        const SemaNode& action = tree_.At(initializer[0]);
+        const std::vector<SemaId> action_children = Children(initializer[0]);
+        if (action.function == 0 || action_children.size() != 1)
+          Unsupported("this return-slot constructor action");
+        const std::vector<SemaId> call_children = Children(action_children[0]);
+        const FunctionEntity& constructor =
+            model_.FunctionAt(action.function);
+        const TypeNode& callable =
+            types_.At(types_.Unqualified(constructor.type));
+        if (call_children.empty() ||
+            call_children.size() > callable.parameters.size() + 1)
+          Unsupported("this return-slot constructor call");
+        std::vector<lowir_model::Operand> arguments(1, TempOperand("%ret"));
+        for (std::size_t i = 2; i < call_children.size(); ++i) {
+          const TypeId parameter = callable.parameters[i - 1];
+          arguments.push_back(types_.Kind(types_.Unqualified(parameter)) ==
+              TYPE_REFERENCE ? LowerReferenceArgument(
+                  call_children[i], parameter).operand :
+              LowerRValue(call_children[i], parameter).operand);
+        }
+        EmitVoidCall(FunctionSymbolName(action.function), arguments);
+      }
+      return;
+    }
     Value object;
     object.type = declared;
     object.lvalue = true;
@@ -432,21 +523,9 @@ void Lowerer::LowerVariable(SemaId variable_node)
       // it through the aggregate constructor argument path.
       if (tree_.At(initializer[0]).binding != 0)
         (void)LowerCall(action_children[0], 0);
-      else {
-        const FunctionEntity& constructor = model_.FunctionAt(function);
-        if (ImplicitValueInitialization(initializer[0])) {
-          const lowir_model::Operand destination =
-              AddressValue(object).operand;
-          ZeroInitializeObject(declared, destination);
-          if (!model_.ClassAt(constructor.member_class)
-                  .trivial_default_constructor)
-            EmitVoidCall(FunctionSymbolName(function),
-                         std::vector<lowir_model::Operand>(1, destination));
-        } else {
-          LowerAggregateConstructor(initializer[0], declared,
-                                    AddressValue(object).operand);
-        }
-      }
+      else
+        LowerClassValueInto(initializer[0], declared,
+                            AddressValue(object).operand);
       RegisterLiveObject(variable.binding, declared);
       return;
     }
@@ -460,6 +539,15 @@ void Lowerer::LowerVariable(SemaId variable_node)
         (void)AddressValue(object);
       LowerAggregateObjectInitializer(initializer[0], declared, object,
                                       std::vector<std::size_t>());
+      RegisterLiveObject(variable.binding, declared);
+      return;
+    }
+    // A class call or a same-class lvalue initializer may already have been
+    // elided semantically.  The destination is nevertheless known here, so
+    // perform the boundary copy or in-place return construction directly.
+    if (initializer.size() == 1) {
+      LowerClassValueInto(initializer[0], declared,
+                          AddressValue(object).operand);
       RegisterLiveObject(variable.binding, declared);
       return;
     }
@@ -1165,7 +1253,22 @@ void Lowerer::RegisterLiveObject(BindingId binding, TypeId type)
 // class model fixed this with the layout.
 bool Lowerer::NeedsDestructor(ClassEntityId entity) const
 {
-  return !model_.ClassAt(entity).trivial_destructor;
+  return !model_.ClassAt(entity).trivial_destructor &&
+      !DestructorHasNoWork(entity);
+}
+
+bool Lowerer::DestructorHasNoWork(ClassEntityId entity) const
+{
+  const ClassEntity& owner = model_.ClassAt(entity);
+  if (owner.trivial_destructor || owner.destructor == 0 ||
+      HasSubobjectDestructors(entity))
+    return false;
+  const std::map<FunctionEntityId, FunctionSymbol>::const_iterator found =
+      functions_.find(owner.destructor);
+  if (found == functions_.end() || found->second.definition == 0)
+    return false;
+  const SemaId body = FunctionBody(found->second.definition);
+  return body != 0 && tree_.At(body).first_child == 0;
 }
 
 bool Lowerer::HasSubobjectDestructors(ClassEntityId entity) const
@@ -2212,6 +2315,58 @@ void Lowerer::LowerReturn(SemaId node)
     ProjectDerivedReference(result, expression.type,
                             function_return_type_id_);
     result.type = function_return_type_id_;
+    if (shared_return_cleanup_)
+      EmitSharedReturn(&result);
+    else {
+      EmitActiveDestructors();
+      EmitReturn(&result);
+    }
+    return;
+  }
+  if (types_.Kind(types_.Unqualified(function_return_type_id_)) == TYPE_CLASS) {
+    const ClassBoundaryMode boundary =
+        ClassBoundary(function_return_type_id_, true);
+    if (boundary == CBM_INDIRECT_RESULT) {
+      // The caller owns the result object.  Construct or copy the selected
+      // return value directly into the hidden first parameter and return
+      // only the ABI void terminator.
+      const SemaNode& returned = tree_.At(children[0]);
+      if ((returned.kind == SEMA_ID_EXPRESSION &&
+           returned.binding == return_slot_binding_) ||
+          IsReturnSlotReuseAction(children[0])) {
+        if (shared_return_cleanup_)
+          EmitSharedReturn(0);
+        else {
+          EmitActiveDestructors();
+          EmitReturn(0);
+        }
+        return;
+      }
+      const lowir_model::Operand destination = TempOperand("%ret");
+      LowerClassValueInto(children[0], function_return_type_id_, destination);
+      if (shared_return_cleanup_)
+        EmitSharedReturn(0);
+      else {
+        EmitActiveDestructors();
+        EmitReturn(0);
+      }
+      return;
+    }
+
+    // Small trivially-copyable class results remain direct object values,
+    // but their return slot is still materialized before source evaluation so
+    // a constructor action can construct in place and a lvalue can copy its
+    // complete object bytes.
+    Value destination;
+    destination.type = function_return_type_id_;
+    destination.lvalue = true;
+    destination.operand = SlotOperand(
+        NewGeneratedSlot("retobj", LowTypeOf(function_return_type_id_)));
+    const lowir_model::Operand address = AddressValue(destination).operand;
+    LowerClassValueInto(children[0], function_return_type_id_, address);
+    Value result;
+    result.type = function_return_type_id_;
+    result.operand = destination.operand;
     if (shared_return_cleanup_)
       EmitSharedReturn(&result);
     else {

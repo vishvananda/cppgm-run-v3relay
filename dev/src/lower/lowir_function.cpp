@@ -16,7 +16,7 @@ Lowerer::Lowerer(ProgramLowering& shared, const std::vector<Pa6Token>& tokens,
       shared_return_end_label_(), shared_return_slot_(),
       shared_return_cleanup_(false), temp_counter_(0), label_counter_(0),
       generated_slot_counter_(0), function_return_type_id_(0),
-      building_base_variant_(false)
+      building_base_variant_(false), return_slot_binding_(0)
 {
 }
 
@@ -41,6 +41,7 @@ void Lowerer::ResetFunction(const std::string& name,
   block_labels_.clear();
   slot_names_.clear();
   slots_.clear();
+  parameter_addresses_.clear();
   temporaries_.clear();
   initialized_bitfield_units_.clear();
   goto_labels_.clear();
@@ -58,6 +59,7 @@ void Lowerer::ResetFunction(const std::string& name,
   label_counter_ = 0;
   generated_slot_counter_ = 0;
   function_return_type_id_ = 0;
+  return_slot_binding_ = 0;
 }
 
 // The startup initializer is one program-wide function: each unit resumes
@@ -311,6 +313,7 @@ void Lowerer::CollectSlots(SemaId node, std::set<BindingId>& seen,
     return;
   if (value.kind == SEMA_VARIABLE && value.binding != 0 &&
       !model_.BindingAt(value.binding).extern_declaration &&
+      value.binding != return_slot_binding_ &&
       seen.insert(value.binding).second)
     AddSourceSlot(value.binding);
   if (value.kind == SEMA_CONSTRUCTOR_ACTION && value.binding == 0 &&
@@ -320,7 +323,9 @@ void Lowerer::CollectSlots(SemaId node, std::set<BindingId>& seen,
     TemporaryObject& temporary = temporaries_[node];
     if (temporary.slot.empty())
     {
-      temporary.slot = NewGeneratedSlot("arg", LowTypeOf(value.type));
+      temporary.slot = NewGeneratedSlot(
+          ConstructorTemporaryIsObjectExpression(node) ? "tmpobj" : "arg",
+          LowTypeOf(value.type));
     }
   }
   const bool child_in_class_initializer = in_class_initializer ||
@@ -391,8 +396,11 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
   const FunctionEntityId id = tree_.At(node).function;
   const FunctionEntity& entity = model_.FunctionAt(id);
   const TypeNode& type = types_.At(types_.Unqualified(entity.type));
+  const ClassBoundaryMode result_boundary =
+      ClassBoundary(type.result, true);
   building_base_variant_ = base_variant;
   ResetFunction(base_variant ? symbol.base_name : symbol.name,
+                result_boundary == CBM_INDIRECT_RESULT ? VoidType() :
                 LowTypeOf(type.result));
   function_return_type_id_ = type.result;
   function_.boundary.arity = type.variadic ? lowir_model::CAM_VARIADIC :
@@ -426,6 +434,15 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
 
   std::vector<SemaId> parameters;
   CollectParameters(node, parameters);
+  const std::size_t parameter_offset =
+      result_boundary == CBM_INDIRECT_RESULT ? 1 : 0;
+  if (result_boundary == CBM_INDIRECT_RESULT) {
+    lowir_model::Parameter result_parameter;
+    result_parameter.name = "%ret";
+    result_parameter.type = PtrType();
+    result_parameter.metadata.passing = lowir_model::PPM_INDIRECT_RESULT;
+    function_.params.push_back(result_parameter);
+  }
   for (std::size_t i = 0; i < type.parameters.size(); ++i) {
     lowir_model::Parameter parameter;
     parameter.name = "%__param" + std::to_string(i);
@@ -437,7 +454,12 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
           TYPE_REFERENCE)
         parameter.metadata.passing = lowir_model::PPM_REFERENCE;
     }
-    parameter.type = LowTypeOf(type.parameters[i]);
+    if (ClassBoundary(type.parameters[i], false) == CBM_BY_ADDRESS) {
+      parameter.type = PtrType();
+      parameter.metadata.passing = lowir_model::PPM_BY_ADDRESS;
+    } else {
+      parameter.type = LowTypeOf(type.parameters[i]);
+    }
     function_.params.push_back(parameter);
   }
 
@@ -461,6 +483,7 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
   const SemaId body = FunctionBody(node);
   if (body == 0)
     Unsupported("a function without a body");
+  return_slot_binding_ = ReturnSlotBinding(body, type.result);
   // A return that destroys a long prefix of the same local-object stack at
   // every source exit would duplicate that suffix quadratically.  For large
   // return sets, route exits through one linked cleanup chain; small
@@ -469,25 +492,42 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
       CountReturnStatements(body) >= kInlineCleanupLimit;
   if (shared_return_cleanup_) {
     shared_return_end_label_ = NewBlockLabel("return_cleanup_end");
-    if (!IsVoidType(types_, type.result))
+    if (result_boundary != CBM_INDIRECT_RESULT &&
+        !IsVoidType(types_, type.result))
       shared_return_slot_ = NewGeneratedSlot("return", LowTypeOf(type.result));
   }
   std::set<BindingId> source_slots;
   CollectSlots(body, source_slots);
   StartBlock("^entry");
-  for (std::size_t i = 0; i < function_.params.size(); ++i) {
+  for (std::size_t i = 0; i < type.parameters.size(); ++i) {
+    const std::size_t parameter_index = i + parameter_offset;
     // An empty class parameter object has no value: its slot is declared
     // but never stored (the fixture shape).  Every other parameter,
     // including a non-empty class object, is stored to its slot on entry.
     const TypeId parameter_type = types_.Unqualified(type.parameters[i]);
     if (types_.Kind(parameter_type) == TYPE_CLASS) {
+      if (ClassBoundary(parameter_type, false) == CBM_BY_ADDRESS) {
+        if (i < parameters.size()) {
+          const BindingId binding = tree_.At(parameters[i]).binding;
+          if (binding != 0)
+            parameter_addresses_[binding] =
+                TempOperand(function_.params[parameter_index].name);
+        }
+        continue;
+      }
       if (model_.ClassAt(types_.At(parameter_type).entity).empty)
         continue;
-      EmitCopyObject(parameter_type, TempOperand(function_.params[i].name),
-                     SlotOperand(function_.slots[i].first));
+      Value destination;
+      destination.type = parameter_type;
+      destination.lvalue = true;
+      destination.operand = SlotOperand(function_.slots[i].first);
+      EmitCopyObject(parameter_type,
+                     TempOperand(function_.params[parameter_index].name),
+                     AddressValue(destination).operand);
       continue;
     }
-    EmitStore(function_.params[i].type, TempOperand(function_.params[i].name),
+    EmitStore(function_.params[parameter_index].type,
+              TempOperand(function_.params[parameter_index].name),
               SlotOperand(function_.slots[i].first));
   }
   if (entity.special_member == SPECIAL_MEMBER_CONSTRUCTOR)

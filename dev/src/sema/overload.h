@@ -14,6 +14,8 @@ struct OverloadArgument
   bool is_null_literal;
   bool is_function_lvalue;
   bool is_implicit_object;
+  ValueCategory implicit_object_category;
+  bool has_implicit_object_category;
   bool user_defined_conversion;
   // 13.3.3.1p4: only a standard conversion sequence may convert this
   // argument (the argument of a constructor that is itself being considered
@@ -31,6 +33,8 @@ struct OverloadArgument
       : type(type), category(category), is_null_literal(is_null_literal),
         is_function_lvalue(is_function_lvalue),
         is_implicit_object(is_implicit_object),
+        implicit_object_category(VC_PRVALUE),
+        has_implicit_object_category(false),
         user_defined_conversion(user_defined_conversion),
         standard_conversions_only(false) {}
 };

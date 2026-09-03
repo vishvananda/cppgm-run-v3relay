@@ -185,6 +185,10 @@ struct ClassEntity
   ScopeId class_scope; // 0 until defined
   TypeId type; // canonical class type, 0 until declared
   FunctionEntityId default_constructor; // synthesized on first default-init
+  FunctionEntityId copy_constructor;
+  FunctionEntityId move_constructor;
+  FunctionEntityId copy_assignment;
+  FunctionEntityId move_assignment;
   std::vector<FunctionEntityId> constructors; // overload set, declaration order
   // 9.5p5: members injected into the enclosing scope, each naming the
   // synthesized object through Binding::object_binding.
@@ -215,6 +219,11 @@ struct ClassEntity
   // synthesize from these; lowering decides which calls to emit from them.
   bool trivial_default_constructor;
   bool trivial_destructor;
+  // 12.8: the complete object can cross a value boundary as bytes only when
+  // its copy/move operations and every class subobject are trivial.  A
+  // reference member is not a class subobject and therefore does not clear
+  // this bit.
+  bool trivially_copyable;
   // 9p7 empty class: no non-static data members (named or not) in the
   // class or any base.  Lowering passes such a by-value parameter as a
   // bare object slot; every other class parameter object is copied.
@@ -266,6 +275,14 @@ struct FunctionEntity
   bool is_member;
   bool member_const;
   bool member_volatile;
+  bool member_lvalue_ref_qualifier;
+  bool member_rvalue_ref_qualifier;
+  // The four special member categories are kept on the canonical function
+  // entity so class layout does not have to rediscover parameter spelling.
+  bool copy_constructor;
+  bool move_constructor;
+  bool copy_assignment;
+  bool move_assignment;
   bool is_template;
   std::vector<TypeId> template_parameters; // TYPE_TEMPLATE_PARAM types, in order
   bool internal_linkage;

@@ -567,7 +567,7 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
       if (return_type == 0)
         throw std::runtime_error("return statement has no function context");
       const bool braced = arena_.At(children[0]).kind == AST_BRACED_INIT_LIST;
-      const SemaId expression = braced ?
+      SemaId expression = braced ?
           expression_.AnalyzeInitializer(children[0], context.scope,
                                           return_type) :
           expression_.Analyze(children[0], context.scope);
@@ -575,7 +575,7 @@ void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
         if (!IsVoidType(types_, expression_.Node(expression).type))
           throw std::runtime_error("void function cannot return a value");
       } else if (!braced) {
-        expression_.Initialize(expression, return_type);
+        expression = expression_.InitializeReturn(expression, return_type);
       }
       if (tree_ != 0)
         tree_->Append(statement, expression);

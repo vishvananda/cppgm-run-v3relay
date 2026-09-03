@@ -86,6 +86,18 @@ bool BetterThan(const SemaModel& model, const TypeTable& types,
   return strict;
 }
 
+bool MemberRefQualifierViable(const FunctionEntity& entity,
+                              ValueCategory object_category)
+{
+  if (!entity.is_member || entity.static_member)
+    return true;
+  if (entity.member_lvalue_ref_qualifier)
+    return object_category == VC_LVALUE;
+  if (entity.member_rvalue_ref_qualifier)
+    return object_category != VC_LVALUE;
+  return true;
+}
+
 // Function type denoted by a pointer/reference-to-function target.
 bool TargetFunctionType(TypeTable& types, TypeId target, TypeId& function)
 {
@@ -221,6 +233,12 @@ FunctionEntityId SelectBestOverload(
     if (member_object && !supplied_object)
       continue;
     const std::size_t parameter_start = member_object ? 1 : 0;
+    if (member_object && supplied_object &&
+        !MemberRefQualifierViable(entity,
+            arguments[0].has_implicit_object_category ?
+                arguments[0].implicit_object_category :
+                arguments[0].category))
+      continue;
     if (parameter_start > function.parameters.size())
       continue;
     const std::size_t explicit_parameters = function.parameters.size() -
@@ -360,6 +378,14 @@ FunctionEntityId SelectBestOverloadCandidates(
       continue;
     const TypeNode& function = types.At(types.Unqualified(function_type));
     const std::vector<OverloadArgument>& arguments = candidates[i].arguments;
+    const bool member_object = entity.is_member && !entity.static_member;
+    if (member_object && !arguments.empty() &&
+        arguments[0].is_implicit_object &&
+        !MemberRefQualifierViable(entity,
+            arguments[0].has_implicit_object_category ?
+                arguments[0].implicit_object_category :
+                arguments[0].category))
+      continue;
     std::size_t required = function.parameters.size();
     while (required > 0 && required <= entity.default_arguments.size() &&
            entity.default_arguments[required - 1] != 0)

@@ -761,6 +761,24 @@ SemaId ExpressionAnalyzer::MakeImplicitObject(SemaId object, ScopeId scope)
   return address;
 }
 
+ValueCategory ExpressionAnalyzer::ImplicitObjectCategory(
+    SemaId object, bool member_callee) const
+{
+  if (object == 0)
+    return VC_LVALUE;
+  if (!member_callee)
+    return VC_LVALUE; // the implicit `this` object is always an lvalue
+  const SemaNode& value = tree_.At(object);
+  if (value.kind == SEMA_UNARY && value.op == OP_AMP &&
+      value.first_child != 0)
+    return tree_.At(value.first_child).category;
+  // Built-in `->` selects a subobject through a pointer; that subobject is
+  // an lvalue regardless of the value category of the pointer expression.
+  if (types_.Kind(types_.Unqualified(value.type)) == TYPE_POINTER)
+    return VC_LVALUE;
+  return value.category;
+}
+
 OverloadArgument ExpressionAnalyzer::MakeOperatorArgument(
     SemaId expression, TypeId target, ScopeId scope)
 {
@@ -854,6 +872,37 @@ SemaId ExpressionAnalyzer::BuildConstructorTemporary(
   for (size_t i = 0; i < converted.size(); ++i)
     Append(call, converted[i]);
   return action;
+}
+
+SemaId ExpressionAnalyzer::InitializeReturn(SemaId expression, TypeId target)
+{
+  if (expression == 0 || target == 0)
+    throw std::runtime_error("invalid return initializer");
+  const SemaNode& source = tree_.At(expression);
+  TypeId target_class = types_.Unqualified(target);
+  if (types_.Kind(target_class) == TYPE_CLASS &&
+      source.kind != SEMA_CONSTRUCTOR_ACTION &&
+      source.category != VC_PRVALUE) {
+    TypeId source_class = source.type;
+    if (types_.Kind(types_.Unqualified(source_class)) == TYPE_REFERENCE)
+      source_class = types_.Referent(source_class);
+    source_class = types_.Unqualified(source_class);
+    if (types_.Kind(source_class) == TYPE_CLASS &&
+        types_.At(source_class).entity == types_.At(target_class).entity) {
+      const ClassEntity& owner = model_.ClassAt(types_.At(target_class).entity);
+      if (!owner.trivially_copyable &&
+          (owner.copy_constructor != 0 || owner.move_constructor != 0)) {
+        const FunctionEntityId selected = builder_.SelectReturnConstructor(
+            target_class, expression, source.scope);
+        if (selected == 0)
+          throw std::runtime_error("return has no viable copy constructor");
+        return BuildConstructorTemporary(
+            0, target_class, source.scope,
+            std::vector<SemaId>(1, expression), false, true, selected);
+      }
+    }
+  }
+  return Initialize(expression, target);
 }
 
 SemaId ExpressionAnalyzer::BuildResolvedCall(
@@ -1018,10 +1067,14 @@ SemaId ExpressionAnalyzer::TryOperatorCall(
         have_member_candidate = true;
         OverloadCandidate candidate(binding.function);
         const Info object_info = NodeInfo(implicit_object);
-        candidate.arguments.push_back(OverloadArgument(
+        OverloadArgument object_argument(
             object_info.type, object_info.category,
             IsNullPointerConstant(implicit_object),
-            object_info.is_function_lvalue, true));
+            object_info.is_function_lvalue, true);
+        object_argument.implicit_object_category =
+            NodeInfo(operands[0]).category;
+        object_argument.has_implicit_object_category = true;
+        candidate.arguments.push_back(object_argument);
         for (size_t j = 1; j < explicit_operands.size(); ++j)
         {
           const TypeNode& callable = types_.At(types_.Unqualified(
@@ -1083,10 +1136,13 @@ SemaId ExpressionAnalyzer::TryCallableObjectCall(
       continue;
     OverloadCandidate candidate(binding.function);
     const Info object_info = NodeInfo(implicit_object);
-    candidate.arguments.push_back(OverloadArgument(
+    OverloadArgument object_argument(
         object_info.type, object_info.category,
         IsNullPointerConstant(implicit_object),
-        object_info.is_function_lvalue, true));
+        object_info.is_function_lvalue, true);
+    object_argument.implicit_object_category = NodeInfo(object).category;
+    object_argument.has_implicit_object_category = true;
+    candidate.arguments.push_back(object_argument);
     for (size_t j = 0; j < arguments.size(); ++j)
     {
       const TypeNode& callable = types_.At(types_.Unqualified(
@@ -1227,8 +1283,16 @@ SemaId ExpressionAnalyzer::AnalyzeMember(AstId expression, ScopeId scope)
   TypeId type = MemberAccessType(types_, member.type, member.static_member,
                                  field != 0 && field->mutable_member,
                                  object_type, op);
+  ValueCategory category = VC_LVALUE;
+  const TypeKind member_kind = types_.Kind(types_.Unqualified(member.type));
+  if (!member.static_member && member_kind != TYPE_REFERENCE &&
+      member_kind != TYPE_FUNCTION &&
+      op == OP_DOT &&
+      (NodeInfo(object).category == VC_PRVALUE ||
+       NodeInfo(object).category == VC_XVALUE))
+    category = VC_XVALUE;
   const SemaId result = MakeExpression(SEMA_MEMBER, expression, type,
-                                       VC_LVALUE, scope, op);
+                                       category, scope, op);
   SemaNode& semantic = tree_.At(result);
   semantic.binding = binding;
   semantic.has_value = member.has_const_value;
@@ -2198,10 +2262,14 @@ SemaId ExpressionAnalyzer::FinishCall(
   if (has_implicit_object)
   {
     const Info object_info = NodeInfo(implicit_object);
-    overload_arguments.insert(overload_arguments.begin(), OverloadArgument(
+    OverloadArgument object_argument(
         object_info.type, member_callee ? VC_PRVALUE : object_info.category,
         IsNullPointerConstant(implicit_object), object_info.is_function_lvalue,
-        true));
+        true);
+    object_argument.implicit_object_category = ImplicitObjectCategory(
+        implicit_object, member_callee);
+    object_argument.has_implicit_object_category = true;
+    overload_arguments.insert(overload_arguments.begin(), object_argument);
   }
 
   // Unqualified calls use ADL unless ordinary lookup found a member function.
@@ -2645,6 +2713,30 @@ SemaId ExpressionAnalyzer::Initialize(SemaId expression, TypeId target,
     (void)RetargetFunctionName(expression, target);
 
   const Info source = NodeInfo(expression);
+  // A same-class initialization is the copy/move constructor boundary, not
+  // merely an identity conversion, when the class has a user-declared
+  // special constructor.  Keep trivial classes as raw object values so the
+  // ABI layer can use copyobj without manufacturing a semantic action.
+  TypeId target_class = types_.Unqualified(target);
+  TypeId source_class = types_.Unqualified(source.type);
+  if (types_.Kind(source_class) == TYPE_REFERENCE)
+    source_class = types_.Unqualified(types_.Referent(source_class));
+  if (types_.Kind(target_class) == TYPE_CLASS &&
+      types_.Kind(source_class) == TYPE_CLASS &&
+      types_.At(target_class).entity == types_.At(source_class).entity &&
+      source.category != VC_PRVALUE &&
+      tree_.At(expression).kind != SEMA_CONSTRUCTOR_ACTION) {
+    const ClassEntity& owner = model_.ClassAt(types_.At(target_class).entity);
+    if (!owner.trivially_copyable &&
+        (owner.copy_constructor != 0 || owner.move_constructor != 0)) {
+      const FunctionEntityId selected = builder_.ResolveConstructor(
+          target_class, std::vector<SemaId>(1, expression),
+          tree_.At(expression).scope, true);
+      return BuildConstructorTemporary(
+          0, target_class, tree_.At(expression).scope,
+          std::vector<SemaId>(1, expression), false, true, selected);
+    }
+  }
   const ImplicitConversion conversion = Classify(
       model_, types_, source.type, source.category,
       IsNullPointerConstant(expression), source.is_function_lvalue, target);

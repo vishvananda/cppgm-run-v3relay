@@ -188,7 +188,7 @@ is a memory error (valgrind first).
 | checkpoint | commit | scope | outcome |
 | --- | --- | --- | --- |
 | plan | this commit | stage design, failure map | 42/228 at start |
-| CP1 value boundary and trivial value transfer | — | bucket A: `ClassBoundary`, `trivially_copyable`, copy/move classification, two-stage return selection, `$argobj`/`$retobj`/`$discard`/`$arg` shapes, indirect result and return-slot reuse | target ≥ 75/228, no regression |
+| CP1 value boundary and trivial value transfer | this checkpoint | bucket A: `ClassBoundary`, `trivially_copyable`, copy/move classification, two-stage return selection, `$argobj`/`$retobj`/`$discard`/`$arg` shapes, indirect result and return-slot reuse | 73/228; PA1-PA16 1382/1382; audit passed; scaling probes 2.0×; coverage unchanged |
 | CP2 implicit copy/move members | — | bucket B: `EnsureCopyMoveMembers`, deletion rules, synthesized bodies with trivial prefix, deleted candidates, elided-copy access | target ≥ 105/228 |
 | review 1 | — | ownership, PA11/PA12 dumps, valgrind, probes | — |
 | CP3 temporaries and lifetimes | — | bucket C: full-expression temporaries, `eh_try` regions, reference extension, condition declarations, empty-destructor elision, slot naming | target ≥ 130/228 |
@@ -199,13 +199,13 @@ is a memory error (valgrind first).
 | CP7 unions, delegating constructors, leftovers | — | bucket G | 228/228; through-pa17 clean |
 | final review | — | ledger closed, probes linear, valgrind clean | — |
 
-## Active Checkpoint: CP1 value boundary and trivial value transfer
+## Completed Checkpoint: CP1 value boundary and trivial value transfer
 
-Goal: one owner for the class value boundary, the class value facts it
-reads, and the copy/move constructor selection for by-value transfer, so
-every bucket-A fixture passes and nothing in PA15/PA16 changes.  Progress is
-the bucket-A set passing (`comm -13` shows no new failure); adding tests is
-not progress.
+Outcome: one owner now supplies the class value boundary, its triviality
+facts, and by-value copy/move selection.  The stabilized stage gate reached
+73/228 from 42/228 with no coverage reduction; `make test-report-through-pa16`
+and the file audit pass.  The remaining bucket-A and implicit-member gaps
+continue in CP2.
 
 ### Implementation packet
 
@@ -345,3 +345,18 @@ per transfer.
   even when never declared or used.  CP1 must reserve those positions (or
   compute the ordinal from a canonical order) before the aggregate
   constructor is appended, or the LowIR name pairing changes.
+
+## Active Checkpoint: CP2 implicit copy/move members
+
+Goal: complete on-demand implicit copy/move constructor and assignment
+entities, including deletion and access rules, then synthesize their
+prefix-plus-subobject bodies without changing the CP1 ABI boundary.  Start
+from 73/228 with PA1-PA16 clean; progress requires fewer PA17 failures.
+
+Scope: `EnsureCopyMoveMembers` and assignment-member ownership in
+`scope_builder_members.cpp`, `scope_model.*`, overload selection, and the
+corresponding LowIR constructor/assignment body lowering.  Focus first on
+`200-implicit-copy-constructor`, `200-implicit-copy-assignment`,
+`300-leading-trivial-prefix-storage-copy`,
+`spec/100-defaulted-move-nontrivial-subobject`,
+`spec/200-moveonly-defaulted-move-assignment`, and the deleted-member cases.
