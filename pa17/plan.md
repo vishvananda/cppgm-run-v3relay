@@ -191,7 +191,7 @@ is a memory error (valgrind first).
 | CP1 value boundary and trivial value transfer | this checkpoint | bucket A: `ClassBoundary`, `trivially_copyable`, copy/move classification, two-stage return selection, `$argobj`/`$retobj`/`$discard`/`$arg` shapes, indirect result and return-slot reuse | 73/228; PA1-PA16 1382/1382; audit passed; scaling probes 2.0×; coverage unchanged |
 | CP2 implicit copy/move members | this checkpoint | bucket B: `EnsureCopyMoveMembers`, deletion rules, synthesized bodies with trivial prefix, deleted candidates, elided-copy access | 106/228; PA1-PA16 1382/1382; PA11 68/68; PA12 166/166; audit passed; focused matrix green; scaling 2.0×/2.1×; coverage unchanged |
 | review 1 | — | ownership, PA11/PA12 dumps, valgrind, probes | — |
-| CP3 temporaries and lifetimes | — | bucket C: full-expression temporaries, `eh_try` regions, reference extension, condition declarations, empty-destructor elision, slot naming | target ≥ 130/228 |
+| CP3 temporaries and lifetimes | this checkpoint | bucket C: canonical temporary ownership, full-expression destruction, `eh_try` cleanup regions, reference extension, condition declarations, empty-destructor elision, conversion-operator condition calls, and slot naming | 113/228 from 106/228; five packet fixtures 5/5; PA1-PA16 1382/1382; full-through 1495/1610; audit passed; coverage unchanged |
 | CP4 ref-qualifiers, out-of-class operators, class casts, braced call arguments | — | bucket D | target ≥ 155/228 |
 | CP5 conversion functions | — | bucket E: parser, `SPECIAL_MEMBER_CONVERSION`, `Classify`, built-in operator candidates | target ≥ 185/228 |
 | review 2 | — | as review 1 | — |
@@ -360,17 +360,18 @@ the file audit passed.  The representative probes measured 2.0× `wideval`
 and 2.1× `byaddr` growth at doubling, with five `copyobj` transfers for five
 modeled `wideval` transfers.
 
-## Active Checkpoint: CP3 temporaries and lifetimes
+## Active Checkpoint: CP4 ref-qualifiers, operators, and class casts
 
-Goal: complete full-expression temporary ownership and destruction while
-preserving the value-boundary and special-member facts established here.
-Start from 106/228 with PA1-PA16 clean; target at least 130/228.
+Goal: complete ref-qualified calls, out-of-class operator ownership, braced
+call arguments, and class-cast initialization while preserving the value and
+lifetime boundaries established here.  Start from 113/228 with PA1-PA16
+clean; target at least 155/228.
 
-Scope: `Lowerer` temporary bookkeeping, reference lifetime extension,
-`eh_try` cleanup regions, conditional/short-circuit paths, and empty
-destructor elision.  Focus next on
-`200-constructor-argument-temporary-dtor`,
-`200-base-initializer-temporary-full-expression`,
-`400-short-circuit-left-temporary-dtor`,
-`400-local-reference-extends-class-temporary-lifetime`, and
-`400-shadowed-local-cleanup-rebind-on-return`.
+Scope: ref-qualified overload viability and implicit-object binding,
+out-of-class special-member/operator definitions, parenthesized braced
+arguments, and `static_cast<Class>`/C-style class initialization.  Focus next
+on `200-ref-qualified-member-call-conditional-shadowed-setter`,
+`spec/200-ref-qualified-mixed-overload-bad`,
+`200-out-of-class-special-members`,
+`200-parenthesized-braced-aggregate-constructor-arg`, and
+`200-static-cast-explicit-constructor`.

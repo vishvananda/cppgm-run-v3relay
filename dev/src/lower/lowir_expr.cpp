@@ -874,6 +874,17 @@ bool Lowerer::IsObjectExpression(SemaId node) const
   if (parent_id == 0)
     return false;
   const SemaNode& parent = tree_.At(parent_id);
+  if (parent.kind == SEMA_VARIABLE && parent.first_child == node &&
+      parent.binding != 0) {
+    const TypeId variable_type = types_.Unqualified(parent.type);
+    if (types_.Kind(variable_type) == TYPE_REFERENCE) {
+      TypeId referent = types_.Unqualified(types_.Referent(variable_type));
+      while (types_.Kind(referent) == TYPE_ARRAY)
+        referent = types_.Unqualified(types_.At(referent).base);
+      if (types_.Kind(referent) == TYPE_CLASS)
+        return true;
+    }
+  }
   if (parent.kind == SEMA_MEMBER && parent.first_child == node)
     return true;
   // A member call stores its prvalue object in the implicit `&object`
@@ -934,6 +945,7 @@ Lowerer::Value Lowerer::LowerConstructorTemporary(SemaId node)
         call.args.push_back(LowerRValue(call_children[i], parameter).operand);
     }
     Emit(call);
+    RegisterTemporary(node, TemporaryExtensionScope(node));
   }
 
   Value result;
@@ -1218,9 +1230,10 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
       types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS) {
     // A direct class result is an object value.  Member access needs a
     // stable address, so materialize it once in an object-expression slot.
-    // Form the destination address before evaluating the call.  Apart from
-    // making the lifetime boundary explicit, this preserves the source
-    // order of the address-producing operation and the value-producing call.
+    // The storage slot is known before the call, but an indirect result's
+    // address is formed by LowerCall at the call's exception boundary.  A
+    // throwing result construction must not expose a destination address
+    // before the handler is active.
     const bool object_expression = IsObjectExpression(node);
     Value storage;
     storage.type = value.type;
@@ -1228,18 +1241,29 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
     storage.operand = SlotOperand(
         NewGeneratedSlot(object_expression ? "tmpobj" : "arg",
                          LowTypeOf(value.type)));
-    const lowir_model::Operand destination = AddressValue(storage).operand;
     const bool indirect_result =
         ClassBoundary(value.type, true) == CBM_INDIRECT_RESULT;
-    Value result = indirect_result ?
-        LowerCall(node, 0, &destination) : LowerCall(node, 0);
-    if (result.lvalue)
+    lowir_model::Operand destination;
+    Value result;
+    if (indirect_result) {
+      result = LowerCall(node, 0, &storage.operand, std::string(), true);
+      destination = result.operand;
+    } else {
+      destination = AddressValue(storage).operand;
+      result = LowerCall(node, 0);
+    }
+    if (result.lvalue) {
+      RegisterMaterializedTemporary(node, value.type, destination,
+                                    TemporaryExtensionScope(node));
       return result;
+    }
     EmitCopyObject(value.type, result.operand, destination);
     // Keep the already-formed address as the lvalue representation.  A
     // member projection can then reuse it instead of emitting a second
     // address calculation for the same temporary slot.
     storage.operand = destination;
+    RegisterMaterializedTemporary(node, value.type, destination,
+                                  TemporaryExtensionScope(node));
     return storage;
   }
   if (value.kind == SEMA_CONDITIONAL && value.category == VC_LVALUE)
@@ -1899,13 +1923,18 @@ void Lowerer::LowerDiscard(SemaId node)
     discard.lvalue = true;
     discard.operand = SlotOperand(
         NewGeneratedSlot("discard", LowTypeOf(discard.type)));
-    const lowir_model::Operand destination = AddressValue(discard).operand;
-    if (ClassBoundary(discard.type, true) == CBM_INDIRECT_RESULT)
-      (void)LowerCall(node, 0, &destination);
-    else {
+    lowir_model::Operand destination;
+    if (ClassBoundary(discard.type, true) == CBM_INDIRECT_RESULT) {
+      const Value result = LowerCall(node, 0, &discard.operand,
+                                     std::string(), true);
+      destination = result.operand;
+    } else {
+      destination = AddressValue(discard).operand;
       const Value result = LowerCall(node, 0);
       EmitCopyObject(discard.type, result.operand, destination);
     }
+    RegisterMaterializedTemporary(node, discard.type, destination,
+                                  TemporaryExtensionScope(node));
   }
   else if (tree_.At(node).kind == SEMA_CALL)
     (void)LowerCall(node, 0);
@@ -1945,6 +1974,8 @@ Lowerer::Value Lowerer::LowerLogicalValue(SemaId node)
   }
 
   StartBlock(rhs_label);
+  if (tree_.At(children[1]).kind == SEMA_CALL)
+    defer_next_call_guard_ = true;
   const Value rhs = LowerRValue(children[1]);
   lowir_model::Instruction compare;
   compare.kind = lowir_model::Instruction::IK_CMP;
@@ -1958,6 +1989,7 @@ Lowerer::Value Lowerer::LowerLogicalValue(SemaId node)
   compare.second = ZeroOperand(rhs.type);
   Emit(compare);
   EmitStore(I64Type(), TempOperand(compare.dest), SlotOperand(slot));
+  FinishDeferredCallGuard();
   EmitJump(end_label);
 
   StartBlock(short_label);
@@ -2193,7 +2225,8 @@ void Lowerer::ProjectDerivedReference(Value& value, TypeId source,
 Lowerer::Value Lowerer::LowerCall(
     SemaId node, TypeId expected,
     const lowir_model::Operand* indirect_destination,
-    const std::string& indirect_stem)
+    const std::string& indirect_stem,
+    bool indirect_destination_is_storage)
 {
   const std::vector<SemaId> children = Children(node);
   if (children.empty())
@@ -2213,10 +2246,47 @@ Lowerer::Value Lowerer::LowerCall(
 
   const ClassBoundaryMode result_boundary = ClassBoundary(type.result, true);
   const bool indirect_result = result_boundary == CBM_INDIRECT_RESULT;
+  const bool call_returns_void = indirect_result ||
+      IsVoidType(types_, type.result);
+  const bool can_throw = direct &&
+      !model_.FunctionAt(callee.function).noexcept_qualifier &&
+      exception_guard_depth_ == 0;
+  const bool guarded_call = can_throw && HasActiveCleanup();
+  const bool guarded_arguments = guarded_call &&
+      HasTemporaryArgument(node);
+  const bool defer_guard = guarded_call && defer_next_call_guard_;
+  defer_next_call_guard_ = false;
+  std::string guarded_result_slot;
+  if (guarded_call && !call_returns_void)
+    guarded_result_slot = NewGeneratedSlot("call", LowTypeOf(type.result));
+  const std::vector<SemaId> pending_at_entry = pending_temporaries_;
+  std::string argument_cleanup;
+  std::string argument_end;
+  bool argument_handler_reused = false;
+  if (guarded_arguments) {
+    const std::string key = CleanupHandlerKey(pending_at_entry);
+    const std::map<std::string, std::string>::const_iterator handler =
+        cleanup_handler_labels_.find(key);
+    if (handler != cleanup_handler_labels_.end()) {
+      argument_cleanup = handler->second;
+      argument_handler_reused = true;
+    } else {
+      argument_cleanup = NewBlockLabel("call_unwind_dispatch");
+      cleanup_handler_labels_[key] = argument_cleanup;
+      argument_end = NewBlockLabel("call_unwind_end");
+    }
+    EmitEhTry(argument_cleanup);
+    ++exception_guard_depth_;
+  }
   lowir_model::Operand result_destination;
+  bool deferred_result_address = false;
   if (indirect_result) {
     if (indirect_destination != 0) {
-      result_destination = *indirect_destination;
+      if (indirect_destination_is_storage) {
+        result_destination = *indirect_destination;
+        deferred_result_address = true;
+      } else
+        result_destination = *indirect_destination;
     } else {
       Value storage;
       storage.type = type.result;
@@ -2232,8 +2302,8 @@ Lowerer::Value Lowerer::LowerCall(
   call.kind = lowir_model::Instruction::IK_CALL;
   call.type = indirect_result ? VoidType() : LowTypeOf(type.result);
   call.call_return_type = call.type;
-  call.call_returns_void = indirect_result || IsVoidType(types_, type.result);
-  if (indirect_result)
+  call.call_returns_void = call_returns_void;
+  if (indirect_result && !deferred_result_address)
     call.args.push_back(result_destination);
   if (direct) {
     call.first = GlobalOperand(FunctionSymbolName(callee.function));
@@ -2274,21 +2344,370 @@ Lowerer::Value Lowerer::LowerCall(
     else
       call.args.push_back(LowerRValue(children[i], parameter_type).operand);
   }
+  if (guarded_arguments) {
+    --exception_guard_depth_;
+    EmitEhEnd();
+    if (!argument_handler_reused) {
+      EmitJump(argument_end);
+      StartBlock(argument_cleanup);
+      EmitTemporaryDestructors(pending_at_entry);
+      EmitActiveDestructors();
+      EmitResume();
+      StartBlock(argument_end);
+    }
+  }
   if (!direct)
     call.first = LowerRValue(children[0]).operand;
   if (!call.call_returns_void)
     call.dest = NewTemp();
-  Emit(call);
   Value result;
   result.type = type.result;
+  if (guarded_call) {
+    std::string cleanup;
+    std::string end;
+    bool handler_reused = false;
+    const std::string key = CleanupHandlerKey(pending_temporaries_);
+    const std::map<std::string, std::string>::const_iterator handler =
+        cleanup_handler_labels_.find(key);
+    if (handler != cleanup_handler_labels_.end()) {
+      cleanup = handler->second;
+      handler_reused = true;
+    } else {
+      cleanup = NewBlockLabel("call_unwind_dispatch");
+      cleanup_handler_labels_[key] = cleanup;
+      end = NewBlockLabel("call_unwind_end");
+    }
+    EmitEhTry(cleanup);
+    if (deferred_result_address) {
+      Value storage;
+      storage.type = type.result;
+      storage.lvalue = true;
+      storage.operand = result_destination;
+      result_destination = AddressValue(storage).operand;
+      call.args.insert(call.args.begin(), result_destination);
+    }
+    Emit(call);
+    if (!guarded_result_slot.empty()) {
+      EmitStore(call.type, TempOperand(call.dest),
+                SlotOperand(guarded_result_slot));
+      lowir_model::Instruction load;
+      load.kind = lowir_model::Instruction::IK_LOAD;
+      load.dest = NewTemp();
+      load.type = LowTypeOf(type.result);
+      load.first = SlotOperand(guarded_result_slot);
+      Emit(load);
+      result.operand = TempOperand(load.dest);
+    }
+    if (defer_guard) {
+      deferred_call_guard_active_ = true;
+      deferred_call_handler_reused_ = handler_reused;
+      deferred_call_cleanup_ = cleanup;
+      deferred_call_end_ = end;
+    } else {
+      EmitEhEnd();
+      if (!handler_reused) {
+        EmitJump(end);
+        StartBlock(cleanup);
+        EmitTemporaryDestructors(pending_temporaries_);
+        EmitActiveDestructors();
+        EmitResume();
+        StartBlock(end);
+      }
+    }
+  } else {
+    if (deferred_result_address) {
+      Value storage;
+      storage.type = type.result;
+      storage.lvalue = true;
+      storage.operand = result_destination;
+      result_destination = AddressValue(storage).operand;
+      call.args.insert(call.args.begin(), result_destination);
+    }
+    Emit(call);
+  }
   if (indirect_result) {
     result.operand = result_destination;
     result.lvalue = true;
-  } else if (!call.call_returns_void)
-    result.operand = TempOperand(call.dest);
+  } else if (!call.call_returns_void) {
+    if (guarded_result_slot.empty())
+      result.operand = TempOperand(call.dest);
+  }
   if (indirect_result)
     return result;
   return Convert(result, expected);
+}
+
+bool Lowerer::ConditionNeedsTemporary(SemaId node) const
+{
+  if (node == 0)
+    return false;
+  const SemaNode& value = tree_.At(node);
+  if (value.kind == SEMA_VARIABLE)
+    return false;
+  if (value.kind == SEMA_CONSTRUCTOR_ACTION && value.binding == 0)
+    return TemporaryNeedsDestructor(value.type);
+  if (value.kind == SEMA_CALL &&
+      types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS)
+    return TemporaryNeedsDestructor(value.type);
+  for (SemaId child = value.first_child; child != 0;
+       child = tree_.At(child).next_sibling)
+    if (ConditionNeedsTemporary(child))
+      return true;
+  return false;
+}
+
+ScopeId Lowerer::TemporaryExtensionScope(SemaId node) const
+{
+  const SemaId parent = SemanticParent(node);
+  if (parent == 0 || tree_.At(parent).kind != SEMA_VARIABLE ||
+      tree_.At(parent).first_child != node ||
+      tree_.At(parent).binding == 0)
+    return 0;
+  const TypeId variable_type = types_.Unqualified(tree_.At(parent).type);
+  if (types_.Kind(variable_type) != TYPE_REFERENCE)
+    return 0;
+  TypeId referent = types_.Unqualified(types_.Referent(variable_type));
+  while (types_.Kind(referent) == TYPE_ARRAY)
+    referent = types_.Unqualified(types_.At(referent).base);
+  if (types_.Kind(referent) != TYPE_CLASS)
+    return 0;
+  const ScopeId scope = model_.BindingAt(tree_.At(parent).binding).scope;
+  return scope != 0 && model_.ScopeAt(scope).kind == SCOPE_BLOCK ? scope : 0;
+}
+
+bool Lowerer::TemporaryNeedsDestructor(TypeId type) const
+{
+  TypeId unqualified = types_.Unqualified(type);
+  while (types_.Kind(unqualified) == TYPE_ARRAY)
+    unqualified = types_.Unqualified(types_.At(unqualified).base);
+  return types_.Kind(unqualified) == TYPE_CLASS &&
+      NeedsDestructor(types_.At(unqualified).entity);
+}
+
+void Lowerer::RegisterTemporary(SemaId node, ScopeId extension_scope)
+{
+  const std::map<SemaId, TemporaryObject>::iterator found =
+      temporaries_.find(node);
+  if (found == temporaries_.end() || !found->second.constructed ||
+      found->second.lifetime_registered)
+    return;
+  if (!TemporaryNeedsDestructor(tree_.At(node).type)) {
+    found->second.lifetime_registered = true;
+    return;
+  }
+  if (extension_scope != 0 && model_.ScopeAt(extension_scope).kind ==
+      SCOPE_BLOCK) {
+    const LiveObject object(0, tree_.At(node).type, node);
+    live_objects_[extension_scope].push_back(object);
+    if (shared_return_cleanup_) {
+      shared_cleanup_nodes_.push_back(SharedCleanupNode(
+          NewBlockLabel("return_cleanup"), shared_cleanup_head_, object));
+      shared_cleanup_head_ = shared_cleanup_nodes_.back().label;
+    }
+  } else {
+    pending_temporaries_.push_back(node);
+  }
+  found->second.lifetime_registered = true;
+}
+
+void Lowerer::RegisterMaterializedTemporary(
+    SemaId node, TypeId type, const lowir_model::Operand& address,
+    ScopeId extension_scope)
+{
+  TemporaryObject& temporary = temporaries_[node];
+  temporary.address = address;
+  temporary.constructed = true;
+  if (temporary.lifetime_registered)
+    return;
+  if (!TemporaryNeedsDestructor(type)) {
+    temporary.lifetime_registered = true;
+    return;
+  }
+  if (extension_scope != 0 && model_.ScopeAt(extension_scope).kind ==
+      SCOPE_BLOCK) {
+    const LiveObject object(0, type, node);
+    live_objects_[extension_scope].push_back(object);
+    if (shared_return_cleanup_) {
+      shared_cleanup_nodes_.push_back(SharedCleanupNode(
+          NewBlockLabel("return_cleanup"), shared_cleanup_head_, object));
+      shared_cleanup_head_ = shared_cleanup_nodes_.back().label;
+    }
+  } else {
+    pending_temporaries_.push_back(node);
+  }
+  temporary.lifetime_registered = true;
+}
+
+void Lowerer::EmitTemporaryDestructor(SemaId node)
+{
+  const std::map<SemaId, TemporaryObject>::const_iterator found =
+      temporaries_.find(node);
+  if (found == temporaries_.end() || !found->second.constructed)
+    return;
+  TypeId unqualified = types_.Unqualified(tree_.At(node).type);
+  if (types_.Kind(unqualified) == TYPE_ARRAY) {
+    const TypeId element = types_.Unqualified(types_.At(unqualified).base);
+    if (types_.Kind(element) != TYPE_CLASS ||
+        !NeedsDestructor(types_.At(element).entity))
+      return;
+    const FunctionEntityId destructor =
+        model_.ClassAt(types_.At(element).entity).destructor;
+    if (destructor == 0)
+      return;
+    Value array;
+    array.type = tree_.At(node).type;
+    array.lvalue = true;
+    array.operand = found->second.address;
+    for (std::size_t i = types_.At(unqualified).array_bound; i != 0; --i)
+      EmitVoidCall(FunctionSymbolName(destructor),
+                   std::vector<lowir_model::Operand>(1,
+                       LowerArrayElementAddress(array, element, i - 1)));
+    return;
+  }
+  if (types_.Kind(unqualified) != TYPE_CLASS ||
+      !NeedsDestructor(types_.At(unqualified).entity))
+    return;
+  const FunctionEntityId destructor =
+      model_.ClassAt(types_.At(unqualified).entity).destructor;
+  if (destructor == 0)
+    return;
+  EmitVoidCall(FunctionSymbolName(destructor),
+               std::vector<lowir_model::Operand>(1, found->second.address));
+}
+
+void Lowerer::EmitTemporaryDestructors(
+    const std::vector<SemaId>& temporaries)
+{
+  for (std::size_t i = temporaries.size(); i != 0; --i)
+    EmitTemporaryDestructor(temporaries[i - 1]);
+}
+
+std::vector<SemaId> Lowerer::PendingTemporarySuffix(std::size_t first) const
+{
+  if (first >= pending_temporaries_.size())
+    return std::vector<SemaId>();
+  return std::vector<SemaId>(pending_temporaries_.begin() + first,
+                             pending_temporaries_.end());
+}
+
+void Lowerer::ClearPendingTemporarySuffix(std::size_t first)
+{
+  if (first < pending_temporaries_.size())
+    pending_temporaries_.resize(first);
+}
+
+void Lowerer::FlushPendingTemporaryDestructors()
+{
+  EmitTemporaryDestructors(pending_temporaries_);
+  pending_temporaries_.clear();
+}
+
+bool Lowerer::HasActiveCleanup() const
+{
+  if (!pending_temporaries_.empty())
+    return true;
+  std::set<ScopeId> visited;
+  for (std::size_t i = lowering_scopes_.size(); i != 0; --i) {
+    const ScopeId scope = lowering_scopes_[i - 1];
+    if (!visited.insert(scope).second)
+      continue;
+    const std::map<ScopeId, std::vector<LiveObject> >::const_iterator found =
+        live_objects_.find(scope);
+    if (found == live_objects_.end())
+      continue;
+    for (std::size_t object = 0; object < found->second.size(); ++object) {
+      const LiveObject& value = found->second[object];
+      if (value.temporary != 0) {
+        if (TemporaryNeedsDestructor(tree_.At(value.temporary).type))
+          return true;
+      } else {
+        TypeId type = types_.Unqualified(value.type);
+        while (types_.Kind(type) == TYPE_ARRAY)
+          type = types_.Unqualified(types_.At(type).base);
+        if (types_.Kind(type) == TYPE_CLASS &&
+            NeedsDestructor(types_.At(type).entity))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool Lowerer::HasTemporaryArgument(SemaId node) const
+{
+  if (node == 0)
+    return false;
+  const SemaNode& value = tree_.At(node);
+  if (value.kind == SEMA_CONSTRUCTOR_ACTION)
+    return true;
+  if (value.kind == SEMA_CALL &&
+      types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS)
+    return true;
+  for (SemaId child = value.first_child; child != 0;
+       child = tree_.At(child).next_sibling)
+    if (HasTemporaryArgument(child))
+      return true;
+  return false;
+}
+
+std::string Lowerer::CleanupHandlerKey(
+    const std::vector<SemaId>& pending) const
+{
+  std::string key;
+  for (std::size_t i = 0; i < pending.size(); ++i)
+    key += "t" + std::to_string(pending[i]) + ";";
+  std::set<ScopeId> visited;
+  for (std::size_t i = lowering_scopes_.size(); i != 0; --i) {
+    const ScopeId scope = lowering_scopes_[i - 1];
+    if (!visited.insert(scope).second)
+      continue;
+    const std::map<ScopeId, std::vector<LiveObject> >::const_iterator found =
+        live_objects_.find(scope);
+    if (found == live_objects_.end())
+      continue;
+    for (std::size_t object = found->second.size(); object != 0; --object) {
+      const LiveObject& value = found->second[object - 1];
+      bool needed = false;
+      if (value.temporary != 0)
+        needed = TemporaryNeedsDestructor(tree_.At(value.temporary).type);
+      else {
+        TypeId type = types_.Unqualified(value.type);
+        while (types_.Kind(type) == TYPE_ARRAY)
+          type = types_.Unqualified(types_.At(type).base);
+        needed = types_.Kind(type) == TYPE_CLASS &&
+            NeedsDestructor(types_.At(type).entity);
+      }
+      if (!needed)
+        continue;
+      key += "s" + std::to_string(scope) + ":";
+      if (value.temporary != 0)
+        key += "t" + std::to_string(value.temporary);
+      else
+        key += "b" + std::to_string(value.binding) + ":" +
+            std::to_string(value.type);
+      key += ";";
+    }
+  }
+  return key;
+}
+
+void Lowerer::FinishDeferredCallGuard()
+{
+  if (!deferred_call_guard_active_)
+    return;
+  EmitEhEnd();
+  if (!deferred_call_handler_reused_) {
+    EmitJump(deferred_call_end_);
+    StartBlock(deferred_call_cleanup_);
+    EmitTemporaryDestructors(pending_temporaries_);
+    EmitActiveDestructors();
+    EmitResume();
+    StartBlock(deferred_call_end_);
+  }
+  deferred_call_guard_active_ = false;
+  deferred_call_handler_reused_ = false;
+  deferred_call_cleanup_.clear();
+  deferred_call_end_.clear();
 }
 
 }  // namespace lowir_lowering

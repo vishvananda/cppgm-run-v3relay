@@ -2,6 +2,7 @@
 #include "lower/lowir_lowering.h"
 
 #include <algorithm>
+#include <functional>
 #include <stdexcept>
 #include <utility>
 
@@ -350,12 +351,14 @@ void Lowerer::LowerVariableDeclaration(SemaId node)
 {
   if (tree_.At(node).kind == SEMA_VARIABLE) {
     LowerVariable(node);
+    FlushPendingTemporaryDestructors();
     return;
   }
   for (SemaId child = tree_.At(node).first_child; child != 0;
        child = tree_.At(child).next_sibling)
     if (tree_.At(child).kind == SEMA_VARIABLE)
       LowerVariable(child);
+  FlushPendingTemporaryDestructors();
 }
 
 void Lowerer::LowerClassValueInto(
@@ -377,11 +380,13 @@ void Lowerer::LowerClassValueInto(
       return;
     }
     if (ImplicitValueInitialization(source)) {
-      ZeroInitializeObject(type, destination);
       const FunctionEntity& constructor = model_.FunctionAt(value.function);
+      const ClassEntity& constructed = model_.ClassAt(constructor.member_class);
+      if (!constructed.empty)
+        ZeroInitializeObject(type, destination);
       if (constructor.member_class != 0 &&
-          !model_.ClassAt(constructor.member_class)
-              .trivial_default_constructor)
+          (!constructed.trivial_default_constructor ||
+           NeedsDestructor(constructor.member_class)))
         EmitVoidCall(FunctionSymbolName(value.function),
                      std::vector<lowir_model::Operand>(1, destination));
       return;
@@ -489,6 +494,8 @@ void Lowerer::LowerVariable(SemaId variable_node)
     // address in the action also makes explicit and synthesized construction
     // use the same call lowering path.
     if (initializer.empty()) {
+      if (NeedsDestructor(types_.At(unqualified).entity))
+        (void)AddressValue(object);
       RegisterLiveObject(variable.binding, declared);
       return;
     }
@@ -1295,6 +1302,10 @@ bool Lowerer::HasSubobjectDestructors(ClassEntityId entity) const
 
 void Lowerer::EmitObjectDestructor(const LiveObject& object)
 {
+  if (object.temporary != 0) {
+    EmitTemporaryDestructor(object.temporary);
+    return;
+  }
   const TypeId unqualified = types_.Unqualified(object.type);
   if (types_.Kind(unqualified) == TYPE_ARRAY) {
     const TypeId element = types_.Unqualified(types_.At(unqualified).base);
@@ -1355,6 +1366,21 @@ void Lowerer::EmitActiveDestructors()
       EmitScopeDestructors(lowering_scopes_[i - 1]);
 }
 
+void Lowerer::EmitParameterDestructors()
+{
+  for (std::size_t i = parameter_destructors_.size(); i != 0; --i) {
+    const ParameterObject& parameter = parameter_destructors_[i - 1];
+    const TypeId type = types_.Unqualified(parameter.type);
+    if (types_.Kind(type) != TYPE_CLASS)
+      continue;
+    const FunctionEntityId destructor =
+        model_.ClassAt(types_.At(type).entity).destructor;
+    if (destructor != 0)
+      EmitVoidCall(FunctionSymbolName(destructor),
+                   std::vector<lowir_model::Operand>(1, parameter.address));
+  }
+}
+
 std::size_t Lowerer::CountReturnStatements(SemaId node) const
 {
   if (node == 0)
@@ -1387,6 +1413,7 @@ void Lowerer::EmitSharedReturnCleanups()
   }
   StartBlock(shared_return_end_label_);
   if (shared_return_slot_.empty()) {
+    EmitParameterDestructors();
     EmitReturn(0);
     return;
   }
@@ -1399,6 +1426,7 @@ void Lowerer::EmitSharedReturnCleanups()
   Value result;
   result.type = function_return_type_id_;
   result.operand = TempOperand(load.dest);
+  EmitParameterDestructors();
   EmitReturn(&result);
 }
 
@@ -1618,6 +1646,9 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
       model_.ClassAt(model_.FunctionAt(owner).member_class);
   const std::vector<SemaId> arguments = Children(node);
   const bool is_base = initializer.binding == 0 && initializer.function != 0;
+  const bool destination_before_arguments = initializer.function != 0 &&
+      (is_base || types_.Kind(types_.Unqualified(initializer.type)) ==
+          TYPE_CLASS);
   const bool aggregate_initializer = !is_base &&
       initializer.function == 0 && arguments.size() == 1 &&
       tree_.At(arguments[0]).kind == SEMA_BRACED_INIT_LIST &&
@@ -1629,8 +1660,9 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
     return;
   }
 
-  // A member's arguments are evaluated before its address is formed; a
-  // base's after, as the fixtures spell the two forms.
+  // Form the subobject destination before evaluating a constructor's
+  // arguments.  The destination is part of the construction boundary and
+  // must not be delayed until after a prvalue argument has run.
   std::vector<lowir_model::Operand> lowered_arguments;
   const TypeNode* constructor_type = 0;
   if (initializer.function != 0)
@@ -1662,44 +1694,91 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
       lowered_arguments.push_back(
           LowerRValue(arguments[0], initializer.type).operand);
   };
-  if (!is_base)
-    lower_arguments();
-
   const ClassField* member_field = 0;
   lowir_model::Operand encoded_bit_field;
   bool preserve = false;
   lowir_model::Operand destination;
-  if (is_base) {
-    const ClassEntityId target_entity = model_.FunctionAt(
-        initializer.function).member_class;
-    bool found = false;
-    for (std::size_t i = 0; i < owner_class.bases.size(); ++i)
-      if (owner_class.bases[i].entity == target_entity) {
-        destination = ProjectField(LoadThis(), owner_class.bases[i].offset,
-                                   lowir_model::IPK_BASE_SUBOBJECT);
-        found = true;
-        break;
-      }
-    if (!found)
-      Unsupported("a base mem-initializer without layout metadata");
-  } else {
+
+  const std::function<bool(SemaId)> throwing_temporary =
+      [&](SemaId expression) -> bool {
+        if (expression == 0)
+          return false;
+        const SemaNode& value = tree_.At(expression);
+        if (value.kind == SEMA_CONSTRUCTOR_ACTION && value.binding == 0 &&
+            value.function != 0 &&
+            !model_.FunctionAt(value.function).noexcept_qualifier)
+          return true;
+        for (SemaId child = value.first_child; child != 0;
+             child = tree_.At(child).next_sibling)
+          if (throwing_temporary(child))
+            return true;
+        return false;
+      };
+  bool guard_arguments = false;
+  for (std::size_t i = 0; i < arguments.size() && !guard_arguments; ++i)
+    guard_arguments = throwing_temporary(arguments[i]);
+  const std::size_t pending_before = pending_temporaries_.size();
+  std::string argument_cleanup;
+  std::string argument_end;
+  if (initializer.function != 0 && guard_arguments) {
+    argument_cleanup = NewBlockLabel("call_unwind_dispatch");
+    argument_end = NewBlockLabel("call_unwind_end");
+    EmitEhTry(argument_cleanup);
+  }
+  const auto compute_destination = [&]() {
+    if (is_base) {
+      const ClassEntityId target_entity = model_.FunctionAt(
+          initializer.function).member_class;
+      bool found = false;
+      for (std::size_t i = 0; i < owner_class.bases.size(); ++i)
+        if (owner_class.bases[i].entity == target_entity) {
+          destination = ProjectField(LoadThis(), owner_class.bases[i].offset,
+                                     lowir_model::IPK_BASE_SUBOBJECT);
+          found = true;
+          break;
+        }
+      if (!found)
+        Unsupported("a base mem-initializer without layout metadata");
+    } else {
+      member_field = model_.FieldFor(initializer.binding);
+      if (member_field == 0)
+        Unsupported("a field mem-initializer without layout metadata");
+      destination = ProjectField(LoadThis(), member_field->offset);
+    }
+  };
+  if (destination_before_arguments)
+    compute_destination();
+
+  lower_arguments();
+  if (!destination_before_arguments && initializer.function == 0) {
     member_field = model_.FieldFor(initializer.binding);
     if (member_field == 0)
       Unsupported("a field mem-initializer without layout metadata");
-    if (member_field->bit_width != 0 && initializer.function == 0) {
+    if (member_field->bit_width != 0) {
       preserve = BitFieldUnitInitialized(*member_field);
       if (!preserve)
         encoded_bit_field = EncodeBitField(
             *member_field, initializer.type, lowered_arguments[0],
             member_field->type);
     }
-    destination = ProjectField(LoadThis(), member_field->offset);
   }
-
+  if (!destination_before_arguments)
+    compute_destination();
+  if (argument_cleanup.empty() == false) {
+    EmitEhEnd();
+    EmitJump(argument_end);
+    StartBlock(argument_cleanup);
+    const std::vector<SemaId> prior_temporaries(
+        pending_temporaries_.begin(),
+        pending_temporaries_.begin() + pending_before);
+    EmitTemporaryDestructors(prior_temporaries);
+    EmitResume();
+    StartBlock(argument_end);
+  }
   if (initializer.function != 0) {
     const FunctionEntity& constructor = model_.FunctionAt(initializer.function);
-    if (is_base)
-      lower_arguments();
+    const std::vector<SemaId> temporary_arguments =
+        PendingTemporarySuffix(pending_before);
     const ClassEntity& constructed_class =
         constructor.member_class == 0 ? owner_class :
         model_.ClassAt(constructor.member_class);
@@ -1708,6 +1787,8 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
       if (lowered_arguments.size() != 1)
         Unsupported("a trivial special member initializer with wrong arity");
       EmitCopyObject(initializer.type, lowered_arguments[0], destination);
+      EmitTemporaryDestructors(temporary_arguments);
+      ClearPendingTemporarySuffix(pending_before);
       return;
     }
     const bool trivial_default =
@@ -1719,8 +1800,11 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
       // zero-initializes the member; a non-trivial one is then
       // default-initialized by the call below.
       ZeroInitializeObject(initializer.type, destination);
-      if (trivial_default)
+      if (trivial_default) {
+        EmitTemporaryDestructors(temporary_arguments);
+        ClearPendingTemporarySuffix(pending_before);
         return;
+      }
     }
     const std::string symbol = is_base ?
         FunctionBaseSymbolName(initializer.function) :
@@ -1728,9 +1812,29 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
     std::vector<lowir_model::Operand> call_arguments(1, destination);
     call_arguments.insert(call_arguments.end(), lowered_arguments.begin(),
                           lowered_arguments.end());
-    EmitVoidCall(symbol, call_arguments);
+    const bool guard_call = !temporary_arguments.empty() &&
+        !constructor.noexcept_qualifier;
+    if (guard_call) {
+      const std::string cleanup = NewBlockLabel("call_unwind_dispatch");
+      const std::string end = NewBlockLabel("call_unwind_end");
+      EmitEhTry(cleanup);
+      EmitVoidCall(symbol, call_arguments);
+      EmitTemporaryDestructors(temporary_arguments);
+      EmitEhEnd();
+      EmitJump(end);
+      StartBlock(cleanup);
+      EmitTemporaryDestructors(temporary_arguments);
+      EmitResume();
+      StartBlock(end);
+    } else {
+      EmitVoidCall(symbol, call_arguments);
+      EmitTemporaryDestructors(temporary_arguments);
+    }
+    ClearPendingTemporarySuffix(pending_before);
     return;
   }
+  const std::vector<SemaId> temporary_arguments =
+      PendingTemporarySuffix(pending_before);
   if (member_field->bit_width != 0) {
     if (preserve) {
       const lowir_model::Operand merged = MergeBitField(
@@ -1742,12 +1846,16 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
       EmitStore(LowTypeOf(member_field->type), encoded_bit_field,
                 destination);
     MarkBitFieldUnitInitialized(*member_field);
+    EmitTemporaryDestructors(temporary_arguments);
+    ClearPendingTemporarySuffix(pending_before);
     return;
   }
   if (types_.Kind(types_.Unqualified(initializer.type)) == TYPE_CLASS)
     EmitCopyObject(initializer.type, lowered_arguments[0], destination);
   else
     EmitStore(LowTypeOf(initializer.type), lowered_arguments[0], destination);
+  EmitTemporaryDestructors(temporary_arguments);
+  ClearPendingTemporarySuffix(pending_before);
 }
 
 // Arguments of an implicit default construction of a subobject: the
@@ -2289,8 +2397,58 @@ bool Lowerer::LowerIf(SemaId node)
   const bool needs_end = !has_else || !then_terminates || !else_terminates;
   const std::string end_label = needs_end ? NewBlockLabel("if_end") :
       std::string();
-  PrepareConditionLabels(children[0]);
-  LowerCondition(children[0], then_label, else_label);
+  SemaId condition_expression = children[0];
+  if (tree_.At(condition_expression).kind == SEMA_CONDITION) {
+    const std::vector<SemaId> wrapped = Children(condition_expression);
+    if (wrapped.size() != 1)
+      Unsupported("this if condition");
+    condition_expression = wrapped[0];
+  }
+  const bool logical = tree_.At(condition_expression).kind == SEMA_BINARY &&
+      IsLogicalOperator(tree_.At(condition_expression).op);
+  const std::vector<SemaId> logical_children = logical ?
+      Children(condition_expression) : std::vector<SemaId>();
+  const bool has_temporary = ConditionNeedsTemporary(children[0]);
+  // A logical expression with a temporary needs one value boundary after
+  // both short-circuit arms: that is where the temporary's full-expression
+  // cleanup can branch to the surrounding statement.  Literal RHS values
+  // happen to be the smallest instance, but a call on the RHS has the same
+  // ownership requirement.
+  const bool materialize_logical = logical && logical_children.size() == 2 &&
+      has_temporary;
+  const std::size_t pending_before = pending_temporaries_.size();
+  std::string cleanup_true;
+  std::string cleanup_false;
+  if (!materialize_logical && has_temporary) {
+    PrepareConditionLabels(children[0]);
+    cleanup_true = NewBlockLabel("cond_true_cleanup");
+    cleanup_false = NewBlockLabel("cond_false_cleanup");
+  }
+  if (materialize_logical) {
+    const Value condition = LowerLogicalValue(condition_expression);
+    if (has_temporary) {
+      cleanup_true = NewBlockLabel("cond_true_cleanup");
+      cleanup_false = NewBlockLabel("cond_false_cleanup");
+    }
+    LowerTruthBranch(condition,
+                     cleanup_true.empty() ? then_label : cleanup_true,
+                     cleanup_false.empty() ? else_label : cleanup_false);
+  } else {
+    PrepareConditionLabels(children[0]);
+    LowerCondition(children[0], cleanup_true.empty() ? then_label : cleanup_true,
+                   cleanup_false.empty() ? else_label : cleanup_false);
+  }
+  if (has_temporary) {
+    const std::vector<SemaId> temporaries =
+        PendingTemporarySuffix(pending_before);
+    StartBlock(cleanup_true);
+    EmitTemporaryDestructors(temporaries);
+    EmitJump(then_label);
+    StartBlock(cleanup_false);
+    EmitTemporaryDestructors(temporaries);
+    EmitJump(else_label);
+    ClearPendingTemporarySuffix(pending_before);
+  }
 
   StartBlock(then_label);
   const bool then_done = LowerStatement(children[1]);
@@ -2525,10 +2683,12 @@ void Lowerer::LowerReturn(SemaId node)
 {
   const std::vector<SemaId> children = Children(node);
   if (children.empty()) {
+    FlushPendingTemporaryDestructors();
     if (shared_return_cleanup_)
       EmitSharedReturn(0);
     else {
       EmitActiveDestructors();
+      EmitParameterDestructors();
       EmitReturn(0);
     }
     return;
@@ -2544,10 +2704,12 @@ void Lowerer::LowerReturn(SemaId node)
     ProjectDerivedReference(result, expression.type,
                             function_return_type_id_);
     result.type = function_return_type_id_;
+    FlushPendingTemporaryDestructors();
     if (shared_return_cleanup_)
       EmitSharedReturn(&result);
     else {
       EmitActiveDestructors();
+      EmitParameterDestructors();
       EmitReturn(&result);
     }
     return;
@@ -2563,20 +2725,24 @@ void Lowerer::LowerReturn(SemaId node)
       if ((returned.kind == SEMA_ID_EXPRESSION &&
            returned.binding == return_slot_binding_) ||
           IsReturnSlotReuseAction(children[0])) {
+        FlushPendingTemporaryDestructors();
         if (shared_return_cleanup_)
           EmitSharedReturn(0);
         else {
           EmitActiveDestructors();
+          EmitParameterDestructors();
           EmitReturn(0);
         }
         return;
       }
       const lowir_model::Operand destination = TempOperand("%ret");
       LowerClassValueInto(children[0], function_return_type_id_, destination);
+      FlushPendingTemporaryDestructors();
       if (shared_return_cleanup_)
         EmitSharedReturn(0);
       else {
         EmitActiveDestructors();
+        EmitParameterDestructors();
         EmitReturn(0);
       }
       return;
@@ -2608,10 +2774,12 @@ void Lowerer::LowerReturn(SemaId node)
     Value result;
     result.type = function_return_type_id_;
     result.operand = destination.operand;
+    FlushPendingTemporaryDestructors();
     if (shared_return_cleanup_)
       EmitSharedReturn(&result);
     else {
       EmitActiveDestructors();
+      EmitParameterDestructors();
       EmitReturn(&result);
     }
     return;
@@ -2624,10 +2792,12 @@ void Lowerer::LowerReturn(SemaId node)
   if (FindBitField(children[0], bit_field))
     result.type = bit_field.type;
   result = Convert(result, function_return_type_id_);
+  FlushPendingTemporaryDestructors();
   if (shared_return_cleanup_)
     EmitSharedReturn(&result);
   else {
     EmitActiveDestructors();
+    EmitParameterDestructors();
     EmitReturn(&result);
   }
 }
@@ -2650,15 +2820,20 @@ bool Lowerer::LowerStatement(SemaId node)
       Unsupported("this for-init statement");
     if (tree_.At(children[0]).kind == SEMA_SIMPLE_DECLARATION)
       LowerVariableDeclaration(children[0]);
-    else
+    else {
       LowerDiscard(children[0]);
+      FlushPendingTemporaryDestructors();
+    }
     return false;
   }
   case SEMA_ITERATION: {
     const std::vector<SemaId> children = Children(node);
     if (children.size() == 1 &&
         tree_.At(children[0]).kind != SEMA_EXPRESSION_STATEMENT)
+    {
       LowerDiscard(children[0]);
+      FlushPendingTemporaryDestructors();
+    }
     else
       (void)LowerSequence(node);
     return false;
@@ -2670,6 +2845,7 @@ bool Lowerer::LowerStatement(SemaId node)
     const std::vector<SemaId> children = Children(node);
     if (!children.empty())
       LowerDiscard(children[0]);
+    FlushPendingTemporaryDestructors();
     return false;
   }
   case SEMA_RETURN_STATEMENT:
@@ -2730,6 +2906,8 @@ bool Lowerer::LowerSequence(SemaId node)
   const bool tracks_scope =
       (kind == SEMA_COMPOUND_STATEMENT || kind == SEMA_THEN ||
        kind == SEMA_ELSE) && tree_.At(node).scope != 0;
+  const bool duplicate_scope = tracks_scope && !lowering_scopes_.empty() &&
+      lowering_scopes_.back() == tree_.At(node).scope;
   if (tracks_scope) {
     lowering_scopes_.push_back(tree_.At(node).scope);
     if (shared_return_cleanup_)
@@ -2745,7 +2923,7 @@ bool Lowerer::LowerSequence(SemaId node)
     terminated = LowerStatement(child);
   }
   if (tracks_scope) {
-    if (!terminated)
+    if (!terminated && !duplicate_scope)
       EmitScopeDestructors(tree_.At(node).scope);
     if (shared_return_cleanup_) {
       shared_cleanup_head_ = shared_cleanup_scope_heads_.back();

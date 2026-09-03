@@ -30,6 +30,8 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
       break;
     }
   const bool destructor = tilde != last;
+  bool conversion_operator = false;
+  TypeId conversion_type = 0;
   std::string name;
   ScopeId target_scope = scope;
   if (destructor)
@@ -58,12 +60,35 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
     name = qualified_name.Last();
     if (qualified_name.Qualified())
       target_scope = ResolveQualifierScope(scope, qualified_name.Prefix());
+    if (first < last && first < tokens_.size() &&
+        tokens_[first].IsSimple(KW_OPERATOR) && first + 1 < last)
+    {
+      const Pa6Token& target_token = tokens_[first + 1];
+      if (target_token.kind == PA6_SIMPLE_TOKEN &&
+          IsFundamentalTypeKeyword(target_token.simple_type))
+      {
+        conversion_operator = true;
+        conversion_type = types_.FundamentalFromKeywords(
+            std::vector<ETokenType>(1, target_token.simple_type));
+      }
+      else if (target_token.IsIdentifier())
+      {
+        const QualifiedName target_name = ReadQualifiedName(
+            tokens_, first + 1, last);
+        if (!target_name.Empty())
+        {
+          conversion_type = TypeForName(target_name, target_scope);
+          conversion_operator = conversion_type != 0;
+        }
+      }
+    }
   }
   ClassEntityId member_class = 0;
   if (!model_.ClassForScope(target_scope, member_class))
     throw std::runtime_error("special member does not name a class");
   const std::string class_name = model_.ScopeAt(target_scope).name;
-  if ((destructor ? name.substr(1) : name) != class_name)
+  if (!conversion_operator && (destructor ? name.substr(1) : name) !=
+      class_name)
     throw std::runtime_error("special member name does not match its class");
   const AstId clause = FindChild(declarator, AST_PARAMETER_CLAUSE);
   std::vector<ParameterInfo> parameters;
@@ -81,7 +106,8 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
   const bool member_const = HasConstFunctionQualifier(declarator);
   const bool member_volatile = HasVolatileFunctionQualifier(declarator);
   const TypeId declared_type = types_.Function(
-      types_.Fundamental(FT_VOID), parameter_types, variadic, member_const);
+      conversion_operator ? conversion_type : types_.Fundamental(FT_VOID),
+      parameter_types, variadic, member_const);
   std::vector<AstId> defaults;
   for (std::size_t i = 0; i < parameters.size(); ++i)
     defaults.push_back(parameters[i].default_initializer);
@@ -100,22 +126,18 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
       member_volatile,
       false, false,
       false, IsNoThrowDeclarator(declarator, target_scope), defaults,
-      explicit_constructor);
+      conversion_operator ? false : explicit_constructor);
   if (binding == 0)
     throw std::runtime_error("special member has no binding");
 
   FunctionEntity& entity = model_.FunctionAt(function);
-  entity.special_member = destructor ? SPECIAL_MEMBER_DESTRUCTOR :
-      SPECIAL_MEMBER_CONSTRUCTOR;
+  entity.special_member = conversion_operator ? SPECIAL_MEMBER_NONE :
+      (destructor ? SPECIAL_MEMBER_DESTRUCTOR : SPECIAL_MEMBER_CONSTRUCTOR);
   entity.parameter_names.clear();
   for (std::size_t i = 0; i < parameters.size(); ++i)
     entity.parameter_names.push_back(parameters[i].name);
   entity.body = FindChild(node, AST_COMPOUND_STATEMENT);
   entity.ctor_initializer = FindChild(node, AST_CTOR_INITIALIZER);
-  // The declaration may be in the class while its definition is qualified
-  // outside it.  Only the former (or an explicitly inline latter) has weak
-  // ODR linkage in LowIR; the entity bit must not be inferred from the
-  // declaration scope alone.
   entity.in_class_definition = entity.in_class_definition ||
       (definition && scope == target_scope) ||
       (member_specifiers != 0 &&
@@ -124,13 +146,9 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
   entity.deleted = entity.deleted || deleted;
   if (destructor)
     model_.ClassAt(member_class).destructor = function;
-  else
+  else if (!conversion_operator)
   {
     ClassEntity& owner = model_.ClassAt(member_class);
-    // 12.8p2-3: a copy/move constructor has a first parameter that is a
-    // reference to the class itself, and every later parameter has a
-    // default argument.  Record the category once on the canonical entity;
-    // overload selection and class triviality then share this fact.
     bool copy_constructor = false;
     bool move_constructor = false;
     if (!parameters.empty()) {
@@ -204,10 +222,6 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
     MakeSemantic(SEMA_PARAMETER, function_scope, function_node,
                  canonical.parameters[i + 1], parameter);
   }
-  // Keep a semantic copy of each constructor default for implicit base and
-  // member initialization.  Explicit call sites are analyzed below as
-  // usual; these detached nodes cover the separate lowering path used when a
-  // subobject is omitted from the mem-initializer list.
   std::vector<SemaId> default_semantic_arguments(
       canonical.parameters.size(), 0);
   for (std::size_t i = 0; i < parameters.size(); ++i)

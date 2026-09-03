@@ -14,7 +14,11 @@ Lowerer::Lowerer(ProgramLowering& shared, const std::vector<Pa6Token>& tokens,
       active_switch_labels_(0), shared_cleanup_scope_heads_(),
       shared_cleanup_nodes_(), shared_cleanup_head_(),
       shared_return_end_label_(), shared_return_slot_(),
-      shared_return_cleanup_(false), temp_counter_(0), label_counter_(0),
+      shared_return_cleanup_(false), exception_guard_depth_(0),
+      defer_next_call_guard_(false), deferred_call_guard_active_(false),
+      deferred_call_handler_reused_(false), deferred_call_cleanup_(),
+      deferred_call_end_(),
+      temp_counter_(0), label_counter_(0),
       generated_slot_counter_(0), function_return_type_id_(0),
       building_base_variant_(false), return_slot_binding_(0)
 {
@@ -43,6 +47,9 @@ void Lowerer::ResetFunction(const std::string& name,
   slots_.clear();
   parameter_addresses_.clear();
   temporaries_.clear();
+  pending_temporaries_.clear();
+  parameter_destructors_.clear();
+  cleanup_handler_labels_.clear();
   initialized_bitfield_units_.clear();
   goto_labels_.clear();
   condition_labels_.clear();
@@ -55,6 +62,12 @@ void Lowerer::ResetFunction(const std::string& name,
   shared_return_end_label_.clear();
   shared_return_slot_.clear();
   shared_return_cleanup_ = false;
+  exception_guard_depth_ = 0;
+  defer_next_call_guard_ = false;
+  deferred_call_guard_active_ = false;
+  deferred_call_handler_reused_ = false;
+  deferred_call_cleanup_.clear();
+  deferred_call_end_.clear();
   temp_counter_ = 0;
   label_counter_ = 0;
   generated_slot_counter_ = 0;
@@ -491,6 +504,31 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
   }
 
   AddParameterSlots(node);
+  for (std::size_t i = 0; i < type.parameters.size(); ++i) {
+    // The implicit object of a member function is borrowed.  Explicit
+    // by-address class parameters, however, are complete objects whose
+    // destructor runs on every function exit, including an empty user body.
+    if (entity.is_member && !entity.static_member && i == 0)
+      continue;
+    const TypeId parameter_type = types_.Unqualified(type.parameters[i]);
+    if (types_.Kind(parameter_type) != TYPE_CLASS ||
+        ClassBoundary(parameter_type, false) != CBM_BY_ADDRESS)
+      continue;
+    const ClassEntityId class_entity = types_.At(parameter_type).entity;
+    const ClassEntity& owner = model_.ClassAt(class_entity);
+    if (owner.destructor == 0)
+      continue;
+    const FunctionEntity& destructor = model_.FunctionAt(owner.destructor);
+    // Class completion may have installed a synthesized placeholder before
+    // the source destructor is visited.  Its `body` is the stable ownership
+    // fact that distinguishes that later user definition from a genuinely
+    // trivial implicit destructor.
+    if (owner.trivial_destructor && destructor.body == 0)
+      continue;
+    parameter_destructors_.push_back(ParameterObject(
+        parameter_type,
+        TempOperand(function_.params[i + parameter_offset].name)));
+  }
   const SemaId body = FunctionBody(node);
   if (body == 0)
     Unsupported("a function without a body");
@@ -562,8 +600,12 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
     // zero terminator: the block is well-formed and reaching it is the
     // program's undefined behaviour, not a compile-time error.
     if (IsVoidType(types_, type.result)) {
+      EmitActiveDestructors();
+      EmitParameterDestructors();
       EmitReturn(0);
     } else {
+      EmitActiveDestructors();
+      EmitParameterDestructors();
       const Value zero = ZeroValue(type.result);
       EmitReturn(&zero);
     }

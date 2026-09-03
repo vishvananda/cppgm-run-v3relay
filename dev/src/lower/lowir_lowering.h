@@ -103,9 +103,22 @@ private:
   {
     BindingId binding;
     TypeId type;
+    SemaId temporary;
 
-    LiveObject(BindingId binding = 0, TypeId type = 0)
-        : binding(binding), type(type) {}
+    LiveObject(BindingId binding = 0, TypeId type = 0,
+               SemaId temporary = 0)
+        : binding(binding), type(type), temporary(temporary) {}
+  };
+
+  struct ParameterObject
+  {
+    TypeId type;
+    lowir_model::Operand address;
+
+    ParameterObject(TypeId type = 0,
+                    const lowir_model::Operand& address =
+                        lowir_model::Operand())
+        : type(type), address(address) {}
   };
 
   struct SharedCleanupNode
@@ -207,8 +220,9 @@ private:
     std::string slot;
     lowir_model::Operand address;
     bool constructed;
+    bool lifetime_registered;
 
-    TemporaryObject() : constructed(false) {}
+    TemporaryObject() : constructed(false), lifetime_registered(false) {}
   };
 
   // Symbols.
@@ -405,7 +419,8 @@ private:
   Value LowerConditional(SemaId node, TypeId expected);
   Value LowerCall(SemaId node, TypeId expected,
                   const lowir_model::Operand* indirect_destination = 0,
-                  const std::string& indirect_stem = std::string());
+                  const std::string& indirect_stem = std::string(),
+                  bool indirect_destination_is_storage = false);
   Value LowerUnary(SemaId node, bool postfix, TypeId expected,
                    bool as_lvalue = false);
   Value LowerIncrement(SemaId node, SemaId operand_node, bool postfix,
@@ -434,6 +449,7 @@ private:
   void LowerCondition(SemaId node, const std::string& true_label,
                       const std::string& false_label);
   void PrepareConditionLabels(SemaId node);
+  bool ConditionNeedsTemporary(SemaId node) const;
   void LowerTruthBranch(Value value, const std::string& true_label,
                         const std::string& false_label);
   bool LowerStatement(SemaId node);
@@ -482,9 +498,26 @@ private:
       BindingId binding, TypeId root_type,
       const std::vector<std::pair<bool, std::size_t> >& path);
   void RegisterLiveObject(BindingId binding, TypeId type);
+  ScopeId TemporaryExtensionScope(SemaId node) const;
+  bool TemporaryNeedsDestructor(TypeId type) const;
+  void RegisterTemporary(SemaId node, ScopeId extension_scope = 0);
+  void RegisterMaterializedTemporary(
+      SemaId node, TypeId type, const lowir_model::Operand& address,
+      ScopeId extension_scope = 0);
+  void EmitTemporaryDestructor(SemaId node);
+  void EmitTemporaryDestructors(const std::vector<SemaId>& temporaries);
+  std::vector<SemaId> PendingTemporarySuffix(std::size_t first) const;
+  void ClearPendingTemporarySuffix(std::size_t first);
+  void FlushPendingTemporaryDestructors();
   void EmitObjectDestructor(const LiveObject& object);
   void EmitScopeDestructors(ScopeId scope);
   void EmitActiveDestructors();
+  void EmitParameterDestructors();
+  bool HasActiveCleanup() const;
+  bool HasTemporaryArgument(SemaId node) const;
+  std::string CleanupHandlerKey(
+      const std::vector<SemaId>& pending) const;
+  void FinishDeferredCallGuard();
   std::size_t CountReturnStatements(SemaId node) const;
   void EmitSharedReturn(const Value* value);
   void EmitSharedReturnCleanups();
@@ -569,6 +602,9 @@ private:
   // denotes the incoming pointer directly.
   std::map<BindingId, lowir_model::Operand> parameter_addresses_;
   std::map<SemaId, TemporaryObject> temporaries_;
+  std::vector<SemaId> pending_temporaries_;
+  std::vector<ParameterObject> parameter_destructors_;
+  std::map<std::string, std::string> cleanup_handler_labels_;
   // Bit-field allocation units (class scope, unit offset) already written
   // by the initialization in progress; later writes preserve neighbours.
   std::set<std::pair<ScopeId, std::size_t> > initialized_bitfield_units_;
@@ -584,6 +620,12 @@ private:
   std::string shared_return_end_label_;
   std::string shared_return_slot_;
   bool shared_return_cleanup_;
+  unsigned exception_guard_depth_;
+  bool defer_next_call_guard_;
+  bool deferred_call_guard_active_;
+  bool deferred_call_handler_reused_;
+  std::string deferred_call_cleanup_;
+  std::string deferred_call_end_;
   unsigned temp_counter_;
   unsigned label_counter_;
   unsigned generated_slot_counter_;

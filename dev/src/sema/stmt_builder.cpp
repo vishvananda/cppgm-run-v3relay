@@ -123,7 +123,10 @@ void ScopeBuilder::BuildCondition(AstId node, const StatementContext& context,
   }
   if (tree_ == 0)
     return;
-  const SemaId expression = expression_.Analyze(condition, context.scope);
+  SemaId expression = expression_.Analyze(condition, context.scope);
+  if (!switch_condition &&
+      !types_.IsScalar(tree_->At(expression).type))
+    expression = expression_.ContextualBool(expression, context.scope);
   const SemaNode& value = tree_->At(expression);
   if (!switch_condition &&
       (!types_.IsScalar(value.type) ||

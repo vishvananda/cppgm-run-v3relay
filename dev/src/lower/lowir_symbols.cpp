@@ -776,7 +776,9 @@ bool OperatorTerminal(const FunctionEntity& entity, bool unary,
     word = unary ? "deref" : "multiply";
   else if (spelling == "&")
     word = unary ? "address-of" : "bit-and";
-  if (word == 0 || !abi_mangle::lookup_operator(word, &kind))
+  if (word == 0)
+    return false;
+  if (!abi_mangle::lookup_operator(word, &kind))
     throw std::logic_error("LowIR lowering does not support the ABI spelling "
                            "of " + name);
   return true;
@@ -824,6 +826,15 @@ std::string Lowerer::MangleFunction(FunctionEntityId id,
     terminal.kind = abi_mangle::ABI_FUNCTION_RECORD_TERMINAL;
     terminal.terminal.kind = abi_mangle::ABI_TERMINAL_OPERATOR;
     terminal.terminal.operator_kind = operator_kind;
+    records.push_back(terminal);
+  } else if (entity.is_member && entity.name.compare(
+                 0, std::string("operator").size(), "operator") == 0) {
+    // A conversion-function id uses the target type as its ABI terminal;
+    // the member signature intentionally excludes the implicit object.
+    abi_mangle::AbiFunctionRecord terminal;
+    terminal.kind = abi_mangle::ABI_FUNCTION_RECORD_TERMINAL;
+    terminal.terminal.kind = abi_mangle::ABI_TERMINAL_CONVERSION;
+    terminal.type = AbiTypeOf(signature_type.result);
     records.push_back(terminal);
   }
   const bool encoding =

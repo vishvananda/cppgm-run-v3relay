@@ -34,6 +34,10 @@ public:
   // selection order; class prvalues are already materialized and are
   // returned unchanged for elision.
   SemaId InitializeReturn(SemaId expression, TypeId target);
+  // Contextual conversion to bool (4p contextually converted expression):
+  // resolve a class conversion function and retain the call in the semantic
+  // tree so lowering and overload lookup consume one canonical fact.
+  SemaId ContextualBool(SemaId expression, ScopeId scope);
   bool TryConstant(SemaId expression, long long& value) const;
   long long Value(SemaId expression) const;
   const SemaNode& Node(SemaId expression) const;
