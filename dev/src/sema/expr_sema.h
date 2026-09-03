@@ -89,6 +89,11 @@ private:
   SemaId AnalyzeCall(AstId expression, ScopeId scope);
   SemaId AnalyzeNew(AstId expression, ScopeId scope);
   void ResolveCallCallee(AstId callee, ScopeId scope, CallResolution& result);
+  void ResolveNamedCallee(const QualifiedName& name, ScopeId scope,
+                          CallResolution& result);
+  SemaId FinishCall(AstId expression, AstId callee, ScopeId scope,
+                    CallResolution& resolution,
+                    const std::vector<SemaId>& analyzed_arguments);
   SemaId TryFunctionalCast(AstId expression, AstId callee, AstId arguments,
                            ScopeId scope);
   SemaId TryCallableObjectExpression(AstId expression, AstId callee,

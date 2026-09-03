@@ -109,7 +109,12 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    `ContextCanAccess` asks only the classes that name the context; the
    implicit object argument of a member call is bound by
    `BindImplicitObject`, which checks viability but not the base path,
-   because 11.2p5 checks the member in its naming class.
+   because 11.2p5 checks the member in its naming class.  Review 3 added
+   `ClassEntity::empty` (computed with the layout: no non-static data
+   member in the class or any base) and made `ScopeBuilder::
+   BuildFunctionBody` the one owner of a body's jump context (labels,
+   gotos, switch entries, initialized locals), so a local class's member
+   bodies set the enclosing function's state aside instead of clearing it.
 
 3. Expression semantics (`dev/src/sema/expr_sema.cpp`, `overload.cpp`).
    `this` (keyword literal → prvalue `cv X*`), unqualified names inside
@@ -130,6 +135,10 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    member callees); the winner becomes an ordinary `SEMA_CALL`; when no
    user candidate is viable the built-in operator applies; a non-member
    operator needs one class/enum operand.  ADL also serves ordinary calls.
+   Every named call, including the parameter-shaped forms CP7 reclassifies
+   (`sizeof(derived::select(index()))`, `X x(f())`), resolves through
+   `ResolveNamedCallee` and `FinishCall`; `BuildResolvedCall` is the
+   operator-call tail.
 
 4. Lowering (`dev/src/lower/*`).  `LowInfoOf(TYPE_CLASS)` → `LK_OBJECT`
    (`obj<SxA>` slots); member access is `index i8 [projection=field] base,
@@ -189,6 +198,13 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    is set by `GlobalFor`, and a constant static member with an in-class
    initializer that was only folded gets no `declare global`, while a
    thread-local one always does so its wrapper's `tls_for` target exists.
+   `ZeroInitializeObject` owns zero-initialization of a value-initialized
+   member (a scalar-width object is one integer store, a wider one is
+   zeroed per base, member and element); a non-empty class passed by value
+   is copied with `copyobj` through `EmitCopyObject` on both sides of the
+   call, an empty one keeps the bare `$argobj__N` slot the fixtures pin;
+   the serializer renders `copyobj` and `zeroinit`.  Object aliases are
+   published after the emission walk, base-owned entities first.
 
 ## Failure map at CP1 (218 failing, 25 passing; 19 fixtures expect EXIT_FAILURE)
 
@@ -261,6 +277,7 @@ comes from the intended check.
 | CP8 enclosing-scope destruction and incomplete types (completed) | qualified special-member ownership for deferred bodies, explicit and pseudo-destructor targets, base/complete ABI variants and aliases, reference-address initialization, incomplete class return declarations, and qualified nested-type mangling | 200/243 pa16 tests pass (43 failures, down from 51); packet 6/6 exact; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | CP9 member initialization and layout paths (completed) | canonical aliased-base initializer matching, reference-member lvalue and address storage, qualified nested class definitions, retained `alignas` metadata, class/member alignment validation, discarded class glvalues, and bit-field aggregate stores | 213/243 pa16 tests pass (30 failures, down from 43) with unchanged coverage; packet 6/6 exact, extended focused set 7/7, and related alignment/layout set 6/6; through-pa15 1139/1139; file audit passes with five warnings; scaling probes remain linear; no fixture or reference changes |
 | CP10 conversion and call-lowering paths (completed) | extern class declarations without lifetime actions, block-scope aggregate array elements through synthesized in-place constructors, reference-return lvalue/rvalue boundaries, assignment conversion ordering, and trivial four-byte value-initialization | 218/243 pa16 tests pass (25 failures, down from 30) with unchanged coverage; the three packet failures now pass exact comparison, as does the adjacent `Pair[]` constructor fixture; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
+| review 3 (completed; `audit.md`) | wide value-initialized members zeroed; by-value class objects copied with `copyobj` (empty classes keep the fixture slot); one owner for a body's jump context; one named-call path; typed alias ordering; serializer writers shared; pseudo-destructor target by type | 218/243 (25 failures, the turn-start set; strict subset of review 2's 58); through-pa15 1139/1139; file audit passes with five warnings; probes linear |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -327,6 +344,22 @@ test-report-through-pa15` 1139/1139, `make test-report-through-pa16`
 1324/1382, the file audit passes with five warnings, and the plan's probes
 plus `prot 8000/16000` (0.70/1.44 s) double per doubling.  Deliberate
 leftovers are listed in `audit.md` review 2 finding 7.
+
+Review 3 evidence (2026-09-03, `audit.md`): diffing the turn-start failing
+set against a rebuilt review-2 executable showed no hidden regression (58
+→ 25, a strict subset).  Probes found three material defects in the
+reviewed checkpoints: a value-initialized member wider than eight bytes
+was left uninitialized, a non-empty class passed by value arrived
+uninitialized on both sides, and a `goto` before a local class with member
+definitions lost its record because three copies of the goto-resolution
+loop cleared the enclosing body's state.  `ZeroInitializeObject`,
+`ClassEntity::empty` with `copyobj`, and `BuildFunctionBody` own those
+facts now; CP7's second call path, CP8's alias sort and serializer copy,
+and a spelling-based pseudo-destructor check were folded into their
+owners.  `make test-pa16` is 218/243 with the identical failing set,
+`make test-report-through-pa15` 1139/1139, the file audit passes with five
+warnings, and the plan's probes double per doubling.  Deliberate leftovers
+are listed in `audit.md` review 3 finding 10.
 
 ## Completed Checkpoint: CP1 — class model, layout, members, methods
 
@@ -688,26 +721,56 @@ changed.
 
 ## Active Checkpoint: CP11 — remaining LowIR shape and diagnostic boundaries
 
-Goal: reduce the remaining pa16 LowIR-shape and semantic-diagnostic failures
-while preserving the completed CP1–CP10 ownership paths.
+Goal: reduce the remaining 25 pa16 failures (15 LowIR-shape mismatches,
+nine semantic rejections, one invalid indirect call) while preserving the
+CP1–CP10 ownership paths and the review-3 owners (`BuildFunctionBody`,
+`FinishCall`, `ZeroInitializeObject`, `ClassEntity::empty`).
 
 ### Implementation Packet
 
-- Own the next semantic or direct lowering boundary in the named source path;
-  do not edit fixtures or `.ref` files.
-- Start with `100-function-pointer-nested-param-name-shadow`,
+- Own the next semantic or direct lowering boundary in the named source
+  path; do not edit fixtures or `.ref` files.
+- Semantic rejections, by first error: `unknown name in expression`
+  (`200-function-boundary-metadata-emission`,
+  `200-parameter-access-metadata-emission`,
+  `200-parameter-alias-metadata-emission`), `initializer conversion is not
+  viable` (`300-using-declaration-public-private-base-member`,
+  `spec/200-conditional-derived-base-lvalue-reference`), `incompatible
+  pointer comparison` (`spec/200-const-reference-binds-derived-pointer-
+  prvalue`), `no unique viable function overload`
+  (`200-implicit-member-call-suppresses-adl`), `no viable constructor`
+  (`200-string-literal-does-not-convert-to-mutable-void-pointer`), `a
+  static or function member lvalue` (`200-parenthesized-member-call`), and
+  the indirect call without a signature
+  (`200-nested-class-private-enclosing-access`).  Start with the trio and
+  the two conversion failures: they share the derived-to-base and
+  reference-binding conversion path in `Initialize` / `conversions.cpp`.
+- LowIR shape mismatches: `100-function-pointer-nested-param-name-shadow`,
   `100-global-aggregate-nested-array-initializer`,
-  `200-const-subobject-member-call`, `200-nested-braced-member-aggregate-init`,
-  `200-nested-class-private-enclosing-access`, and
-  `300-value-init-empty-functional-cast-aggregate`.
+  `200-const-subobject-member-call`,
+  `200-friend-derived-private-base-defaulted-constructor`,
+  `200-member-pointer-const-typedef-return`,
+  `200-nested-braced-member-aggregate-init`,
+  `200-nonliteral-field-condition-not-folded`,
+  `200-unnamed-namespace-hidden-friend-single-definition`,
+  `300-callable-field-hides-private-base-method`,
+  `300-friend-function-definition-skip`,
+  `300-namespace-aggregate-array-string-members`,
+  `300-operator-nullptr-t-from-zero`,
+  `300-synthesized-array-member-lifecycle`,
+  `300-value-init-empty-functional-cast-aggregate`,
+  `400-bit-field-prefix-postfix-increment`.  Read each
+  `.my.lowir.compare.diff` first; a defaulted constructor's
+  value-initialization should reuse `ZeroInitializeObject`.
 - Inspect `dev/src/lower/lowir_expr.cpp` (`Convert`, `LowerMember`,
   `LowerCall`, `LowerAssignment`), `dev/src/lower/lowir_program.cpp`
-  (`LowerVariable`, `LowerAggregateObjectInitializer`), and
-  `dev/src/lower/lowir_symbols.cpp` (`BuildGlobalDefinitions`,
-  `BuildDeclarations`) before changing a consumer; consult the matching
-  sema owner only when the canonical fact is missing.
-- Trace each failure from its canonical conversion/call or initialization
-  fact through LowIR, keeping destructor, pseudo-destructor, incomplete-type,
-  and alignment state unchanged.  Require a focused comparison,
-  `make test-pa16`, the through-pa15 report, and the pa16 file audit before
-  closing CP11.
+  (`LowerVariable`, `LowerAggregateObjectInitializer`,
+  `LowerMemberInitializer`), and `dev/src/lower/lowir_symbols.cpp`
+  (`BuildGlobalDefinitions`, `BuildDeclarations`) before changing a
+  consumer; consult the matching sema owner only when the canonical fact
+  is missing.
+- Known non-goals recorded in `audit.md` review 3 finding 10: block-scope
+  `static` objects (no fixture), by-value copy semantics (PA17).
+- Require a focused comparison, `make test-pa16`, the through-pa15 report,
+  and the pa16 file audit before closing CP11; the failing set must shrink,
+  never merely shift.

@@ -239,6 +239,20 @@ void Lowerer::EmitStore(const lowir_model::LowType& type,
   Emit(store);
 }
 
+// A trivial object copy of `type`'s complete size from a pointer or an
+// object-typed value into the object at `destination`.
+void Lowerer::EmitCopyObject(TypeId type, const lowir_model::Operand& source,
+                             const lowir_model::Operand& destination)
+{
+  lowir_model::Instruction copy;
+  copy.kind = lowir_model::Instruction::IK_COPYOBJ;
+  copy.byte_count = types_.SizeOf(type);
+  copy.byte_alignment = types_.AlignOf(type);
+  copy.first = source;
+  copy.second = destination;
+  Emit(copy);
+}
+
 void Lowerer::EmitVoidCall(
     const std::string& symbol,
     const std::vector<lowir_model::Operand>& arguments)
@@ -436,11 +450,17 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
   CollectSlots(body, source_slots);
   StartBlock("^entry");
   for (std::size_t i = 0; i < function_.params.size(); ++i) {
-    // Object parameters are opaque LowIR values.  Their storage is only
-    // materialized at a use site; an empty class parameter with no semantic
-    // use must not acquire an observable copy at function entry.
-    if (types_.Kind(types_.Unqualified(type.parameters[i])) == TYPE_CLASS)
+    // An empty class parameter object has no value: its slot is declared
+    // but never stored (the fixture shape).  Every other parameter,
+    // including a non-empty class object, is stored to its slot on entry.
+    const TypeId parameter_type = types_.Unqualified(type.parameters[i]);
+    if (types_.Kind(parameter_type) == TYPE_CLASS) {
+      if (model_.ClassAt(types_.At(parameter_type).entity).empty)
+        continue;
+      EmitCopyObject(parameter_type, TempOperand(function_.params[i].name),
+                     SlotOperand(function_.slots[i].first));
       continue;
+    }
     EmitStore(function_.params[i].type, TempOperand(function_.params[i].name),
               SlotOperand(function_.slots[i].first));
   }

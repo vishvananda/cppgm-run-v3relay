@@ -1920,21 +1920,26 @@ Lowerer::Value Lowerer::LowerClassArgument(SemaId node, TypeId parameter)
   const TypeId object_type = types_.Unqualified(parameter);
   if (types_.Kind(object_type) != TYPE_CLASS)
     Unsupported("a non-class object argument");
+  const ClassEntity& class_entity =
+      model_.ClassAt(types_.At(object_type).entity);
 
   const std::string slot = NewGeneratedSlot("argobj", LowTypeOf(parameter));
   Value destination;
   destination.type = parameter;
   destination.lvalue = true;
   destination.operand = SlotOperand(slot);
-  // Keep the materialized destination's address in the instruction stream;
+  // The parameter object's address enters the instruction stream first;
   // the opaque object operand passed to the call is the slot itself.
-  (void)AddressValue(destination);
+  const Value destination_address = AddressValue(destination);
 
+  // Copy construction is outside PA16, so the class objects that reach a
+  // by-value parameter are trivially copyable: an empty class has no value
+  // to copy, any other class is copied as one object (`copyobj`).
   const SemaNode& source = tree_.At(node);
-  if (source.category == VC_LVALUE)
-    (void)AddressValue(LowerLValue(node));
-  else
-    (void)LowerRValue(node, parameter);
+  const Value copied = source.category == VC_LVALUE ?
+      AddressValue(LowerLValue(node)) : LowerRValue(node, parameter);
+  if (!class_entity.empty)
+    EmitCopyObject(object_type, copied.operand, destination_address.operand);
 
   Value result;
   result.type = parameter;

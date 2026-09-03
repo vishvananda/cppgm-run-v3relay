@@ -103,35 +103,8 @@ void ScopeBuilder::CompleteClassMembers(ClassEntityId entity,
     const DeferredMemberBody pending = deferred_member_bodies_[i];
     if (pending.function == 0)
       continue;
-    labels_.clear();
-    gotos_.clear();
-    initialized_locals_.clear();
-    jump_sequence_ = 0;
-    if (pending.body != 0)
-      (void)BuildCompound(pending.body, pending.scope, pending.function, 0, 0,
-                          pending.function_node);
-    else if (pending.function_node != 0)
-      (void)MakeSemantic(SEMA_COMPOUND_STATEMENT, pending.scope,
-                         pending.function_node);
-    for (std::size_t g = 0; g < gotos_.size(); ++g)
-    {
-      const std::map<std::string, LabelRecord>::const_iterator label =
-          labels_.find(gotos_[g].name);
-      if (label == labels_.end())
-        throw std::runtime_error("goto target does not name a label");
-      if (gotos_[g].node != 0)
-      {
-        tree_->At(gotos_[g].node).has_value = true;
-        tree_->At(gotos_[g].node).value = label->second.ordinal;
-      }
-      CheckJumpTarget(gotos_[g].sequence,
-                      gotos_[g].node != 0 ? tree_->At(gotos_[g].node).scope :
-                      pending.scope,
-                      label->second.sequence, label->second.scope);
-    }
-    labels_.clear();
-    gotos_.clear();
-    initialized_locals_.clear();
+    BuildFunctionBody(pending.body, pending.scope, pending.function,
+                      pending.function_node);
   }
   if (EmitsSemantics())
   {

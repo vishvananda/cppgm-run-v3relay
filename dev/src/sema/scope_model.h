@@ -213,6 +213,10 @@ struct ClassEntity
   // synthesize from these; lowering decides which calls to emit from them.
   bool trivial_default_constructor;
   bool trivial_destructor;
+  // 9p7 empty class: no non-static data members (named or not) in the
+  // class or any base.  Lowering passes such a by-value parameter as a
+  // bare object slot; every other class parameter object is copied.
+  bool empty;
   bool aggregate;
   bool is_union;
   bool defined;

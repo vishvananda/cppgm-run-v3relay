@@ -182,39 +182,11 @@ void ScopeBuilder::BuildSpecialMember(AstId node, ScopeId scope)
           canonical.parameters[i + 1]);
   model_.FunctionAt(function).default_semantic_arguments.swap(
       default_semantic_arguments);
-  labels_.clear();
-  gotos_.clear();
-  initialized_locals_.clear();
-  jump_sequence_ = 0;
   if (deferred_definition)
     deferred_member_bodies_.push_back(DeferredMemberBody(
         model_.FunctionAt(function).body, function_scope, function,
         function_node));
   else
-  {
-    if (model_.FunctionAt(function).body != 0)
-      (void)BuildCompound(model_.FunctionAt(function).body, function_scope,
-                           function, 0, 0, function_node);
-    else
-      (void)MakeSemantic(SEMA_COMPOUND_STATEMENT, function_scope,
-                         function_node);
-    for (std::size_t i = 0; i < gotos_.size(); ++i)
-    {
-      const std::map<std::string, LabelRecord>::const_iterator label =
-          labels_.find(gotos_[i].name);
-      if (label == labels_.end())
-        throw std::runtime_error("goto target does not name a label");
-      if (gotos_[i].node != 0)
-      {
-        tree_->At(gotos_[i].node).has_value = true;
-        tree_->At(gotos_[i].node).value = label->second.ordinal;
-      }
-      CheckJumpTarget(gotos_[i].sequence, gotos_[i].node != 0 ?
-                          tree_->At(gotos_[i].node).scope : function_scope,
-                      label->second.sequence, label->second.scope);
-    }
-    labels_.clear();
-    gotos_.clear();
-    initialized_locals_.clear();
-  }
+    BuildFunctionBody(model_.FunctionAt(function).body, function_scope,
+                      function, function_node);
 }

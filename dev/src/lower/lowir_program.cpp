@@ -1,7 +1,6 @@
 // Translation-unit entry, condition lowering, and statement lowering.
 #include "lower/lowir_lowering.h"
 
-#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -148,6 +147,12 @@ void Lowerer::Run()
   // walk bounded by the unit's finite entity table while allowing those
   // references to request the matching variant before validation.
   std::set<FunctionEntityId> emitted;
+  // Object aliases are published after the walk: a base-subobject entry
+  // is the first semantic reason for an alias, so aliases of entities that
+  // own one precede aliases of complete-only weak definitions, each group
+  // in emission order.
+  std::vector<std::pair<FunctionEntityId, lowir_model::ObjectAlias> >
+      pending_aliases;
   bool emitted_one = true;
   while (emitted_one) {
     emitted_one = false;
@@ -172,7 +177,7 @@ void Lowerer::Run()
           lowir_model::ObjectAlias alias;
           alias.object_symbol = symbol.base_object;
           alias.target = symbol.name;
-          program_.object_aliases.push_back(alias);
+          pending_aliases.push_back(std::make_pair(id, alias));
         }
       }
       if (symbol.definition != 0 && symbol.base_required &&
@@ -183,21 +188,11 @@ void Lowerer::Run()
       }
     }
   }
-  // Base-entry ownership is the first semantic reason for an object alias;
-  // keep those aliases ahead of aliases for complete-only weak definitions,
-  // while preserving function order within each ownership class.
-  std::set<std::string> base_alias_targets;
-  for (std::size_t i = 0; i < function_order_.size(); ++i)
-    if (functions_[function_order_[i]].base_required)
-      base_alias_targets.insert(functions_[function_order_[i]].name);
-  std::stable_sort(program_.object_aliases.begin(),
-                   program_.object_aliases.end(),
-                   [&base_alias_targets](const lowir_model::ObjectAlias& left,
-                                         const lowir_model::ObjectAlias& right) {
-    const bool left_base = base_alias_targets.count(left.target) != 0;
-    const bool right_base = base_alias_targets.count(right.target) != 0;
-    return left_base && !right_base;
-  });
+  for (int base_owned = 1; base_owned >= 0; --base_owned)
+    for (std::size_t i = 0; i < pending_aliases.size(); ++i)
+      if (functions_[pending_aliases[i].first].base_required ==
+          (base_owned != 0))
+        program_.object_aliases.push_back(pending_aliases[i].second);
   BuildThreadLocalInitializers();
   BuildGlobalInitializers();
   BuildGlobalFinalizers();
@@ -1346,22 +1341,10 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
         constructor.member_class != 0 &&
         model_.ClassAt(constructor.member_class).trivial_default_constructor;
     if (!is_base && constructor.synthesized && arguments.empty()) {
-      // Value-initialization of a trivial synthesized class constructor is
-      // the zero-initialization of the complete object.  The old lowering
-      // only handled the eight-byte case, which made a four-byte trivial
-      // derived subobject fall through to the intentionally omitted symbol.
-      const std::size_t size = types_.SizeOf(initializer.type);
-      if (size == 1)
-        EmitStore(LowTypeOf(types_.Fundamental(FT_CHAR)), Immediate(0),
-                  destination);
-      else if (size == 2)
-        EmitStore(LowTypeOf(types_.Fundamental(FT_SHORT_INT)), Immediate(0),
-                  destination);
-      else if (size == 4)
-        EmitStore(LowTypeOf(types_.Fundamental(FT_INT)), Immediate(0),
-                  destination);
-      else if (size == 8)
-        EmitStore(I64Type(), Immediate(0), destination);
+      // 8.5p7: `m()` with a default constructor that is not user-provided
+      // zero-initializes the member; a non-trivial one is then
+      // default-initialized by the call below.
+      ZeroInitializeObject(initializer.type, destination);
       if (trivial_default)
         return;
     }
@@ -1411,6 +1394,75 @@ void Lowerer::EmitDefaultConstruction(FunctionEntityId constructor,
         type.parameters[parameter]).operand);
   }
   EmitVoidCall(symbol, arguments);
+}
+
+// 8.5p5 zero-initialization of one object at `destination`.  An object of
+// scalar width is one integer store (the fixtures' spelling for a
+// value-initialized class member); a wider object is zeroed per base,
+// member and element, with one store per bit-field allocation unit.
+void Lowerer::ZeroInitializeObject(TypeId type,
+                                   const lowir_model::Operand& destination)
+{
+  const TypeId unqualified = types_.Unqualified(type);
+  const bool is_class = types_.Kind(unqualified) == TYPE_CLASS;
+  const bool is_array = types_.Kind(unqualified) == TYPE_ARRAY;
+  if (!is_class && !is_array) {
+    EmitStore(LowTypeOf(unqualified), ZeroOperand(unqualified), destination);
+    return;
+  }
+  switch (types_.SizeOf(unqualified)) {
+  case 1:
+    EmitStore(LowTypeOf(types_.Fundamental(FT_CHAR)), Immediate(0),
+              destination);
+    return;
+  case 2:
+    EmitStore(LowTypeOf(types_.Fundamental(FT_SHORT_INT)), Immediate(0),
+              destination);
+    return;
+  case 4:
+    EmitStore(LowTypeOf(types_.Fundamental(FT_INT)), Immediate(0),
+              destination);
+    return;
+  case 8:
+    EmitStore(I64Type(), Immediate(0), destination);
+    return;
+  default:
+    break;
+  }
+  if (is_array) {
+    const TypeId element = types_.At(unqualified).base;
+    const std::size_t bound = types_.At(unqualified).array_bound;
+    for (std::size_t i = 0; i < bound; ++i)
+      ZeroInitializeObject(element,
+                           ProjectArrayElement(destination, element, i));
+    return;
+  }
+  const ClassEntity& class_entity = model_.ClassAt(
+      types_.At(unqualified).entity);
+  for (std::size_t i = 0; i < class_entity.bases.size(); ++i) {
+    const ClassBase& base = class_entity.bases[i];
+    ZeroInitializeObject(
+        model_.ClassAt(base.entity).type,
+        ProjectField(destination, base.offset,
+                     lowir_model::IPK_BASE_SUBOBJECT));
+  }
+  bool have_unit = false;
+  std::size_t unit_offset = 0;
+  for (std::size_t i = 0; i < class_entity.fields.size(); ++i) {
+    const ClassField& field = class_entity.fields[i];
+    if (field.static_member)
+      continue;
+    if (field.bit_width != 0) {
+      if (have_unit && field.offset == unit_offset)
+        continue;
+      have_unit = true;
+      unit_offset = field.offset;
+    } else if (field.binding == 0 &&
+               types_.Kind(types_.Unqualified(field.type)) != TYPE_CLASS) {
+      continue;  // a zero-width bit-field only realigns the next unit
+    }
+    ZeroInitializeObject(field.type, ProjectField(destination, field.offset));
+  }
 }
 
 void Lowerer::LowerConstructorInitializers(FunctionEntityId function,

@@ -46,7 +46,7 @@ ClassEntity::ClassEntity()
       size(0), alignment(1), requested_alignment(0), pack_alignment(0),
       destructor(0), inheriting_constructor_base(0), layout_complete(false),
       trivial_default_constructor(true), trivial_destructor(true),
-      aggregate(true), is_union(false), defined(false)
+      empty(false), aggregate(true), is_union(false), defined(false)
 {
 }
 
@@ -716,12 +716,10 @@ void SemaModel::CollectClassMember(
       result.resize(before);
       result.insert(result.end(), kept.begin(), kept.end());
     }
+    // A declaration in the derived class hides every base declaration of
+    // the same name, including declarations that are not viable overloads.
     return;
   }
-  // A declaration in the derived class hides every base declaration of the
-  // same name, including declarations that are not viable overloads.
-  if (result.size() != before)
-    return;
   for (std::size_t i = 0; i < value.bases.size(); ++i)
     CollectClassMember(value.bases[i].entity, name, filter, visited, result);
 }

@@ -899,34 +899,12 @@ void ScopeBuilder::BuildFunctionDefinition(AstId node, ScopeId scope)
       }
     }
   }
-  labels_.clear();
-  gotos_.clear();
-  initialized_locals_.clear();
-  jump_sequence_ = 0;
   if (model_.ScopeAt(scope).kind == SCOPE_CLASS) {
     deferred_member_bodies_.push_back(DeferredMemberBody(
         body, function_scope, function, function_node));
     return;
   }
-  (void)BuildCompound(body, function_scope, function, 0, 0, function_node);
-  for (std::size_t i = 0; i < gotos_.size(); ++i)
-  {
-    const std::map<std::string, LabelRecord>::const_iterator label =
-        labels_.find(gotos_[i].name);
-    if (label == labels_.end())
-      throw std::runtime_error("goto target does not name a label");
-    if (gotos_[i].node != 0)
-    {
-      tree_->At(gotos_[i].node).has_value = true;
-      tree_->At(gotos_[i].node).value = label->second.ordinal;
-    }
-    CheckJumpTarget(gotos_[i].sequence, tree_ != 0 && gotos_[i].node != 0 ?
-                        tree_->At(gotos_[i].node).scope : function_scope,
-                    label->second.sequence, label->second.scope);
-  }
-  labels_.clear();
-  gotos_.clear();
-  initialized_locals_.clear();
+  BuildFunctionBody(body, function_scope, function, function_node);
 }
 
 // Special members are declarations without a decl-specifier-seq in the AST.
@@ -1687,6 +1665,12 @@ void ScopeBuilder::CompleteClassLayout(ClassEntityId entity)
   }
   if (have_bit_unit)
     offset = std::max(offset, bit_unit_offset + bit_unit_size);
+  bool empty = true;
+  for (std::size_t i = 0; empty && i < value.bases.size(); ++i)
+    empty = model_.ClassAt(value.bases[i].entity).empty;
+  for (std::size_t i = 0; empty && i < value.fields.size(); ++i)
+    empty = value.fields[i].static_member;
+  value.empty = empty;
 
   // C++ gives every complete class object a nonzero size, and an object's
   // size is a multiple of its alignment.

@@ -457,6 +457,53 @@ bool ScopeBuilder::TryBuildAmbiguousReferenceDeclaration(
   return true;
 }
 
+// A function body owns its labels, gotos, switch entries and initialized
+// locals.  A local class member body is built while its enclosing body is
+// open, so that body's state is set aside rather than cleared.
+void ScopeBuilder::BuildFunctionBody(AstId body, ScopeId function_scope,
+                                     FunctionEntityId function,
+                                     SemaId function_node)
+{
+  std::map<std::string, LabelRecord> saved_labels;
+  std::vector<GotoRecord> saved_gotos;
+  std::map<ScopeId, std::vector<unsigned> > saved_initialized_locals;
+  std::vector<SwitchEntry> saved_switch_entries;
+  saved_labels.swap(labels_);
+  saved_gotos.swap(gotos_);
+  saved_initialized_locals.swap(initialized_locals_);
+  saved_switch_entries.swap(switch_entries_);
+  const unsigned saved_jump_sequence = jump_sequence_;
+  jump_sequence_ = 0;
+
+  if (body != 0)
+    (void)BuildCompound(body, function_scope, function, 0, 0, function_node);
+  else if (function_node != 0)
+    (void)MakeSemantic(SEMA_COMPOUND_STATEMENT, function_scope,
+                       function_node);
+  for (std::size_t i = 0; i < gotos_.size(); ++i)
+  {
+    const std::map<std::string, LabelRecord>::const_iterator label =
+        labels_.find(gotos_[i].name);
+    if (label == labels_.end())
+      throw std::runtime_error("goto target does not name a label");
+    const bool has_node = tree_ != 0 && gotos_[i].node != 0;
+    if (has_node)
+    {
+      tree_->At(gotos_[i].node).has_value = true;
+      tree_->At(gotos_[i].node).value = label->second.ordinal;
+    }
+    CheckJumpTarget(gotos_[i].sequence,
+                    has_node ? tree_->At(gotos_[i].node).scope : function_scope,
+                    label->second.sequence, label->second.scope);
+  }
+
+  labels_.swap(saved_labels);
+  gotos_.swap(saved_gotos);
+  initialized_locals_.swap(saved_initialized_locals);
+  switch_entries_.swap(saved_switch_entries);
+  jump_sequence_ = saved_jump_sequence;
+}
+
 void ScopeBuilder::BuildStatement(AstId node, const StatementContext& context)
 {
   if (node == 0)

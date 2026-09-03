@@ -1,5 +1,175 @@
 # PA16 Checkpoint Review — cppgm++ --emit-lowir with the basic object model
 
+## Review 3 (2026-09-03): CP7–CP10
+
+Scope: the four implementation checkpoints since review 2 (`8d71a7b5d`
+qualified and deferred member types, `5cedae657` enclosing special-member
+contexts, `95f01acef` member initialization and layout, `3ea514d42`
+aggregate and reference conversion boundaries), read in full against the
+README boundary, the plan's ownership and performance rules, spec.md's
+one-owner and bounded-work requirements, and the fixtures they cite.
+Method: the review-2 executable was rebuilt in a worktree and its pa16
+failing set diffed against the turn-start set (58 → 25, a strict subset:
+no regression hidden by the count); representative facts were traced from
+their owner to the emitted text (the reclassified
+`sizeof(derived::select(index()))` call, a qualified nested constructor
+definition with its C1/C2 variants and alias, an explicit destructor call,
+`alignas` on a class head, a member and a forward declaration, a reference
+member read, a value-initialized trivial member, a reference-returning call
+used as lvalue and rvalue, an in-place aggregate array element, and the
+empty-class by-value parameter fixture); generated probes covered a `goto`
+around a local class, a twelve-byte value-initialized member, a non-empty
+class passed by value, and block-scope statics; the plan's scaling probes
+were timed on the review build.
+
+### Findings and changes
+
+1. **Value-initialized members wider than eight bytes were left
+   uninitialized (material, fixed).**  CP10 replaced the eight-byte-only
+   zero store in `LowerMemberInitializer` with a 1/2/4/8 switch and then
+   returned for every trivial default constructor, so `Q() : p() {}` with a
+   twelve-byte `P` emitted a field projection and no store (before CP10 the
+   same input failed cleanly).  `Lowerer::ZeroInitializeObject` now owns
+   8.5p5 zero-initialization of one object: scalar widths keep the fixtures'
+   single integer store, wider objects are zeroed per base, member and
+   element with one store per bit-field allocation unit, and a synthesized
+   non-trivial default constructor is zeroed before its call (8.5p7).
+2. **By-value class arguments lost their value (material, fixed).**  CP8's
+   `LowerClassArgument` materialized `$argobj__N` for the empty-class
+   fixture and passed it without a copy, and `BuildFunctionVariant` stopped
+   storing every class parameter, so a non-empty trivially copyable class
+   arrived uninitialized on both sides.  The pre-CP8 spelling (`load
+   obj<8x4>` / `store obj<8x4>`) was itself invalid LowIR: the validator's
+   `load`/`store` take word types, and object copies are `copyobj`.  The
+   class model now records `ClassEntity::empty` with the layout (no
+   non-static data member in the class or any base); the empty case keeps
+   the fixture shape, every other class parameter object is copied with
+   `copyobj` (caller: source pointer → parameter object; callee: object
+   value → slot) through `EmitCopyObject`.  The serializer learned
+   `copyobj` and `zeroinit`, which the parser, the in-process validator and
+   the CY86 backend already accepted.  Pass-by-value semantics stay PA17's
+   layer; this is the trivial copy the IR defines, validated by the
+   harness on the probe.
+3. **Function-body jump state was cleared, not saved, around nested
+   bodies (material, fixed).**  `labels_`, `gotos_`, `initialized_locals_`
+   and `jump_sequence_` were reset by three copies of the same
+   goto-resolution loop (`BuildFunctionDefinition`, `CompleteClassMembers`,
+   and CP8's `BuildSpecialMember`, which also cleared them at declaration
+   time).  A `goto` placed before a local class with any member definition
+   lost its record ("label without a semantic ordinal"), and an initialized
+   local declared before such a class was forgotten by the 6.7p3 check.
+   `ScopeBuilder::BuildFunctionBody` is the one owner: it sets the
+   enclosing body's state aside (including `switch_entries_`), builds and
+   resolves the body, and restores it; the three sites call it.  The
+   goto-past-initialization probe now fails with "jump bypasses variable
+   initialization" and the goto-around-local-class probe compiles.
+4. **A second call-resolution path (fixed).**  CP7's `AnalyzeNamedCall`
+   re-implemented named-callee lookup, implicit-object detection, overload
+   selection and call construction for the reclassified ambiguous forms.
+   `ResolveNamedCallee` (shared with `ResolveCallCallee`) and `FinishCall`
+   (the tail of `AnalyzeCall`, which now takes analyzed arguments) are the
+   single path, so those forms get the same template, builtin, arity and
+   default-argument treatment as ordinary calls.
+5. **Alias ordering through a name set (fixed).**  CP8 sorted
+   `object_aliases` after the emission walk with a `std::set<std::string>`
+   of base-required symbol names.  Aliases are collected with their
+   `FunctionEntityId` and published in two linear passes (base-owned
+   first): typed identity, no sort, no string set; output unchanged.
+6. **Duplicated serializer metadata writer (fixed).**
+   `append_function_metadata` copied the bodies of
+   `append_boundary_metadata` and `append_symbol_metadata`; the three now
+   share `append_boundary_items` / `append_symbol_items`.  Output unchanged
+   (through-pa15 1139/1139).
+7. **Pseudo-destructor name compared by spelling (fixed).**  `p->~T()` on
+   a class required `T` to equal the class scope's printed name.  The name
+   is now looked up as a type in the object's class and then in the context
+   (3.4.5p3) and compared by canonical type, so a typedef spelling names
+   the class and a different class is still rejected.
+8. **Dead branch (fixed).**  `CollectClassMember` kept an unreachable
+   derived-hides-base return behind CP7's early return.
+9. **Verified and kept.**  CP7's reclassification of parameter-shaped
+   expressions (`FindAmbiguousDirectInitializer`,
+   `AnalyzeAmbiguousParameter` / `AnalyzeAmbiguousTypeId`,
+   `TryBuildAmbiguousReferenceDeclaration`) is bounded (per-declarator
+   lookups, one retry per `sizeof` operand) and lives in sema because the
+   parser's disambiguator cannot see inherited names; injected-class-name
+   materialization and using-declaration hiding in `CollectClassMember`
+   are per lookup and bounded by overload-set sizes.  CP8's out-of-class
+   special members mark `base_required` so one definition owns both
+   Itanium variants; `QualifiedTypeName` renders the ABI type name once per
+   symbol at the PA14 adapter boundary (`AbiType::name` is that adapter's
+   input); the incomplete-class return declaration is `-> void` as the
+   fixture pins.  CP9's `alignas` clauses are canonicalized per declaration
+   by `AlignmentSpecifiers` and validated in `CompleteClassLayout`, with
+   `pack_alignment` and `requested_alignment` kept as separate facts; a
+   reference member expression denotes its referent.  CP10's extern class
+   declarations start no lifetime and are declared only when referenced;
+   the reference-return load sits at the rvalue boundary; aggregate class
+   array elements construct in place.
+10. **Kept deliberately, recorded here.**  Block-scope `static` objects
+    (scalar and class alike) are lowered as automatic slots re-initialized
+    on every call: pre-PA16 behaviour with no fixture, and the CP10 array
+    element path inherits it.  `AnalyzeSizeof` and
+    `AnalyzeAmbiguousParameter` retry the expression reading from a caught
+    exception (one per operand).  `BuildResolvedCall` remains the
+    operator-call tail beside `FinishCall`.  The bit-field branch of
+    `LowerAggregateObjectInitializer` duplicates its value computation to
+    order the encode before the projection.
+
+### Ownership after review
+
+| fact | owner | consumers |
+| --- | --- | --- |
+| empty class (no non-static member through any base) | `ClassEntity::empty`, computed in `CompleteClassLayout` | `LowerClassArgument`, `BuildFunctionVariant` |
+| zero-initialization of one object (8.5p5) | `Lowerer::ZeroInitializeObject` | `LowerMemberInitializer` |
+| trivial object copy | `Lowerer::EmitCopyObject` → `copyobj` | by-value class parameters, both sides |
+| a function body's jump context (labels, gotos, switch entries, initialized locals) | `ScopeBuilder::BuildFunctionBody` | `BuildFunctionDefinition`, `BuildSpecialMember`, `CompleteClassMembers` |
+| named callee resolution and call completion | `ResolveNamedCallee`, `FinishCall` | `AnalyzeCall`, `AnalyzeNamedCall` (ambiguous forms) |
+| object alias publication order | the emission walk (`pending_aliases`) | serializer |
+| pseudo-destructor target | type lookup in the class, then the context; canonical type equality | `AnalyzeMember` |
+| `copyobj` / `zeroinit` text | `lowir_serialize.cpp` beside the parser's `parse_bulk` | — |
+
+### Validation
+
+- `make test-pa16`: 218/243 (25 failures), the same set as the turn start
+  and a strict subset of the review-2 set; no fixture that passed at
+  review 2 or at the turn start fails.
+- `make test-report-through-pa15`: 1139/1139.
+- `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src`: passes
+  with the five pre-existing warnings.
+- Probes: the twelve-byte value-initialized member and the eight-byte
+  by-value class pass the harness's sanity validation and relaxed compare
+  against their own output; the goto probes behave as in finding 3.
+- Remaining failures by first error: `unknown name in expression` ×3 (the
+  metadata-emission trio), `initializer conversion is not viable` ×2
+  (`300-using-declaration-public-private-base-member`,
+  `spec/200-conditional-derived-base-lvalue-reference`), `incompatible
+  pointer comparison` (`spec/200-const-reference-binds-derived-pointer-
+  prvalue`), `no unique viable function overload`
+  (`200-implicit-member-call-suppresses-adl`), `no viable constructor`
+  (`200-string-literal-does-not-convert-to-mutable-void-pointer`), `a
+  static or function member lvalue` (`200-parenthesized-member-call`), one
+  sanity failure (`200-nested-class-private-enclosing-access`: indirect
+  call without a signature), and 15 LowIR shape mismatches (nested and
+  namespace aggregate data, bit-field increments, callable field, hidden
+  friend definitions, synthesized array member lifecycle, `nullptr_t`
+  operator, value-initialized functional cast, const subobject call,
+  member-pointer typedef return, non-literal field condition,
+  function-pointer parameter shadowing, defaulted constructor through a
+  friend).
+
+### Performance evidence
+
+Review build, wall seconds and peak RSS; the plan's probes.
+
+| probe | N | N×2 |
+| --- | --- | --- |
+| wide (fields + methods) 2000 | 0.06 s / 17.9 MB | 0.12 s / 30.8 MB |
+| deep (inheritance) 300 | 0.00 s / 6.2 MB | 0.01 s / 7.2 MB |
+| exits (locals with destructors + returns) 400 | 0.02 s / 10.1 MB | 0.04 s / 15.1 MB |
+
+Every probe doubles at most in time and memory per doubling.
+
 ## Review 2 (2026-09-02): CP4b.1–CP6
 
 Scope: the four implementation checkpoints since review 1 (`25437f10b`
@@ -421,4 +591,9 @@ cheap comparisons (~0.05 s); it is gone rather than deferred.
 | CP4b.2 copy-list and access | `5f224e380` | 169/243; regressed `300-private-base-using-method-call` while fixing 11 |
 | CP5 static-member identity | `041f12f07` | 175/243 |
 | CP6 thread-local and static storage | `32ff02d5d` | 180/243 |
-| review 2 (this section) | review commit | 185/243; through-pa15 1139/1139; findings 1–7 |
+| review 2 | `42b656245` | 185/243; through-pa15 1139/1139; findings 1–7 |
+| CP7 qualified and deferred member type contexts | `8d71a7b5d` | 192/243 |
+| CP8 enclosing-scope destruction and incomplete types | `5cedae657` | 200/243 |
+| CP9 member initialization and layout paths | `95f01acef` | 213/243 |
+| CP10 conversion and call-lowering paths | `3ea514d42` | 218/243 |
+| review 3 (this section) | review commit | 218/243, same failing set; through-pa15 1139/1139; findings 1–10 |

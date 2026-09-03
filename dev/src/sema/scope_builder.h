@@ -111,6 +111,10 @@ private:
       TypeId type, BindingId binding, SemaId variable, ScopeId scope,
       bool static_member, const std::vector<AstId>& arguments);
   void BuildFunctionDefinition(AstId node, ScopeId scope);
+  // One body in its own jump context (labels, gotos, switch entries,
+  // initialized locals); an enclosing body resumes its own afterwards.
+  void BuildFunctionBody(AstId body, ScopeId function_scope,
+                         FunctionEntityId function, SemaId function_node);
   void BuildSpecialMember(AstId node, ScopeId scope);
   // 9.2p2 complete-class contexts, run once when the class body closes over
   // the function definitions deferred since `first_pending`.

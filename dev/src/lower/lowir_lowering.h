@@ -271,6 +271,8 @@ private:
   void EmitStore(const lowir_model::LowType& type,
                  const lowir_model::Operand& value,
                  const lowir_model::Operand& destination);
+  void EmitCopyObject(TypeId type, const lowir_model::Operand& source,
+                      const lowir_model::Operand& destination);
   void EmitVoidCall(const std::string& symbol,
                     const std::vector<lowir_model::Operand>& arguments);
   void EmitReturn(const Value* value);
@@ -353,6 +355,8 @@ private:
   Value LowerLogicalValue(SemaId node);
   void LowerDiscard(SemaId node);
   lowir_model::Operand ZeroOperand(TypeId type) const;
+  void ZeroInitializeObject(TypeId type,
+                            const lowir_model::Operand& destination);
   lowir_model::Operand OneOperand(TypeId type) const;
   std::string BinaryName(ETokenType op, TypeId type) const;
   std::string CompareName(ETokenType op, TypeId type) const;

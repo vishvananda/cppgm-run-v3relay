@@ -35,14 +35,14 @@ const char* role_name(SymbolRole role)
   return names[static_cast<unsigned>(role)];
 }
 
-void append_symbol_metadata(std::ostringstream& out,
-                            const SymbolMetadata& metadata,
-                            GlobalStorageMode storage = GSM_DEFAULT)
+// Metadata items shared by symbol declarations, definitions and call
+// boundaries; each writer appends to one bracketed list.
+void append_symbol_items(std::ostringstream& body, bool& first,
+                         const SymbolMetadata& metadata,
+                         GlobalStorageMode storage)
 {
-  bool first = true;
-  std::ostringstream body;
   if (storage == GSM_THREAD_LOCAL) {
-    body << "storage=thread_local";
+    body << (first ? "" : ", ") << "storage=thread_local";
     first = false;
   }
   if (metadata.role != SR_NONE) { body << (first ? "" : ", ") << "role=" << role_name(metadata.role); first = false; }
@@ -61,6 +61,24 @@ void append_symbol_metadata(std::ostringstream& out,
   if (metadata.object_output_root) { body << (first ? "" : ", ") << "object_root=yes"; first = false; }
   if (metadata.object_trivial_lifecycle) { body << (first ? "" : ", ") << "trivial_lifecycle=yes"; first = false; }
   if (metadata.force_inline) { body << (first ? "" : ", ") << "force_inline=yes"; first = false; }
+}
+
+void append_boundary_items(std::ostringstream& body, bool& first,
+                           const FunctionBoundaryMetadata& boundary)
+{
+  if (boundary.arity != CAM_FIXED) { body << (first ? "" : ", ") << "arity=" << (boundary.arity == CAM_VARIADIC ? "variadic" : "prototype_relaxed"); first = false; }
+  if (boundary.effects != CFXM_DEFAULT) { body << (first ? "" : ", ") << "effects=" << (boundary.effects == CFXM_READNONE ? "readnone" : boundary.effects == CFXM_READONLY ? "readonly" : "readwrite"); first = false; }
+  if (boundary.unwind != CUM_DEFAULT) { body << (first ? "" : ", ") << "unwind=" << (boundary.unwind == CUM_MAY ? "may" : "no"); first = false; }
+  if (boundary.returns != CRM_DEFAULT) { body << (first ? "" : ", ") << "return=" << (boundary.returns == CRM_RETURNS ? "returns" : "noreturn"); first = false; }
+}
+
+void append_symbol_metadata(std::ostringstream& out,
+                            const SymbolMetadata& metadata,
+                            GlobalStorageMode storage = GSM_DEFAULT)
+{
+  bool first = true;
+  std::ostringstream body;
+  append_symbol_items(body, first, metadata, storage);
   if (!first)
     out << " [" << body.str() << "]";
 }
@@ -70,10 +88,20 @@ void append_boundary_metadata(std::ostringstream& out,
 {
   bool first = true;
   std::ostringstream body;
-  if (boundary.arity != CAM_FIXED) { body << "arity=" << (boundary.arity == CAM_VARIADIC ? "variadic" : "prototype_relaxed"); first = false; }
-  if (boundary.effects != CFXM_DEFAULT) { body << (first ? "" : ", ") << "effects=" << (boundary.effects == CFXM_READNONE ? "readnone" : boundary.effects == CFXM_READONLY ? "readonly" : "readwrite"); first = false; }
-  if (boundary.unwind != CUM_DEFAULT) { body << (first ? "" : ", ") << "unwind=" << (boundary.unwind == CUM_MAY ? "may" : "no"); first = false; }
-  if (boundary.returns != CRM_DEFAULT) { body << (first ? "" : ", ") << "return=" << (boundary.returns == CRM_RETURNS ? "returns" : "noreturn"); first = false; }
+  append_boundary_items(body, first, boundary);
+  if (!first)
+    out << " [" << body.str() << "]";
+}
+
+// A function header carries its boundary and symbol metadata in one list.
+void append_function_metadata(std::ostringstream& out,
+                              const FunctionBoundaryMetadata& boundary,
+                              const SymbolMetadata& metadata)
+{
+  bool first = true;
+  std::ostringstream body;
+  append_boundary_items(body, first, boundary);
+  append_symbol_items(body, first, metadata, GSM_DEFAULT);
   if (!first)
     out << " [" << body.str() << "]";
 }
@@ -106,89 +134,6 @@ void append_call_boundary(std::ostringstream& out,
   append_boundary_metadata(out, boundary);
 }
 
-void append_function_metadata(std::ostringstream& out,
-                              const FunctionBoundaryMetadata& boundary,
-                              const SymbolMetadata& metadata)
-{
-  bool first = true;
-  std::ostringstream body;
-  if (boundary.arity != CAM_FIXED) {
-    body << "arity=" << (boundary.arity == CAM_VARIADIC ?
-        "variadic" : "prototype_relaxed");
-    first = false;
-  }
-  if (boundary.effects != CFXM_DEFAULT) {
-    body << (first ? "" : ", ") << "effects=" <<
-        (boundary.effects == CFXM_READNONE ? "readnone" :
-         boundary.effects == CFXM_READONLY ? "readonly" : "readwrite");
-    first = false;
-  }
-  if (boundary.unwind != CUM_DEFAULT) {
-    body << (first ? "" : ", ") << "unwind=" <<
-        (boundary.unwind == CUM_MAY ? "may" : "no");
-    first = false;
-  }
-  if (boundary.returns != CRM_DEFAULT) {
-    body << (first ? "" : ", ") << "return=" <<
-        (boundary.returns == CRM_RETURNS ? "returns" : "noreturn");
-    first = false;
-  }
-  if (metadata.role != SR_NONE) {
-    body << (first ? "" : ", ") << "role=" << role_name(metadata.role);
-    first = false;
-  }
-  if (metadata.linkage != LLM_DEFAULT) {
-    body << (first ? "" : ", ") << "linkage=" <<
-        (metadata.linkage == LLM_C ? "c" : "cpp");
-    first = false;
-  }
-  if (metadata.binding != SBM_DEFAULT) {
-    const char* value = metadata.binding == SBM_INTERNAL ? "internal" :
-        metadata.binding == SBM_STRONG ? "strong" : "weak";
-    body << (first ? "" : ", ") << "binding=" << value;
-    first = false;
-  }
-  if (!metadata.object_symbol.empty()) {
-    body << (first ? "" : ", ") << "object=" << metadata.object_symbol;
-    first = false;
-  }
-  if (!metadata.tls_for_symbol.empty()) {
-    body << (first ? "" : ", ") << "tls_for=" << metadata.tls_for_symbol;
-    first = false;
-  }
-  if (!metadata.section_segment.empty()) {
-    body << (first ? "" : ", ") << "section_segment=" <<
-        metadata.section_segment;
-    first = false;
-  }
-  if (!metadata.section_name.empty()) {
-    body << (first ? "" : ", ") << "section=" << metadata.section_name;
-    first = false;
-  }
-  if (metadata.keep_internal_alias) {
-    body << (first ? "" : ", ") << "keep_alias=yes";
-    first = false;
-  }
-  if (metadata.prefer_local_object_binding) {
-    body << (first ? "" : ", ") << "prefer_local=yes";
-    first = false;
-  }
-  if (metadata.object_output_root) {
-    body << (first ? "" : ", ") << "object_root=yes";
-    first = false;
-  }
-  if (metadata.object_trivial_lifecycle) {
-    body << (first ? "" : ", ") << "trivial_lifecycle=yes";
-    first = false;
-  }
-  if (metadata.force_inline) {
-    body << (first ? "" : ", ") << "force_inline=yes";
-    first = false;
-  }
-  if (!first)
-    out << " [" << body.str() << "]";
-}
-
 std::string instruction_text(const Instruction& instruction)
 {
   std::ostringstream out;
@@ -211,6 +156,15 @@ std::string instruction_text(const Instruction& instruction)
   case Instruction::IK_STORE:
     out << "store " << instruction.type.text << " " << operand(instruction.first)
         << ", " << operand(instruction.second);
+    break;
+  case Instruction::IK_COPYOBJ:
+    out << "copyobj " << instruction.byte_count << "x"
+        << instruction.byte_alignment << " " << operand(instruction.first)
+        << ", " << operand(instruction.second);
+    break;
+  case Instruction::IK_ZEROINIT:
+    out << "zeroinit " << instruction.byte_count << "x"
+        << instruction.byte_alignment << " " << operand(instruction.first);
     break;
   case Instruction::IK_INDEX:
     out << "index " << instruction.type.text;
