@@ -2667,7 +2667,22 @@ SemaId ExpressionAnalyzer::AnalyzeAggregateClause(
   if (arena_.At(clause).kind == AST_BRACED_INIT_LIST) {
     if (IsAggregateType(target)) {
       ++index;
-      return AnalyzeBraced(clause, scope, target);
+      const SemaId aggregate = AnalyzeBraced(clause, scope, target);
+      const TypeId unqualified = types_.Unqualified(target);
+      // An aggregate element of an array is a class prvalue: retain its
+      // canonical synthesized aggregate constructor action so lowering can
+      // construct the element in place.  Arrays remain nested braced lists;
+      // only class elements have a constructor entity to select here.
+      if (types_.Kind(unqualified) == TYPE_CLASS &&
+          model_.ScopeAt(scope).kind == SCOPE_BLOCK)
+      {
+        std::vector<SemaId> values;
+        for (SemaId child = tree_.At(aggregate).first_child; child != 0;
+             child = tree_.At(child).next_sibling)
+          values.push_back(child);
+        return BuildConstructorTemporary(clause, target, scope, values, true);
+      }
+      return aggregate;
     }
     const TypeId unqualified = types_.Unqualified(target);
     if (types_.Kind(unqualified) != TYPE_CLASS) {

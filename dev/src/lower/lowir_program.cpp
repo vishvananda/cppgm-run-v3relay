@@ -500,6 +500,15 @@ void Lowerer::LowerVariable(SemaId variable_node)
         Emit(projection);
         destination = TempOperand(projection.dest);
       }
+      if (types_.Kind(types_.Unqualified(element)) == TYPE_CLASS &&
+          i < elements.size() &&
+          tree_.At(elements[i]).kind == SEMA_CONSTRUCTOR_ACTION) {
+        // Aggregate class elements carry an in-place constructor action;
+        // passing the existing element address avoids materializing a
+        // temporary object and copying it over the array slot.
+        LowerAggregateConstructor(elements[i], element, destination);
+        continue;
+      }
       // 8.5.1p7: elements without an initializer are zero-initialized.
       const lowir_model::Operand value = i < elements.size() ?
           LowerRValue(elements[i], element).operand : ZeroOperand(element);
@@ -676,7 +685,11 @@ void Lowerer::LowerAggregateObjectInitializer(
       const TypeId element_unqualified = types_.Unqualified(element);
       if (types_.Kind(element_unqualified) == TYPE_CLASS &&
           model_.ClassAt(types_.At(element_unqualified).entity).aggregate) {
-        LowerAggregateObjectInitializer(value, element, object, element_path);
+        if (value != 0 && tree_.At(value).kind == SEMA_CONSTRUCTOR_ACTION)
+          LowerAggregateConstructor(
+              value, element, AggregateDestination(object, element_path));
+        else
+          LowerAggregateObjectInitializer(value, element, object, element_path);
       } else if (types_.Kind(element_unqualified) == TYPE_ARRAY) {
         LowerAggregateObjectInitializer(value, element, object, element_path);
       } else {
@@ -1328,9 +1341,30 @@ void Lowerer::LowerMemberInitializer(SemaId node, FunctionEntityId owner)
 
   if (initializer.function != 0) {
     const FunctionEntity& constructor = model_.FunctionAt(initializer.function);
-    if (!is_base && constructor.synthesized && arguments.empty() &&
-        types_.SizeOf(initializer.type) == 8)
-      EmitStore(I64Type(), Immediate(0), destination);
+    const bool trivial_default =
+        constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
+        constructor.member_class != 0 &&
+        model_.ClassAt(constructor.member_class).trivial_default_constructor;
+    if (!is_base && constructor.synthesized && arguments.empty()) {
+      // Value-initialization of a trivial synthesized class constructor is
+      // the zero-initialization of the complete object.  The old lowering
+      // only handled the eight-byte case, which made a four-byte trivial
+      // derived subobject fall through to the intentionally omitted symbol.
+      const std::size_t size = types_.SizeOf(initializer.type);
+      if (size == 1)
+        EmitStore(LowTypeOf(types_.Fundamental(FT_CHAR)), Immediate(0),
+                  destination);
+      else if (size == 2)
+        EmitStore(LowTypeOf(types_.Fundamental(FT_SHORT_INT)), Immediate(0),
+                  destination);
+      else if (size == 4)
+        EmitStore(LowTypeOf(types_.Fundamental(FT_INT)), Immediate(0),
+                  destination);
+      else if (size == 8)
+        EmitStore(I64Type(), Immediate(0), destination);
+      if (trivial_default)
+        return;
+    }
     const std::string symbol = is_base ?
         FunctionBaseSymbolName(initializer.function) :
         FunctionSymbolName(initializer.function);

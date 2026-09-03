@@ -1116,6 +1116,9 @@ Lowerer::Value Lowerer::LowerLValue(SemaId node)
     return LowerSubscript(node, true);
   if (value.kind == SEMA_CALL && types_.Kind(value.type) == TYPE_REFERENCE) {
     Value result = LowerCall(node, 0);
+    // The ABI result is already the address of the referent.  Keep that
+    // address for lvalue consumers such as `first(&item).x`; an rvalue
+    // consumer performs the object load at its own boundary below.
     result.type = types_.Referent(value.type);
     result.lvalue = true;
     return result;
@@ -1208,7 +1211,18 @@ Lowerer::Value Lowerer::LowerRValue(SemaId node, TypeId expected)
     return zero;
   }
   case SEMA_CALL:
-    return LowerCall(node, expected);
+  {
+    Value result = LowerCall(node, 0);
+    if (types_.Kind(value.type) == TYPE_REFERENCE) {
+      // A reference-returning call is an lvalue designating the object at
+      // the returned address.  Loading that lvalue is what turns `T&` into a
+      // value, including the pointer value in `Derived*&`.
+      result.type = types_.Referent(value.type);
+      result.lvalue = true;
+      result = LoadValue(result);
+    }
+    return Convert(result, expected);
+  }
   case SEMA_SUBSCRIPT:
     return Convert(LoadValue(LowerSubscript(node, false)), expected);
   case SEMA_PSEUDO_DESTRUCTOR:
@@ -1676,6 +1690,11 @@ Lowerer::Value Lowerer::LowerAssignment(SemaId node, Value* assigned_lvalue)
     const TypeId target = ReferentType(tree_.At(children[0]).type);
     rhs = tree_.At(children[1]).kind == SEMA_BRACED_INIT_LIST ?
         LowerRValue(children[1], target) : LowerRValue(children[1]);
+    // Apply the assignment conversion while the right operand is still the
+    // only evaluated side.  Derived-to-base pointer projection (and any
+    // future conversion with observable lowering) therefore precedes the
+    // left-lvalue evaluation required by the LowIR fixture order.
+    rhs = Convert(rhs, target);
     lhs = LowerLValue(children[0]);
     rhs = Convert(rhs, lhs.type);
   } else {

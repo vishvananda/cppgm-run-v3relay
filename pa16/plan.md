@@ -260,6 +260,7 @@ comes from the intended check.
 | CP7 qualified and deferred member type contexts (completed) | declaration-scope trailing-return construction, injected-class-name and `decltype` qualified lookup, bounded ambiguous direct-initializer classification, deferred local reference binding, and derived-over-base same-signature member lookup | 192/243 pa16 tests pass (51 failures, down from 58); packet 7/7; through-pa15 1139/1139; through-pa16 1331/1382; file audit passes with five warnings |
 | CP8 enclosing-scope destruction and incomplete types (completed) | qualified special-member ownership for deferred bodies, explicit and pseudo-destructor targets, base/complete ABI variants and aliases, reference-address initialization, incomplete class return declarations, and qualified nested-type mangling | 200/243 pa16 tests pass (43 failures, down from 51); packet 6/6 exact; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | CP9 member initialization and layout paths (completed) | canonical aliased-base initializer matching, reference-member lvalue and address storage, qualified nested class definitions, retained `alignas` metadata, class/member alignment validation, discarded class glvalues, and bit-field aggregate stores | 213/243 pa16 tests pass (30 failures, down from 43) with unchanged coverage; packet 6/6 exact, extended focused set 7/7, and related alignment/layout set 6/6; through-pa15 1139/1139; file audit passes with five warnings; scaling probes remain linear; no fixture or reference changes |
+| CP10 conversion and call-lowering paths (completed) | extern class declarations without lifetime actions, block-scope aggregate array elements through synthesized in-place constructors, reference-return lvalue/rvalue boundaries, assignment conversion ordering, and trivial four-byte value-initialization | 218/243 pa16 tests pass (25 failures, down from 30) with unchanged coverage; the three packet failures now pass exact comparison, as does the adjacent `Pair[]` constructor fixture; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -663,11 +664,32 @@ audit passes with five nonfatal warnings.  The wide/deep/early-exit probes
 measured 0.06s/18432KB, 0.00s/6396KB, and 0.02s/10312KB respectively.  No
 fixtures or reference files changed.
 
-## Active Checkpoint: CP10 — remaining conversion and call-lowering paths
+## Completed Checkpoint: CP10 — conversion and call-lowering paths
 
-Goal: reduce the remaining pa16 conversion, aggregate, member-call, and
-metadata-lowering failures while preserving the completed CP1–CP9 ownership
-paths.
+Delivered: declaration-only extern class objects no longer synthesize
+construction/destruction actions or unused LowIR global declarations;
+automatic aggregate-class array elements now retain their canonical
+synthesized constructor actions and lower directly into existing element
+storage; reference-returning calls preserve the referent address for lvalue
+consumers and load only for rvalue consumers; simple-assignment conversions
+run before left-lvalue lowering; and trivial synthesized value-initialization
+handles one-, two-, four-, and eight-byte objects without naming omitted
+constructors.
+
+Evidence (2026-09-03): the three packet fixtures that failed at the start of
+CP10 (`200-extern-class-object-declaration`,
+`200-function-reference-return-expression-type`, and
+`200-reference-indexed-pointer-member-access`) pass exact comparison, as does
+the adjacent `200-local-struct-array-init` regression fixture.  The final
+`make test-pa16` result is 218/243 (25 failures, down from 30) with unchanged
+coverage; the required through-pa15 report is 1139/1139, and the pa16 file
+audit passes with five nonfatal warnings.  No fixtures or reference files
+changed.
+
+## Active Checkpoint: CP11 — remaining LowIR shape and diagnostic boundaries
+
+Goal: reduce the remaining pa16 LowIR-shape and semantic-diagnostic failures
+while preserving the completed CP1–CP10 ownership paths.
 
 ### Implementation Packet
 
@@ -675,10 +697,17 @@ paths.
   do not edit fixtures or `.ref` files.
 - Start with `100-function-pointer-nested-param-name-shadow`,
   `100-global-aggregate-nested-array-initializer`,
-  `200-const-subobject-member-call`, `200-extern-class-object-declaration`,
-  `200-function-reference-return-expression-type`, and
-  `200-reference-indexed-pointer-member-access`.
-- Trace each failure from canonical conversion/call facts through its LowIR
-  consumer, keeping destructor, pseudo-destructor, incomplete-type, and
-  alignment state unchanged.  Require a focused comparison, `make test-pa16`,
-  the through-pa15 report, and the pa16 file audit before closing CP10.
+  `200-const-subobject-member-call`, `200-nested-braced-member-aggregate-init`,
+  `200-nested-class-private-enclosing-access`, and
+  `300-value-init-empty-functional-cast-aggregate`.
+- Inspect `dev/src/lower/lowir_expr.cpp` (`Convert`, `LowerMember`,
+  `LowerCall`, `LowerAssignment`), `dev/src/lower/lowir_program.cpp`
+  (`LowerVariable`, `LowerAggregateObjectInitializer`), and
+  `dev/src/lower/lowir_symbols.cpp` (`BuildGlobalDefinitions`,
+  `BuildDeclarations`) before changing a consumer; consult the matching
+  sema owner only when the canonical fact is missing.
+- Trace each failure from its canonical conversion/call or initialization
+  fact through LowIR, keeping destructor, pseudo-destructor, incomplete-type,
+  and alignment state unchanged.  Require a focused comparison,
+  `make test-pa16`, the through-pa15 report, and the pa16 file audit before
+  closing CP11.

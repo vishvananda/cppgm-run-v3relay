@@ -670,6 +670,12 @@ void ScopeBuilder::BuildVariable(BindingId binding, AstId initializer,
                                  SemaId variable, bool is_constexpr)
 {
   const TypeId type = model_.BindingAt(binding).type;
+  // An extern declaration reserves the namespace object without starting
+  // its lifetime in this translation unit.  In particular, do not synthesize
+  // a default construction or destructor use for `extern T object;` when T
+  // is a class with no zero-argument constructor.
+  if (model_.BindingAt(binding).extern_declaration && initializer == 0)
+    return;
   const bool records = RecordsConstantValue(type);
   const TypeId unqualified = types_.Unqualified(type);
   if (variable != 0) {

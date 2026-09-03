@@ -1308,8 +1308,13 @@ void Lowerer::BuildDeclarations()
     const GlobalSymbol& symbol = globals_[global_order_[i]];
     if (symbol.definition != 0)
       continue;
+    const Binding& binding = model_.BindingAt(symbol.binding);
+    // A declaration-only object needs a LowIR declaration only once this
+    // unit actually forms an address/value use.  An unused extern class
+    // declaration must not leak a backend symbol merely because its type is
+    // non-constant; thread-local wrappers remain an explicit exception.
     if (!symbol.referenced && !symbol.thread_local_storage &&
-        model_.BindingAt(symbol.binding).has_const_value)
+        (binding.has_const_value || binding.extern_declaration))
       continue;
     program_.global_declarations.push_back(BuildGlobalDeclaration(symbol));
   }
