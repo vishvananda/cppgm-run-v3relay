@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
 #include <vector>
 
 #include "parser/ast_model.h"
@@ -89,6 +90,7 @@ private:
   SemaId AnalyzeCall(AstId expression, ScopeId scope);
   SemaId AnalyzeNew(AstId expression, ScopeId scope);
   void ResolveCallCallee(AstId callee, ScopeId scope, CallResolution& result);
+  FunctionEntityId BuiltinFunction(const std::string& name);
   void ResolveNamedCallee(const QualifiedName& name, ScopeId scope,
                           CallResolution& result);
   SemaId FinishCall(AstId expression, AstId callee, ScopeId scope,
@@ -184,4 +186,5 @@ private:
   TypeTable& types_;
   SemaTree& tree_;
   ScopeBuilder& builder_;
+  std::map<std::string, FunctionEntityId> builtin_functions_;
 };

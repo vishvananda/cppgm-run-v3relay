@@ -91,6 +91,15 @@ void Lowerer::CollectSymbols(SemaId node)
   if (node == 0)
     return;
   const SemaNode& value = tree_.At(node);
+  if (value.kind == SEMA_CALLEE && value.function != 0 &&
+      model_.FunctionAt(value.function).builtin) {
+    FunctionSymbol& symbol = functions_[value.function];
+    if (symbol.declaration == 0) {
+      symbol.declaration = node;
+      function_order_.push_back(value.function);
+    }
+    return;
+  }
   if (value.kind == SEMA_FUNCTION_DEFINITION ||
       value.kind == SEMA_FUNCTION_DECLARATION) {
     if (value.function != 0) {
@@ -450,6 +459,11 @@ std::string Lowerer::FunctionObjectName(FunctionEntityId id,
                                         bool base_variant) const
 {
   const FunctionEntity& entity = model_.FunctionAt(id);
+  if (entity.builtin) {
+    const std::string prefix = "__builtin_";
+    if (entity.name.compare(0, prefix.size(), prefix) == 0)
+      return "cppgm_builtin_" + entity.name.substr(prefix.size());
+  }
   if (entity.c_linkage)
     return entity.name;
   return MangleFunction(id, base_variant);
@@ -1325,10 +1339,58 @@ void Lowerer::BuildDeclarations()
     if (symbol.base_required)
       program_.function_declarations.push_back(
           BuildFunctionDeclaration(function_order_[i], symbol, true));
-    if (symbol.referenced)
-      program_.function_declarations.push_back(
+    if (symbol.referenced) {
+      const FunctionEntity& entity = model_.FunctionAt(function_order_[i]);
+      program_.function_declarations.push_back(entity.builtin ?
+          BuildBuiltinDeclaration(function_order_[i], symbol) :
           BuildFunctionDeclaration(function_order_[i], symbol, false));
+    }
   }
+}
+
+lowir_model::FunctionDeclaration Lowerer::BuildBuiltinDeclaration(
+    FunctionEntityId id, const FunctionSymbol& symbol) const
+{
+  const FunctionEntity& entity = model_.FunctionAt(id);
+  const TypeNode& type = types_.At(types_.Unqualified(entity.type));
+  lowir_model::FunctionDeclaration result;
+  result.name = symbol.name;
+  result.return_type = LowTypeOf(type.result);
+  result.metadata.binding = lowir_model::SBM_STRONG;
+  result.metadata.object_symbol = symbol.object;
+  result.boundary.unwind = lowir_model::CUM_NO;
+  if (entity.name == "__builtin_unreachable") {
+    result.boundary.effects = lowir_model::CFXM_READNONE;
+    result.boundary.returns = lowir_model::CRM_NORETURN;
+  } else if (entity.name == "__builtin_strlen") {
+    result.boundary.effects = lowir_model::CFXM_READONLY;
+  } else if (entity.name == "__builtin_memcpy" ||
+             entity.name == "__builtin_memmove") {
+    result.boundary.effects = lowir_model::CFXM_READWRITE;
+  }
+  for (std::size_t i = 0; i < type.parameters.size(); ++i) {
+    lowir_model::Parameter parameter;
+    parameter.name = "%arg" + std::to_string(i);
+    parameter.type = LowTypeOf(type.parameters[i]);
+    if (entity.name == "__builtin_strlen") {
+      parameter.metadata.capture = lowir_model::PCM_NOCAPTURE;
+      parameter.metadata.access = lowir_model::PAM_READ;
+    } else if (entity.name == "__builtin_memcpy") {
+      if (i < 2)
+        parameter.metadata.capture = lowir_model::PCM_NOCAPTURE;
+      parameter.metadata.access = i == 0 ? lowir_model::PAM_WRITE :
+          i == 1 ? lowir_model::PAM_READ : lowir_model::PAM_DEFAULT;
+      if (i < 2)
+        parameter.metadata.alias = lowir_model::PALM_NOALIAS;
+    } else if (entity.name == "__builtin_memmove") {
+      if (i < 2)
+        parameter.metadata.capture = lowir_model::PCM_NOCAPTURE;
+      parameter.metadata.access = i == 0 ? lowir_model::PAM_READWRITE :
+          i == 1 ? lowir_model::PAM_READ : lowir_model::PAM_DEFAULT;
+    }
+    result.params.push_back(parameter);
+  }
+  return result;
 }
 
 lowir_model::FunctionDeclaration Lowerer::BuildFunctionDeclaration(

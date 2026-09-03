@@ -278,6 +278,7 @@ comes from the intended check.
 | CP9 member initialization and layout paths (completed) | canonical aliased-base initializer matching, reference-member lvalue and address storage, qualified nested class definitions, retained `alignas` metadata, class/member alignment validation, discarded class glvalues, and bit-field aggregate stores | 213/243 pa16 tests pass (30 failures, down from 43) with unchanged coverage; packet 6/6 exact, extended focused set 7/7, and related alignment/layout set 6/6; through-pa15 1139/1139; file audit passes with five warnings; scaling probes remain linear; no fixture or reference changes |
 | CP10 conversion and call-lowering paths (completed) | extern class declarations without lifetime actions, block-scope aggregate array elements through synthesized in-place constructors, reference-return lvalue/rvalue boundaries, assignment conversion ordering, and trivial four-byte value-initialization | 218/243 pa16 tests pass (25 failures, down from 30) with unchanged coverage; the three packet failures now pass exact comparison, as does the adjacent `Pair[]` constructor fixture; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | review 3 (completed; `audit.md`) | wide value-initialized members zeroed; by-value class objects copied with `copyobj` (empty classes keep the fixture slot); one owner for a body's jump context; one named-call path; typed alias ordering; serializer writers shared; pseudo-destructor target by type | 218/243 (25 failures, the turn-start set; strict subset of review 2's 58); through-pa15 1139/1139; file audit passes with five warnings; probes linear |
+| CP11 builtin, lookup, and common-reference boundaries (completed) | builtin declaration ownership and LowIR metadata; using-declaration overload sets; function/tag call disambiguation; derived/base conditional glvalue binding and address projection | 223/243 pa16 tests pass (20 failures, down from 25) with unchanged coverage; focused packet 6/6; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -719,33 +720,47 @@ coverage; the required through-pa15 report is 1139/1139, and the pa16 file
 audit passes with five nonfatal warnings.  No fixtures or reference files
 changed.
 
-## Active Checkpoint: CP11 — remaining LowIR shape and diagnostic boundaries
+## Completed Checkpoint: CP11 — builtin, lookup, and common-reference boundaries
 
-Goal: reduce the remaining 25 pa16 failures (15 LowIR-shape mismatches,
-nine semantic rejections, one invalid indirect call) while preserving the
-CP1–CP10 ownership paths and the review-3 owners (`BuildFunctionBody`,
-`FinishCall`, `ZeroInitializeObject`, `ClassEntity::empty`).
+Delivered: the four packet builtins are now canonical function entities
+created on demand, collected as declarations, and serialized with their
+pointer access/alias metadata, including the `cppgm_builtin_*` object names.
+Using-declarations import the complete declaration set instead of only the
+latest binding, while a visible function wins over a same-name tag during
+call classification.  Conditional derived/base lvalue arms retain their
+common-base glvalue category and LowIR projects each selected address to the
+base subobject before storing it.
+
+Evidence (2026-09-03): the three builtin metadata fixtures, the public/private
+base using-declaration fixture, the function/tag collision regression, and the
+derived/base conditional-reference fixture pass exact comparison (6/6).
+The final `make test-pa16` result is 223/243 (20 failures, down from the
+25-failure start) with unchanged coverage; `make test-report-through-pa15`
+is 1139/1139, and `perl scripts/cppgm_file_audit.pl --stage pa16 --paths
+dev/src` passes with five nonfatal warnings.  No fixtures or reference files
+changed.
+
+## Active Checkpoint: CP12 — remaining LowIR shape and call/conversion boundaries
+
+Goal: reduce the remaining 20 pa16 failures while preserving the CP1–CP11
+semantic owners and the review-3 owners (`BuildFunctionBody`, `FinishCall`,
+`ZeroInitializeObject`, `ClassEntity::empty`).
 
 ### Implementation Packet
 
-- Own the next semantic or direct lowering boundary in the named source
-  path; do not edit fixtures or `.ref` files.
-- Semantic rejections, by first error: `unknown name in expression`
-  (`200-function-boundary-metadata-emission`,
-  `200-parameter-access-metadata-emission`,
-  `200-parameter-alias-metadata-emission`), `initializer conversion is not
-  viable` (`300-using-declaration-public-private-base-member`,
-  `spec/200-conditional-derived-base-lvalue-reference`), `incompatible
-  pointer comparison` (`spec/200-const-reference-binds-derived-pointer-
-  prvalue`), `no unique viable function overload`
-  (`200-implicit-member-call-suppresses-adl`), `no viable constructor`
-  (`200-string-literal-does-not-convert-to-mutable-void-pointer`), `a
-  static or function member lvalue` (`200-parenthesized-member-call`), and
-  the indirect call without a signature
-  (`200-nested-class-private-enclosing-access`).  Start with the trio and
-  the two conversion failures: they share the derived-to-base and
-  reference-binding conversion path in `Initialize` / `conversions.cpp`.
-- LowIR shape mismatches: `100-function-pointer-nested-param-name-shadow`,
+- Own the next canonical semantic or direct-lowering boundary; do not edit
+  fixtures or `.ref` files.  Remaining semantic failures are
+  `200-implicit-member-call-suppresses-adl` (no unique viable overload),
+  `200-nested-class-private-enclosing-access` (indirect call lacks a
+  signature), `200-parenthesized-member-call` (static/function member
+  lvalue), `200-string-literal-does-not-convert-to-mutable-void-pointer`
+  (no viable constructor), and
+  `spec/200-const-reference-binds-derived-pointer-prvalue` (incompatible
+  pointer comparison).  Trace these through `expr_sema.cpp`,
+  `conversions.cpp`, `overload.cpp`, and the corresponding LowIR call/type
+  consumer before changing a layer.
+- Remaining LowIR shape mismatches are
+  `100-function-pointer-nested-param-name-shadow`,
   `100-global-aggregate-nested-array-initializer`,
   `200-const-subobject-member-call`,
   `200-friend-derived-private-base-defaulted-constructor`,
@@ -758,19 +773,17 @@ CP1–CP10 ownership paths and the review-3 owners (`BuildFunctionBody`,
   `300-namespace-aggregate-array-string-members`,
   `300-operator-nullptr-t-from-zero`,
   `300-synthesized-array-member-lifecycle`,
-  `300-value-init-empty-functional-cast-aggregate`,
-  `400-bit-field-prefix-postfix-increment`.  Read each
-  `.my.lowir.compare.diff` first; a defaulted constructor's
-  value-initialization should reuse `ZeroInitializeObject`.
-- Inspect `dev/src/lower/lowir_expr.cpp` (`Convert`, `LowerMember`,
-  `LowerCall`, `LowerAssignment`), `dev/src/lower/lowir_program.cpp`
-  (`LowerVariable`, `LowerAggregateObjectInitializer`,
-  `LowerMemberInitializer`), and `dev/src/lower/lowir_symbols.cpp`
-  (`BuildGlobalDefinitions`, `BuildDeclarations`) before changing a
-  consumer; consult the matching sema owner only when the canonical fact
-  is missing.
-- Known non-goals recorded in `audit.md` review 3 finding 10: block-scope
-  `static` objects (no fixture), by-value copy semantics (PA17).
+  `300-value-init-empty-functional-cast-aggregate`, and
+  `400-bit-field-prefix-postfix-increment`; read each current
+  `.my.lowir.compare.diff` before editing.
+- The direct lowering owners are `dev/src/lower/lowir_expr.cpp`
+  (`Convert`, `LowerMember`, `LowerCall`, `LowerAssignment`),
+  `dev/src/lower/lowir_program.cpp` (`LowerVariable`,
+  `LowerAggregateObjectInitializer`, `LowerMemberInitializer`), and
+  `dev/src/lower/lowir_symbols.cpp` (`BuildGlobalDefinitions`,
+  `BuildDeclarations`).  Preserve the known non-goals in `audit.md` review
+  3 finding 10: block-scope `static` objects and by-value copy semantics
+  (PA17).
 - Require a focused comparison, `make test-pa16`, the through-pa15 report,
-  and the pa16 file audit before closing CP11; the failing set must shrink,
+  and the pa16 file audit before closing CP12; the failing set must shrink,
   never merely shift.

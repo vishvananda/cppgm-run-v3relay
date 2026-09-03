@@ -741,7 +741,12 @@ Lowerer::Value Lowerer::LowerConditionalLValue(SemaId node)
   LowerCondition(children[0], then_label, else_label);
   for (std::size_t arm = 1; arm <= 2; ++arm) {
     StartBlock(arm == 1 ? then_label : else_label);
-    const Value address = AddressValue(LowerLValue(children[arm]));
+    Value address = AddressValue(LowerLValue(children[arm]));
+    // The semantic conditional type is the common base object.  Preserve
+    // that reference binding in LowIR by projecting a derived arm to the
+    // selected base subobject before storing its address.
+    ProjectDerivedReference(address, tree_.At(children[arm]).type,
+                            value.type);
     EmitStore(PtrType(), address.operand, SlotOperand(slot));
     EmitJump(end_label);
   }

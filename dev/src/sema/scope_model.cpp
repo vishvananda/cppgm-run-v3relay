@@ -64,6 +64,7 @@ FunctionEntity::FunctionEntity()
       body(0), ctor_initializer(0), parameter_names(), defaulted(false),
       deleted(false), explicit_constructor(false),
       static_member(false), in_class_definition(false), synthesized(false),
+      builtin(false),
       default_semantic_arguments(), default_member_initializers(),
       defined(false)
 {

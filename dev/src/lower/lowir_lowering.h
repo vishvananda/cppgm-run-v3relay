@@ -237,6 +237,8 @@ private:
   lowir_model::FunctionDeclaration BuildFunctionDeclaration(
       FunctionEntityId id, const FunctionSymbol& symbol,
       bool base_variant = false);
+  lowir_model::FunctionDeclaration BuildBuiltinDeclaration(
+      FunctionEntityId id, const FunctionSymbol& symbol) const;
 
   // Type and ABI ownership.
   LowInfo LowInfoOf(TypeId type) const;

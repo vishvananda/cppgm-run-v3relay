@@ -262,6 +262,10 @@ struct FunctionEntity
   bool static_member;
   bool in_class_definition;
   bool synthesized;
+  // Compiler-provided call target with no source declaration.  Builtin
+  // signatures are still represented by a normal function entity so
+  // overload argument conversion and lowering share the ordinary call path.
+  bool builtin;
   // 11.3: the classes whose friend declarations name this function.
   std::vector<ClassEntityId> friend_of;
   // One entry per canonical parameter; a zero entry means that parameter

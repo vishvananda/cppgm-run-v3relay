@@ -92,7 +92,7 @@ ExpressionAnalyzer::ExpressionAnalyzer(const vector<Pa6Token>& tokens,
                                        SemaModel& model, SemaTree& tree,
                                        ScopeBuilder& builder)
     : tokens_(tokens), arena_(arena), model_(model), types_(model.Types()),
-      tree_(tree), builder_(builder)
+      tree_(tree), builder_(builder), builtin_functions_()
 {
 }
 
@@ -1687,11 +1687,30 @@ SemaId ExpressionAnalyzer::AnalyzeConditional(AstId expression, ScopeId scope)
   const TypeId result_type = CommonConditionalType(left, right);
   if (result_type == 0)
     throw std::runtime_error("conditional operands have no common type");
-  const Info lhs = NodeInfo(left);
-  const Info rhs = NodeInfo(right);
-  const ValueCategory category = lhs.category == VC_LVALUE &&
+  const Info lhs = NodeInfo(left), rhs = NodeInfo(right);
+  ValueCategory category = lhs.category == VC_LVALUE &&
       rhs.category == VC_LVALUE && lhs.type == rhs.type ? VC_LVALUE :
       VC_PRVALUE;
+  // Derived/base class lvalue arms retain a glvalue common base; exact-type
+  // arms, including arrays, retain the existing path above.
+  if (category == VC_PRVALUE && lhs.category == VC_LVALUE &&
+      rhs.category == VC_LVALUE &&
+      types_.Kind(types_.Unqualified(result_type)) == TYPE_CLASS)
+  {
+    const TypeId common_reference = types_.Reference(result_type);
+    const ImplicitConversion left_conversion = Classify(
+        model_, types_, lhs.type, lhs.category, false,
+        lhs.is_function_lvalue, common_reference);
+    const ImplicitConversion right_conversion = Classify(
+        model_, types_, rhs.type, rhs.category, false,
+        rhs.is_function_lvalue, common_reference);
+    if (left_conversion.Viable() && right_conversion.Viable())
+    {
+      CheckBaseConversionAccess(lhs.type, common_reference, scope);
+      CheckBaseConversionAccess(rhs.type, common_reference, scope);
+      category = VC_LVALUE;
+    }
+  }
   const SemaId result = MakeExpression(SEMA_CONDITIONAL, expression,
                                        result_type, category, scope);
   Append(result, condition);
@@ -2000,6 +2019,19 @@ SemaId ExpressionAnalyzer::TryFunctionalCast(AstId expression, AstId callee,
                                               AstId arguments, ScopeId scope)
 {
   TypeId target = 0;
+  if (!IsFundamentalCastCallee(callee)) {
+    const AstNode& callee_node = arena_.At(callee);
+    if (callee_node.kind == AST_ID_EXPRESSION ||
+        callee_node.kind == AST_IDENTIFIER) {
+      const QualifiedName name = ExpressionName(callee);
+      std::vector<BindingId> bindings;
+      LookupNameBindings(name, scope, bindings);
+      for (std::size_t i = 0; i < bindings.size(); ++i)
+        if (model_.BindingAt(bindings[i]).kind == BINDING_FUNCTION &&
+            model_.IsAccessible(bindings[i], scope))
+          return 0;
+    }
+  }
   if (IsFundamentalCastCallee(callee))
   {
     const AstNode& node = arena_.At(callee);
@@ -2038,16 +2070,18 @@ SemaId ExpressionAnalyzer::TryCallableObjectExpression(
     const QualifiedName callee_name = ExpressionName(callee);
     vector<BindingId> direct_bindings;
     LookupNameBindings(callee_name, scope, direct_bindings);
-    for (size_t i = 0; i < direct_bindings.size(); ++i)
-      if (model_.BindingAt(direct_bindings[i]).kind != BINDING_FUNCTION)
-      {
+    bool has_function = false;
+    for (size_t i = 0; i < direct_bindings.size(); ++i) {
+      if (model_.BindingAt(direct_bindings[i]).kind == BINDING_FUNCTION)
+        has_function = true;
+      else if (!has_function)
         may_be_callable_object = true;
-        break;
-      }
+    }
+    if (has_function)
+      may_be_callable_object = false;
   }
   if (!may_be_callable_object)
     return 0;
-
   const SemaId object = Analyze(callee, scope);
   TypeId object_type = NodeInfo(object).type;
   if (types_.Kind(object_type) == TYPE_REFERENCE)
@@ -2222,6 +2256,15 @@ SemaId ExpressionAnalyzer::FinishCall(
                                     vector<TypeId>());
     function = model_.CreateFunction(model_.GlobalScope(), name.Last(),
                                      function_type);
+  }
+  else if (builtin_name &&
+           (name.Last() == "__builtin_unreachable" ||
+            name.Last() == "__builtin_strlen" ||
+            name.Last() == "__builtin_memcpy" ||
+            name.Last() == "__builtin_memmove"))
+  {
+    function = BuiltinFunction(name.Last());
+    function_type = model_.FunctionAt(function).type;
   }
   else if (builtin_name && name.Last() == "__builtin_constant_p")
   {

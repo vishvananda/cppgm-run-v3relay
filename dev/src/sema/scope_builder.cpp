@@ -279,7 +279,6 @@ void ScopeBuilder::BuildUsingDeclaration(AstId node, ScopeId scope)
   if (target_node == 0)
     throw std::runtime_error("using-declaration has no target");
   const QualifiedName name = NodeName(target_node);
-  const BindingId target = model_.Lookup(scope, name, LOOKUP_ANY);
   ClassEntityId derived = 0;
   if (model_.ClassForScope(scope, derived) && name.Qualified() &&
       name.components.size() == 2 &&
@@ -293,20 +292,43 @@ void ScopeBuilder::BuildUsingDeclaration(AstId node, ScopeId scope)
       }
     }
   }
-  if (target == 0 || model_.BindingAt(target).kind == BINDING_NAMESPACE)
+  std::vector<BindingId> targets;
+  if (name.Qualified())
+    model_.LookupQualifiedSet(scope, name, LOOKUP_ANY, targets);
+  else
+    model_.LookupSet(scope, name.Last(), LOOKUP_ANY, targets);
+  if (targets.empty())
     throw std::runtime_error("using-declaration target not found");
-  if (!model_.IsAccessible(target, scope))
-    throw std::runtime_error("using-declaration names an inaccessible member");
-  const Binding source = model_.BindingAt(target);
-  Binding& imported = model_.BindingAt(model_.AddBinding(
-      scope, name.Last(), source.kind, source.type));
-  imported.function = source.function;
-  imported.declaring_class = source.declaring_class;
-  imported.access = member_access_;
-  imported.static_member = source.static_member;
-  imported.field_index = source.field_index;
-  imported.has_const_value = source.has_const_value;
-  imported.const_value = source.const_value;
+
+  // A using-declaration names a declaration set, not the most recently
+  // declared overload.  Import each canonical binding so overload
+  // resolution can still distinguish the base member signatures; the
+  // access of the using-declaration itself is the access seen by callers.
+  for (std::size_t i = 0; i < targets.size(); ++i) {
+    const Binding& source = model_.BindingAt(targets[i]);
+    if (source.kind == BINDING_NAMESPACE)
+      throw std::runtime_error("using-declaration target not found");
+    if (!model_.IsAccessible(targets[i], scope))
+      throw std::runtime_error(
+          "using-declaration names an inaccessible member");
+    Binding& imported = model_.BindingAt(model_.AddBinding(
+        scope, name.Last(), source.kind, source.type));
+    imported.function = source.function;
+    imported.object_binding = source.object_binding;
+    imported.declaring_class = source.declaring_class;
+    imported.internal_linkage = source.internal_linkage;
+    imported.c_linkage = source.c_linkage;
+    imported.thread_local_storage = source.thread_local_storage;
+    imported.extern_declaration = source.extern_declaration;
+    imported.hidden_friend = source.hidden_friend;
+    imported.noexcept_qualifier = source.noexcept_qualifier;
+    imported.access = member_access_;
+    imported.static_member = source.static_member;
+    imported.field_index = source.field_index;
+    imported.redeclared_binding = source.redeclared_binding;
+    imported.has_const_value = source.has_const_value;
+    imported.const_value = source.const_value;
+  }
 }
 
 void ScopeBuilder::BuildInheritedConstructors(ClassEntityId derived,
