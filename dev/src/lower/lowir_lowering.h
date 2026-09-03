@@ -224,6 +224,9 @@ private:
       lowir_model::GlobalDefinition& global);
   bool ConstantGlobalItem(SemaId node, TypeId type,
                           lowir_model::GlobalDefinition::DataItem& item);
+  bool ConstantGlobalAggregate(
+      SemaId node, TypeId type,
+      std::vector<lowir_model::GlobalDefinition::DataItem>& items);
   bool FoldConstructorAction(
       SemaId action, TypeId class_type,
       std::vector<lowir_model::GlobalDefinition::DataItem>& items);
@@ -462,6 +465,7 @@ private:
   std::vector<DynamicInitializer> dynamic_initializers_;
   std::vector<ThreadLocalInitializer> thread_local_initializers_;
   std::map<SemaId, std::string> string_symbols_;
+  std::map<std::string, std::string> string_content_symbols_;
 
   // Function-level state.
   lowir_model::Function function_;

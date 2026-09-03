@@ -835,6 +835,141 @@ bool Lowerer::ConstantGlobalItem(SemaId node, TypeId type,
   return true;
 }
 
+// Flatten one wholly constant aggregate while retaining object layout.  The
+// temporary result makes the operation transactional: a dynamic leaf never
+// leaves a partly-folded definition behind for startup lowering to mistake
+// for complete static data.
+bool Lowerer::ConstantGlobalAggregate(
+    SemaId node, TypeId type,
+    std::vector<lowir_model::GlobalDefinition::DataItem>& items)
+{
+  typedef lowir_model::GlobalDefinition::DataItem DataItem;
+  if (node == 0 || tree_.At(node).kind != SEMA_BRACED_INIT_LIST)
+    return false;
+  const TypeId unqualified = types_.Unqualified(type);
+  const TypeKind kind = types_.Kind(unqualified);
+  if (kind != TYPE_ARRAY && kind != TYPE_CLASS)
+    return false;
+
+  std::vector<DataItem> folded;
+  const auto append_zero = [&](TypeId zero_type) {
+    const TypeId zero_unqualified = types_.Unqualified(zero_type);
+    const TypeKind zero_kind = types_.Kind(zero_unqualified);
+    if (zero_kind != TYPE_ARRAY && zero_kind != TYPE_CLASS) {
+      DataItem zero;
+      zero.kind = DataItem::ITEM_INTEGER;
+      zero.type = LowTypeOf(zero_type);
+      zero.literal_operand = Immediate(0);
+      zero.literal_operand.literal_type = zero.type;
+      folded.push_back(zero);
+    } else {
+      DataItem zero;
+      zero.kind = DataItem::ITEM_ZERO;
+      zero.zero_bytes = types_.SizeOf(zero_type);
+      folded.push_back(zero);
+    }
+  };
+  const auto append_padding = [&](std::size_t bytes) {
+    if (bytes == 0)
+      return;
+    DataItem zero;
+    zero.kind = DataItem::ITEM_ZERO;
+    zero.zero_bytes = bytes;
+    folded.push_back(zero);
+  };
+
+  const std::vector<SemaId> values = Children(node);
+  if (kind == TYPE_ARRAY) {
+    const TypeId element = types_.At(unqualified).base;
+    const std::size_t bound = types_.At(unqualified).array_bound;
+    if (values.size() > bound)
+      return false;
+    for (std::size_t index = 0; index < bound; ++index) {
+      if (index >= values.size()) {
+        append_zero(element);
+        continue;
+      }
+      const SemaId value = values[index];
+      const TypeId element_unqualified = types_.Unqualified(element);
+      if (types_.Kind(element_unqualified) == TYPE_ARRAY) {
+        std::vector<DataItem> nested;
+        if (!ConstantGlobalAggregate(value, element, nested))
+          return false;
+        folded.insert(folded.end(), nested.begin(), nested.end());
+      } else if (types_.Kind(element_unqualified) == TYPE_CLASS) {
+        std::vector<DataItem> nested;
+        bool constant = false;
+        if (tree_.At(value).kind == SEMA_BRACED_INIT_LIST)
+          constant = ConstantGlobalAggregate(value, element, nested);
+        else if (tree_.At(value).kind == SEMA_CONSTRUCTOR_ACTION)
+          constant = FoldConstructorAction(value, element_unqualified, nested);
+        if (!constant)
+          return false;
+        folded.insert(folded.end(), nested.begin(), nested.end());
+      } else {
+        DataItem item;
+        if (!ConstantGlobalItem(value, element, item))
+          return false;
+        folded.push_back(item);
+      }
+    }
+  } else {
+    const ClassEntity& class_entity = model_.ClassAt(
+        types_.At(unqualified).entity);
+    if (class_entity.is_union || !class_entity.bases.empty())
+      return false;
+    std::size_t value_index = 0;
+    std::size_t cursor = 0;
+    for (std::size_t field_index = 0;
+         field_index < class_entity.fields.size(); ++field_index) {
+      const ClassField& field = class_entity.fields[field_index];
+      if (field.static_member || field.binding == 0)
+        continue;
+      if (field.bit_width != 0 || field.offset < cursor)
+        return false;
+      append_padding(field.offset - cursor);
+
+      const TypeId field_unqualified = types_.Unqualified(field.type);
+      if (value_index >= values.size()) {
+        append_zero(field.type);
+      } else {
+        const SemaId value = values[value_index];
+        if (types_.Kind(field_unqualified) == TYPE_ARRAY) {
+          std::vector<DataItem> nested;
+          if (!ConstantGlobalAggregate(value, field.type, nested))
+            return false;
+          folded.insert(folded.end(), nested.begin(), nested.end());
+        } else if (types_.Kind(field_unqualified) == TYPE_CLASS &&
+                   tree_.At(value).kind == SEMA_BRACED_INIT_LIST) {
+          std::vector<DataItem> nested;
+          if (!ConstantGlobalAggregate(value, field.type, nested))
+            return false;
+          folded.insert(folded.end(), nested.begin(), nested.end());
+        } else if (types_.Kind(field_unqualified) == TYPE_CLASS &&
+                   tree_.At(value).kind == SEMA_CONSTRUCTOR_ACTION) {
+          std::vector<DataItem> nested;
+          if (!FoldConstructorAction(value, field_unqualified, nested))
+            return false;
+          folded.insert(folded.end(), nested.begin(), nested.end());
+        } else {
+          DataItem item;
+          if (!ConstantGlobalItem(value, field.type, item))
+            return false;
+          folded.push_back(item);
+        }
+        ++value_index;
+      }
+      cursor = field.offset + types_.SizeOf(field.type);
+    }
+    if (value_index != values.size())
+      return false;
+    append_padding(types_.SizeOf(unqualified) > cursor ?
+                   types_.SizeOf(unqualified) - cursor : 0);
+  }
+  items.swap(folded);
+  return true;
+}
+
 // A braced element of a non-aggregate class array names a constructor.
 // When that constructor's body is empty and each mem-initializer stores one
 // parameter or constant into a field, the element is constant data, which
@@ -1002,11 +1137,24 @@ void Lowerer::BuildGlobalDefinitions()
 
     if (types_.Kind(object_type) == TYPE_CLASS) {
       global.structured = true;
-      DataItem zero;
-      zero.kind = DataItem::ITEM_ZERO;
-      zero.zero_bytes = types_.SizeOf(binding.type);
-      global.data_items.push_back(zero);
+      bool folded_aggregate = false;
+      if (initializer.size() == 1 &&
+          tree_.At(initializer[0]).kind == SEMA_BRACED_INIT_LIST) {
+        std::vector<DataItem> folded;
+        folded_aggregate = ConstantGlobalAggregate(
+            initializer[0], binding.type, folded);
+        if (folded_aggregate)
+          global.data_items.swap(folded);
+      }
+      if (!folded_aggregate) {
+        DataItem zero;
+        zero.kind = DataItem::ITEM_ZERO;
+        zero.zero_bytes = types_.SizeOf(binding.type);
+        global.data_items.push_back(zero);
+      }
       program_.globals.push_back(global);
+      if (folded_aggregate)
+        continue;
       if (initializer.size() == 1 &&
           tree_.At(initializer[0]).kind == SEMA_CONSTRUCTOR_ACTION) {
         const std::vector<SemaId> action_children =

@@ -688,19 +688,30 @@ void Lowerer::LowerAggregateObjectInitializer(
       } else if (types_.Kind(element_unqualified) == TYPE_ARRAY) {
         LowerAggregateObjectInitializer(value, element, object, element_path);
       } else {
-        const lowir_model::Operand destination = AggregateDestination(
-            object, element_path);
         if (types_.Kind(element_unqualified) == TYPE_CLASS) {
-          if (value == 0)
+          if (value == 0) {
+            const lowir_model::Operand destination = AggregateDestination(
+                object, element_path);
             LowerAggregateDefaultConstructor(element, destination);
-          else if (tree_.At(value).kind == SEMA_CONSTRUCTOR_ACTION)
+          } else if (tree_.At(value).kind == SEMA_CONSTRUCTOR_ACTION) {
+            const lowir_model::Operand destination = AggregateDestination(
+                object, element_path);
             LowerAggregateConstructor(value, element, destination);
-          else
+          } else {
+            // Evaluate a supplied initializer before projecting the
+            // destination subobject.  This keeps expression side effects in
+            // source order and matches the member-initializer boundary.
+            const Value initialized = LowerRValue(value, element);
+            const lowir_model::Operand destination = AggregateDestination(
+                object, element_path);
             EmitStore(LowTypeOf(element),
-                      LowerRValue(value, element).operand, destination);
+                      initialized.operand, destination);
+          }
         } else {
           const lowir_model::Operand operand = value == 0 ?
               ZeroOperand(element) : LowerRValue(value, element).operand;
+          const lowir_model::Operand destination = AggregateDestination(
+              object, element_path);
           EmitStore(LowTypeOf(element), operand, destination);
         }
       }
@@ -740,17 +751,23 @@ void Lowerer::LowerAggregateObjectInitializer(
     }
 
     if (types_.Kind(field_type) == TYPE_CLASS) {
-      const lowir_model::Operand destination = AggregateDestination(
-          object, field_path);
       const bool have_value = value_index < values.size();
-      if (!have_value)
+      if (!have_value) {
+        const lowir_model::Operand destination = AggregateDestination(
+            object, field_path);
         LowerAggregateDefaultConstructor(field.type, destination);
-      else if (tree_.At(values[value_index]).kind == SEMA_CONSTRUCTOR_ACTION)
+      } else if (tree_.At(values[value_index]).kind ==
+                 SEMA_CONSTRUCTOR_ACTION) {
+        const lowir_model::Operand destination = AggregateDestination(
+            object, field_path);
         LowerAggregateConstructor(values[value_index], field.type, destination);
-      else
+      } else {
+        const Value initialized = LowerRValue(values[value_index], field.type);
+        const lowir_model::Operand destination = AggregateDestination(
+            object, field_path);
         EmitStore(LowTypeOf(field.type),
-                  LowerRValue(values[value_index], field.type).operand,
-                  destination);
+                  initialized.operand, destination);
+      }
       if (have_value)
         ++value_index;
       continue;
@@ -789,8 +806,6 @@ void Lowerer::LowerAggregateObjectInitializer(
       EmitStore(LowTypeOf(field.type), encoded, destination);
       MarkBitFieldUnitInitialized(field);
     } else {
-      const lowir_model::Operand destination = AggregateDestination(
-          object, field_path);
       Value initialized_value;
       if (value_index < values.size())
         initialized_value = LowerRValue(values[value_index], field.type);
@@ -798,6 +813,8 @@ void Lowerer::LowerAggregateObjectInitializer(
         initialized_value.type = field.type;
         initialized_value.operand = ZeroOperand(field.type);
       }
+      const lowir_model::Operand destination = AggregateDestination(
+          object, field_path);
       if (bit_field) {
         StoreBitField(field, destination, initialized_value.type,
                       initialized_value.operand, preserve, field.type);
@@ -948,11 +965,17 @@ void Lowerer::LowerAggregateMemberLeaves(
       else {
         const SemaId value = value_index < values.size() ?
             values[value_index] : 0;
+        Value initialized;
+        if (value == 0) {
+          initialized.type = field.type;
+          initialized.operand = ZeroOperand(field.type);
+        } else {
+          initialized = LowerRValue(value, field.type);
+        }
         const lowir_model::Operand destination = MemberLeafDestination(
             binding, root_type, nested_path);
         EmitStore(LowTypeOf(field.type),
-                  value == 0 ? ZeroOperand(field.type) :
-                      LowerRValue(value, field.type).operand,
+                  initialized.operand,
                   destination);
       }
       ++value_index;
@@ -974,11 +997,17 @@ void Lowerer::LowerAggregateMemberLeaves(
                                    nested_path);
       else {
         const SemaId value = i < values.size() ? values[i] : 0;
+        Value initialized;
+        if (value == 0) {
+          initialized.type = element;
+          initialized.operand = ZeroOperand(element);
+        } else {
+          initialized = LowerRValue(value, element);
+        }
         const lowir_model::Operand destination = MemberLeafDestination(
             binding, root_type, nested_path);
         EmitStore(LowTypeOf(element),
-                  value == 0 ? ZeroOperand(element) :
-                      LowerRValue(value, element).operand,
+                  initialized.operand,
                   destination);
       }
     }

@@ -279,6 +279,7 @@ comes from the intended check.
 | CP10 conversion and call-lowering paths (completed) | extern class declarations without lifetime actions, block-scope aggregate array elements through synthesized in-place constructors, reference-return lvalue/rvalue boundaries, assignment conversion ordering, and trivial four-byte value-initialization | 218/243 pa16 tests pass (25 failures, down from 30) with unchanged coverage; the three packet failures now pass exact comparison, as does the adjacent `Pair[]` constructor fixture; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | review 3 (completed; `audit.md`) | wide value-initialized members zeroed; by-value class objects copied with `copyobj` (empty classes keep the fixture slot); one owner for a body's jump context; one named-call path; typed alias ordering; serializer writers shared; pseudo-destructor target by type | 218/243 (25 failures, the turn-start set; strict subset of review 2's 58); through-pa15 1139/1139; file audit passes with five warnings; probes linear |
 | CP11 builtin, lookup, and common-reference boundaries (completed) | builtin declaration ownership and LowIR metadata; using-declaration overload sets; function/tag call disambiguation; derived/base conditional glvalue binding and address projection | 223/243 pa16 tests pass (20 failures, down from 25) with unchanged coverage; focused packet 6/6; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
+| CP12 aggregate leaf evaluation and constant global data (completed) | supplied local aggregate values lower before destination projection, including member leaves; recursive transactional folding of constant class/array globals with layout padding; translation-unit string pooling by code-unit type and bytes | 227/243 pa16 tests pass (16 failures, down from 20) with unchanged coverage; focused aggregate/data set 4/4; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -740,9 +741,30 @@ is 1139/1139, and `perl scripts/cppgm_file_audit.pl --stage pa16 --paths
 dev/src` passes with five nonfatal warnings.  No fixtures or reference files
 changed.
 
-## Active Checkpoint: CP12 — remaining LowIR shape and call/conversion boundaries
+## Completed Checkpoint: CP12 — aggregate leaf evaluation and constant global data
 
-Goal: reduce the remaining 20 pa16 failures while preserving the CP1–CP11
+Delivered: local aggregate lowering now evaluates each supplied leaf before
+forming its destination projection, preserving source-order side effects for
+pointer, scalar, class, bit-field, and deferred member leaves.  Global class
+definitions use a transactional recursive constant flattener for nested
+arrays/classes, retaining explicit scalar zeros and ABI padding while leaving
+dynamic aggregates on the existing startup path.  Repeated string literals in
+one translation unit share a global data object keyed by decoded code-unit type
+and bytes.
+
+Evidence (2026-09-03): the focused aggregate/data comparison for
+`100-global-aggregate-nested-array-initializer`,
+`200-member-pointer-const-typedef-return`,
+`200-nonliteral-field-condition-not-folded`, and
+`300-namespace-aggregate-array-string-members` passed 4/4.  The required
+`make test-pa16` result is 227/243 (16 failures, down from the 20-failure
+start) with unchanged coverage; `make test-report-through-pa15` is 1139/1139;
+and `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src` passes
+with five nonfatal warnings.  No fixtures or reference files changed.
+
+## Active Checkpoint: CP13 — remaining call, constructor, lifecycle, and bit-field boundaries
+
+Goal: reduce the remaining 16 pa16 failures while preserving the CP1–CP12
 semantic owners and the review-3 owners (`BuildFunctionBody`, `FinishCall`,
 `ZeroInitializeObject`, `ClassEntity::empty`).
 
@@ -761,16 +783,12 @@ semantic owners and the review-3 owners (`BuildFunctionBody`, `FinishCall`,
   consumer before changing a layer.
 - Remaining LowIR shape mismatches are
   `100-function-pointer-nested-param-name-shadow`,
-  `100-global-aggregate-nested-array-initializer`,
   `200-const-subobject-member-call`,
   `200-friend-derived-private-base-defaulted-constructor`,
-  `200-member-pointer-const-typedef-return`,
   `200-nested-braced-member-aggregate-init`,
-  `200-nonliteral-field-condition-not-folded`,
   `200-unnamed-namespace-hidden-friend-single-definition`,
   `300-callable-field-hides-private-base-method`,
   `300-friend-function-definition-skip`,
-  `300-namespace-aggregate-array-string-members`,
   `300-operator-nullptr-t-from-zero`,
   `300-synthesized-array-member-lifecycle`,
   `300-value-init-empty-functional-cast-aggregate`, and
@@ -779,11 +797,10 @@ semantic owners and the review-3 owners (`BuildFunctionBody`, `FinishCall`,
 - The direct lowering owners are `dev/src/lower/lowir_expr.cpp`
   (`Convert`, `LowerMember`, `LowerCall`, `LowerAssignment`),
   `dev/src/lower/lowir_program.cpp` (`LowerVariable`,
-  `LowerAggregateObjectInitializer`, `LowerMemberInitializer`), and
-  `dev/src/lower/lowir_symbols.cpp` (`BuildGlobalDefinitions`,
-  `BuildDeclarations`).  Preserve the known non-goals in `audit.md` review
-  3 finding 10: block-scope `static` objects and by-value copy semantics
-  (PA17).
+  `LowerMemberInitializer`, `ZeroInitializeObject`), and
+  `dev/src/lower/lowir_symbols.cpp` (`BuildDeclarations`, symbol/function
+  emission).  Preserve the known non-goals in `audit.md` review 3 finding 10:
+  block-scope `static` objects and by-value copy semantics (PA17).
 - Require a focused comparison, `make test-pa16`, the through-pa15 report,
-  and the pa16 file audit before closing CP12; the failing set must shrink,
+  and the pa16 file audit before closing CP13; the failing set must shrink,
   never merely shift.
