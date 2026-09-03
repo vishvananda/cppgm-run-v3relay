@@ -78,6 +78,9 @@ struct SemaNode
   TypeId type;
   BindingId binding;
   FunctionEntityId function;
+  // This action materializes a class temporary selected by an implicit
+  // user-defined conversion rather than an explicit constructor expression.
+  bool user_defined_conversion;
   ScopeId scope;
   std::size_t first; // token span; empty for synthesized nodes
   std::size_t last;

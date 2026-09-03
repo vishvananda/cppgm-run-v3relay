@@ -310,6 +310,7 @@ comes from the intended check.
 | CP13 direct call resolution and nested LowIR naming (completed) | ordinary member lookup suppresses ADL; parenthesized member calls retain direct member resolution; nested class scope spellings use one LowIR component without changing ABI object names | 229/243 pa16 tests pass (14 failures, down from 16) with unchanged coverage; focused call set 3/3; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | CP14 class member selection and lifetime initialization (completed) | const-qualified member projections with mutable/reference exceptions; recursive class completion through arrays; empty aggregate-constructor elision; synthesized array construction/unwind and reverse destruction; value-initialization zeroing | 231/243 pa16 tests pass (12 failures, down from 14) with unchanged coverage; packet 4/5 exact, with the remaining friend fixture retaining the standard-required base construction; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | review 4 (completed; `audit.md`) | three review-3 regressions restored (function-pointer field callee, temporary-constructor demand); qualified class-head spelling owned by sema (correct ABI names); linked guard chains at `kInlineCleanupLimit`; omitted aggregate subobjects constructed, dynamic class aggregates initialized at startup; startup bodies built before the emission walk; builtin kinds typed | 234/243 (9 failures; strict subset of the turn-start 12 and of review 3's 25); through-pa15 1139/1139; file audit passes with five warnings; probes linear, quadratic array/member emission removed |
+| CP16 conversion classification and temporary ownership (completed) | converting-constructor viability and copy-initialization actions; derived-pointer composite types and reference projection; source-ordered conversion temporaries without perturbing ordinary constructor/conditional slots | 242/243 pa16 tests pass (one failure, down from three) with unchanged coverage; focused conversion and recovery set passes; through-pa15 1139/1139; file audit passes with six warnings; no fixture or reference changes |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -873,26 +874,45 @@ unchanged coverage; `make test-report-through-pa15` is 1139/1139; and
 `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src` passes with
 six nonfatal warnings.  No fixtures or reference files changed.
 
-## Active Checkpoint: CP16 — conversion diagnostics and defaulted construction
+## Completed Checkpoint: CP16 — conversion diagnostics and temporary ownership
 
-Goal: reduce the remaining three pa16 failures while preserving CP1–CP15 and
-the review-4 ownership boundaries.
+Delivered: conversion classification now owns viable non-explicit converting
+constructors in copy-initialization contexts, with a recursion guard around
+overload ranking.  Reference binding records temporary materialization and
+top-level qualification, while the semantic initializer creates the selected
+constructor action.  Derived-pointer comparisons and conditional common types
+share a model-aware composite-pointer path, and LowIR reserves only marked
+conversion temporaries inside declaration-owned class construction so ordinary
+constructor, aggregate, placement-new, friend, and conditional slot order is
+unchanged.
+
+Evidence (2026-09-03): both queued diagnostics pass exact comparison, and the
+13 focused recovery fixtures covering aggregates, placement new, references,
+and hidden friends also pass.  The defaulted-constructor comparison remains
+the sole mismatch: its checked reference omits the derived constructor's
+standard-required base call, so the implementation preserves that call and
+does not alter the fixture.  `make test-pa16` is 242/243 (one failure, down
+from three) with unchanged coverage; `make test-report-through-pa15` is
+1139/1139; and `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src`
+passes with six nonfatal warnings.  No fixtures or reference files changed.
+
+## Active Checkpoint: CP17 — defaulted-constructor emission boundary
+
+Goal: resolve or formally bound the remaining defaulted-constructor LowIR
+shape mismatch without weakening standard-required base initialization.
 
 ### Implementation Packet
 
-- Start with the two queued diagnostics
-  (`200-string-literal-does-not-convert-to-mutable-void-pointer` and
-  `spec/200-const-reference-binds-derived-pointer-prvalue`); isolate their
-  conversion classification and initialization ownership in `conversions.cpp`
-  before changing lowering.
-- Revisit
-  `200-friend-derived-private-base-defaulted-constructor` only after reading
-  its current diff and confirming whether the checked reference's omitted
-  base call is a fixture/reference-shape issue or an actual semantic owner;
-  preserve the standard-required base initialization unless evidence assigns
-  the omission elsewhere.
+- Start with the exact LowIR diff for
+  `200-friend-derived-private-base-defaulted-constructor` and trace the
+  defaulted constructor's complete/base entry ownership through sema and
+  lowering; keep the required base call unless a canonical ABI rule assigns
+  the omission to another layer.
+- Treat the checked reference's omitted derived-constructor body as an oracle
+  boundary until semantic and ABI evidence shows a compiler-owned mismatch;
+  do not regenerate the fixture to hide the difference.
 - Leave the block-scope `extern` class declaration gap recorded and preserve
   the PA17 non-goals: block-scope `static` objects and by-value copy semantics.
-- Require focused diagnostics and constructor comparisons, `make test-pa16`,
-  the through-pa15 report, and the pa16 file audit; the failing set must shrink
-  without shifting or reducing coverage.
+- Require the focused constructor comparison, `make test-pa16`, the
+  through-pa15 report, and the pa16 file audit; preserve the current one-failure
+  boundary unless a standard-aligned fix removes it.

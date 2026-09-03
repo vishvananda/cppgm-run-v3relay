@@ -1634,7 +1634,7 @@ Lowerer::Value Lowerer::LowerComparison(SemaId node,
   TypeId common = 0;
   if (left_pointer && right_pointer) {
     bool ok = false;
-    common = types_.CompositePointer(left_source, right_source, ok);
+    common = CompositePointer(model_, types_, left_source, right_source, ok);
     if (!ok)
       Unsupported("this pointer comparison");
   } else if (left_pointer && (types_.IsNullPointerType(right_source) ||

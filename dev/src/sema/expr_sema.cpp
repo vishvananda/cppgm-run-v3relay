@@ -1531,7 +1531,7 @@ SemaId ExpressionAnalyzer::AnalyzeBinary(AstId expression, ScopeId scope)
     else if (types_.IsPointer(left_type) && types_.IsPointer(right_type))
     {
       bool ok = false;
-      (void)types_.CompositePointer(left_type, right_type, ok);
+      (void)CompositePointer(model_, types_, left_type, right_type, ok);
       if (!ok)
         throw std::runtime_error("incompatible pointer comparison");
       result_type = types_.Fundamental(FT_BOOL);
@@ -1663,8 +1663,8 @@ TypeId ExpressionAnalyzer::CommonConditionalType(SemaId left,
   if (types_.IsPointer(left_type) && types_.IsPointer(right_type))
   {
     bool ok = false;
-    const TypeId composite = mutable_types.CompositePointer(
-        left_type, right_type, ok);
+    const TypeId composite = CompositePointer(
+        model_, mutable_types, left_type, right_type, ok);
     if (ok)
       return composite;
   }
@@ -2652,6 +2652,23 @@ SemaId ExpressionAnalyzer::Initialize(SemaId expression, TypeId target,
   if (list_initialization &&
       IsNarrowingListInitialization(expression, target))
     throw std::runtime_error("narrowing conversion in list-initialization");
+  if (conversion.kind == CONV_USER_DEFINED)
+  {
+    TypeId class_type = target;
+    if (types_.Kind(class_type) == TYPE_REFERENCE)
+      class_type = types_.Referent(class_type);
+    class_type = types_.Unqualified(class_type);
+    const vector<SemaId> constructor_arguments(1, expression);
+    // The conversion sequence selected a converting constructor in a
+    // copy-initialization context.  Materialize that class temporary here so
+    // reference and by-value callers share the normal constructor-action
+    // ownership path.
+    const SemaId temporary = BuildConstructorTemporary(
+        0, class_type, tree_.At(expression).scope, constructor_arguments,
+        false, true);
+    tree_.At(temporary).user_defined_conversion = true;
+    return temporary;
+  }
   if (types_.Kind(target) == TYPE_REFERENCE)
   {
     // 8.5.3p5: a temporary created through a promotion or conversion is

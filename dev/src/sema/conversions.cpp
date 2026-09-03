@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "sema/overload.h"
+
 namespace
 {
 
@@ -114,6 +116,26 @@ bool PointerToVoidCompatible(const TypeTable& types, TypeId source,
        !IsVolatile(types, source_pointee));
   return true;
 }
+
+unsigned& UserDefinedConversionDepth()
+{
+  static thread_local unsigned depth = 0;
+  return depth;
+}
+
+class UserDefinedConversionGuard
+{
+public:
+  UserDefinedConversionGuard()
+  {
+    ++UserDefinedConversionDepth();
+  }
+
+  ~UserDefinedConversionGuard()
+  {
+    --UserDefinedConversionDepth();
+  }
+};
 
 ImplicitConversion ClassifyValue(TypeTable& types, TypeId source,
                                  ValueCategory source_category,
@@ -428,6 +450,59 @@ bool CVCompatibleForBase(const TypeTable& types, TypeId source, TypeId target)
       !(IsVolatile(types, source) && !IsVolatile(types, target));
 }
 
+bool HasConvertingConstructor(const SemaModel& model, TypeTable& types,
+                              TypeId source, ValueCategory source_category,
+                              bool is_null_literal,
+                              bool is_function_lvalue, TypeId target)
+{
+  TypeId target_value = target;
+  if (types.Kind(target_value) == TYPE_REFERENCE)
+    target_value = types.Referent(target_value);
+  const TypeId class_type = types.Unqualified(target_value);
+  if (types.Kind(class_type) != TYPE_CLASS)
+    return false;
+
+  TypeId source_value = source;
+  if (types.Kind(source_value) == TYPE_REFERENCE)
+    source_value = types.Referent(source_value);
+  if (types.Unqualified(source_value) == class_type)
+    return false;
+
+  const ClassEntityId class_entity =
+      static_cast<ClassEntityId>(types.At(class_type).entity);
+  const ClassEntity& owner = model.ClassAt(class_entity);
+  if (owner.class_scope == 0 || owner.constructors.empty())
+    return false;
+
+  std::vector<BindingId> bindings;
+  model.DirectBindings(owner.class_scope,
+                       model.ScopeAt(owner.class_scope).name,
+                       LOOKUP_FUNCTIONS, bindings);
+  std::vector<BindingId> converting;
+  for (std::size_t i = 0; i < bindings.size(); ++i)
+  {
+    const Binding& binding = model.BindingAt(bindings[i]);
+    if (binding.function == 0)
+      continue;
+    const FunctionEntity& function = model.FunctionAt(binding.function);
+    // An implicit conversion is a copy-initialization of the target class;
+    // explicit constructors are therefore not candidates here.
+    if (function.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
+        !function.deleted && !function.explicit_constructor)
+      converting.push_back(bindings[i]);
+  }
+  if (converting.empty())
+    return false;
+
+  std::vector<OverloadArgument> arguments;
+  arguments.push_back(OverloadArgument(
+      types.Pointer(class_type), VC_PRVALUE, false, false, true));
+  arguments.push_back(OverloadArgument(
+      source, source_category, is_null_literal, is_function_lvalue));
+  UserDefinedConversionGuard guard;
+  return SelectBestOverload(model, types, converting, arguments, true) != 0;
+}
+
 } // namespace
 
 ImplicitConversion Classify(const SemaModel& model, TypeTable& types,
@@ -500,8 +575,44 @@ ImplicitConversion Classify(const SemaModel& model, TypeTable& types,
       result.kind = CONV_DERIVED_TO_BASE;
       result.qualification = IsConst(types, target_pointee) &&
           !IsConst(types, source_pointee);
+      if (target_reference)
+      {
+        const bool target_rvalue = !types.At(target).lvalue_reference;
+        if (!target_rvalue && !IsConst(types, target_value) &&
+            !IsVolatile(types, target_value))
+          return ImplicitConversion();
+        result.reference = REFERENCE_TEMPORARY;
+        result.rvalue_ref_to_rvalue = target_rvalue;
+        result.qualification = result.qualification ||
+            (IsConst(types, target_value) &&
+             !IsConst(types, source_value)) ||
+            (IsVolatile(types, target_value) &&
+             !IsVolatile(types, source_value));
+      }
       return result;
     }
+  }
+
+  // 13.3.3.1.2: a converting constructor contributes one user-defined
+  // conversion sequence after the standard sequence has been ruled out.
+  // The guard prevents constructor-parameter ranking from recursively
+  // introducing a second user-defined conversion into the same sequence.
+  if (UserDefinedConversionDepth() == 0 &&
+      (!target_reference ||
+       !types.At(target).lvalue_reference ||
+       IsConst(types, target_value) || IsVolatile(types, target_value)) &&
+      HasConvertingConstructor(model, types, source, source_category,
+                               is_null_literal, is_function_lvalue, target))
+  {
+    ImplicitConversion result;
+    result.rank = RANK_CONVERSION;
+    result.kind = CONV_USER_DEFINED;
+    if (target_reference)
+    {
+      result.reference = REFERENCE_TEMPORARY;
+      result.rvalue_ref_to_rvalue = !types.At(target).lvalue_reference;
+    }
+    return result;
   }
   return standard;
 }
@@ -534,4 +645,36 @@ ConversionComparison Compare(const ImplicitConversion& left,
     return left.function_lvalue_to_lvalue_ref ? CONVERSION_BETTER :
         CONVERSION_WORSE;
   return CONVERSION_EQUAL;
+}
+
+TypeId CompositePointer(const SemaModel& model, TypeTable& types,
+                        TypeId left, TypeId right, bool& ok)
+{
+  const TypeId left_pointer = types.Decay(left);
+  const TypeId right_pointer = types.Decay(right);
+  const TypeId composite = types.CompositePointer(
+      left_pointer, right_pointer, ok);
+  if (ok)
+    return composite;
+  if (!types.IsPointer(left_pointer) || !types.IsPointer(right_pointer))
+    return 0;
+
+  const ImplicitConversion left_to_right = Classify(
+      model, types, left_pointer, VC_PRVALUE, false, false, right_pointer);
+  if (left_to_right.Viable() &&
+      left_to_right.kind == CONV_DERIVED_TO_BASE)
+  {
+    ok = true;
+    return right_pointer;
+  }
+  const ImplicitConversion right_to_left = Classify(
+      model, types, right_pointer, VC_PRVALUE, false, false, left_pointer);
+  if (right_to_left.Viable() &&
+      right_to_left.kind == CONV_DERIVED_TO_BASE)
+  {
+    ok = true;
+    return left_pointer;
+  }
+  ok = false;
+  return 0;
 }

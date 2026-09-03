@@ -303,7 +303,8 @@ private:
 
   // Semantic traversal and slots.
   std::vector<SemaId> Children(SemaId node) const;
-  void CollectSlots(SemaId node, std::set<BindingId>& seen);
+  void CollectSlots(SemaId node, std::set<BindingId>& seen,
+                    bool in_class_initializer = false);
   void CollectParameters(SemaId function_node,
                          std::vector<SemaId>& parameters) const;
   void AddParameterSlots(SemaId function_node);

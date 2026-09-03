@@ -300,7 +300,8 @@ void Lowerer::CollectParameters(SemaId function_node,
 // Source slots are declared in encounter order over the whole body, nested
 // blocks included, so the frame layout is fixed before any statement is
 // lowered.
-void Lowerer::CollectSlots(SemaId node, std::set<BindingId>& seen)
+void Lowerer::CollectSlots(SemaId node, std::set<BindingId>& seen,
+                           bool in_class_initializer)
 {
   if (node == 0)
     return;
@@ -311,9 +312,22 @@ void Lowerer::CollectSlots(SemaId node, std::set<BindingId>& seen)
   if (value.kind == SEMA_VARIABLE && value.binding != 0 &&
       seen.insert(value.binding).second)
     AddSourceSlot(value.binding);
+  if (value.kind == SEMA_CONSTRUCTOR_ACTION && value.binding == 0 &&
+      value.function != 0 && value.user_defined_conversion &&
+      in_class_initializer)
+  {
+    TemporaryObject& temporary = temporaries_[node];
+    if (temporary.slot.empty())
+    {
+      temporary.slot = NewGeneratedSlot("arg", LowTypeOf(value.type));
+    }
+  }
+  const bool child_in_class_initializer = in_class_initializer ||
+      (value.kind == SEMA_VARIABLE &&
+       types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS);
   for (SemaId child = value.first_child; child != 0;
        child = tree_.At(child).next_sibling)
-    CollectSlots(child, seen);
+    CollectSlots(child, seen, child_in_class_initializer);
 }
 
 const std::string& Lowerer::SlotFor(BindingId binding) const

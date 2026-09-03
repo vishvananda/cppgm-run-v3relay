@@ -4,8 +4,9 @@
 
 SemaNode::SemaNode()
     : kind(SEMA_TRANSLATION_UNIT), category(VC_PRVALUE), op(KW_AUTO),
-      has_value(false), type(0), binding(0), function(0), scope(0), first(0),
-      last(0), value(0), first_child(0), last_child(0), next_sibling(0)
+      has_value(false), type(0), binding(0), function(0),
+      user_defined_conversion(false), scope(0), first(0), last(0), value(0),
+      first_child(0), last_child(0), next_sibling(0)
 {
 }
 

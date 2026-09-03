@@ -27,7 +27,8 @@ enum ConversionKind
   CONV_NULL_TO_NULLPTR,
   CONV_QUALIFICATION,
   CONV_BOOLEAN,
-  CONV_DERIVED_TO_BASE
+  CONV_DERIVED_TO_BASE,
+  CONV_USER_DEFINED
 };
 
 enum ReferenceBinding
@@ -90,3 +91,9 @@ enum ConversionComparison
 // conversion layer.
 ConversionComparison Compare(const ImplicitConversion& left,
                         const ImplicitConversion& right);
+
+// The composite pointer type needs the owning class graph for a derived
+// pointer conversion; TypeTable's model-free helper remains the fast path
+// for identical, void, and qualification-compatible pointers.
+TypeId CompositePointer(const SemaModel& model, TypeTable& types,
+                        TypeId left, TypeId right, bool& ok);
