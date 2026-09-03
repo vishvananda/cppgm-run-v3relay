@@ -1,5 +1,200 @@
 # PA16 Checkpoint Review — cppgm++ --emit-lowir with the basic object model
 
+## Review 4 (2026-09-03): CP11–CP14
+
+Scope: the four implementation checkpoints since review 3 (`0ec81b58e`
+builtin and common-reference boundaries, `0a4d0ae66` aggregate
+initialization data, `b6f7a72cc` direct member calls and nested symbols,
+`c6a5f196f` class object boundary), read in full against the README
+boundary, the plan's ownership and performance rules, spec.md's one-owner,
+typed-vocabulary and bounded-work requirements, and the fixtures they cite.
+Method: the review-3 executable was rebuilt in a worktree and its pa16
+failing set diffed against the turn-start set (25 → 12, but not a subset:
+three fixtures regressed, see finding 1); representative facts were traced
+from their owner to the emitted text (a builtin call and its declaration
+metadata, a using-declaration overload set, a derived/base conditional
+reference, a supplied aggregate leaf with a side effect, a constant nested
+class/array global, a pooled string literal, an unqualified call from a
+member body, a parenthesized member call, a qualified nested class head, a
+const object's member projection, a value-initialized functional cast, a
+member array's construction and destruction); generated probes covered a
+qualified class head three levels deep, an omitted aggregate member and
+array element with user-provided default constructors, a class global with
+a dynamic leaf, a function-pointer field called with and without
+parentheses, a block-scope `extern` class object, and member arrays and
+member lists of 250 to 2000 objects with constructors and destructors;
+probe outputs were passed through the harness's LowIR validator; the
+plan's scaling probes were timed on the review build.
+
+### Findings and changes
+
+1. **Three fixtures regressed since review 3, hidden by the net count
+   (material, fixed).**  CP13's evidence reads "16 → 14 with 3 fixed" and
+   CP14's "14 → 12 with 4 fixed": one and two regressions.  CP13's
+   parenthesized-callee unwrap in `ResolveCallCallee` sent `(h.fn)(4)`
+   (`300-member-function-pointer-field-call`) down the member-function
+   path, which found no function; a `SEMA_MEMBER` naming a data member is
+   now `CallResolution::indirect_callee` and `FinishCall` calls through its
+   value, which also makes the unparenthesized `h.fn(4)` work (it failed on
+   every earlier build).  CP14's `CollectTemporaryConstructorUses` dropped
+   the emission demand of every trivially value-initialized temporary, but
+   `LowerVariable` zeroes only a variable's initializer without a call; an
+   expression temporary (`F()(x)` in `300-temporary-functor-call`,
+   `Derived() - Derived()` in `300-prvalue-derived-base-friend-operator`)
+   keeps the constructor call the fixtures spell, so its helper was called
+   but never defined.  `Lowerer::ImplicitValueInitialization` is the one
+   predicate for the action shape, and the demand walk drops the demand
+   only where lowering drops the call.
+2. **Qualified class-head spelling split by text below its owner
+   (material, fixed).**  `BuildClassDefinition` named the class scope and
+   type of `struct B::D : B {}` by the joined spelling `B::D` under `B`;
+   CP13 then stripped `::` prefixes from scope names in `NameSymbols` for
+   the LowIR name while the ABI encoder still received the doubled path:
+   `object=_ZN1B1B1D1fEv` for `B::D::f`, and `_ZN1N1B1N1B1E1N1B1E1F1gEv`
+   for a three-level probe.  The fixture passed only because the relaxed
+   compare drops `object=`.  Sema now names the scope and type by the last
+   component under the prefix scope (`ResolveQualifierScope`), the strip is
+   gone, and the encoder, `NamespacePieces` and `QualifiedTypeName` read
+   the same typed chain: `_ZN1B1D1fEv`, `_ZN1N1B1E1F1gEv`.  The PA11 dump
+   fixture for a qualified enum head keeps its own joined spelling.
+3. **Guarded subobject sequences were quadratic (material, fixed).**
+   CP14's destructor suffix cleanups repeat the whole remaining suffix in
+   every cleanup block, and its array-member construction unwind repeats
+   the whole destroyed prefix in every dispatch block.  A 1000-element
+   member array with a constructor and destructor took 13.95 s, 4.3 GB and
+   6.0 M lines of LowIR (0.81 s → 3.24 s → 13.95 s per doubling); 1000
+   members with destructors 3.26 s and 1.1 GB.  Both sequences now share
+   `Lowerer::kInlineCleanupLimit` (32, the constant the return-cleanup
+   chain of review 1 already used): below it the fixture shape is
+   unchanged; at it the handler blocks form one linked chain, each
+   destroying one subobject and continuing with the next block, and only
+   the last pops the handler and resumes.  The same inputs take 0.08 s /
+   42 MB / 46 K lines and 0.04 s / 20 MB, doubling per doubling; the
+   chained output passes the harness validator.  `EmitEhTry`,
+   `EmitEhCleanup`, `EmitEhEnd` and `EmitResume` replace the inline
+   instruction builders.
+4. **Constant folding zeroed subobjects that need construction, and the
+   fallback it named did not exist (material, fixed).**  CP12's
+   `ConstantGlobalAggregate` folded an omitted class member or element as
+   `zero` whatever its default constructor: `Out o = {1}` with `In() :
+   v(3) {}` became `{ i32 1, zero 4 }` and `o.in.v` read 0.  Its comment
+   left "dynamic aggregates on the existing startup path", but a class
+   global whose braced list has a dynamic leaf (`Out o = {f()}`) was `zero
+   12` with no startup code on this and on the review-3 build (a
+   pre-existing gap: only arrays had leaf stores).  8.5.1p7 now holds at
+   namespace scope: an omitted subobject is constant only when its class,
+   or its element class, has a trivial default constructor; otherwise, and
+   for a dynamic leaf, the zeroed object is aggregate-initialized at
+   startup through the same `LowerAggregateObjectInitializer` the locals
+   use (`DynamicInitializer::aggregate_object`), and an omitted array
+   element with a non-trivial default constructor is constructed in place
+   (`default_construction`, `AddOmittedElementConstructions`, shared by
+   the namespace and static-member array paths).  A thread-local aggregate
+   with a dynamic initializer is rejected instead of zeroed silently.
+5. **Demand raised from the startup bodies was lost (material, fixed).**
+   The validator on the probe reported `@__cppgm_init` calling `@In__In`
+   that the unit never defined: `BuildGlobalInitializers` ran after the
+   emission walk, so a weak body first named while lowering a startup body
+   was never chosen.  The thread-local, startup and shutdown bodies are
+   demand roots outside the semantic call graph and are built before the
+   walk; the finalizer's separate pre-marking block is redundant and gone.
+6. **Builtin identity by string in two layers (fixed).**  CP11 classified
+   `__builtin_*` by spelling in `FinishCall`, in `BuiltinFunction`, in
+   `FunctionObjectName` (prefix surgery) and twice in
+   `BuildBuiltinDeclaration`, cached by `std::map<std::string, …>`.
+   `BuiltinFunctionKind` on `FunctionEntity` is the typed vocabulary: the
+   spelling is classified once at the call site (`BuiltinKindOf`), the
+   object symbol comes from the same table (`BuiltinObjectName`),
+   signatures and boundary metadata switch on the kind, and the
+   per-analyzer cache is a vector indexed by kind.
+7. **A default-constructor call reconstructed below its owner (fixed).**
+   CP14 made `LowerVariable` look up `DefaultConstructor(entity)` and call
+   it for a class local with no initializer child.  Sema records a
+   constructor action for every non-extern class local, so the branch was
+   reachable only for a block-scope `extern` declaration, where it
+   constructed an object this unit must not construct; it is gone.
+8. **String pool keyed by a rendered tag (fixed).**  The literal pool's
+   key rendered the code-unit type to decimal text in front of the bytes;
+   it is `pair<EFundamentalType, bytes>`.
+9. **Verified and kept.**  CP11's using-declaration set import, the
+   derived/base conditional glvalue binding and the function-over-tag
+   callee classification are one lookup each per call site; CP12's
+   leaf-before-projection order and transactional folding; CP13's ADL
+   suppression when ordinary lookup finds a member (3.4.2p3); CP14's
+   `ClassField::mutable_member` with `MemberAccessType`,
+   `trivial_default_constructor` through array members,
+   `CanElideEmptyAggregateConstructor` (the fixture's reference omits the
+   empty user constructor's call; arguments are still evaluated; the walk
+   is bounded by the definition's children), and the eight-byte-chunk
+   zeroing of a byte-zeroable class whose size is a multiple of eight
+   (`300-value-init-empty-functional-cast-aggregate` pins it; other shapes
+   keep the per-member stores).
+10. **Kept deliberately, recorded here.**  Block-scope `extern T x;` of a
+    class object is lowered as an automatic slot with a destructor at
+    scope exit (pre-existing; it should denote the namespace object and
+    start no lifetime).  Omitted aggregate subobjects are
+    default-constructed by lowering through `DefaultConstructor` rather
+    than by a sema-recorded action (pre-existing since CP4a: the aggregate
+    list carries only the written clauses).  A call expression looks its
+    callee name up three times (`TryFunctionalCast`,
+    `TryCallableObjectExpression`, `ResolveNamedCallee`), each bounded.
+    `ZeroInitializeObject` keeps two spellings by size.  The aggregate
+    analysis moved unchanged to `sema/expr_sema_aggregate.cpp` to keep
+    `expr_sema.cpp` under the audit limit.
+
+### Ownership after review
+
+| fact | owner | consumers |
+| --- | --- | --- |
+| a qualified class-head's scope and type name | `BuildClassDefinition`: last component under `ResolveQualifierScope(prefix)` | `NamespacePieces`, `QualifiedTypeName`, the ABI encoder |
+| builtin function identity | `FunctionEntity::builtin` (`BuiltinFunctionKind`), classified once by `BuiltinKindOf` | `BuiltinFunction`, `FunctionObjectName`, `BuildBuiltinDeclaration`, `CollectSymbols` |
+| a pointer-to-function data member as callee | `CallResolution::indirect_callee` (`ResolveCallCallee`) | `FinishCall` |
+| expression-owned value-initialization shape | `Lowerer::ImplicitValueInitialization` | `LowerVariable`, `CollectTemporaryConstructorUses` |
+| inline-vs-linked guard limit | `Lowerer::kInlineCleanupLimit` | return cleanups, `EmitSubobjectDestructors`, `EmitArrayDefaultConstructions` |
+| omitted aggregate subobject at namespace scope | `ConstantGlobalAggregate` (constant only if trivially constructible), else `DynamicInitializer::aggregate_object` / `default_construction` | `BuildGlobalInitializers` |
+| emission demand from startup, thread-local and shutdown bodies | built before the emission walk in `Lowerer::Run` | the walk |
+
+### Validation
+
+- `make test-pa16`: 234/243 (9 failures; 12 at the turn start).  The three
+  review-3 regressions pass; the failing set is a strict subset of the
+  turn-start set and of review 3's; no fixture that passed at review 3 or
+  at the turn start fails.
+- `make test-report-through-pa15`: 1139/1139.
+- `perl scripts/cppgm_file_audit.pl --stage pa16 --paths dev/src`: passes
+  with the five pre-existing warnings.
+- Probes through the harness's validation and relaxed self-compare (6/6):
+  the omitted-member and dynamic-leaf aggregates, a 40-element member array
+  and a 40-member class (linked chains), the function-pointer field call,
+  and the three-level qualified class head.
+- Remaining failures by first error: two EXIT_FAILURE fixtures
+  (`200-string-literal-does-not-convert-to-mutable-void-pointer`,
+  `spec/200-const-reference-binds-derived-pointer-prvalue`) and seven LowIR
+  shape mismatches: `300-callable-field-hides-private-base-method` (its
+  call resolves; the layout places an empty member after an empty base at
+  offset 1, the reference at offset 0 with size 1), two hidden-friend
+  definitions, function-pointer parameter shadowing, the `nullptr_t`
+  operator, bit-field increments, and the defaulted constructor through a
+  friend whose reference omits the base call.
+
+### Performance evidence
+
+Review build, wall seconds and peak RSS; the plan's probes and the two
+review probes (`array N`: a member array of N objects with a constructor
+and destructor; `members N`: N members with destructors).
+
+| probe | N | N×2 |
+| --- | --- | --- |
+| wide (fields + methods) 2000 | 0.06 s / 18.0 MB | 0.13 s / 31.1 MB |
+| deep (inheritance) 300 | 0.00 s / 6.4 MB | 0.01 s / 7.3 MB |
+| exits (locals with destructors + returns) 400 | 0.02 s / 9.9 MB | 0.04 s / 15.2 MB |
+| array (member array, ctor + dtor) 1000 | 0.08 s / 41.7 MB | 0.17 s / 78.3 MB |
+| members (dtor each) 1000 | 0.04 s / 20.1 MB | 0.09 s / 35.2 MB |
+
+Every probe doubles at most in time and memory per doubling.  Before the
+review `array 1000` measured 13.95 s / 4.3 GB and `members 1000` 3.26 s /
+1.1 GB, quadrupling per doubling.
+
 ## Review 3 (2026-09-03): CP7–CP10
 
 Scope: the four implementation checkpoints since review 2 (`8d71a7b5d`
@@ -596,4 +791,9 @@ cheap comparisons (~0.05 s); it is gone rather than deferred.
 | CP8 enclosing-scope destruction and incomplete types | `5cedae657` | 200/243 |
 | CP9 member initialization and layout paths | `95f01acef` | 213/243 |
 | CP10 conversion and call-lowering paths | `3ea514d42` | 218/243 |
-| review 3 (this section) | review commit | 218/243, same failing set; through-pa15 1139/1139; findings 1–10 |
+| review 3 | `a0f917238` | 218/243, same failing set; through-pa15 1139/1139; findings 1–10 |
+| CP11 builtin, lookup and common-reference boundaries | `0ec81b58e` | 223/243 |
+| CP12 aggregate leaf evaluation and constant global data | `0a4d0ae66` | 227/243 |
+| CP13 direct call resolution and nested LowIR naming | `b6f7a72cc` | 229/243; regressed `300-member-function-pointer-field-call` while fixing 3 |
+| CP14 class member selection and lifetime initialization | `c6a5f196f` | 231/243; regressed `300-temporary-functor-call` and `300-prvalue-derived-base-friend-operator` while fixing 4 |
+| review 4 (this section) | review commit | 234/243; the three regressions restored, strict subset of the turn-start set; through-pa15 1139/1139; findings 1–10 |

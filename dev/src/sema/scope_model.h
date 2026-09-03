@@ -237,6 +237,23 @@ struct EnumEntity
   EnumEntity();
 };
 
+// The compiler-provided functions a call may name without a declaration.
+// The source spelling is classified once, at the call site; every later
+// consumer (signature, object symbol, boundary metadata) reads the kind.
+enum BuiltinFunctionKind
+{
+  BUILTIN_NONE,
+  BUILTIN_UNREACHABLE,
+  BUILTIN_STRLEN,
+  BUILTIN_MEMCPY,
+  BUILTIN_MEMMOVE,
+  BUILTIN_KIND_COUNT
+};
+
+BuiltinFunctionKind BuiltinKindOf(const std::string& spelling);
+const char* BuiltinSpelling(BuiltinFunctionKind kind);
+const char* BuiltinObjectName(BuiltinFunctionKind kind);
+
 struct FunctionEntity
 {
   ScopeId scope; // declaration scope, not the function body's block scope
@@ -263,10 +280,11 @@ struct FunctionEntity
   bool static_member;
   bool in_class_definition;
   bool synthesized;
-  // Compiler-provided call target with no source declaration.  Builtin
-  // signatures are still represented by a normal function entity so
-  // overload argument conversion and lowering share the ordinary call path.
-  bool builtin;
+  // Compiler-provided call target with no source declaration (BUILTIN_NONE
+  // for a declared function).  Builtin signatures are still represented by
+  // a normal function entity so overload argument conversion and lowering
+  // share the ordinary call path.
+  BuiltinFunctionKind builtin;
   // 11.3: the classes whose friend declarations name this function.
   std::vector<ClassEntityId> friend_of;
   // One entry per canonical parameter; a zero entry means that parameter

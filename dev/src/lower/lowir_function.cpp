@@ -440,7 +440,8 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
   // every source exit would duplicate that suffix quadratically.  For large
   // return sets, route exits through one linked cleanup chain; small
   // functions retain the direct form used by the normal LowIR shape.
-  shared_return_cleanup_ = CountReturnStatements(body) >= 32;
+  shared_return_cleanup_ =
+      CountReturnStatements(body) >= kInlineCleanupLimit;
   if (shared_return_cleanup_) {
     shared_return_end_label_ = NewBlockLabel("return_cleanup_end");
     if (!IsVoidType(types_, type.result))

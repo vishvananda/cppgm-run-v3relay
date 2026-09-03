@@ -2,12 +2,14 @@
 
 #include <stdexcept>
 
-FunctionEntityId ExpressionAnalyzer::BuiltinFunction(const std::string& name)
+// One function entity per builtin kind and translation unit, created on
+// first use with the signature the kind defines.
+FunctionEntityId ExpressionAnalyzer::BuiltinFunction(BuiltinFunctionKind kind)
 {
-  const std::map<std::string, FunctionEntityId>::const_iterator found =
-      builtin_functions_.find(name);
-  if (found != builtin_functions_.end())
-    return found->second;
+  if (kind <= BUILTIN_NONE || kind >= BUILTIN_KIND_COUNT)
+    throw std::logic_error("unknown builtin function");
+  if (builtin_functions_[kind] != 0)
+    return builtin_functions_[kind];
 
   const TypeId void_type = types_.Fundamental(FT_VOID);
   const TypeId const_char = types_.Cv(types_.Fundamental(FT_CHAR), true);
@@ -18,24 +20,29 @@ FunctionEntityId ExpressionAnalyzer::BuiltinFunction(const std::string& name)
   const TypeId size_type = types_.Fundamental(FT_UNSIGNED_LONG_INT);
   std::vector<TypeId> parameters;
   TypeId result = void_type;
-  if (name == "__builtin_unreachable") {
-    // no parameters
-  } else if (name == "__builtin_strlen") {
+  switch (kind)
+  {
+  case BUILTIN_UNREACHABLE:
+    break;
+  case BUILTIN_STRLEN:
     parameters.push_back(const_char_pointer);
     result = size_type;
-  } else if (name == "__builtin_memcpy" ||
-             name == "__builtin_memmove") {
+    break;
+  case BUILTIN_MEMCPY:
+  case BUILTIN_MEMMOVE:
     parameters.push_back(void_pointer);
     parameters.push_back(const_void_pointer);
     parameters.push_back(size_type);
     result = void_pointer;
-  } else {
-    throw std::runtime_error("unknown builtin function");
+    break;
+  default:
+    break;
   }
 
   const FunctionEntityId function = model_.CreateFunction(
-      model_.GlobalScope(), name, types_.Function(result, parameters));
-  model_.FunctionAt(function).builtin = true;
-  builtin_functions_[name] = function;
+      model_.GlobalScope(), BuiltinSpelling(kind),
+      types_.Function(result, parameters));
+  model_.FunctionAt(function).builtin = kind;
+  builtin_functions_[kind] = function;
   return function;
 }

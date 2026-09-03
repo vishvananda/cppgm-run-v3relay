@@ -115,6 +115,10 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    BuildFunctionBody` the one owner of a body's jump context (labels,
    gotos, switch entries, initialized locals), so a local class's member
    bodies set the enclosing function's state aside instead of clearing it.
+   Review 4 named a qualified class-head's scope and type
+   (`struct B::D : B {}`) by the last component under the prefix scope, so
+   `NamespacePieces`, `QualifiedTypeName` and the ABI encoder read one
+   typed chain (`_ZN1B1D1fEv`); no consumer splits a joined spelling.
 
 3. Expression semantics (`dev/src/sema/expr_sema.cpp`, `overload.cpp`).
    `this` (keyword literal → prvalue `cv X*`), unqualified names inside
@@ -138,7 +142,14 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    Every named call, including the parameter-shaped forms CP7 reclassifies
    (`sizeof(derived::select(index()))`, `X x(f())`), resolves through
    `ResolveNamedCallee` and `FinishCall`; `BuildResolvedCall` is the
-   operator-call tail.
+   operator-call tail.  A member expression naming a pointer-to-function
+   data member is an indirect callee (`CallResolution::indirect_callee`,
+   review 4), with or without parentheses; ordinary lookup finding a member
+   function suppresses ADL (3.4.2p3, `suppress_adl`).  The four supported
+   `__builtin_*` calls are a typed vocabulary: `BuiltinKindOf` classifies
+   the spelling once at the call site into `FunctionEntity::builtin`
+   (`BuiltinFunctionKind`), and the signature, the `cppgm_builtin_*` object
+   symbol and the declaration's boundary metadata switch on the kind.
 
 4. Lowering (`dev/src/lower/*`).  `LowInfoOf(TYPE_CLASS)` → `LK_OBJECT`
    (`obj<SxA>` slots); member access is `index i8 [projection=field] base,
@@ -204,7 +215,23 @@ PA16 adds one owning boundary per layer; nothing is duplicated across layers.
    is copied with `copyobj` through `EmitCopyObject` on both sides of the
    call, an empty one keeps the bare `$argobj__N` slot the fixtures pin;
    the serializer renders `copyobj` and `zeroinit`.  Object aliases are
-   published after the emission walk, base-owned entities first.
+   published after the emission walk, base-owned entities first.  Review 4:
+   the thread-local, startup and shutdown bodies are built before the
+   emission walk because they are demand roots outside the semantic call
+   graph; a namespace-scope aggregate folds to constant data only when every
+   omitted subobject is trivially constructible, otherwise the zeroed object
+   is aggregate-initialized at startup by the same
+   `LowerAggregateObjectInitializer` the locals use
+   (`DynamicInitializer::aggregate_object`) and an omitted array element with
+   a non-trivial default constructor is constructed in place
+   (`default_construction`); every guarded subobject sequence (return
+   cleanups, destructor suffix cleanups, member-array construction unwinds)
+   shares `Lowerer::kInlineCleanupLimit`: below 32 the handler blocks repeat
+   the fixture shape, at 32 they form one linked chain so the text stays
+   linear; `ImplicitValueInitialization` is the one predicate for an
+   expression-owned `T()` action, applied by `LowerVariable` (zero, call only
+   a non-trivial constructor) and mirrored by the temporary-constructor
+   demand walk (an expression temporary keeps its constructor call).
 
 ## Failure map at CP1 (218 failing, 25 passing; 19 fixtures expect EXIT_FAILURE)
 
@@ -282,6 +309,7 @@ comes from the intended check.
 | CP12 aggregate leaf evaluation and constant global data (completed) | supplied local aggregate values lower before destination projection, including member leaves; recursive transactional folding of constant class/array globals with layout padding; translation-unit string pooling by code-unit type and bytes | 227/243 pa16 tests pass (16 failures, down from 20) with unchanged coverage; focused aggregate/data set 4/4; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | CP13 direct call resolution and nested LowIR naming (completed) | ordinary member lookup suppresses ADL; parenthesized member calls retain direct member resolution; nested class scope spellings use one LowIR component without changing ABI object names | 229/243 pa16 tests pass (14 failures, down from 16) with unchanged coverage; focused call set 3/3; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
 | CP14 class member selection and lifetime initialization (completed) | const-qualified member projections with mutable/reference exceptions; recursive class completion through arrays; empty aggregate-constructor elision; synthesized array construction/unwind and reverse destruction; value-initialization zeroing | 231/243 pa16 tests pass (12 failures, down from 14) with unchanged coverage; packet 4/5 exact, with the remaining friend fixture retaining the standard-required base construction; through-pa15 1139/1139; file audit passes with five warnings; no fixture or reference changes |
+| review 4 (completed; `audit.md`) | three review-3 regressions restored (function-pointer field callee, temporary-constructor demand); qualified class-head spelling owned by sema (correct ABI names); linked guard chains at `kInlineCleanupLimit`; omitted aggregate subobjects constructed, dynamic class aggregates initialized at startup; startup bodies built before the emission walk; builtin kinds typed | 234/243 (9 failures; strict subset of the turn-start 12 and of review 3's 25); through-pa15 1139/1139; file audit passes with five warnings; probes linear, quadratic array/member emission removed |
 
 CP1 evidence (2026-09-02): the semantic class model now owns direct bases,
 fields, access/static metadata, layout size/alignment and member lookup; the
@@ -364,6 +392,28 @@ owners.  `make test-pa16` is 218/243 with the identical failing set,
 `make test-report-through-pa15` 1139/1139, the file audit passes with five
 warnings, and the plan's probes double per doubling.  Deliberate leftovers
 are listed in `audit.md` review 3 finding 10.
+
+Review 4 evidence (2026-09-03, `audit.md`): diffing the turn-start failing
+set against a rebuilt review-3 executable showed three regressions hidden
+by the count (25 → 12): CP13's parenthesized-callee unwrap broke a
+function-pointer field call and CP14's temporary-constructor filter left
+the helpers of `F()(x)` and `Derived() - Derived()` undefined; all three
+pass again.  Probes found four more material defects: a qualified class
+head mangled with a doubled path (`_ZN1B1B1D1fEv`, hidden by the relaxed
+compare), quadratic destructor-suffix and array-construction unwind
+emission (a 1000-element member array took 13.95 s and 4.3 GB), constant
+folding that zeroed omitted subobjects with user-provided default
+constructors while a class aggregate with a dynamic leaf got no startup
+code at all, and startup-body demand raised after the emission walk.  Sema
+now names a qualified class head by its last component, the guard chains
+share `kInlineCleanupLimit`, omitted subobjects and dynamic class aggregates
+initialize at startup, the startup bodies precede the walk, and builtins
+are a typed kind.  `make test-pa16` is 234/243 (9 failures, a strict
+subset of the turn-start set), `make test-report-through-pa15` 1139/1139,
+the file audit passes with five warnings (the aggregate analysis moved to
+`expr_sema_aggregate.cpp`), and the plan's probes plus `array 1000/2000`
+(0.08/0.17 s) and `members 1000/2000` (0.04/0.09 s) double per doubling.
+Deliberate leftovers are listed in `audit.md` review 4 finding 10.
 
 ## Completed Checkpoint: CP1 — class model, layout, members, methods
 
@@ -799,24 +849,40 @@ failures, down from 14) with unchanged coverage; `make
 test-report-through-pa15` is 1139/1139; and the pa16 file audit passes with
 five warnings.  No fixtures or reference files changed.
 
-## Active Checkpoint: CP15 — callable conversion and friend lookup boundaries
+## Active Checkpoint: CP15 — empty-base layout and hidden-friend definitions
 
-Goal: reduce the remaining 12 pa16 failures while preserving CP1–CP14 and
-their canonical owners.
+Goal: reduce the remaining 9 pa16 failures while preserving CP1–CP14 and the
+review-4 owners (`BuildClassDefinition`'s last-component spelling,
+`CallResolution::indirect_callee`, `BuiltinFunctionKind`,
+`kInlineCleanupLimit`, the startup-first emission order in `Lowerer::Run`).
 
 ### Implementation Packet
 
-- Start with `300-member-function-pointer-field-call`,
-  `300-temporary-functor-call`, and
-  `300-prvalue-derived-base-friend-operator`; trace callable/member-pointer
-  conversion, implicit-object ranking, and derived-prvalue binding through
-  `expr_sema.cpp`, `conversions.cpp`, `overload.cpp`, and
-  `lower/lowir_expr.cpp`.
-- If that path is stable, inspect the remaining named LowIR mismatches for
-  function-pointer parameter shadowing, hidden-friend definitions, callable
-  fields, nullptr operators, and bit-field increment ordering.  Keep the
-  string-literal mutable-void-pointer and const-reference derived-pointer
-  diagnostics queued until their conversion ownership is isolated.
-- Preserve the known PA17 non-goals: block-scope `static` objects and by-value
-  copy semantics.  Require focused comparisons, `make test-pa16`, the
-  through-pa15 report, and the pa16 file audit; the failing set must shrink.
+- Start with `300-callable-field-hides-private-base-method`: the call already
+  resolves through the callable field; the mismatch is layout.  Itanium gives
+  an empty direct base at offset 0 no storage, so a first member of another
+  type also sits at offset 0 and the class has size 1 (the fixture pins
+  `obj<1x1>` and `index i8 %t, 0`).  Own this in `CompleteClassLayout`
+  (`scope_builder.cpp`) beside `ClassEntity::empty`; a member whose type is
+  the empty base itself must still follow it.  Re-run the alignment and
+  derived-layout fixtures after the change.
+- Then the hidden-friend definition shapes
+  (`200-unnamed-namespace-hidden-friend-single-definition`,
+  `300-friend-function-definition-skip`) and the remaining LowIR mismatches
+  (`100-function-pointer-nested-param-name-shadow`,
+  `300-operator-nullptr-t-from-zero`,
+  `400-bit-field-prefix-postfix-increment`, and
+  `200-friend-derived-private-base-defaulted-constructor`, whose reference
+  omits the base call); read each `.my.lowir.compare.diff` first.
+- Keep the two diagnostics
+  (`200-string-literal-does-not-convert-to-mutable-void-pointer`,
+  `spec/200-const-reference-binds-derived-pointer-prvalue`) queued until
+  their conversion ownership in `conversions.cpp` is isolated.
+- Leave the block-scope `extern` class declaration gap (audit review 4,
+  finding 10) recorded; do not extend the automatic-slot lowering it falls
+  into.  Preserve the PA17 non-goals: block-scope `static` objects and
+  by-value copy semantics.
+- Require focused comparisons, `make test-pa16`, the through-pa15 report, and
+  the pa16 file audit; the failing set must shrink, never merely shift, and
+  every fixture passing at review 4 must still pass (diff the sets, not the
+  counts).

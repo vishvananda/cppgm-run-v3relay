@@ -572,11 +572,11 @@ std::string Lowerer::RegisterStringLiteral(SemaId node_id,
   const std::size_t width = FundamentalSize(token.lit_type);
   if (width == 0 || token.lit_bytes.size() % width != 0)
     Unsupported("a string literal with an invalid code-unit width");
-  std::string content_key = std::to_string(static_cast<int>(token.lit_type));
-  content_key.push_back('\0');
-  for (std::size_t byte = 0; byte < token.lit_bytes.size(); ++byte)
-    content_key.push_back(static_cast<char>(token.lit_bytes[byte]));
-  const std::map<std::string, std::string>::const_iterator pooled =
+  const std::pair<EFundamentalType, std::string> content_key(
+      token.lit_type,
+      std::string(token.lit_bytes.begin(), token.lit_bytes.end()));
+  const std::map<std::pair<EFundamentalType, std::string>,
+                 std::string>::const_iterator pooled =
       string_content_symbols_.find(content_key);
   if (pooled != string_content_symbols_.end()) {
     string_symbols_[node_id] = pooled->second;

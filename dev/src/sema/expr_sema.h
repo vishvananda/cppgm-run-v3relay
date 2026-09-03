@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <map>
 #include <vector>
 
 #include "parser/ast_model.h"
@@ -58,6 +57,9 @@ private:
     std::vector<BindingId> bindings;
     SemaId implicit_object;
     SemaId pseudo_expression;
+    // The analyzed callee when it is a class member of pointer-to-function
+    // type: the call is through the member's value (5.2.2p1).
+    SemaId indirect_callee;
     bool member_callee;
     bool named_callee;
     bool suppress_adl;
@@ -65,8 +67,8 @@ private:
     bool pseudo_destructor;
 
     CallResolution()
-        : implicit_object(0), pseudo_expression(0), member_callee(false),
-          named_callee(false), suppress_adl(false),
+        : implicit_object(0), pseudo_expression(0), indirect_callee(0),
+          member_callee(false), named_callee(false), suppress_adl(false),
           has_implicit_object(false),
           pseudo_destructor(false) {}
   };
@@ -92,7 +94,7 @@ private:
   SemaId AnalyzeCall(AstId expression, ScopeId scope);
   SemaId AnalyzeNew(AstId expression, ScopeId scope);
   void ResolveCallCallee(AstId callee, ScopeId scope, CallResolution& result);
-  FunctionEntityId BuiltinFunction(const std::string& name);
+  FunctionEntityId BuiltinFunction(BuiltinFunctionKind kind);
   void ResolveNamedCallee(const QualifiedName& name, ScopeId scope,
                           CallResolution& result);
   SemaId FinishCall(AstId expression, AstId callee, ScopeId scope,
@@ -188,5 +190,5 @@ private:
   TypeTable& types_;
   SemaTree& tree_;
   ScopeBuilder& builder_;
-  std::map<std::string, FunctionEntityId> builtin_functions_;
+  std::vector<FunctionEntityId> builtin_functions_; // by BuiltinFunctionKind
 };

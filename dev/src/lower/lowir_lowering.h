@@ -59,6 +59,13 @@ private:
 class Lowerer
 {
 public:
+  // Guarded sequences (return cleanups, subobject constructor unwinds,
+  // destructor suffix cleanups) repeat their remaining actions in every
+  // handler block below this count, the shape the fixtures pin; at or
+  // above it the handler blocks form one linked chain so the emitted text
+  // stays linear in the sequence length.
+  static const std::size_t kInlineCleanupLimit = 32;
+
   Lowerer(ProgramLowering& shared, const std::vector<Pa6Token>& tokens,
           SemaModel& model, const SemaTree& tree);
 
@@ -168,11 +175,17 @@ private:
     std::vector<std::size_t> aggregate_path;
     bool aggregate_subobject;
     bool constructor_action;
+    // The whole braced aggregate is lowered into the zeroed object.
+    bool aggregate_object;
+    // Array element `element_index`, omitted from the list, is
+    // default-constructed in place (8.5.1p7).
+    bool default_construction;
 
     DynamicInitializer()
         : expression(0), byte_offset(0), element_index(0), type(0),
           aggregate_type(0), aggregate_path(), aggregate_subobject(false),
-          constructor_action(false) {}
+          constructor_action(false), aggregate_object(false),
+          default_construction(false) {}
   };
 
   // A class prvalue materialized by a constructor call in expression
@@ -187,7 +200,9 @@ private:
   };
 
   // Symbols.
-  void CollectTemporaryConstructorUses(SemaId node);
+  void CollectTemporaryConstructorUses(SemaId node,
+                                       bool variable_initializer = false);
+  bool ImplicitValueInitialization(SemaId action) const;
   void CollectSymbols(SemaId node);
   void CollectReferencedFunctions(SemaId node,
                                   std::set<FunctionEntityId>& result) const;
@@ -224,6 +239,9 @@ private:
       lowir_model::GlobalDefinition& global);
   bool ConstantGlobalItem(SemaId node, TypeId type,
                           lowir_model::GlobalDefinition::DataItem& item);
+  void AddOmittedElementConstructions(const GlobalSymbol& symbol,
+                                      TypeId element, std::size_t first,
+                                      std::size_t bound);
   bool ConstantGlobalAggregate(
       SemaId node, TypeId type,
       std::vector<lowir_model::GlobalDefinition::DataItem>& items);
@@ -452,6 +470,10 @@ private:
   void EmitSubobjectDestructor(ClassEntityId entity,
                                const SubobjectDestructor& destructor);
   void EmitSubobjectDestructors(ClassEntityId entity, bool guarded);
+  void EmitEhTry(const std::string& label);
+  void EmitEhCleanup(const std::string& label);
+  void EmitEhEnd();
+  void EmitResume();
   void EmitDestructorBody(FunctionEntityId function, SemaId function_node);
   void LowerConstructorInitializers(FunctionEntityId function,
                                     SemaId function_node);
@@ -488,7 +510,9 @@ private:
   std::vector<DynamicInitializer> dynamic_initializers_;
   std::vector<ThreadLocalInitializer> thread_local_initializers_;
   std::map<SemaId, std::string> string_symbols_;
-  std::map<std::string, std::string> string_content_symbols_;
+  // Literal objects shared by code-unit type and decoded bytes.
+  std::map<std::pair<EFundamentalType, std::string>, std::string>
+      string_content_symbols_;
 
   // Function-level state.
   lowir_model::Function function_;

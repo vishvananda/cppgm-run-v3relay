@@ -1383,7 +1383,11 @@ TypeId ScopeBuilder::BuildClassDefinition(AstId node, ScopeId scope,
   const AstNode& value = arena_.At(node);
   const TypeKeyword key = ClassKey(node);
   const QualifiedName name = NodeName(node);
-  string spelling = name.Empty() ? anonymous_name : name.Joined();
+  // A qualified class-head (`struct B::D : B {}`) defines the class
+  // declared in its prefix scope; the class scope and type keep the
+  // declared spelling `D` under `B`, so every consumer (LowIR names, the
+  // ABI encoder, the type dump) reads the same typed scope chain.
+  string spelling = name.Empty() ? anonymous_name : name.Last();
   const bool injected_union = name.Empty() && anonymous_name.empty() &&
       key == TK_UNION;
   if (spelling.empty())

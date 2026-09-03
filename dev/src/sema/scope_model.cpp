@@ -55,6 +55,43 @@ EnumEntity::EnumEntity()
 {
 }
 
+namespace {
+
+struct BuiltinNames
+{
+  const char* spelling;
+  const char* object;
+};
+
+// Indexed by BuiltinFunctionKind.
+const BuiltinNames kBuiltinNames[BUILTIN_KIND_COUNT] = {
+  { "", "" },
+  { "__builtin_unreachable", "cppgm_builtin_unreachable" },
+  { "__builtin_strlen", "cppgm_builtin_strlen" },
+  { "__builtin_memcpy", "cppgm_builtin_memcpy" },
+  { "__builtin_memmove", "cppgm_builtin_memmove" },
+};
+
+}  // namespace
+
+BuiltinFunctionKind BuiltinKindOf(const std::string& spelling)
+{
+  for (int kind = BUILTIN_NONE + 1; kind < BUILTIN_KIND_COUNT; ++kind)
+    if (spelling == kBuiltinNames[kind].spelling)
+      return static_cast<BuiltinFunctionKind>(kind);
+  return BUILTIN_NONE;
+}
+
+const char* BuiltinSpelling(BuiltinFunctionKind kind)
+{
+  return kBuiltinNames[kind].spelling;
+}
+
+const char* BuiltinObjectName(BuiltinFunctionKind kind)
+{
+  return kBuiltinNames[kind].object;
+}
+
 FunctionEntity::FunctionEntity()
     : scope(0), type(0), member_type(0), member_pointer_type(0),
       member_class(0), is_member(false), member_const(false),
@@ -64,7 +101,7 @@ FunctionEntity::FunctionEntity()
       body(0), ctor_initializer(0), parameter_names(), defaulted(false),
       deleted(false), explicit_constructor(false),
       static_member(false), in_class_definition(false), synthesized(false),
-      builtin(false),
+      builtin(BUILTIN_NONE),
       default_semantic_arguments(), default_member_initializers(),
       defined(false)
 {

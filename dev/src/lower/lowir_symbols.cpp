@@ -73,29 +73,48 @@ const char* OperatorWord(const std::string& spelling)
 // one function share its entity; repeated declarations of one object share
 // the first binding (Binding::redeclared_binding), so each symbol is created
 // once and its definition, if any, is remembered.
-void Lowerer::CollectTemporaryConstructorUses(SemaId node)
+// An expression-owned `T()` / `T{}` whose default constructor is not
+// user-provided: 8.5p7 zero-initializes the object, and a trivial
+// constructor adds no call.  LowerVariable applies this to a variable's
+// initializer; an expression temporary (`F()(x)`) keeps the constructor
+// call the fixtures spell, so only the variable form drops the demand.
+bool Lowerer::ImplicitValueInitialization(SemaId action) const
+{
+  const SemaNode& node = tree_.At(action);
+  if (node.kind != SEMA_CONSTRUCTOR_ACTION || node.binding != 0 ||
+      node.function == 0)
+    return false;
+  const SemaId call = node.first_child;
+  if (call == 0 || tree_.At(call).kind != SEMA_CALL ||
+      tree_.At(call).next_sibling != 0)
+    return false;
+  const SemaId callee = tree_.At(call).first_child;
+  if (callee == 0 || tree_.At(callee).next_sibling != 0)
+    return false;
+  const FunctionEntity& constructor = model_.FunctionAt(node.function);
+  return constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
+      constructor.member_class != 0 &&
+      (constructor.synthesized || constructor.defaulted);
+}
+
+void Lowerer::CollectTemporaryConstructorUses(SemaId node,
+                                              bool variable_initializer)
 {
   if (node == 0)
     return;
   const SemaNode& value = tree_.At(node);
   if (value.kind == SEMA_CONSTRUCTOR_ACTION && value.binding == 0 &&
       value.function != 0) {
-    const FunctionEntity& constructor = model_.FunctionAt(value.function);
-    const std::vector<SemaId> action_children = Children(node);
-    const bool value_initialization = action_children.size() == 1 &&
-        tree_.At(action_children[0]).kind == SEMA_CALL &&
-        Children(action_children[0]).size() == 1;
-    const bool trivial_value_initialization = value_initialization &&
-        constructor.special_member == SPECIAL_MEMBER_CONSTRUCTOR &&
-        constructor.member_class != 0 &&
-        model_.ClassAt(constructor.member_class).trivial_default_constructor &&
-        (constructor.synthesized || constructor.defaulted);
-    if (!trivial_value_initialization)
+    const bool elided = variable_initializer &&
+        ImplicitValueInitialization(node) &&
+        model_.ClassAt(model_.FunctionAt(value.function).member_class)
+            .trivial_default_constructor;
+    if (!elided)
       temporary_constructors_.insert(value.function);
   }
   for (SemaId child = value.first_child; child != 0;
        child = tree_.At(child).next_sibling)
-    CollectTemporaryConstructorUses(child);
+    CollectTemporaryConstructorUses(child, value.kind == SEMA_VARIABLE);
 }
 
 void Lowerer::CollectSymbols(SemaId node)
@@ -104,7 +123,7 @@ void Lowerer::CollectSymbols(SemaId node)
     return;
   const SemaNode& value = tree_.At(node);
   if (value.kind == SEMA_CALLEE && value.function != 0 &&
-      model_.FunctionAt(value.function).builtin) {
+      model_.FunctionAt(value.function).builtin != BUILTIN_NONE) {
     FunctionSymbol& symbol = functions_[value.function];
     if (symbol.declaration == 0) {
       symbol.declaration = node;
@@ -271,22 +290,9 @@ void Lowerer::NameSymbols()
         SPECIAL_MEMBER_DESTRUCTOR;
     const std::string destructor_name = destructor ?
         model_.ScopeAt(entity.scope).name : entity.name;
-    // A nested class scope is recorded with its qualified spelling (for
-    // example `B::D`) even though its enclosing class is already a separate
-    // scope component.  LowIR names are a flat display namespace, so retain
-    // only the innermost component here; ABI object names continue to use the
-    // canonical qualified spelling through NamespacePieces below.
-    std::vector<std::string> lowir_scopes = NamespacePieces(entity.scope);
-    for (std::size_t scope_index = 0; scope_index < lowir_scopes.size();
-         ++scope_index) {
-      const std::size_t separator = lowir_scopes[scope_index].rfind("::");
-      if (separator != std::string::npos)
-        lowir_scopes[scope_index] =
-            lowir_scopes[scope_index].substr(separator + 2);
-    }
     const std::string member_name = destructor ?
-        Join(lowir_scopes, "__", "_" + destructor_name) :
-        Join(lowir_scopes, "__",
+        Join(NamespacePieces(entity.scope), "__", "_" + destructor_name) :
+        Join(NamespacePieces(entity.scope), "__",
              LowirNamePiece(entity.name));
     symbol.name = TopLevelName(
         "@" + member_name,
@@ -484,11 +490,8 @@ std::string Lowerer::FunctionObjectName(FunctionEntityId id,
                                         bool base_variant) const
 {
   const FunctionEntity& entity = model_.FunctionAt(id);
-  if (entity.builtin) {
-    const std::string prefix = "__builtin_";
-    if (entity.name.compare(0, prefix.size(), prefix) == 0)
-      return "cppgm_builtin_" + entity.name.substr(prefix.size());
-  }
+  if (entity.builtin != BUILTIN_NONE)
+    return BuiltinObjectName(entity.builtin);
   if (entity.c_linkage)
     return entity.name;
   return MangleFunction(id, base_variant);
@@ -707,8 +710,10 @@ void Lowerer::BuildGlobalArrayDefinition(
     }
     global.data_items.push_back(item);
   }
-  if (bound > elements.size())
+  if (bound > elements.size()) {
     pending_zero += (bound - elements.size()) * element_size;
+    AddOmittedElementConstructions(symbol, element, elements.size(), bound);
+  }
   if (pending_zero != 0 || global.data_items.empty()) {
     DataItem zero;
     zero.kind = DataItem::ITEM_ZERO;
@@ -877,9 +882,18 @@ bool Lowerer::ConstantGlobalAggregate(
     return false;
 
   std::vector<DataItem> folded;
-  const auto append_zero = [&](TypeId zero_type) {
+  // A subobject the list omits is value-initialized (8.5.1p7): constant
+  // zero data when its class, or its element class, has a trivial default
+  // constructor; otherwise the whole object is constructed at startup.
+  const auto append_zero = [&](TypeId zero_type) -> bool {
     const TypeId zero_unqualified = types_.Unqualified(zero_type);
     const TypeKind zero_kind = types_.Kind(zero_unqualified);
+    TypeId element = zero_unqualified;
+    while (types_.Kind(element) == TYPE_ARRAY)
+      element = types_.Unqualified(types_.At(element).base);
+    if (types_.Kind(element) == TYPE_CLASS &&
+        !model_.ClassAt(types_.At(element).entity).trivial_default_constructor)
+      return false;
     if (zero_kind != TYPE_ARRAY && zero_kind != TYPE_CLASS) {
       DataItem zero;
       zero.kind = DataItem::ITEM_INTEGER;
@@ -893,6 +907,7 @@ bool Lowerer::ConstantGlobalAggregate(
       zero.zero_bytes = types_.SizeOf(zero_type);
       folded.push_back(zero);
     }
+    return true;
   };
   const auto append_padding = [&](std::size_t bytes) {
     if (bytes == 0)
@@ -911,7 +926,8 @@ bool Lowerer::ConstantGlobalAggregate(
       return false;
     for (std::size_t index = 0; index < bound; ++index) {
       if (index >= values.size()) {
-        append_zero(element);
+        if (!append_zero(element))
+          return false;
         continue;
       }
       const SemaId value = values[index];
@@ -956,7 +972,8 @@ bool Lowerer::ConstantGlobalAggregate(
 
       const TypeId field_unqualified = types_.Unqualified(field.type);
       if (value_index >= values.size()) {
-        append_zero(field.type);
+        if (!append_zero(field.type))
+          return false;
       } else {
         const SemaId value = values[value_index];
         if (types_.Kind(field_unqualified) == TYPE_ARRAY) {
@@ -1181,6 +1198,20 @@ void Lowerer::BuildGlobalDefinitions()
       if (folded_aggregate)
         continue;
       if (initializer.size() == 1 &&
+          tree_.At(initializer[0]).kind == SEMA_BRACED_INIT_LIST) {
+        // A dynamic leaf or an omitted subobject that needs construction:
+        // the zeroed object is aggregate-initialized at startup.
+        if (symbol.thread_local_storage)
+          Unsupported("a thread-local aggregate with a dynamic initializer");
+        DynamicInitializer dynamic;
+        dynamic.expression = initializer[0];
+        dynamic.symbol = symbol.name;
+        dynamic.type = binding.type;
+        dynamic.aggregate_object = true;
+        dynamic_initializers_.push_back(dynamic);
+        continue;
+      }
+      if (initializer.size() == 1 &&
           tree_.At(initializer[0]).kind == SEMA_CONSTRUCTOR_ACTION) {
         const std::vector<SemaId> action_children =
             Children(initializer[0]);
@@ -1356,7 +1387,32 @@ bool Lowerer::TryBuildRuntimeClassAggregate(
       }
     }
   }
+  AddOmittedElementConstructions(symbol, element, elements.size(),
+                                 types_.At(types_.Unqualified(binding.type))
+                                     .array_bound);
   return true;
+}
+
+// 8.5.1p7: array elements the list omits are value-initialized; a class
+// element with a non-trivial default constructor is constructed in place at
+// startup, after the listed elements.
+void Lowerer::AddOmittedElementConstructions(const GlobalSymbol& symbol,
+                                             TypeId element,
+                                             std::size_t first,
+                                             std::size_t bound)
+{
+  const TypeId unqualified = types_.Unqualified(element);
+  if (types_.Kind(unqualified) != TYPE_CLASS ||
+      model_.ClassAt(types_.At(unqualified).entity).trivial_default_constructor)
+    return;
+  for (std::size_t index = first; index < bound; ++index) {
+    DynamicInitializer dynamic;
+    dynamic.symbol = symbol.name;
+    dynamic.type = element;
+    dynamic.element_index = index;
+    dynamic.default_construction = true;
+    dynamic_initializers_.push_back(dynamic);
+  }
 }
 
 // The program's startup initializer stores every non-constant initializer
@@ -1368,6 +1424,29 @@ void Lowerer::BuildGlobalInitializers()
   ResumeInitFunction();
   for (std::size_t i = 0; i < dynamic_initializers_.size(); ++i) {
     const DynamicInitializer& dynamic = dynamic_initializers_[i];
+    if (dynamic.aggregate_object) {
+      Value object;
+      object.type = dynamic.type;
+      object.lvalue = true;
+      object.operand = GlobalOperand(dynamic.symbol);
+      initialized_bitfield_units_.clear();
+      LowerAggregateObjectInitializer(dynamic.expression, dynamic.type,
+                                      object, std::vector<std::size_t>());
+      continue;
+    }
+    if (dynamic.default_construction) {
+      lowir_model::Instruction base;
+      base.kind = lowir_model::Instruction::IK_ADDR;
+      base.dest = NewTemp();
+      base.type = PtrType();
+      base.first = GlobalOperand(dynamic.symbol);
+      Emit(base);
+      LowerAggregateDefaultConstructor(
+          dynamic.type,
+          ProjectArrayElement(TempOperand(base.dest), dynamic.type,
+                              dynamic.element_index));
+      continue;
+    }
     if (dynamic.constructor_action) {
       if (tree_.At(dynamic.expression).kind == SEMA_CONSTRUCTOR_ACTION) {
         // An array element constructed at startup, in place.
@@ -1514,7 +1593,8 @@ void Lowerer::BuildDeclarations()
           BuildFunctionDeclaration(function_order_[i], symbol, true));
     if (symbol.referenced) {
       const FunctionEntity& entity = model_.FunctionAt(function_order_[i]);
-      program_.function_declarations.push_back(entity.builtin ?
+      program_.function_declarations.push_back(
+          entity.builtin != BUILTIN_NONE ?
           BuildBuiltinDeclaration(function_order_[i], symbol) :
           BuildFunctionDeclaration(function_order_[i], symbol, false));
     }
@@ -1532,34 +1612,48 @@ lowir_model::FunctionDeclaration Lowerer::BuildBuiltinDeclaration(
   result.metadata.binding = lowir_model::SBM_STRONG;
   result.metadata.object_symbol = symbol.object;
   result.boundary.unwind = lowir_model::CUM_NO;
-  if (entity.name == "__builtin_unreachable") {
+  switch (entity.builtin)
+  {
+  case BUILTIN_UNREACHABLE:
     result.boundary.effects = lowir_model::CFXM_READNONE;
     result.boundary.returns = lowir_model::CRM_NORETURN;
-  } else if (entity.name == "__builtin_strlen") {
+    break;
+  case BUILTIN_STRLEN:
     result.boundary.effects = lowir_model::CFXM_READONLY;
-  } else if (entity.name == "__builtin_memcpy" ||
-             entity.name == "__builtin_memmove") {
+    break;
+  case BUILTIN_MEMCPY:
+  case BUILTIN_MEMMOVE:
     result.boundary.effects = lowir_model::CFXM_READWRITE;
+    break;
+  default:
+    break;
   }
   for (std::size_t i = 0; i < type.parameters.size(); ++i) {
     lowir_model::Parameter parameter;
     parameter.name = "%arg" + std::to_string(i);
     parameter.type = LowTypeOf(type.parameters[i]);
-    if (entity.name == "__builtin_strlen") {
+    switch (entity.builtin)
+    {
+    case BUILTIN_STRLEN:
       parameter.metadata.capture = lowir_model::PCM_NOCAPTURE;
       parameter.metadata.access = lowir_model::PAM_READ;
-    } else if (entity.name == "__builtin_memcpy") {
-      if (i < 2)
+      break;
+    case BUILTIN_MEMCPY:
+    case BUILTIN_MEMMOVE:
+      // Destination and source pointers are not captured; memcpy's do not
+      // alias.  The byte count carries no pointer metadata.
+      if (i < 2) {
         parameter.metadata.capture = lowir_model::PCM_NOCAPTURE;
-      parameter.metadata.access = i == 0 ? lowir_model::PAM_WRITE :
+        if (entity.builtin == BUILTIN_MEMCPY)
+          parameter.metadata.alias = lowir_model::PALM_NOALIAS;
+      }
+      parameter.metadata.access = i == 0 ?
+          (entity.builtin == BUILTIN_MEMCPY ? lowir_model::PAM_WRITE :
+           lowir_model::PAM_READWRITE) :
           i == 1 ? lowir_model::PAM_READ : lowir_model::PAM_DEFAULT;
-      if (i < 2)
-        parameter.metadata.alias = lowir_model::PALM_NOALIAS;
-    } else if (entity.name == "__builtin_memmove") {
-      if (i < 2)
-        parameter.metadata.capture = lowir_model::PCM_NOCAPTURE;
-      parameter.metadata.access = i == 0 ? lowir_model::PAM_READWRITE :
-          i == 1 ? lowir_model::PAM_READ : lowir_model::PAM_DEFAULT;
+      break;
+    default:
+      break;
     }
     result.params.push_back(parameter);
   }

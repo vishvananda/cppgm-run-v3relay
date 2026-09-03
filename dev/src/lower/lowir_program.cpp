@@ -124,24 +124,14 @@ void Lowerer::Run()
       symbol.base_required = true;
   }
   BuildGlobalDefinitions();
-  // Finalization roots are outside the semantic call graph.  Mark their
-  // complete destructor entries before deciding which weak bodies to emit.
-  for (std::size_t i = 0; i < global_order_.size(); ++i) {
-    const GlobalSymbol& global = globals_[global_order_[i]];
-    if (global.definition == 0)
-      continue;
-    TypeId type = types_.Unqualified(model_.BindingAt(global.binding).type);
-    if (types_.Kind(type) == TYPE_ARRAY)
-      type = types_.Unqualified(types_.At(type).base);
-    if (types_.Kind(type) != TYPE_CLASS)
-      continue;
-    const ClassEntityId entity = types_.At(type).entity;
-    if (!NeedsDestructor(entity))
-      continue;
-    const FunctionEntityId destructor = model_.ClassAt(entity).destructor;
-    if (destructor != 0)
-      (void)FunctionSymbolName(destructor);
-  }
+  // The startup, thread-local and shutdown bodies are demand roots outside
+  // the semantic call graph: an omitted aggregate subobject's constructor or
+  // a namespace-scope destructor is first named while they are lowered.
+  // Build them before the emission walk so every helper they call is a
+  // known reference when the weak bodies are chosen.
+  BuildThreadLocalInitializers();
+  BuildGlobalInitializers();
+  BuildGlobalFinalizers();
   // Lowering a constructor or destructor can discover a base-subobject
   // entry, or can discover a member's complete entry.  Keep the emission
   // walk bounded by the unit's finite entity table while allowing those
@@ -193,9 +183,6 @@ void Lowerer::Run()
       if (functions_[pending_aliases[i].first].base_required ==
           (base_owned != 0))
         program_.object_aliases.push_back(pending_aliases[i].second);
-  BuildThreadLocalInitializers();
-  BuildGlobalInitializers();
-  BuildGlobalFinalizers();
   BuildDeclarations();
 }
 
@@ -401,16 +388,6 @@ void Lowerer::LowerVariable(SemaId variable_node)
     // address in the action also makes explicit and synthesized construction
     // use the same call lowering path.
     if (initializer.empty()) {
-      const ClassEntityId entity = types_.At(unqualified).entity;
-      const ClassEntity& class_entity = model_.ClassAt(entity);
-      if (!class_entity.trivial_default_constructor) {
-        const FunctionEntityId constructor = DefaultConstructor(entity);
-        if (constructor == 0)
-          Unsupported("a class without a default constructor");
-        const Value address = AddressValue(object);
-        EmitVoidCall(FunctionSymbolName(constructor),
-                     std::vector<lowir_model::Operand>(1, address.operand));
-      }
       RegisterLiveObject(variable.binding, declared);
       return;
     }
@@ -442,9 +419,7 @@ void Lowerer::LowerVariable(SemaId variable_node)
         (void)LowerCall(action_children[0], 0);
       else {
         const FunctionEntity& constructor = model_.FunctionAt(function);
-        const bool value_initialization = call_children.size() == 1;
-        if (value_initialization &&
-            (constructor.synthesized || constructor.defaulted)) {
+        if (ImplicitValueInitialization(initializer[0])) {
           const lowir_model::Operand destination =
               AddressValue(object).operand;
           ZeroInitializeObject(declared, destination);
@@ -1372,33 +1347,82 @@ void Lowerer::EmitSubobjectDestructor(
                                             destructor.array_index)));
 }
 
+void Lowerer::EmitEhTry(const std::string& label)
+{
+  lowir_model::Instruction instruction;
+  instruction.kind = lowir_model::Instruction::IK_EH_TRY;
+  instruction.first = LabelOperand(label);
+  Emit(instruction);
+}
+
+void Lowerer::EmitEhCleanup(const std::string& label)
+{
+  lowir_model::Instruction instruction;
+  instruction.kind = lowir_model::Instruction::IK_EH_CLEANUP;
+  instruction.first = LabelOperand(label);
+  Emit(instruction);
+}
+
+void Lowerer::EmitEhEnd()
+{
+  lowir_model::Instruction instruction;
+  instruction.kind = lowir_model::Instruction::IK_EH_END;
+  Emit(instruction);
+}
+
+void Lowerer::EmitResume()
+{
+  lowir_model::Instruction instruction;
+  instruction.kind = lowir_model::Instruction::IK_RESUME;
+  Emit(instruction);
+}
+
+// Every subobject destructor but the last runs under a cleanup that
+// destroys the remaining subobjects.  Below kInlineCleanupLimit each cleanup
+// block repeats its whole suffix (the fixture shape); at the limit the
+// blocks form one chain, each destroying one subobject and continuing with
+// the next, and only the last pops the handler and resumes.
 void Lowerer::EmitSubobjectDestructors(ClassEntityId entity, bool guarded)
 {
   std::vector<SubobjectDestructor> destructors;
   CollectSubobjectDestructors(entity, destructors);
+  const std::size_t guards = guarded && destructors.size() > 1 ?
+      destructors.size() - 1 : 0;
+  const bool linked = guards >= kInlineCleanupLimit;
+  std::vector<std::string> chain;
+  if (linked)
+    for (std::size_t i = 0; i < guards; ++i)
+      chain.push_back(NewBlockLabel("destructor_suffix_cleanup"));
   for (std::size_t i = 0; i < destructors.size(); ++i) {
-    if (!guarded || i + 1 == destructors.size()) {
+    if (i >= guards) {
       EmitSubobjectDestructor(entity, destructors[i]);
       continue;
     }
-    const std::string cleanup_label = NewBlockLabel("destructor_suffix_cleanup");
+    const std::string cleanup_label = linked ? chain[i] :
+        NewBlockLabel("destructor_suffix_cleanup");
     const std::string next_label = NewBlockLabel("destructor_suffix_next");
-    lowir_model::Instruction cleanup;
-    cleanup.kind = lowir_model::Instruction::IK_EH_CLEANUP;
-    cleanup.first = LabelOperand(cleanup_label);
-    Emit(cleanup);
+    EmitEhCleanup(cleanup_label);
     EmitSubobjectDestructor(entity, destructors[i]);
-    lowir_model::Instruction end;
-    end.kind = lowir_model::Instruction::IK_EH_END;
-    Emit(end);
+    EmitEhEnd();
     EmitJump(next_label);
-    StartBlock(cleanup_label);
-    for (std::size_t suffix = i + 1; suffix < destructors.size(); ++suffix)
-      EmitSubobjectDestructor(entity, destructors[suffix]);
-    Emit(end);
-    lowir_model::Instruction resume;
-    resume.kind = lowir_model::Instruction::IK_RESUME;
-    Emit(resume);
+    if (!linked) {
+      StartBlock(cleanup_label);
+      for (std::size_t suffix = i + 1; suffix < destructors.size(); ++suffix)
+        EmitSubobjectDestructor(entity, destructors[suffix]);
+      EmitEhEnd();
+      EmitResume();
+    } else if (i + 1 == guards) {
+      for (std::size_t link = 0; link < guards; ++link) {
+        StartBlock(chain[link]);
+        EmitSubobjectDestructor(entity, destructors[link + 1]);
+        if (link + 1 < guards)
+          EmitJump(chain[link + 1]);
+        else {
+          EmitEhEnd();
+          EmitResume();
+        }
+      }
+    }
     StartBlock(next_label);
   }
 }
@@ -1413,26 +1437,17 @@ void Lowerer::EmitDestructorBody(FunctionEntityId function,
   }
   const std::string cleanup_label = NewBlockLabel("destructor_cleanup");
   const std::string end_label = NewBlockLabel("destructor_end");
-  lowir_model::Instruction cleanup;
-  cleanup.kind = lowir_model::Instruction::IK_EH_CLEANUP;
-  cleanup.first = LabelOperand(cleanup_label);
-  Emit(cleanup);
+  EmitEhCleanup(cleanup_label);
   LowerSequence(FunctionBody(function_node));
   if (!Terminated()) {
-    lowir_model::Instruction end;
-    end.kind = lowir_model::Instruction::IK_EH_END;
-    Emit(end);
+    EmitEhEnd();
     EmitSubobjectDestructors(entity.member_class, true);
     EmitJump(end_label);
   }
   StartBlock(cleanup_label);
   EmitSubobjectDestructors(entity.member_class, false);
-  lowir_model::Instruction end;
-  end.kind = lowir_model::Instruction::IK_EH_END;
-  Emit(end);
-  lowir_model::Instruction resume;
-  resume.kind = lowir_model::Instruction::IK_RESUME;
-  Emit(resume);
+  EmitEhEnd();
+  EmitResume();
   StartBlock(end_label);
 }
 
@@ -1641,28 +1656,44 @@ void Lowerer::EmitArrayDefaultConstructions(FunctionEntityId constructor,
                      LowerArrayElementAddress(subobject, element, index)));
   };
 
+  // Element k > 0 is constructed under a handler that destroys elements
+  // k-1 .. 0.  Below kInlineCleanupLimit each dispatch block repeats that
+  // whole prefix (the fixture shape); at the limit the blocks form one
+  // chain, each destroying one element and continuing with the previous
+  // element's block, and only the first element's block resumes.
+  const std::size_t guards = guarded && bound > 1 ? bound - 1 : 0;
+  const bool linked = guards >= kInlineCleanupLimit;
+  std::vector<std::string> chain;
+  if (linked)
+    for (std::size_t i = 0; i < guards; ++i)
+      chain.push_back(NewBlockLabel("call_unwind_dispatch"));
   for (std::size_t index = 0; index < bound; ++index) {
-    if (!guarded || index == 0) {
+    if (index > guards || index == 0) {
       emit_constructor(index);
       continue;
     }
-    const std::string cleanup_label = NewBlockLabel("call_unwind_dispatch");
+    const std::string cleanup_label = linked ? chain[index - 1] :
+        NewBlockLabel("call_unwind_dispatch");
     const std::string end_label = NewBlockLabel("call_unwind_end");
-    lowir_model::Instruction try_instruction;
-    try_instruction.kind = lowir_model::Instruction::IK_EH_TRY;
-    try_instruction.first = LabelOperand(cleanup_label);
-    Emit(try_instruction);
+    EmitEhTry(cleanup_label);
     emit_constructor(index);
-    lowir_model::Instruction end;
-    end.kind = lowir_model::Instruction::IK_EH_END;
-    Emit(end);
+    EmitEhEnd();
     EmitJump(end_label);
-    StartBlock(cleanup_label);
-    for (std::size_t previous = index; previous != 0; --previous)
-      emit_destructor(previous - 1);
-    lowir_model::Instruction resume;
-    resume.kind = lowir_model::Instruction::IK_RESUME;
-    Emit(resume);
+    if (!linked) {
+      StartBlock(cleanup_label);
+      for (std::size_t previous = index; previous != 0; --previous)
+        emit_destructor(previous - 1);
+      EmitResume();
+    } else if (index == guards) {
+      for (std::size_t link = guards; link != 0; --link) {
+        StartBlock(chain[link - 1]);
+        emit_destructor(link - 1);
+        if (link > 1)
+          EmitJump(chain[link - 2]);
+        else
+          EmitResume();
+      }
+    }
     StartBlock(end_label);
   }
 }
