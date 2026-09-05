@@ -52,9 +52,33 @@ ClassEntity::ClassEntity()
       size(0), alignment(1), requested_alignment(0), pack_alignment(0),
       destructor(0), inheriting_constructor_base(0), layout_complete(false),
       trivial_default_constructor(true), trivial_destructor(true),
-      trivially_copyable(true),
+      trivially_copyable(true), copy_move_constructors_declared(false),
+      copy_move_assignments_declared(false),
       empty(false), aggregate(true), is_union(false), defined(false)
 {
+}
+
+SubobjectTransfer SemaModel::CopyMoveTransfer(ClassEntityId subobject,
+                                              bool constructor,
+                                              bool move) const
+{
+  const ClassEntity& value = ClassAt(subobject);
+  if (constructor)
+  {
+    if (value.trivially_copyable)
+      return SubobjectTransfer(true);
+    const FunctionEntityId operation =
+        move && value.move_constructor != 0 ? value.move_constructor :
+        value.copy_constructor;
+    return SubobjectTransfer(false, operation);
+  }
+  if (value.trivially_copyable && value.copy_assignment == 0 &&
+      value.move_assignment == 0)
+    return SubobjectTransfer(true);
+  const FunctionEntityId operation =
+      move && value.move_assignment != 0 ? value.move_assignment :
+      value.copy_assignment;
+  return SubobjectTransfer(false, operation);
 }
 
 EnumEntity::EnumEntity()

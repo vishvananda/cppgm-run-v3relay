@@ -106,6 +106,8 @@ public:
 
   SemaId Root() const;
   void SetRoot(SemaId root);
+  // Nodes made so far; ids are dense in [1, Size()).
+  std::size_t Size() const;
 
   // Nodes made for a transient analysis (an array bound, an enumerator
   // value, a decltype operand) are released once their fact has been read:

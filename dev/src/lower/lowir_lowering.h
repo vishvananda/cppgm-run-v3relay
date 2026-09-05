@@ -142,14 +142,46 @@ private:
     std::string base_object;
     SemaId declaration; // first declaration or definition node
     SemaId definition;  // 0 when the unit has no body for it
+    // 12.8p31: the top-level local the definition lowers in %ret, and the
+    // `return local;` copy/move action that reuse elides (0 when none).
+    BindingId return_slot_binding;
+    SemaId elided_return_action;
     bool referenced;    // named by a call, an address, or an initializer
     bool base_required;
     bool base_emitted;
 
     FunctionSymbol()
-        : declaration(0), definition(0), referenced(false),
+        : declaration(0), definition(0), return_slot_binding(0),
+          elided_return_action(0), referenced(false),
           base_required(false), base_emitted(false) {}
   };
+
+  // One object an exception handler must destroy: a pending full-expression
+  // temporary (scope 0) or a scope-owned object, by binding or by the
+  // extended temporary it holds.  A handler is shared between call sites
+  // whose ordered live sets are equal.
+  struct CleanupEntry
+  {
+    ScopeId scope;
+    SemaId temporary;
+    BindingId binding;
+    TypeId type;
+
+    CleanupEntry(ScopeId scope = 0, SemaId temporary = 0,
+                 BindingId binding = 0, TypeId type = 0)
+        : scope(scope), temporary(temporary), binding(binding), type(type) {}
+    bool operator<(const CleanupEntry& other) const
+    {
+      if (scope != other.scope)
+        return scope < other.scope;
+      if (temporary != other.temporary)
+        return temporary < other.temporary;
+      if (binding != other.binding)
+        return binding < other.binding;
+      return type < other.type;
+    }
+  };
+  typedef std::vector<CleanupEntry> CleanupKey;
 
   // One entry per namespace-scope object, keyed by its first binding.
   struct GlobalSymbol
@@ -240,8 +272,8 @@ private:
                             std::set<FunctionEntityId>& active) const;
   void MarkElidedConstructorBaseVariants();
   void CollectSymbols(SemaId node);
-  void CollectReturnSlotCandidates(SemaId node);
-  BindingId ReturnSlotBinding(SemaId body, TypeId result) const;
+  BindingId ReturnSlotBinding(SemaId body, TypeId result,
+                              SemaId& returned_action) const;
   bool IsReturnSlotReuseAction(SemaId node) const;
   void CollectReferencedFunctions(SemaId node,
                                   std::set<FunctionEntityId>& result) const;
@@ -515,10 +547,8 @@ private:
   void EmitScopeDestructors(ScopeId scope);
   void EmitActiveDestructors();
   void EmitParameterDestructors();
-  bool HasActiveCleanup() const;
+  CleanupKey ActiveCleanupKey(const std::vector<SemaId>& pending) const;
   bool HasTemporaryArgument(SemaId node) const;
-  std::string CleanupHandlerKey(
-      const std::vector<SemaId>& pending) const;
   void FinishDeferredCallGuard();
   std::size_t CountReturnStatements(SemaId node) const;
   void EmitSharedReturn(const Value* value);
@@ -578,9 +608,10 @@ private:
   // Unit-level symbol state.
   std::map<FunctionEntityId, FunctionSymbol> functions_;
   std::vector<FunctionEntityId> function_order_;
-  // Build once per unit; temporary context otherwise would require a full
-  // semantic-tree scan for every constructor action.
-  std::map<SemaId, SemaId> semantic_parents_;
+  // Parent of every semantic node, indexed by id, built once per unit;
+  // temporary context otherwise would require a full semantic-tree scan
+  // for every constructor action.
+  std::vector<SemaId> semantic_parents_;
   std::set<FunctionEntityId> temporary_constructors_;
   std::set<SemaId> elided_return_actions_;
   std::set<FunctionEntityId> referenced_functions_;
@@ -606,7 +637,7 @@ private:
   std::map<SemaId, TemporaryObject> temporaries_;
   std::vector<SemaId> pending_temporaries_;
   std::vector<ParameterObject> parameter_destructors_;
-  std::map<std::string, std::string> cleanup_handler_labels_;
+  std::map<CleanupKey, std::string> cleanup_handler_labels_;
   // Bit-field allocation units (class scope, unit offset) already written
   // by the initialization in progress; later writes preserve neighbours.
   std::set<std::pair<ScopeId, std::size_t> > initialized_bitfield_units_;

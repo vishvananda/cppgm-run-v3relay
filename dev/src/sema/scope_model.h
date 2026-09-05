@@ -219,11 +219,19 @@ struct ClassEntity
   // synthesize from these; lowering decides which calls to emit from them.
   bool trivial_default_constructor;
   bool trivial_destructor;
-  // 12.8: the complete object can cross a value boundary as bytes only when
-  // its copy/move operations and every class subobject are trivial.  A
-  // reference member is not a class subobject and therefore does not clear
-  // this bit.
+  // 12.8p12-13: copy/move *construction* and destruction of the complete
+  // object are trivial, counting every base and member subobject, so a
+  // value boundary transfers it as bytes.  Assignment operators are not
+  // part of this fact (the ABI passes such an object by value regardless);
+  // an assignment consumer reads CopyMoveTransfer, which also consults the
+  // declared operator= members.  A reference member is not a class
+  // subobject and therefore does not clear this bit.
   bool trivially_copyable;
+  // EnsureCopyMoveMembers has declared the implicit copy/move constructors
+  // (assignments) and fixed their deletion state; a later demand reads the
+  // entity ids without another subobject walk.
+  bool copy_move_constructors_declared;
+  bool copy_move_assignments_declared;
   // 9p7 empty class: no non-static data members (named or not) in the
   // class or any base.  Lowering passes such a by-value parameter as a
   // bare object slot; every other class parameter object is copied.
@@ -320,10 +328,31 @@ struct FunctionEntity
   FunctionEntity();
 };
 
+// How a synthesized copy/move member transfers one class subobject
+// (12.8p15, p28): as part of the surrounding byte range, or through the
+// subobject's own copy/move member.  The caller decides what a missing or
+// deleted operation means (sema declares it on demand; lowering rejects).
+struct SubobjectTransfer
+{
+  bool bytes;
+  FunctionEntityId operation; // 0 when the class declares none
+
+  SubobjectTransfer(bool bytes = false, FunctionEntityId operation = 0)
+      : bytes(bytes), operation(operation) {}
+};
+
 class SemaModel
 {
 public:
   explicit SemaModel(TypeTable& types);
+
+  // The one rule for which member a synthesized copy/move constructor
+  // (assignment) uses on a class subobject: a trivially copyable subobject
+  // is bytes, except that a declared operator= is always called for an
+  // assignment; an xvalue source uses the move member and falls back to the
+  // copy member when no move member is declared (13.3.3.2).
+  SubobjectTransfer CopyMoveTransfer(ClassEntityId subobject,
+                                     bool constructor, bool move) const;
 
   ScopeId GlobalScope() const;
   // 7.3.1.1: whether a scope lies inside an unnamed namespace, the one fact

@@ -544,7 +544,7 @@ lowir_model::Function Lowerer::BuildFunctionVariant(
   const SemaId body = FunctionBody(node);
   if (body == 0)
     Unsupported("a function without a body");
-  return_slot_binding_ = ReturnSlotBinding(body, type.result);
+  return_slot_binding_ = symbol.return_slot_binding;
   if (return_slot_binding_ != 0)
     parameter_addresses_[return_slot_binding_] = TempOperand("%ret");
   // A return that destroys a long prefix of the same local-object stack at

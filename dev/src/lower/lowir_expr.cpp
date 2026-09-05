@@ -2251,7 +2251,9 @@ Lowerer::Value Lowerer::LowerCall(
   const bool can_throw = direct &&
       !model_.FunctionAt(callee.function).noexcept_qualifier &&
       exception_guard_depth_ == 0;
-  const bool guarded_call = can_throw && HasActiveCleanup();
+  const CleanupKey entry_cleanup = can_throw ?
+      ActiveCleanupKey(pending_temporaries_) : CleanupKey();
+  const bool guarded_call = can_throw && !entry_cleanup.empty();
   const bool guarded_arguments = guarded_call &&
       HasTemporaryArgument(node);
   const bool defer_guard = guarded_call && defer_next_call_guard_;
@@ -2264,15 +2266,14 @@ Lowerer::Value Lowerer::LowerCall(
   std::string argument_end;
   bool argument_handler_reused = false;
   if (guarded_arguments) {
-    const std::string key = CleanupHandlerKey(pending_at_entry);
-    const std::map<std::string, std::string>::const_iterator handler =
-        cleanup_handler_labels_.find(key);
+    const std::map<CleanupKey, std::string>::const_iterator handler =
+        cleanup_handler_labels_.find(entry_cleanup);
     if (handler != cleanup_handler_labels_.end()) {
       argument_cleanup = handler->second;
       argument_handler_reused = true;
     } else {
       argument_cleanup = NewBlockLabel("call_unwind_dispatch");
-      cleanup_handler_labels_[key] = argument_cleanup;
+      cleanup_handler_labels_[entry_cleanup] = argument_cleanup;
       argument_end = NewBlockLabel("call_unwind_end");
     }
     EmitEhTry(argument_cleanup);
@@ -2366,8 +2367,8 @@ Lowerer::Value Lowerer::LowerCall(
     std::string cleanup;
     std::string end;
     bool handler_reused = false;
-    const std::string key = CleanupHandlerKey(pending_temporaries_);
-    const std::map<std::string, std::string>::const_iterator handler =
+    const CleanupKey key = ActiveCleanupKey(pending_temporaries_);
+    const std::map<CleanupKey, std::string>::const_iterator handler =
         cleanup_handler_labels_.find(key);
     if (handler != cleanup_handler_labels_.end()) {
       cleanup = handler->second;
@@ -2602,60 +2603,16 @@ void Lowerer::FlushPendingTemporaryDestructors()
   pending_temporaries_.clear();
 }
 
-bool Lowerer::HasActiveCleanup() const
-{
-  if (!pending_temporaries_.empty())
-    return true;
-  std::set<ScopeId> visited;
-  for (std::size_t i = lowering_scopes_.size(); i != 0; --i) {
-    const ScopeId scope = lowering_scopes_[i - 1];
-    if (!visited.insert(scope).second)
-      continue;
-    const std::map<ScopeId, std::vector<LiveObject> >::const_iterator found =
-        live_objects_.find(scope);
-    if (found == live_objects_.end())
-      continue;
-    for (std::size_t object = 0; object < found->second.size(); ++object) {
-      const LiveObject& value = found->second[object];
-      if (value.temporary != 0) {
-        if (TemporaryNeedsDestructor(tree_.At(value.temporary).type))
-          return true;
-      } else {
-        TypeId type = types_.Unqualified(value.type);
-        while (types_.Kind(type) == TYPE_ARRAY)
-          type = types_.Unqualified(types_.At(type).base);
-        if (types_.Kind(type) == TYPE_CLASS &&
-            NeedsDestructor(types_.At(type).entity))
-          return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool Lowerer::HasTemporaryArgument(SemaId node) const
-{
-  if (node == 0)
-    return false;
-  const SemaNode& value = tree_.At(node);
-  if (value.kind == SEMA_CONSTRUCTOR_ACTION)
-    return true;
-  if (value.kind == SEMA_CALL &&
-      types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS)
-    return true;
-  for (SemaId child = value.first_child; child != 0;
-       child = tree_.At(child).next_sibling)
-    if (HasTemporaryArgument(child))
-      return true;
-  return false;
-}
-
-std::string Lowerer::CleanupHandlerKey(
+// The objects a handler raised at this point destroys, in destruction
+// order: the pending full-expression temporaries (every one of which needs
+// a destructor), then the scope-owned objects from the innermost scope
+// outward.  An empty key means a throwing call needs no guard.
+Lowerer::CleanupKey Lowerer::ActiveCleanupKey(
     const std::vector<SemaId>& pending) const
 {
-  std::string key;
+  CleanupKey key;
   for (std::size_t i = 0; i < pending.size(); ++i)
-    key += "t" + std::to_string(pending[i]) + ";";
+    key.push_back(CleanupEntry(0, pending[i]));
   std::set<ScopeId> visited;
   for (std::size_t i = lowering_scopes_.size(); i != 0; --i) {
     const ScopeId scope = lowering_scopes_[i - 1];
@@ -2677,18 +2634,29 @@ std::string Lowerer::CleanupHandlerKey(
         needed = types_.Kind(type) == TYPE_CLASS &&
             NeedsDestructor(types_.At(type).entity);
       }
-      if (!needed)
-        continue;
-      key += "s" + std::to_string(scope) + ":";
-      if (value.temporary != 0)
-        key += "t" + std::to_string(value.temporary);
-      else
-        key += "b" + std::to_string(value.binding) + ":" +
-            std::to_string(value.type);
-      key += ";";
+      if (needed)
+        key.push_back(CleanupEntry(scope, value.temporary, value.binding,
+                                   value.type));
     }
   }
   return key;
+}
+
+bool Lowerer::HasTemporaryArgument(SemaId node) const
+{
+  if (node == 0)
+    return false;
+  const SemaNode& value = tree_.At(node);
+  if (value.kind == SEMA_CONSTRUCTOR_ACTION)
+    return true;
+  if (value.kind == SEMA_CALL &&
+      types_.Kind(types_.Unqualified(value.type)) == TYPE_CLASS)
+    return true;
+  for (SemaId child = value.first_child; child != 0;
+       child = tree_.At(child).next_sibling)
+    if (HasTemporaryArgument(child))
+      return true;
+  return false;
 }
 
 void Lowerer::FinishDeferredCallGuard()

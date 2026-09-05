@@ -765,64 +765,44 @@ void ScopeBuilder::BuildVariable(BindingId binding, AstId initializer,
     const bool copy_list_initialization = value_kind == AST_BRACED_INIT_LIST &&
         after_declarator < tokens_.size() &&
         tokens_[after_declarator].IsSimple(OP_ASS);
-    // A conditional expression already produces the complete class value.
-    // Copy-initialization of that prvalue is the elided class boundary; it
-    // must not be reinterpreted as a one-argument constructor call.
-    if (value_kind == AST_CONDITIONAL_EXPRESSION)
-    {
-      const std::size_t mark = Tree().Mark();
-      const SemaId conditional = expression_.Analyze(value, scope);
-      const TypeId source_type = types_.Unqualified(
-          tree_->At(conditional).type);
-      if (types_.Kind(source_type) == TYPE_CLASS &&
-          types_.At(source_type).entity == types_.At(unqualified).entity &&
-          tree_->At(conditional).category == VC_PRVALUE)
-      {
-        tree_->Append(variable, conditional);
-        return;
-      }
-      Tree().Truncate(mark);
-    }
-    // A C-style or named cast to this class is likewise an expression-owned
-    // construction.  Preserve that complete value so lowering can initialize
-    // the declared object at its destination instead of trying to resolve
-    // the cast AST itself as a constructor argument.
-    if (value_kind == AST_CAST_EXPRESSION)
-    {
-      const std::size_t mark = Tree().Mark();
-      const SemaId cast = expression_.Analyze(value, scope);
-      const SemaNode& cast_node = tree_->At(cast);
-      const TypeId source_type = types_.Unqualified(cast_node.type);
-      if (types_.Kind(source_type) == TYPE_CLASS &&
-          types_.At(source_type).entity == types_.At(unqualified).entity &&
-          (cast_node.kind == SEMA_CONSTRUCTOR_ACTION ||
-           cast_node.category == VC_PRVALUE))
-      {
-        tree_->Append(variable, cast);
-        return;
-      }
-      Tree().Truncate(mark);
-    }
-    // A direct one-argument initialization from the same trivially
-    // copyable class still selects the copy constructor semantically, but
-    // its complete-object transfer is the raw value boundary.  Retain the
-    // source expression so lowering emits `copyobj` instead of manufacturing
-    // an otherwise empty constructor call.
-    if (value_kind == AST_PAREN_INITIALIZER &&
+    // An expression-shaped initializer (a conditional, a cast, or a
+    // one-argument paren form) is analyzed once and never discarded: the
+    // analysis may have declared deferred special-member definitions that a
+    // re-analysis would not recreate.  A same-class prvalue is the elided
+    // boundary and initializes the object directly (12.8p31); a trivially
+    // copyable same-class glvalue in the paren form is the raw value
+    // boundary (lowering emits `copyobj`); any other analyzed expression is
+    // the one constructor argument, or the copy-initialization source of a
+    // class without constructors.
+    const bool single_paren = value_kind == AST_PAREN_INITIALIZER &&
         arena_.At(value).children.size() == 1 &&
         arena_.At(arena_.At(value).children[0]).kind !=
-            AST_BRACED_INIT_LIST) {
-      const SemaId argument = expression_.Analyze(
-          arena_.At(value).children[0], scope);
-      TypeId source_type = types_.Unqualified(tree_->At(argument).type);
+            AST_BRACED_INIT_LIST;
+    if (value_kind == AST_CONDITIONAL_EXPRESSION ||
+        value_kind == AST_CAST_EXPRESSION || single_paren)
+    {
+      const SemaId analyzed = expression_.Analyze(
+          single_paren ? arena_.At(value).children[0] : value, scope);
+      const SemaNode& node = tree_->At(analyzed);
+      TypeId source_type = types_.Unqualified(node.type);
       if (types_.Kind(source_type) == TYPE_REFERENCE)
         source_type = types_.Unqualified(types_.Referent(source_type));
-      if (types_.Kind(source_type) == TYPE_CLASS &&
-          types_.At(source_type).entity == types_.At(unqualified).entity &&
-          class_entity.trivially_copyable) {
-        tree_->Append(variable, expression_.Initialize(argument, type));
-        return;
-      }
+      const bool same_class = types_.Kind(source_type) == TYPE_CLASS &&
+          types_.At(source_type).entity == types_.At(unqualified).entity;
+      if (same_class && !single_paren &&
+          (node.kind == SEMA_CONSTRUCTOR_ACTION ||
+           node.category == VC_PRVALUE))
+        tree_->Append(variable, analyzed);
+      else if (same_class && single_paren && class_entity.trivially_copyable)
+        tree_->Append(variable, expression_.Initialize(analyzed, type));
+      else if (single_paren ||
+               (!class_entity.aggregate && !class_entity.constructors.empty()))
+        AddConstructorActionWithAnalyzedArguments(
+            variable, scope, type, binding, std::vector<SemaId>(1, analyzed),
+            !single_paren, false);
+      else
+        tree_->Append(variable, expression_.Initialize(analyzed, type));
+      return;
     }
     // A class functional cast (`T(args)`) is an expression-shaped
     // constructor action.  Let expression analysis own that form; the
@@ -1420,6 +1400,16 @@ void ScopeBuilder::AddConstructorActionWithArguments(
   std::vector<SemaId> arguments;
   for (std::size_t i = 0; i < argument_nodes.size(); ++i)
     arguments.push_back(expression_.Analyze(argument_nodes[i], scope));
+  AddConstructorActionWithAnalyzedArguments(
+      variable, scope, type, binding, arguments, copy_initialization,
+      list_initialization);
+}
+
+void ScopeBuilder::AddConstructorActionWithAnalyzedArguments(
+    SemaId variable, ScopeId scope, TypeId type, BindingId binding,
+    const std::vector<SemaId>& arguments, bool copy_initialization,
+    bool list_initialization)
+{
   const FunctionEntityId constructor = ResolveConstructor(
       type, arguments, scope, copy_initialization);
   const FunctionEntity& function = model_.FunctionAt(constructor);

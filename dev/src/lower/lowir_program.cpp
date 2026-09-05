@@ -101,13 +101,12 @@ void ProgramLowering::Finish()
 // referenced functions this unit never defines.
 void Lowerer::Run()
 {
-  semantic_parents_.clear();
+  semantic_parents_.assign(tree_.Size(), 0);
   CollectSemanticParents(tree_.Root(), 0);
   constructor_no_work_cache_.clear();
   CollectTemporaryConstructorUses(tree_.Root());
-  CollectSymbols(tree_.Root());
   elided_return_actions_.clear();
-  CollectReturnSlotCandidates(tree_.Root());
+  CollectSymbols(tree_.Root());
   MarkElidedConstructorBaseVariants();
   ComputeReferencedFunctions();
   // Deferred in-class definitions are visited in declaration order, while a
@@ -499,30 +498,11 @@ void Lowerer::LowerVariable(SemaId variable_node)
   if (types_.Kind(unqualified) == TYPE_CLASS)
   {
     if (variable.binding == return_slot_binding_) {
-      if (!initializer.empty() && initializer.size() == 1 &&
-          tree_.At(initializer[0]).kind == SEMA_CONSTRUCTOR_ACTION) {
-        const SemaNode& action = tree_.At(initializer[0]);
-        const std::vector<SemaId> action_children = Children(initializer[0]);
-        if (action.function == 0 || action_children.size() != 1)
-          Unsupported("this return-slot constructor action");
-        const std::vector<SemaId> call_children = Children(action_children[0]);
-        const FunctionEntity& constructor =
-            model_.FunctionAt(action.function);
-        const TypeNode& callable =
-            types_.At(types_.Unqualified(constructor.type));
-        if (call_children.empty() ||
-            call_children.size() > callable.parameters.size() + 1)
-          Unsupported("this return-slot constructor call");
-        std::vector<lowir_model::Operand> arguments(1, TempOperand("%ret"));
-        for (std::size_t i = 2; i < call_children.size(); ++i) {
-          const TypeId parameter = callable.parameters[i - 1];
-          arguments.push_back(types_.Kind(types_.Unqualified(parameter)) ==
-              TYPE_REFERENCE ? LowerReferenceArgument(
-                  call_children[i], parameter).operand :
-              LowerRValue(call_children[i], parameter).operand);
-        }
-        EmitVoidCall(FunctionSymbolName(action.function), arguments);
-      }
+      // 12.8p31: the local is the caller's result object.  Its constructor
+      // action reaches %ret through the binding's parameter address, and a
+      // constructor-less aggregate has nothing to run.
+      if (!initializer.empty())
+        LowerClassValueInto(initializer[0], declared, TempOperand("%ret"));
       return;
     }
     Value object;
@@ -2149,21 +2129,17 @@ void Lowerer::LowerImplicitSpecialMember(FunctionEntityId function,
       result = types_.Unqualified(types_.At(result).base);
     return result;
   };
-  const auto Operation = [&](ClassEntityId sub) -> FunctionEntityId {
-    const ClassEntity& value = model_.ClassAt(sub);
-    FunctionEntityId result = 0;
-    if (constructor) {
-      result = move ? value.move_constructor : value.copy_constructor;
-      if (move && result == 0)
-        result = value.copy_constructor;
-    } else {
-      result = move ? value.move_assignment : value.copy_assignment;
-      if (move && result == 0)
-        result = value.copy_assignment;
-    }
-    if (result == 0 || model_.FunctionAt(result).deleted)
+  // The class model owns which member each subobject uses (or that it is
+  // bytes); sema declared every needed member when it declared this one.
+  const auto Operation = [&](ClassEntityId sub, bool& bytes)
+      -> FunctionEntityId {
+    const SubobjectTransfer transfer =
+        model_.CopyMoveTransfer(sub, constructor, move);
+    bytes = transfer.bytes;
+    if (bytes || transfer.operation == 0 ||
+        model_.FunctionAt(transfer.operation).deleted)
       return 0;
-    return result;
+    return transfer.operation;
   };
 
   struct Subobject
@@ -2183,18 +2159,15 @@ void Lowerer::LowerImplicitSpecialMember(FunctionEntityId function,
   std::vector<Subobject> subobjects;
   for (std::size_t i = 0; i < owner.bases.size(); ++i) {
     const ClassBase& base = owner.bases[i];
-    const ClassEntity& value = model_.ClassAt(base.entity);
-    const bool has_operation = constructor ?
-        (move ? value.move_constructor != 0 : value.copy_constructor != 0) :
-        (move ? value.move_assignment != 0 : value.copy_assignment != 0);
-    if ((constructor && value.trivially_copyable) ||
-        (!constructor && value.trivially_copyable && !has_operation))
+    bool bytes = false;
+    const FunctionEntityId operation = Operation(base.entity, bytes);
+    if (bytes)
       continue;
-    const FunctionEntityId operation = Operation(base.entity);
     if (operation == 0)
       Unsupported("a special member with an unavailable base operation");
-    subobjects.push_back(Subobject(base.offset, value.size, base.entity, true,
-                                   operation));
+    subobjects.push_back(Subobject(base.offset,
+                                   model_.ClassAt(base.entity).size,
+                                   base.entity, true, operation));
   }
   for (std::size_t i = 0; i < owner.fields.size(); ++i) {
     const ClassField& field = owner.fields[i];
@@ -2205,14 +2178,10 @@ void Lowerer::LowerImplicitSpecialMember(FunctionEntityId function,
       continue;
     const ClassEntityId sub_entity =
         static_cast<ClassEntityId>(types_.At(element).entity);
-    const ClassEntity& value = model_.ClassAt(sub_entity);
-    const bool has_operation = constructor ?
-        (move ? value.move_constructor != 0 : value.copy_constructor != 0) :
-        (move ? value.move_assignment != 0 : value.copy_assignment != 0);
-    if ((constructor && value.trivially_copyable) ||
-        (!constructor && value.trivially_copyable && !has_operation))
+    bool bytes = false;
+    const FunctionEntityId operation = Operation(sub_entity, bytes);
+    if (bytes)
       continue;
-    const FunctionEntityId operation = Operation(sub_entity);
     if (operation == 0)
       Unsupported("a special member with an unavailable field operation");
     const std::size_t element_size = types_.SizeOf(element);

@@ -866,30 +866,45 @@ SemaId ExpressionAnalyzer::InitializeReturn(SemaId expression, TypeId target)
   }
   return Initialize(expression, target);
 }
+
+// CP3 interim: only `operator bool` is found, by its lookup spelling.  CP5
+// replaces this with the typed conversion-function set the class owns and
+// the 13.3.1.5 candidate selection shared with Classify.
 SemaId ExpressionAnalyzer::ContextualBool(SemaId expression, ScopeId scope)
 {
-  if (expression == 0) throw std::runtime_error("missing contextual-bool expression");
+  if (expression == 0)
+    throw std::runtime_error("missing contextual-bool expression");
   TypeId object_type = types_.Unqualified(NodeInfo(expression).type);
-  if (types_.Kind(object_type) == TYPE_REFERENCE) object_type =
-      types_.Unqualified(types_.Referent(object_type));
-  if (types_.Kind(object_type) != TYPE_CLASS) throw std::runtime_error("condition is not contextual bool");
+  if (types_.Kind(object_type) == TYPE_REFERENCE)
+    object_type = types_.Unqualified(types_.Referent(object_type));
+  if (types_.Kind(object_type) != TYPE_CLASS)
+    throw std::runtime_error("condition is not contextual bool");
   vector<BindingId> bindings;
-  model_.LookupMember(types_.At(object_type).entity, "operatorbool", LOOKUP_FUNCTIONS, bindings);
+  model_.LookupMember(types_.At(object_type).entity, "operatorbool",
+                      LOOKUP_FUNCTIONS, bindings);
   FilterAccessibleBindings(scope, bindings);
   FunctionEntityId selected = 0;
-  for (size_t i = 0; i < bindings.size(); ++i) {
+  for (size_t i = 0; i < bindings.size(); ++i)
+  {
     const Binding& binding = model_.BindingAt(bindings[i]);
-    if (binding.kind != BINDING_FUNCTION || binding.function == 0) continue;
+    if (binding.kind != BINDING_FUNCTION || binding.function == 0)
+      continue;
     const FunctionEntity& function = model_.FunctionAt(binding.function);
-    if (!function.is_member || function.static_member) continue;
+    if (!function.is_member || function.static_member)
+      continue;
     const TypeNode& callable = types_.At(types_.Unqualified(function.type));
-    if (callable.parameters.size() != 1 || types_.Unqualified(callable.result) != types_.Fundamental(FT_BOOL)) continue;
-    if (selected != 0) throw std::runtime_error(
-        "ambiguous contextual bool conversion");
+    if (callable.parameters.size() != 1 ||
+        types_.Unqualified(callable.result) != types_.Fundamental(FT_BOOL))
+      continue;
+    if (selected != 0)
+      throw std::runtime_error("ambiguous contextual bool conversion");
     selected = binding.function;
   }
-  if (selected == 0) throw std::runtime_error("condition is not contextual bool");
-  const SemaId result = BuildResolvedCall(0, scope, selected, MakeImplicitObject(expression, scope), vector<SemaId>());
+  if (selected == 0)
+    throw std::runtime_error("condition is not contextual bool");
+  const SemaId result = BuildResolvedCall(
+      0, scope, selected, MakeImplicitObject(expression, scope),
+      vector<SemaId>());
   tree_.At(result).first = tree_.At(expression).first;
   tree_.At(result).last = tree_.At(expression).last;
   return result;

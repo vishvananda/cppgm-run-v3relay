@@ -62,6 +62,11 @@ void SemaTree::SetRoot(SemaId root)
   root_ = root;
 }
 
+std::size_t SemaTree::Size() const
+{
+  return nodes_.size();
+}
+
 std::size_t SemaTree::Mark() const
 {
   return nodes_.size();

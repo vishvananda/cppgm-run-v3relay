@@ -72,6 +72,8 @@ void Lowerer::CollectSemanticParents(SemaId node, SemaId parent)
 {
   if (node == 0)
     return;
+  if (node >= semantic_parents_.size())
+    semantic_parents_.resize(node + 1, 0);
   semantic_parents_[node] = parent;
   for (SemaId child = tree_.At(node).first_child; child != 0;
        child = tree_.At(child).next_sibling)
@@ -80,9 +82,7 @@ void Lowerer::CollectSemanticParents(SemaId node, SemaId parent)
 
 SemaId Lowerer::SemanticParent(SemaId node) const
 {
-  const std::map<SemaId, SemaId>::const_iterator found =
-      semantic_parents_.find(node);
-  return found == semantic_parents_.end() ? 0 : found->second;
+  return node < semantic_parents_.size() ? semantic_parents_[node] : 0;
 }
 
 // One walk over the unit in source order records every function entity the
@@ -358,8 +358,14 @@ void Lowerer::CollectSymbols(SemaId node)
         symbol.declaration = node;
         function_order_.push_back(value.function);
       }
-      if (value.kind == SEMA_FUNCTION_DEFINITION && symbol.definition == 0)
+      if (value.kind == SEMA_FUNCTION_DEFINITION && symbol.definition == 0) {
         symbol.definition = node;
+        const TypeNode& callable = types_.At(types_.Unqualified(entity.type));
+        symbol.return_slot_binding = ReturnSlotBinding(
+            FunctionBody(node), callable.result, symbol.elided_return_action);
+        if (symbol.elided_return_action != 0)
+          elided_return_actions_.insert(symbol.elided_return_action);
+      }
     }
   } else if (value.kind == SEMA_VARIABLE && value.binding != 0) {
     const Binding& binding = model_.BindingAt(value.binding);
@@ -392,8 +398,14 @@ void Lowerer::CollectSymbols(SemaId node)
     CollectSymbols(child);
 }
 
-BindingId Lowerer::ReturnSlotBinding(SemaId body, TypeId result) const
+// 12.8p31 return-slot reuse (the README's accepted direct form): a body
+// whose first statement declares one local of the result class, whose only
+// return statement is the last statement and returns that local.  The
+// local's initializer is empty or one constructor action.
+BindingId Lowerer::ReturnSlotBinding(SemaId body, TypeId result,
+                                     SemaId& returned_action) const
 {
+  returned_action = 0;
   if (body == 0 || ClassBoundary(result, true) != CBM_INDIRECT_RESULT ||
       types_.Kind(types_.Unqualified(result)) != TYPE_CLASS)
     return 0;
@@ -425,7 +437,7 @@ BindingId Lowerer::ReturnSlotBinding(SemaId body, TypeId result) const
           types_.At(types_.Unqualified(result)).entity)
     return 0;
   const std::vector<SemaId> initializer = Children(declarations[0]);
-  bool default_initialized = initializer.empty();
+  bool constructed = initializer.empty();
   if (initializer.size() == 1 &&
       tree_.At(initializer[0]).kind == SEMA_CONSTRUCTOR_ACTION) {
     const SemaNode& action = tree_.At(initializer[0]);
@@ -434,11 +446,9 @@ BindingId Lowerer::ReturnSlotBinding(SemaId body, TypeId result) const
         action_children.size() != 1 ||
         tree_.At(action_children[0]).kind != SEMA_CALL)
       return 0;
-    const FunctionEntity& constructor = model_.FunctionAt(action.function);
-    default_initialized = constructor.special_member ==
-        SPECIAL_MEMBER_CONSTRUCTOR;
+    constructed = true;
   }
-  if (!default_initialized)
+  if (!constructed)
     return 0;
   const std::vector<SemaId> returned = Children(statements.back());
   if (returned.size() != 1)
@@ -447,33 +457,31 @@ BindingId Lowerer::ReturnSlotBinding(SemaId body, TypeId result) const
   if (expression.kind == SEMA_ID_EXPRESSION &&
       expression.binding == variable.binding)
     return variable.binding;
-  if (expression.kind == SEMA_CONSTRUCTOR_ACTION &&
-      expression.binding == 0)
-    return variable.binding;
-  return 0;
-}
-
-void Lowerer::CollectReturnSlotCandidates(SemaId node)
-{
-  if (node == 0)
-    return;
-  const SemaNode& value = tree_.At(node);
-  if (value.kind == SEMA_FUNCTION_DEFINITION && value.function != 0) {
-    const FunctionEntity& function = model_.FunctionAt(value.function);
-    const TypeNode& callable = types_.At(types_.Unqualified(function.type));
-    const SemaId body = FunctionBody(node);
-    const BindingId binding = ReturnSlotBinding(body, callable.result);
-    if (binding != 0) {
-      const std::vector<SemaId> statements = Children(body);
-      const std::vector<SemaId> returned = Children(statements.back());
-      if (returned.size() == 1 &&
-          tree_.At(returned[0]).kind == SEMA_CONSTRUCTOR_ACTION)
-        elided_return_actions_.insert(returned[0]);
-    }
-  }
-  for (SemaId child = value.first_child; child != 0;
-       child = tree_.At(child).next_sibling)
-    CollectReturnSlotCandidates(child);
+  // `return local;` of a class with copy/move constructors is the selected
+  // copy/move action whose one argument names the local (InitializeReturn).
+  // Any other returned expression constructs a different object.
+  if (expression.kind != SEMA_CONSTRUCTOR_ACTION ||
+      expression.binding != 0 || expression.function == 0)
+    return 0;
+  const FunctionEntity& selected = model_.FunctionAt(expression.function);
+  if (!selected.copy_constructor && !selected.move_constructor)
+    return 0;
+  const std::vector<SemaId> action_children = Children(returned[0]);
+  if (action_children.size() != 1 ||
+      tree_.At(action_children[0]).kind != SEMA_CALL)
+    return 0;
+  const std::vector<SemaId> call_children = Children(action_children[0]);
+  if (call_children.size() != 2)
+    return 0;
+  SemaId source = call_children[1];
+  while (tree_.At(source).kind == SEMA_CAST &&
+         tree_.At(source).first_child != 0)
+    source = tree_.At(source).first_child;
+  if (tree_.At(source).kind != SEMA_ID_EXPRESSION ||
+      tree_.At(source).binding != variable.binding)
+    return 0;
+  returned_action = returned[0];
+  return variable.binding;
 }
 
 bool Lowerer::IsReturnSlotReuseAction(SemaId node) const
@@ -502,23 +510,11 @@ void Lowerer::CollectReferencedFunctions(
             function.move_assignment;
         const ClassEntity& owner = model_.ClassAt(function.member_class);
         const auto add_subobject = [&](ClassEntityId sub) {
-          const ClassEntity& value = model_.ClassAt(sub);
-          if (value.trivially_copyable)
-            return;
-          FunctionEntityId operation = 0;
-          if (constructor) {
-            operation = move ? value.move_constructor :
-                value.copy_constructor;
-            if (move && operation == 0)
-              operation = value.copy_constructor;
-          } else {
-            operation = move ? value.move_assignment :
-                value.copy_assignment;
-            if (move && operation == 0)
-              operation = value.copy_assignment;
-          }
-          if (operation != 0 && !model_.FunctionAt(operation).deleted)
-            result.insert(operation);
+          const SubobjectTransfer transfer =
+              model_.CopyMoveTransfer(sub, constructor, move);
+          if (!transfer.bytes && transfer.operation != 0 &&
+              !model_.FunctionAt(transfer.operation).deleted)
+            result.insert(transfer.operation);
         };
         for (std::size_t i = 0; i < owner.bases.size(); ++i)
           add_subobject(owner.bases[i].entity);

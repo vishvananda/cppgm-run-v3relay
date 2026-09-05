@@ -378,6 +378,10 @@ void ScopeBuilder::EnsureCopyMoveMembers(TypeId type, bool constructors,
   ClassEntity& owner = model_.ClassAt(class_entity);
   if (!owner.layout_complete || owner.class_scope == 0)
     return;
+  constructors = constructors && !owner.copy_move_constructors_declared;
+  assignments = assignments && !owner.copy_move_assignments_declared;
+  if (!constructors && !assignments)
+    return;
 
   const bool user_copy_constructor = UserDeclared(
       model_, owner.copy_constructor);
@@ -390,21 +394,15 @@ void ScopeBuilder::EnsureCopyMoveMembers(TypeId type, bool constructors,
   const bool user_destructor = owner.destructor != 0 &&
       UserDeclared(model_, owner.destructor);
 
-  // A trivial class subobject is covered by the surrounding byte range.  A
-  // nontrivial one must have the corresponding canonical operation available;
-  // an xvalue first tries the move member, then falls back to copy only when
-  // no move member was declared.
+  // 12.8p11/p23: a subobject that is not transferred as bytes must have its
+  // canonical operation declared (on demand here) and not deleted.
   const auto constructor_viable = [&](ClassEntityId sub,
                                       bool move) -> bool {
-    const ClassEntity& subowner = model_.ClassAt(sub);
-    if (subowner.trivially_copyable)
+    if (model_.CopyMoveTransfer(sub, true, move).bytes)
       return true;
-    EnsureCopyMoveMembers(subowner.type, true, false);
-    const ClassEntity& refreshed = model_.ClassAt(sub);
-    FunctionEntityId operation = move ? refreshed.move_constructor :
-        refreshed.copy_constructor;
-    if (move && operation == 0)
-      operation = refreshed.copy_constructor;
+    EnsureCopyMoveMembers(model_.ClassAt(sub).type, true, false);
+    const FunctionEntityId operation =
+        model_.CopyMoveTransfer(sub, true, move).operation;
     return operation != 0 && !model_.FunctionAt(operation).deleted;
   };
   const auto assignment_viable = [&](TypeId subobject, bool move) -> bool {
@@ -416,18 +414,11 @@ void ScopeBuilder::EnsureCopyMoveMembers(TypeId type, bool constructors,
       return true;
     const ClassEntityId sub_entity =
         static_cast<ClassEntityId>(types_.At(sub).entity);
-    const ClassEntity& subowner = model_.ClassAt(sub_entity);
-    const bool has_requested_operation = move ?
-        (subowner.move_assignment != 0 || subowner.copy_assignment != 0) :
-        subowner.copy_assignment != 0;
-    if (subowner.trivially_copyable && !has_requested_operation)
+    if (model_.CopyMoveTransfer(sub_entity, false, move).bytes)
       return true;
-    EnsureCopyMoveMembers(subowner.type, false, true);
-    const ClassEntity& refreshed = model_.ClassAt(sub_entity);
-    FunctionEntityId operation = move ? refreshed.move_assignment :
-        refreshed.copy_assignment;
-    if (move && operation == 0)
-      operation = refreshed.copy_assignment;
+    EnsureCopyMoveMembers(model_.ClassAt(sub_entity).type, false, true);
+    const FunctionEntityId operation =
+        model_.CopyMoveTransfer(sub_entity, false, move).operation;
     return operation != 0 && !model_.FunctionAt(operation).deleted;
   };
   const auto subobjects_viable = [&](bool constructor,
@@ -528,9 +519,6 @@ void ScopeBuilder::EnsureCopyMoveMembers(TypeId type, bool constructors,
       owner.copy_constructor = create_member(
           model_.ScopeAt(owner.class_scope).name, true, false, deleted);
       ClassEntity& refreshed = model_.ClassAt(class_entity);
-      if (refreshed.copy_constructor != 0 &&
-          model_.FunctionAt(refreshed.copy_constructor).deleted)
-        model_.FunctionAt(refreshed.copy_constructor).defined = false;
       refreshed.constructors.push_back(refreshed.copy_constructor);
     }
     if (owner.move_constructor == 0 && !user_copy_constructor &&
@@ -552,6 +540,7 @@ void ScopeBuilder::EnsureCopyMoveMembers(TypeId type, bool constructors,
         !model_.FunctionAt(refreshed.move_constructor).deleted &&
         !subobjects_viable(true, true))
       model_.FunctionAt(refreshed.move_constructor).deleted = true;
+    refreshed.copy_move_constructors_declared = true;
   }
 
   if (assignments)
@@ -580,5 +569,6 @@ void ScopeBuilder::EnsureCopyMoveMembers(TypeId type, bool constructors,
         !model_.FunctionAt(refreshed.move_assignment).deleted &&
         !subobjects_viable(false, true))
       model_.FunctionAt(refreshed.move_assignment).deleted = true;
+    refreshed.copy_move_assignments_declared = true;
   }
 }

@@ -199,6 +199,12 @@ private:
       const std::vector<AstId>& arguments,
       bool copy_initialization = false,
       bool list_initialization = false);
+  // The same action over already analyzed arguments; the AST form analyzes
+  // its arguments and delegates here.
+  void AddConstructorActionWithAnalyzedArguments(
+      SemaId variable, ScopeId scope, TypeId type, BindingId binding,
+      const std::vector<SemaId>& arguments, bool copy_initialization,
+      bool list_initialization);
   void BuildMemberInitializers(AstId initializer, ScopeId function_scope,
                                SemaId function_node,
                                FunctionEntityId owner);
